@@ -1709,6 +1709,7 @@ class PluginContext:
         description: str = "",
         emoji: str = "",
         override: bool = False,
+        end_turn: bool = False,
     ) -> Optional[PluginRegistration]:
         """Register a tool in the global registry **and** track it as plugin-provided.
 
@@ -1758,6 +1759,7 @@ class PluginContext:
             emoji=emoji,
             override=override,
             scope=scope,
+            end_turn=end_turn,
         )
         registered = registry.snapshot_registration(name, scope=scope)
         if (
