@@ -177,6 +177,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "-1001",
             "thread_id": "17585",
+            "agent_id": None,
         }
 
 
@@ -237,6 +238,7 @@ class TestResolveDeliveryTarget:
             "platform": "whatsapp",
             "chat_id": "12345678901234@lid",
             "thread_id": None,
+            "agent_id": None,
         }
 
 
@@ -252,6 +254,7 @@ class TestResolveDeliveryTarget:
             "platform": "whatsapp",
             "chat_id": "12345@lid",
             "thread_id": None,
+            "agent_id": None,
         }
 
     def test_unresolved_target_still_delivered_as_written(self):
@@ -291,6 +294,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "-4004",
             "thread_id": None,
+            "agent_id": None,
         }
 
 
