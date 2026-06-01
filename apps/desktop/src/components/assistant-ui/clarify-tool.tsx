@@ -8,6 +8,7 @@ import {
   type KeyboardEvent,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState
@@ -26,11 +27,18 @@ import { triggerHaptic } from '@/lib/haptics'
 import { CircleLetterA, Loader2, MessageQuestion } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import {
+  $clarifyInputs,
   bareChoice,
+  clarifyInputKey,
+  type ClarifyTextareaPosition,
   clearClarifyRequest,
   normalizeChoices,
   RECOMMENDED_LABEL,
   sessionClarifyRequest,
+  setClarifyDraft,
+  setClarifyFocusLocked,
+  setClarifySelectedChoices,
+  setClarifyTextareaPosition,
   warnDroppedChoices
 } from '@/store/clarify'
 import { $gateway } from '@/store/gateway'
@@ -311,6 +319,7 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
   const sessionId = useStore(useSessionView().$runtimeId)
   const $request = useMemo(() => sessionClarifyRequest(sessionId), [sessionId])
   const request = useStore($request)
+  const clarifyInputs = useStore($clarifyInputs)
   const gateway = useStore($gateway)
   const fromArgs = useMemo(() => readClarifyArgs(args), [args])
 
@@ -340,14 +349,31 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
   const hasChoices = choices.length > 0
   const multiSelect = hasChoices && Boolean(matchingRequest?.multiSelect ?? fromArgs.multiSelect)
 
-  const [draft, setDraft] = useState('')
   const [submitting, setSubmitting] = useState(false)
-  const [selectedChoices, setSelectedChoices] = useState<string[]>([])
   // The keyboard cursor. Indices 0..choices.length-1 are the options; the
   // trailing index (=== choices.length) is the "Other" free-text row.
   const [activeIndex, setActiveIndex] = useState(0)
   const [otherFocused, setOtherFocused] = useState(false)
+  const rootRef = useRef<HTMLDivElement | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement | null>(null)
+  const userFocusAwayUntilRef = useRef(0)
+
+  const inputSessionId = matchingRequest?.sessionId ?? sessionId
+
+  const inputKey = useMemo(
+    () => clarifyInputKey(inputSessionId, matchingRequest?.requestId ?? null, question),
+    [inputSessionId, matchingRequest?.requestId, question]
+  )
+
+  const clarifyInput = clarifyInputs[inputKey]
+  const draft = clarifyInput?.draft ?? ''
+  const focusLocked = clarifyInput?.focusLocked ?? false
+  const scrollTop = clarifyInput?.scrollTop ?? 0
+  // Memoized so the empty fallback keeps a stable identity across renders —
+  // selectChoice's callback deps must not churn on every keystroke.
+  const selectedChoices = useMemo(() => clarifyInput?.selectedChoices ?? [], [clarifyInput])
+  const selectionEnd = clarifyInput?.selectionEnd ?? null
+  const selectionStart = clarifyInput?.selectionStart ?? null
 
   // Race: tool.start fires a tick before clarify.request, so request_id
   // arrives slightly after the tool block mounts. Hold the whole panel on a
@@ -355,6 +381,129 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
   // a "loading question" stub is worse than a brief wait.
   const ready = Boolean(matchingRequest?.requestId)
   const loading = !ready && !submitting
+
+  const readTextareaPosition = useCallback((textarea: HTMLTextAreaElement): ClarifyTextareaPosition => {
+    return {
+      scrollTop: textarea.scrollTop,
+      selectionEnd: textarea.selectionEnd,
+      selectionStart: textarea.selectionStart
+    }
+  }, [])
+
+  const saveTextareaPosition = useCallback(() => {
+    const textarea = textareaRef.current
+
+    if (textarea) {
+      setClarifyTextareaPosition(inputKey, readTextareaPosition(textarea))
+    }
+  }, [inputKey, readTextareaPosition])
+
+  const focusTextareaAtSavedPosition = useCallback(() => {
+    const textarea = textareaRef.current
+
+    if (!textarea || textarea.disabled) {
+      return
+    }
+
+    textarea.focus({ preventScroll: true })
+
+    const fallbackSelection = textarea.value.length
+    const nextSelectionStart = Math.min(selectionStart ?? fallbackSelection, textarea.value.length)
+    const nextSelectionEnd = Math.min(selectionEnd ?? nextSelectionStart, textarea.value.length)
+
+    textarea.setSelectionRange(nextSelectionStart, nextSelectionEnd)
+    textarea.scrollTop = scrollTop
+  }, [scrollTop, selectionEnd, selectionStart])
+
+  const restoreTextareaFocus = useCallback(() => {
+    if (!ready || !focusLocked || submitting) {
+      return
+    }
+
+    const root = rootRef.current
+    const textarea = textareaRef.current
+
+    if (!textarea || textarea.disabled) {
+      return
+    }
+
+    const active = document.activeElement
+
+    if (active === textarea || (root && active instanceof Node && root.contains(active))) {
+      return
+    }
+
+    if (userFocusAwayUntilRef.current > window.performance.now()) {
+      return
+    }
+
+    focusTextareaAtSavedPosition()
+  }, [focusLocked, focusTextareaAtSavedPosition, ready, submitting])
+
+  useLayoutEffect(() => {
+    restoreTextareaFocus()
+
+    if (!ready || submitting) {
+      return undefined
+    }
+
+    const frame = window.requestAnimationFrame(restoreTextareaFocus)
+    const timeout = window.setTimeout(restoreTextareaFocus, 0)
+
+    return () => {
+      window.cancelAnimationFrame(frame)
+      window.clearTimeout(timeout)
+    }
+  }, [ready, restoreTextareaFocus, submitting])
+
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (focus-away timestamp, see eslint rule comment)
+  useEffect(() => {
+    if (!ready || submitting) {
+      return undefined
+    }
+
+    const markUserFocusAway = () => {
+      userFocusAwayUntilRef.current = window.performance.now() + 1000
+      setClarifyFocusLocked(inputKey, false)
+    }
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const root = rootRef.current
+
+      if (root && event.target instanceof Node && root.contains(event.target)) {
+        return
+      }
+
+      markUserFocusAway()
+    }
+
+    const handleKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== 'Escape' && event.key !== 'Tab') {
+        return
+      }
+
+      const root = rootRef.current
+      const active = document.activeElement
+
+      if (root && active instanceof Node && root.contains(active)) {
+        markUserFocusAway()
+      }
+    }
+
+    const handleFocusIn = () => {
+      window.setTimeout(restoreTextareaFocus, 0)
+    }
+
+    window.addEventListener('pointerdown', handlePointerDown, true)
+    window.addEventListener('keydown', handleKeyDown, true)
+    window.addEventListener('focusin', handleFocusIn, true)
+
+    return () => {
+      window.removeEventListener('pointerdown', handlePointerDown, true)
+      window.removeEventListener('keydown', handleKeyDown, true)
+      window.removeEventListener('focusin', handleFocusIn, true)
+    }
+  }, [inputKey, ready, restoreTextareaFocus, submitting])
 
   const respond = useCallback(
     async (answer: string) => {
@@ -404,17 +553,18 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
   const selectChoice = useCallback(
     (choice: string, index: number) => {
       // Picking a choice and typing are mutually exclusive answers.
-      setDraft('')
-      setSelectedChoices(selected => {
-        if (!multiSelect) {
-          return [choice]
-        }
-
-        return selected.includes(choice) ? selected.filter(value => value !== choice) : [...selected, choice]
-      })
+      setClarifyDraft(inputKey, '')
+      setClarifySelectedChoices(
+        inputKey,
+        multiSelect
+          ? selectedChoices.includes(choice)
+            ? selectedChoices.filter(value => value !== choice)
+            : [...selectedChoices, choice]
+          : [choice]
+      )
       setActiveIndex(index)
     },
-    [multiSelect]
+    [inputKey, multiSelect, selectedChoices]
   )
 
   // Keep the cursor in range when the choice set changes (never past "Other").
@@ -429,15 +579,15 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
       // Arrow navigation is a move, not a pick. Multi-select keeps staged
       // choices while the cursor moves so the user can build a set; the
       // single-select path retains its existing clear-on-navigation behaviour.
-      setDraft('')
+      setClarifyDraft(inputKey, '')
 
       if (!multiSelect) {
-        setSelectedChoices([])
+        setClarifySelectedChoices(inputKey, [])
       }
 
       setActiveIndex(index => (index + delta + itemCount) % itemCount)
     },
-    [choices.length, multiSelect]
+    [choices.length, inputKey, multiSelect]
   )
 
   const submitAnswer = useCallback(() => {
@@ -584,13 +734,11 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
   }
 
   const onDraftChange = (value: string) => {
-    setDraft(value)
+    const textarea = textareaRef.current
 
     // Typing is its own answer — drop any picked choice so the two inputs can't
     // both look selected.
-    if (value.trim()) {
-      setSelectedChoices([])
-    }
+    setClarifyDraft(inputKey, value, textarea ? readTextareaPosition(textarea) : undefined)
   }
 
   return (
@@ -608,7 +756,7 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
       data-clarify-choices={hasChoices ? choices.length : undefined}
       onSubmit={handleSubmit}
     >
-      <ClarifyShell className="grid gap-2">
+      <ClarifyShell className="grid gap-2" ref={rootRef}>
         <div className="flex items-start gap-2">
           <span className="flex-1 whitespace-pre-wrap font-medium leading-(--conversation-line-height)">
             {question}
@@ -648,14 +796,22 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
                 aria-keyshortcuts={`${letterFor(choices.length)} ${choices.length + 1}`}
                 className={CLARIFY_TEXTAREA_CLASS}
                 disabled={submitting}
-                onBlur={() => setOtherFocused(false)}
+                onBlur={event => {
+                  setOtherFocused(false)
+                  setClarifyTextareaPosition(inputKey, readTextareaPosition(event.currentTarget))
+                  window.setTimeout(restoreTextareaFocus, 0)
+                }}
                 onChange={event => onDraftChange(event.target.value)}
                 onFocus={() => {
-                  setSelectedChoices([])
+                  setClarifySelectedChoices(inputKey, [])
+                  setClarifyFocusLocked(inputKey, true)
                   setActiveIndex(choices.length)
                   setOtherFocused(true)
+                  window.requestAnimationFrame(focusTextareaAtSavedPosition)
                 }}
                 onKeyDown={handleTextareaKey}
+                onScroll={saveTextareaPosition}
+                onSelect={saveTextareaPosition}
                 placeholder={copy.other}
                 ref={textareaRef}
                 rows={1}
@@ -668,8 +824,18 @@ function ClarifyToolPending({ args }: ToolCallMessagePartProps) {
           <Textarea
             className={CLARIFY_TEXTAREA_CLASS}
             disabled={submitting}
+            onBlur={event => {
+              setClarifyTextareaPosition(inputKey, readTextareaPosition(event.currentTarget))
+              window.setTimeout(restoreTextareaFocus, 0)
+            }}
             onChange={event => onDraftChange(event.target.value)}
+            onFocus={() => {
+              setClarifyFocusLocked(inputKey, true)
+              window.requestAnimationFrame(focusTextareaAtSavedPosition)
+            }}
             onKeyDown={handleTextareaKey}
+            onScroll={saveTextareaPosition}
+            onSelect={saveTextareaPosition}
             placeholder={copy.placeholder}
             ref={textareaRef}
             rows={1}
