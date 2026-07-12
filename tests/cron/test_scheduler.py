@@ -210,6 +210,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "-1001234567890",
             "thread_id": "42",
+            "agent_id": None,
         }
 
 
@@ -222,6 +223,7 @@ class TestResolveDeliveryTarget:
             "platform": "telegram",
             "chat_id": "-1003724596514",
             "thread_id": "17",
+            "agent_id": None,
         }
 
 
