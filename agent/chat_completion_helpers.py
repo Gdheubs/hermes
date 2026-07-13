@@ -4139,9 +4139,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _fire_first_delta()
                 agent._fire_reasoning_delta(reasoning_text)
 
-            # Accumulate text content — fire callback only when no tool calls
+            # Accumulate text content — fire callback only when no tool calls.
+            # Some OpenAI-compatible providers emit a text delta as a list of
+            # content blocks.  Convert it once so callbacks and the synthetic
+            # completion message always receive plain text.
             if delta and delta.content:
-                content_parts.append(delta.content)
+                _delta_content = flatten_message_text(delta.content, sep="")
+                content_parts.append(_delta_content)
                 if not tool_calls_acc:
                     if pending_text_parts or _provider_stream_text_may_be_sse(delta.content):
                         pending_text_parts.append(delta.content)
@@ -4151,7 +4155,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         _flush_pending_stream_text()
                         continue
                     _fire_first_delta()
-                    agent._fire_stream_delta(delta.content)
+                    agent._fire_stream_delta(_delta_content)
                     deltas_were_sent["yes"] = True
                 # Tool calls suppress regular content streaming (avoids
                 # displaying chatty "I'll use the tool..." text alongside
@@ -4166,8 +4170,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # box is already closed (tool boundary flush).
                 elif agent.stream_delta_callback:
                     try:
-                        agent.stream_delta_callback(delta.content)
-                        agent._record_streamed_assistant_text(delta.content)
+                        agent.stream_delta_callback(_delta_content)
+                        agent._record_streamed_assistant_text(_delta_content)
                     except Exception:
                         pass
 
