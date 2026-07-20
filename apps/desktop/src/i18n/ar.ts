@@ -963,6 +963,7 @@ export const ar = defineLocale({
     running: 'قيد التشغيل',
     failed: 'فشل',
     done: 'تم',
+    verificationRequired: 'التحقق مطلوب',
     streaming: 'جار البث',
     files: 'الملفات',
     moreFiles: count => `+${count} ملفات إضافية`,
@@ -2425,6 +2426,8 @@ export const ar = defineLocale({
       statusError: 'خطأ',
       statusRecovered: 'تم الاسترداد',
       statusDone: 'تم',
+      statusUnverified: 'غير مُتحقَّق منه',
+      statusPartial: 'جزئي',
       memoryWriteNoted: 'تم تسجيل كتابة الذاكرة',
       actions: {
         read: 'قراءة',

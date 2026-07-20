@@ -1263,6 +1263,7 @@ export const en: Translations = {
     running: 'Running',
     failed: 'Failed',
     done: 'Done',
+    verificationRequired: 'Verification required',
     streaming: 'Streaming',
     files: 'Files',
     moreFiles: count => `+${count} more files`,
@@ -3048,6 +3049,8 @@ export const en: Translations = {
       statusError: 'Error',
       statusRecovered: 'Recovered',
       statusDone: 'Done',
+      statusUnverified: 'Unverified',
+      statusPartial: 'Partial',
       memoryWriteNoted: 'Memory write noted',
       actions: {
         read: 'Read',
