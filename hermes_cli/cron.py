@@ -173,6 +173,9 @@ def cron_list(show_all: bool = False):
         workdir = job.get("workdir")
         if workdir:
             print(f"    Workdir:   {workdir}")
+        interpreter = job.get("interpreter")
+        if interpreter:
+            print(f"    Python:    {interpreter}")
 
         # Execution history
         last_status = job.get("last_status")
@@ -361,6 +364,7 @@ def cron_create(args):
         workdir=getattr(args, "workdir", None),
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
+        interpreter=getattr(args, "interpreter", None),
         no_agent=getattr(args, "no_agent", False) or None,
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),
@@ -384,6 +388,8 @@ def cron_create(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if job_data.get("workdir"):
         print(f"  Workdir: {job_data['workdir']}")
+    if job_data.get("interpreter"):
+        print(f"  Python: {job_data['interpreter']}")
     print(f"  Next run: {result['next_run_at']}")
     _warn_if_gateway_not_running()
     return 0
@@ -432,6 +438,7 @@ def cron_edit(args):
         workdir=getattr(args, "workdir", None),
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
+        interpreter=getattr(args, "interpreter", None),
         no_agent=getattr(args, "no_agent", None),
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),
@@ -458,6 +465,8 @@ def cron_edit(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if updated.get("workdir"):
         print(f"  Workdir: {updated['workdir']}")
+    if updated.get("interpreter"):
+        print(f"  Python: {updated['interpreter']}")
     return 0
 
 
