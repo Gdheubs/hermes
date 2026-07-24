@@ -865,6 +865,35 @@ class TestCronjobToolScript:
         assert result["job"]["script"] == "monitor.py"
         assert result["job"]["interpreter"] == "~/venvs/reporting/bin/python3"
 
+    def test_cronjob_positional_task_id_not_shifted_by_interpreter(self, cron_env, monkeypatch):
+        """``interpreter`` must not break positional callers of ``cronjob()``.
+
+        Existing callers may pass the trailing monitor/task/session fields
+        positionally. ``interpreter`` is appended after ``session_id`` so none
+        of those established slots can be rebound to an interpreter path.
+        """
+        import inspect
+        from tools.cronjob_tools import cronjob
+
+        params = list(inspect.signature(cronjob).parameters)
+        assert params.index("interpreter") > params.index("task_id")
+        assert params.index("interpreter") > params.index("session_id")
+
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        # Simulate a positional call through task_id. ``interpreter`` stays at
+        # its default; a wrong signature order would persist the task id as a
+        # bogus interpreter path.
+        positional = [None] * (params.index("task_id") + 1)
+        positional[0] = "create"            # action
+        positional[2] = "Monitor things"    # prompt
+        positional[3] = "every 1h"          # schedule
+        positional[14] = "monitor.py"       # script
+        positional[params.index("task_id")] = "legacy-task-id"
+        result = json.loads(cronjob(*positional))
+        assert result["success"] is True
+        # No interpreter was supplied; the task id must not leak into the job.
+        assert "interpreter" not in result["job"]
+
     def test_update_interpreter(self, cron_env, monkeypatch):
         monkeypatch.setenv("HERMES_INTERACTIVE", "1")
         from tools.cronjob_tools import cronjob
