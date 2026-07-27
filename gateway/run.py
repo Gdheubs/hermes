@@ -25307,11 +25307,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     )
 
     _HONCHO_CACHE_BUSTING_KEYS = (
+        "honcho.workspace_id",
+        "honcho.api_key_fingerprint",
+        "honcho.environment",
+        "honcho.base_url",
+        "honcho.timeout",
         "honcho.peer_name",
         "honcho.ai_peer",
         "honcho.pin_peer_name",
         "honcho.runtime_peer_prefix",
         "honcho.user_peer_aliases",
+        "honcho.enabled",
+        "honcho.save_messages",
+        "honcho.context_tokens",
+        "honcho.write_frequency",
+        "honcho.dialectic_reasoning_level",
+        "honcho.dialectic_dynamic",
+        "honcho.dialectic_max_chars",
+        "honcho.dialectic_depth",
+        "honcho.dialectic_depth_levels",
+        "honcho.reasoning_heuristic",
+        "honcho.reasoning_level_cap",
+        "honcho.user_observe_me",
+        "honcho.user_observe_others",
+        "honcho.ai_observe_me",
+        "honcho.ai_observe_others",
+        "honcho.observation_explicit",
+        "honcho.message_max_chars",
+        "honcho.dialectic_max_input_chars",
+        "honcho.recall_mode",
+        "honcho.init_on_session_start",
+        "honcho.injection_frequency",
+        "honcho.context_cadence",
+        "honcho.dialectic_cadence",
+        "honcho.query_rewrite",
+        "honcho.first_turn_base_wait",
+        "honcho.first_turn_dialectic_wait",
+        "honcho.session_strategy",
+        "honcho.session_peer_prefix",
+        "honcho.sessions",
     )
     _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, int | None], dict[str, Any]] = {}
 
@@ -25321,7 +25355,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @classmethod
     def _extract_honcho_cache_busting_config(cls) -> dict[str, Any]:
-        """Extract Honcho identity keys, memoized by honcho.json mtime."""
+        """Extract effective Honcho behavior settings, memoized by config mtime."""
         try:
             from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
 
@@ -25337,12 +25371,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             hcfg = HonchoClientConfig.from_global_config(config_path=path)
             aliases = hcfg.user_peer_aliases or {}
+            sessions = hcfg.sessions or {}
+            api_key_fingerprint = None
+            if hcfg.api_key:
+                import hashlib
+
+                api_key_fingerprint = hashlib.sha256(
+                    hcfg.api_key.encode("utf-8")
+                ).hexdigest()
             values = {
+                "honcho.workspace_id": hcfg.workspace_id,
+                "honcho.api_key_fingerprint": api_key_fingerprint,
+                "honcho.environment": hcfg.environment,
+                "honcho.base_url": hcfg.base_url,
+                "honcho.timeout": hcfg.timeout,
                 "honcho.peer_name": hcfg.peer_name,
                 "honcho.ai_peer": hcfg.ai_peer,
                 "honcho.pin_peer_name": bool(hcfg.pin_peer_name),
                 "honcho.runtime_peer_prefix": hcfg.runtime_peer_prefix or "",
                 "honcho.user_peer_aliases": sorted(aliases.items()) if isinstance(aliases, dict) else [],
+                "honcho.enabled": bool(hcfg.enabled),
+                "honcho.save_messages": bool(hcfg.save_messages),
+                "honcho.context_tokens": hcfg.context_tokens,
+                "honcho.write_frequency": hcfg.write_frequency,
+                "honcho.dialectic_reasoning_level": hcfg.dialectic_reasoning_level,
+                "honcho.dialectic_dynamic": bool(hcfg.dialectic_dynamic),
+                "honcho.dialectic_max_chars": hcfg.dialectic_max_chars,
+                "honcho.dialectic_depth": hcfg.dialectic_depth,
+                "honcho.dialectic_depth_levels": hcfg.dialectic_depth_levels,
+                "honcho.reasoning_heuristic": bool(hcfg.reasoning_heuristic),
+                "honcho.reasoning_level_cap": hcfg.reasoning_level_cap,
+                "honcho.user_observe_me": bool(hcfg.user_observe_me),
+                "honcho.user_observe_others": bool(hcfg.user_observe_others),
+                "honcho.ai_observe_me": bool(hcfg.ai_observe_me),
+                "honcho.ai_observe_others": bool(hcfg.ai_observe_others),
+                "honcho.observation_explicit": bool(hcfg.observation_explicit),
+                "honcho.message_max_chars": hcfg.message_max_chars,
+                "honcho.dialectic_max_input_chars": hcfg.dialectic_max_input_chars,
+                "honcho.recall_mode": hcfg.recall_mode,
+                "honcho.init_on_session_start": bool(hcfg.init_on_session_start),
+                "honcho.injection_frequency": hcfg.injection_frequency,
+                "honcho.context_cadence": hcfg.context_cadence,
+                "honcho.dialectic_cadence": hcfg.dialectic_cadence,
+                "honcho.query_rewrite": bool(hcfg.query_rewrite),
+                "honcho.first_turn_base_wait": hcfg.first_turn_base_wait,
+                "honcho.first_turn_dialectic_wait": hcfg.first_turn_dialectic_wait,
+                "honcho.session_strategy": hcfg.session_strategy,
+                "honcho.session_peer_prefix": bool(hcfg.session_peer_prefix),
+                "honcho.sessions": (
+                    sorted(sessions.items()) if isinstance(sessions, dict) else []
+                ),
             }
             cls._HONCHO_CACHE_BUSTING_MEMO = {memo_key: values}
             return dict(values)
@@ -25382,7 +25460,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             out["tools.registry_generation"] = None
 
-        # Honcho identity-mapping keys live in honcho.json, not user_config.
+        # Honcho behavior settings live in honcho.json, not user_config.
         # Only read that file when Honcho is the active memory provider.
         provider = cfg_get(cfg, "memory", "provider")
         if isinstance(provider, str) and provider.lower() == "honcho":

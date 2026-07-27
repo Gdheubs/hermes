@@ -389,6 +389,7 @@ class HonchoSessionManager:
         auth_dead = False
         try:
             from honcho.session import SessionPeerConfig
+
             user_config = SessionPeerConfig(
                 observe_me=self._user_observe_me,
                 observe_others=self._user_observe_others,
@@ -404,21 +405,44 @@ class HonchoSessionManager:
                 lambda: self._sdk_session(session_id).add_peers(peer_entries),
             )
 
-            # Sync back: server-side config (set via Honcho UI) wins over
-            # local defaults. Read the effective config after add_peers.
-            # Note: observation booleans are manager-scoped, not per-session.
-            # Last session init wins. Fine for CLI; gateway should scope per-session.
-            try:
-                def _read_server_configs() -> tuple[Any, Any]:
-                    sdk_session = self._sdk_session(session_id)
-                    return (
-                        sdk_session.get_peer_configuration(user_peer),
-                        sdk_session.get_peer_configuration(assistant_peer),
-                    )
-
-                server_user, server_ai = self._authed_call(
-                    "peer configuration read", _read_server_configs
+            def _read_server_configs() -> tuple[Any, Any]:
+                sdk_session = self._sdk_session(session_id)
+                return (
+                    sdk_session.get_peer_configuration(user_peer),
+                    sdk_session.get_peer_configuration(assistant_peer),
                 )
+
+            server_user, server_ai = self._authed_call(
+                "peer configuration read", _read_server_configs
+            )
+            if getattr(self._config, "observation_explicit", False) is True:
+                configured_peers = [
+                    (user_peer, user_config, server_user),
+                    (assistant_peer, ai_config, server_ai),
+                ]
+                updates = [
+                    (peer, local_config)
+                    for peer, local_config, server_config in configured_peers
+                    if (
+                        server_config.observe_me,
+                        server_config.observe_others,
+                    ) != (
+                        local_config.observe_me,
+                        local_config.observe_others,
+                    )
+                ]
+                # Disable observers before enabling others so the server's
+                # observer limit is never exceeded during a handoff.
+                updates.sort(key=lambda update: update[1].observe_others is True)
+                for peer, local_config in updates:
+                    self._authed_call(
+                        "peer configuration update",
+                        lambda peer=peer, local_config=local_config: self._sdk_session(
+                            session_id
+                        ).set_peer_configuration(peer, local_config),
+                    )
+            else:
+                # Without an explicit local policy, retain server-managed values.
                 if server_user.observe_me is not None:
                     self._user_observe_me = server_user.observe_me
                 if server_user.observe_others is not None:
@@ -429,20 +453,19 @@ class HonchoSessionManager:
                     self._ai_observe_others = server_ai.observe_others
                 logger.debug(
                     "Honcho observation synced from server: user(me=%s,others=%s) ai(me=%s,others=%s)",
-                    self._user_observe_me, self._user_observe_others,
-                    self._ai_observe_me, self._ai_observe_others,
+                    self._user_observe_me,
+                    self._user_observe_others,
+                    self._ai_observe_me,
+                    self._ai_observe_others,
                 )
-            except HonchoAuthError:
-                raise
-            except Exception as e:
-                logger.debug("Honcho get_peer_configuration failed (using local config): %s", e)
         except HonchoAuthError:
             # Already recorded by _authed_call; skip the remaining init calls.
             auth_dead = True
         except Exception as e:
             logger.warning(
-                "Honcho session '%s' add_peers failed (non-fatal): %s",
-                session_id, e,
+                "Honcho session '%s' peer configuration failed (non-fatal): %s",
+                session_id,
+                e,
             )
 
         # Load existing messages via context() - single call for messages + metadata
