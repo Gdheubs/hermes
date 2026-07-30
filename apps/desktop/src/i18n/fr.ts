@@ -129,10 +129,12 @@ export const fr: Translations = {
     updateHermes: 'Mettre à jour Hermes',
     updateReadyTitle: 'Mise à jour prête',
     updateReadyMessage: count => `${count} nouvelle modification${count === 1 ? '' : 's'} disponible.`,
+    updateReadyMessageUnknown: 'Une nouvelle mise à jour est disponible.',
     seeWhatsNew: 'Voir les nouveautés',
     errors: {
       elevenLabsNeedsKey: 'STT ElevenLabs nécessite ELEVENLABS_API_KEY.',
       elevenLabsRejectedKey: 'ElevenLabs a rejeté la clé API (401).',
+      diskFull: 'Le disque est plein. Libérez de l’espace disque, puis réessayez.',
       gatewayAuthFailed: "Échec de l'authentification du gateway — vérifiez API_SERVER_KEY.",
       methodNotAllowed:
         'Le backend du desktop a rejeté cette requête (405 Method Not Allowed). Essayez de redémarrer Hermes Desktop.',
@@ -202,9 +204,10 @@ export const fr: Translations = {
     unmuteHaptics: 'Réactiver les vibrations',
     openSettings: 'Ouvrir les paramètres',
     openStarmap: 'Ouvrir le graphe de mémoire',
-    openKeybinds: 'Raccourcis clavier',
+    enterHud: 'Mode HUD',
+    exitHud: 'Quitter le mode HUD',
     layoutEditor: 'Éditeur de disposition',
-    layoutEditorTitle: 'Éditeur de disposition — clic avec ⌘ pour réinitialiser la disposition'
+    layoutEditorTitle: mod => `Éditeur de disposition — ${mod}-clic réinitialise la disposition`
   },
 
   keybinds: {
@@ -340,6 +343,7 @@ export const fr: Translations = {
       providerApiKeys: 'Clés API',
       providerCustomEndpoints: 'Points de terminaison personnalisés',
       gateway: 'Gateway',
+      connections: 'Connexions',
       apiKeys: 'Outils et clés',
       keybinds: 'Raccourcis clavier',
       keysTools: 'Outils',
@@ -350,6 +354,51 @@ export const fr: Translations = {
       billing: 'Facturation',
       notifications: 'Notifications',
       plugins: 'Plugins'
+    },
+    connections: {
+      title: 'Connexions',
+      intro:
+        'Enregistrez tous les emplacements où vivent vos agents : cet appareil, les gateways distantes de votre réseau et les instances Hermes Cloud. Ils sont tous conservés ici.',
+      stagedNote:
+        "Les conversations et la liste des agents suivent la source choisie ; le backend de fenêtre géré par l'application reste sélectionné dans Paramètres → Gateway.",
+      loadFailed: 'Impossible de charger les connexions',
+      primaryPill: 'Principale',
+      managedPill: 'Cet appareil',
+      addConnection: 'Ajouter une connexion',
+      editConnection: 'Modifier',
+      removeConnection: 'Supprimer',
+      removeConfirmTitle: 'Supprimer cette connexion ?',
+      removeConfirmDesc: label =>
+        `« ${label} » sera supprimée de cette application. L'instance elle-même ne sera pas modifiée ; vous pourrez la rajouter à tout moment.`,
+      makePrimary: 'Définir comme principale',
+      testConnection: 'Tester',
+      testOk: 'Accessible',
+      testFailed: 'Le test de connexion a échoué',
+      saveFailed: "Impossible d'enregistrer la connexion",
+      removeFailed: 'Impossible de supprimer la connexion',
+      updateAll: 'Mettre à jour toutes les instances',
+      updateAllRunning: 'Mise à jour de toutes les instances…',
+      updateAllDone: 'Mises à jour envoyées',
+      updateAllFailed: "L'envoi groupé des mises à jour a échoué",
+      updateSkippedCloud: 'Gérée par Hermes Cloud',
+      kindLocal: 'Locale',
+      kindRemote: 'Gateway distante',
+      kindCloud: 'Hermes Cloud',
+      kindSsh: 'SSH',
+      kindLocalDesc: "L'environnement Hermes géré par cette application.",
+      kindRemoteDesc: 'Une gateway Hermes accessible en HTTP(S), par le LAN, Tailscale ou Internet.',
+      kindCloudDesc: 'Une instance hébergée découverte via votre compte Hermes Cloud.',
+      kindSshDesc: 'Une installation Hermes accessible en SSH.',
+      labelTitle: 'Nom',
+      labelDesc:
+        'Obligatoire. Affiché partout où cette instance apparaît et nécessairement unique (par exemple « Homelab » ou « PC professionnel »).',
+      labelPlaceholder: 'Homelab',
+      urlTitle: 'URL de la gateway',
+      sshHostTitle: 'Hôte SSH',
+      save: 'Enregistrer la connexion',
+      saving: 'Enregistrement…',
+      cancel: 'Annuler',
+      empty: 'Aucune connexion enregistrée.'
     },
     plugins: {
       title: 'Plugins du desktop',
@@ -362,7 +411,20 @@ export const fr: Translations = {
       disable: 'Désactiver',
       failed: 'échec',
       empty: 'Aucun plugin desktop installé pour le moment.',
-      kinds: { bundled: 'intégré', disk: 'sur le disque', runtime: "à l'exécution" }
+      kinds: { bundled: 'intégré', disk: 'sur le disque', runtime: "à l'exécution" },
+      agent: {
+        title: "Plugins de l'agent",
+        blurb:
+          "S'exécutent dans le backend Hermes : outils, skills, serveurs MCP, hooks et commandes slash. Les plugins portables sont des paquets Agent Plugins (skills et ensembles MCP compatibles avec d'autres agents). Les changements s'appliquent aux nouvelles sessions.",
+        empty: "Aucun plugin d'agent installé pour le moment.",
+        loadFailed: "Impossible de charger les plugins de l'agent",
+        portable: 'portable',
+        search: 'Rechercher des plugins…',
+        noMatches: 'Aucun plugin ne correspond à votre recherche.',
+        toggleFailed: (name: string) => `Impossible de modifier l’état de ${name}`,
+        updateBackendToManage: 'Mettez à jour le backend Hermes pour gérer ce plugin depuis le Desktop.',
+        sources: { bundled: 'intégré', user: 'utilisateur', git: 'git', project: 'projet', entrypoint: 'pip' }
+      }
     },
     notifications: {
       title: 'Notifications',
@@ -394,6 +456,10 @@ export const fr: Translations = {
         credits: {
           label: 'Alertes de crédits',
           description: "L'accès aux crédits est suspendu ou rétabli."
+        },
+        plugin: {
+          label: 'Notifications des plugins',
+          description: 'Un plugin desktop a envoyé une notification pendant que Hermes était en arrière-plan.'
         }
       },
       test: 'Envoyer une notification de test',
@@ -438,13 +504,31 @@ export const fr: Translations = {
       toolViewTitle: "Affichage des appels d'outil",
       toolViewDesc:
         'Le mode Produit masque les charges utiles brutes ; le mode Technique affiche les entrées/sorties complètes.',
+      reasoningCollapsedTitle: 'Réduire le raisonnement par défaut',
+      reasoningCollapsedDesc:
+        "Conserver le raisonnement diffusé en continu sans le développer tant que vous ne l'ouvrez pas.",
       uiScaleTitle: "Échelle de l'interface",
       uiScaleDesc: (percent: number) =>
         `Redimensionne le texte et les contrôles dans toute l'application. Cmd/Ctrl avec +, - et 0 fonctionne aussi. Actuel : ${percent}%.`,
+      sessionDensityTitle: 'Densité de la liste des sessions',
+      sessionDensityDesc: 'Choisissez la quantité de contexte affichée sous les titres de session dans la barre latérale.',
+      sessionDensityCompact: 'Compacte',
+      sessionDensityComfortable: 'Confortable',
+      sessionDensityDetailed: 'Détaillée',
+      terminalFontTitle: 'Police du terminal',
+      terminalFontDesc:
+        'Choisissez une police installée pour les terminaux Desktop. Les Nerd Fonts affichent correctement Powerlevel10k et les icônes du shell ; laissez vide pour utiliser JetBrains Mono intégré.',
+      terminalFontPlaceholder: 'MesloLGS NF ou une pile de polices CSS',
+      terminalFontPreview: 'Aperçu des glyphes',
+      terminalFontReset: 'Utiliser la valeur par défaut',
       translucencyTitle: 'Translucidité de la fenêtre',
       translucencyDesc: 'Voir votre bureau à travers toute la fenêtre. macOS et Windows uniquement.',
       backdropTitle: 'Arrière-plan de la conversation',
       backdropDesc: "L'image de statue discrète derrière la conversation.",
+      reactionsTitle: 'Réactions aux messages',
+      reactionsDesc: 'Réactions emoji façon iMessage — réagissez aux messages, et Hermes peut réagir aux vôtres.',
+      composerPopoutTitle: 'Détacher la zone de saisie',
+      composerPopoutDesc: 'Autoriser la zone de saisie à s’ouvrir dans une fenêtre flottante distincte.',
       embedsTitle: 'Intégrations en ligne',
       embedsDesc:
         "Les aperçus enrichis se chargent depuis des sites tiers (YouTube, X, …). Demander affiche un espace réservé jusqu'à ce que vous autorisiez chacun ; Toujours les charge automatiquement ; Désactivé conserve les liens simples.",
@@ -774,6 +858,7 @@ export const fr: Translations = {
       cantReach: "Impossible d'atteindre le serveur de mises à jour.",
       tapCheck: 'Cliquez sur « Vérifier maintenant » pour rechercher des mises à jour.',
       updateReady: count => `Une nouvelle mise à jour est prête (${count} changement${count === 1 ? '' : 's'} inclus).`,
+      updateReadyUnknown: 'Une nouvelle mise à jour est prête.',
       lastChecked: age => `Dernière vérification ${age}`,
       justNowSuffix: " · à l'instant",
       automaticUpdates: 'Mises à jour automatiques',
@@ -802,9 +887,14 @@ export const fr: Translations = {
       autosaveFailed: "Échec de l'enregistrement automatique",
       imported: 'Configuration importée',
       invalidJson: 'JSON de configuration invalide',
+      toolsetsWipeConfirm:
+        'Retirer tous les ensembles d’outils activés ? Cela désactive la mémoire, le terminal, la recherche web, la délégation et la plupart des autres outils jusqu’à leur réactivation.',
       keepAwakeTitle: "Garder l'ordinateur éveillé",
       keepAwakeDesc:
         "Empêcher cette machine de se mettre en veille pendant les exécutions longues ou nocturnes. L'écran peut toujours s'obscurcir.",
+      disableF12Title: 'Désactiver les outils de développement avec F12',
+      disableF12Desc:
+        'Empêcher F12 d’ouvrir les outils de développement. Ctrl+Maj+I (ou Cmd+Option+I sur Mac) continue de fonctionner.',
       attachmentSizeTitle: 'Taille maximale de chargement des aperçus / images',
       attachmentSizeDesc:
         'Taille maximale d’un fichier local que Desktop chargera pour les aperçus et les pièces jointes image, en Mo. La valeur par défaut est 16. Les pièces jointes distantes non-image utilisent une limite distincte de 256 Mo. Une valeur très élevée charge le fichier entier en mémoire et peut figer ou planter l’application.',
@@ -924,6 +1014,13 @@ export const fr: Translations = {
       existingToken: value => `Jeton existant ${value}`,
       savedToken: 'enregistré',
       pasteSessionToken: 'Coller le jeton de session',
+      plainTextConfirmTitle: 'Stocker le jeton du gateway en clair ?',
+      plainTextConfirmDesc:
+        "Aucun service de trousseau système n'a été trouvé sur cette machine. Le jeton serait donc enregistré sans chiffrement dans le fichier des paramètres de connexion de l'application et serait lisible par tout processus exécuté par cet utilisateur. Installez ou activez GNOME Keyring ou KWallet pour bénéficier d'un stockage chiffré.",
+      plainTextConfirmAction: 'Enregistrer en clair',
+      plainTextStoredTitle: 'Jeton stocké en clair',
+      plainTextStoredDesc:
+        "Le stockage sécurisé est indisponible. Le jeton enregistré est donc stocké sans chiffrement dans le fichier des paramètres de connexion de l'application sur cette machine. Installez ou activez GNOME Keyring ou KWallet pour le chiffrer.",
       testRemote: 'Tester le distant',
       saveForRestart: 'Enregistrer pour le prochain redémarrage',
       saveAndReconnect: 'Enregistrer et se reconnecter',
@@ -972,6 +1069,8 @@ export const fr: Translations = {
       sshHermesPathTitle: 'Chemin Hermes (facultatif)',
       sshHermesPathDesc: 'Chemin complet vers le binaire hermes distant. Vide = détection automatique.',
       sshHermesPathPlaceholder: 'détection automatique',
+      sshRemoteProfileTitle: 'Profil distant (facultatif)',
+      sshRemoteProfileDesc: "Nom du profil sur l'hôte distant. Vide = utiliser le nom du profil Desktop.",
       sshTestConnection: 'Tester SSH',
       sshConnect: 'Se connecter',
       sshButtonsHint: "Enregistrer s'applique au prochain lancement. Connecter se reconnecte immédiatement.",
@@ -1246,6 +1345,7 @@ export const fr: Translations = {
   skills: {
     tabSkills: 'Skills',
     tabToolsets: 'Outils',
+    configuringProfile: 'Configuration de :',
     tabMcp: 'MCP',
     tabHub: 'Parcourir le Hub',
     all: 'Tout',
@@ -1417,6 +1517,10 @@ export const fr: Translations = {
     goTo: 'Aller à',
     goToSession: 'Aller à la session',
     branches: 'Branches',
+    projects: 'Projets',
+    openFolder: 'Ouvrir un dossier en tant que projet…',
+    openFolderAt: path => `Ouvrir le dossier en tant que projet — ${path}`,
+    newSessionInProject: project => `Nouvelle session dans ${project}`,
     commands: 'Commandes',
     startInBranch: branch => `Nouvelle conversation dans ${branch}`,
     commandCenter: 'Centre de commandes',
@@ -1436,7 +1540,7 @@ export const fr: Translations = {
       installed: 'Installé',
       generatedTag: 'Généré',
       adoptFailed: "Impossible d'adopter cet animal.",
-      toggleFailed: "Impossible de basculer l'animal.",
+      toggleFailed: enabled => `Impossible d'${enabled ? 'activer' : 'désactiver'} l'animal.`,
       noneAvailable: "Aucun animal disponible — choisissez-en un ci-dessous pour l'installer."
     },
     generatePet: {
@@ -1653,8 +1757,7 @@ export const fr: Translations = {
     revoking: 'Révocation…',
     revokeAria: name => `Révoquer l'accès de ${name}`,
     revokeTitle: "Révoquer l'accès",
-    revokeDesc: name =>
-      `${name} perdra l'accès et ne sera plus reconnu à partir de son prochain message.`,
+    revokeDesc: name => `${name} perdra l'accès et ne sera plus reconnu à partir de son prochain message.`,
     approvedUser: name => `${name} approuvé`,
     approvedHint: 'Cet utilisateur sera reconnu automatiquement à partir de son prochain message.',
     revokedUser: name => `Accès de ${name} révoqué`,
@@ -1829,6 +1932,12 @@ export const fr: Translations = {
     search: 'Rechercher des profils...',
     loading: 'Chargement des profils...',
     newProfile: 'Nouveau profil',
+    importProfile: 'Importer un profil…',
+    exportProfile: 'Exporter le profil…',
+    imported: 'Profil importé',
+    exported: 'Profil exporté',
+    failedImport: "Échec de l'importation du profil",
+    failedExport: "Échec de l'exportation du profil",
     allProfiles: 'Tous les profils',
     showAllProfiles: 'Afficher tous les profils',
     switchToProfile: name => `Basculer vers ${name}`,
@@ -1904,6 +2013,16 @@ export const fr: Translations = {
     close: 'Fermer le cron',
     title: 'Tâches planifiées',
     count: count => `${count} ${count === 1 ? 'tâche' : 'tâches'}`,
+    modelImpact: {
+      title: 'Les tâches planifiées nécessitent une vérification',
+      message: count =>
+        count === 1
+          ? "1 tâche planifiée sera ignorée jusqu'à ce que vous vérifiiez ses paramètres de modèle."
+          : `${count} tâches planifiées seront ignorées jusqu'à ce que vous vérifiiez leurs paramètres de modèle.`,
+      detailMore: (names, remaining) => `${names} et ${remaining} autre${remaining === 1 ? '' : 's'}`,
+      review: 'Vérifier les tâches planifiées',
+      saveFailed: "Hermes n'a pas enregistré ce changement de modèle."
+    },
     search: 'Rechercher des tâches cron...',
     loading: 'Chargement des tâches cron...',
     states: {
@@ -2098,7 +2217,8 @@ export const fr: Translations = {
       'new-session': 'Nouvelle session',
       skills: 'Capacités',
       messaging: 'Messagerie',
-      artifacts: 'Artefacts'
+      artifacts: 'Artefacts',
+      cron: 'Tâches planifiées'
     },
     searchAria: 'Rechercher des sessions',
     searchPlaceholder: 'Rechercher des sessions…',
@@ -2119,6 +2239,7 @@ export const fr: Translations = {
     noWorkspace: 'Aucun espace de travail',
     projectEmpty: 'Aucune session pour le moment',
     noSessions: 'Aucune session pour le moment',
+    noFilterMatches: 'Aucune session ne correspond à ces filtres',
     projects: {
       sectionLabel: 'Projets',
       home: 'Accueil',
@@ -2146,6 +2267,11 @@ export const fr: Translations = {
       menuAddFolder: 'Ajouter un dossier',
       menuSetActive: 'Définir comme actif',
       menuDelete: 'Supprimer',
+      moveToProject: 'Déplacer vers un projet',
+      movedTo: name => `Déplacée vers ${name}`,
+      moveFailed: 'Impossible de déplacer la session',
+      moveNoFolder: "Ce projet n'a aucun dossier vers lequel effectuer le déplacement",
+      moveNoProjects: 'Aucun autre projet',
       reveal: 'Afficher dans le dossier',
       copyPath: 'Copier le chemin',
       removeFromSidebar: 'Masquer de la barre latérale',
@@ -2162,6 +2288,9 @@ export const fr: Translations = {
       baseBranchPlaceholder: 'Rechercher des branches…',
       baseBranchNone: 'Aucune branche trouvée',
       startWorkFailed: 'Impossible de créer le worktree',
+      worktreeProjectLabel: 'Projet',
+      worktreeProjectPlaceholder: 'Rechercher des projets…',
+      worktreeProjectNone: 'Aucun projet avec un dossier',
       convertBranch: 'Convertir une branche…',
       convertBranchTitle: 'Convertir une branche',
       convertBranchDesc: 'Ouvrez des branches vérifiées ou créez un worktree pour une branche libre.',
@@ -2170,6 +2299,7 @@ export const fr: Translations = {
       branchOpenExisting: 'ouverte',
       branchSwitchHome: "basculer l'accueil",
       branchCreateWorktree: 'nouveau worktree',
+      branchTrackRemote: 'suivre la branche distante',
       branchesLoading: 'Chargement des branches…',
       noBranches: 'Aucune branche trouvée',
       removeWorktree: 'Supprimer le worktree',
@@ -2189,15 +2319,21 @@ export const fr: Translations = {
     loading: 'Chargement…',
     loadMore: 'Charger plus',
     loadCount: step => `Charger ${step} de plus`,
+    messageCount: count => `${count} ${count === 1 ? 'message' : 'messages'}`,
+    toolCallCount: count => `${count} ${count === 1 ? "appel d'outil" : "appels d'outil"}`,
     row: {
       pin: 'Épingler',
       unpin: 'Désépingler',
+      markUnread: 'Marquer comme non lue',
+      markRead: 'Marquer comme lue',
+      unreadFailed: "Impossible de mettre à jour l'état de lecture",
       copyId: "Copier l'ID",
       export: 'Exporter',
       branchFrom: 'Branche',
       rename: 'Renommer',
       archive: 'Archiver',
       newWindow: 'Nouvelle fenêtre',
+      openInTerminal: 'Ouvrir dans le terminal',
       hideTabBar: "Masquer la barre d'onglets",
       openInNewTab: 'Ouvrir dans un nouvel onglet',
       openInSplit: 'Ouvrir en split',
@@ -2208,6 +2344,7 @@ export const fr: Translations = {
       waitingForAnswer: 'En attente de votre réponse',
       finishedUnread: 'Terminée — non lue',
       backgroundRunning: 'Tâche en arrière-plan en cours',
+      draftSession: 'Brouillon — aucun message envoyé',
       handoffOrigin: platform => `Transférée depuis ${platform}`,
       ownedByProfile: profile => `Profil : ${profile}`,
       renamed: 'Renommée',
@@ -2215,19 +2352,30 @@ export const fr: Translations = {
       renameTitle: 'Renommer la session',
       renameDesc: 'Laissez vide pour effacer.',
       untitledPlaceholder: 'Session sans titre',
+      deleteTitle: 'Supprimer la session ?',
+      deleteDesc: title => `« ${title} » sera définitivement supprimée. Cette action est irréversible.`,
+      deleting: 'Suppression…',
+      deleted: 'Session supprimée',
       untitledChat: id => `Conversation ${id}`,
+      messageCount: count => `${count} message${count === 1 ? '' : 's'}`,
+      todoProgress: 'Tâches terminées',
       ageNow: 'maintenant',
       ageDay: 'j',
       ageHour: 'h',
       ageMin: 'm'
     },
     dateDivider: {
-      today: "Plus tôt aujourd'hui",
+      today: "Aujourd'hui",
       yesterday: 'Hier',
       thisWeek: 'Plus tôt cette semaine',
       lastWeek: 'La semaine dernière',
       thisMonth: 'Plus tôt ce mois'
-    }
+    },
+    statusDivider: {
+      working: 'En cours',
+      done: 'Terminées'
+    },
+    markAllRead: 'Tout marquer comme lu'
   },
 
   composer: {
@@ -2255,6 +2403,7 @@ export const fr: Translations = {
       'Ajustez ou continuez'
     ],
     startVoice: 'Démarrer la conversation vocale',
+    openDirective: 'Ouvrir',
     queueMessage: "Mettre le message en file d'attente",
     steer: "Diriger l'exécution en cours",
     stop: 'Arrêter',
@@ -2317,6 +2466,7 @@ export const fr: Translations = {
     editingQueuedInComposer: "Modification du tour en file d'attente dans le compositeur",
     queueEdit: 'Modifier',
     queueSendNext: 'Suivant',
+    queueSteer: 'Diriger — réorienter maintenant le tour en cours',
     queueSend: 'Envoyer',
     queueDelete: 'Supprimer',
     queueResume: 'Reprendre',
@@ -2349,6 +2499,43 @@ export const fr: Translations = {
     snippetsDesc: 'Choisissez une invite de démarrage à insérer dans le compositeur.',
     dropFiles: 'Déposez des fichiers pour les attacher',
     dropSession: 'Déposez pour lier cette conversation',
+    mcpSuggestions: {
+      label: server => `Ajouter ${server}`,
+      tip: keyword => `Suggéré car vous avez mentionné « ${keyword} » — cliquez pour vous connecter`,
+      connecting: server => `Connexion à ${server}…`,
+      cancelTip: 'Cliquez pour annuler',
+      added: server => `${server} ajouté`,
+      addedTip: 'Connecté — ses outils sont prêts dans cette conversation',
+      connectFailed: server => `Impossible de se connecter à ${server}`
+    },
+    skillSuggestions: {
+      label: skill => `Utiliser le skill : ${skill}`,
+      tip: skill => `Vous avez mentionné « ${skill} » — cliquez pour commencer avec ce skill`,
+      done: skill => `/${skill} ajouté`,
+      doneTip: "Le skill se charge lors de l'envoi"
+    },
+    githubSuggestions: {
+      label: 'Configurer GitHub',
+      tip: 'GitHub fonctionne ici grâce aux skills de la CLI gh ; cliquez pour connecter votre compte',
+      done: 'Ajout de /github-auth',
+      doneTip: "Envoyez le message et l'agent vous guidera dans la connexion à GitHub"
+    },
+    repairSuggestions: {
+      label: server => `Reconnecter ${server}`,
+      tip: server => `Un appel à ${server} vient d'échouer à cause d'une erreur de connexion`,
+      working: server => `Reconnexion à ${server}…`,
+      workingTip: 'Cliquez pour annuler',
+      done: server => `${server} reconnecté`,
+      doneTip: 'Les nouveaux identifiants sont actifs dans cette conversation',
+      failed: server => `Impossible de reconnecter ${server}`
+    },
+    cronSuggestions: {
+      label: 'Planifier ceci',
+      tip: phrase => `« ${phrase} » semble récurrent — exécutez-le plutôt selon une planification`,
+      prefix: 'Configurer ceci comme tâche planifiée :',
+      done: 'Marqué pour planification',
+      doneTip: "Envoyez-le pour que l'agent crée la tâche"
+    },
     snippets: {
       codeReview: {
         label: 'Revue de code',
@@ -2414,7 +2601,7 @@ export const fr: Translations = {
       scopeLastTurn: 'Dernier tour',
       commit: 'Valider',
       commitAndPush: 'Valider et pousser',
-      commitPlaceholder: 'Message (⌘↵ pour valider)',
+      commitPlaceholder: shortcut => `Message (${shortcut} pour valider)`,
       generateCommitMessage: 'Générer un message de validation',
       stopGenerating: 'Arrêter la génération',
       createPr: 'Créer une PR',
@@ -2757,6 +2944,7 @@ export const fr: Translations = {
       gatewayTitle: 'Gateway',
       customizeTitle: "Afficher dans la barre d'état",
       hideStatusbar: "Masquer la barre d'état",
+      resetStatusbar: 'Réinitialiser les valeurs par défaut',
       toggleApprovalMode: 'Approbations',
       toggleBackendVersion: 'Version du backend',
       toggleCommandCenter: 'Centre de commandes',
@@ -2850,10 +3038,6 @@ export const fr: Translations = {
 
   preview: {
     tab: 'Aperçu',
-    closeTab: label => `Fermer ${label}`,
-    closeOthers: 'Fermer les autres',
-    closeToRight: 'Fermer à droite',
-    closeAll: 'Tout fermer',
     closePane: "Fermer le panneau d'aperçu",
     loading: "Chargement de l'aperçu",
     unavailable: 'Aperçu indisponible',
@@ -2952,16 +3136,11 @@ export const fr: Translations = {
     closeRunningBody:
       "Cette conversation est toujours en cours (ou en attente de votre saisie). Fermer l'onglet la masque — la session conserve sa progression et peut être rouverte depuis la barre latérale.",
     closeRunningConfirm: "Fermer l'onglet",
+    reload: 'Recharger',
     closeOthers: 'Fermer les autres',
     closeToRight: 'Fermer à droite',
     closeAll: 'Tout fermer',
     newSessionTab: 'Nouvel onglet de session',
-    split: dir => `Diviser ${dir}`,
-    move: dir => `Déplacer ${dir}`,
-    dirUp: 'en haut',
-    dirDown: 'en bas',
-    dirLeft: 'à gauche',
-    dirRight: 'à droite',
     pluginDisabled: pluginId => `Plugin « ${pluginId} » désactivé`,
     pluginDisabledBody: 'Réactivez-le dans Paramètres → Plugins pour faire revenir le panneau.',
     missingPane: paneId => `panneau manquant : ${paneId}`,
@@ -2989,7 +3168,8 @@ export const fr: Translations = {
     layoutNamePlaceholder: fallback => `Nom de la mise en page (${fallback})`,
     saveApply: 'Enregistrer et appliquer',
     notExpressible: "cet agencement s'entrelace (roue) — pas encore exprimable comme des divisions imbriquées",
-    zoneCount: count => `${count} zones`
+    zoneCount: count => `${count} zones`,
+    tabCount: count => `${count} onglet${count === 1 ? '' : 's'}`
   },
 
   assistant: {
@@ -3011,6 +3191,9 @@ export const fr: Translations = {
       refresh: 'Actualiser',
       moreActions: "Plus d'actions",
       branchNewChat: 'Créer une branche dans une nouvelle conversation',
+      react: 'Réagir',
+      filesChanged: count => (count === 1 ? '1 fichier modifié' : `${count} fichiers modifiés`),
+      reviewChanges: 'Examiner',
       dismissError: "Ignorer l'erreur",
       readAloudFailed: 'Échec de la lecture à voix haute',
       preparingAudio: "Préparation de l'audio…",
@@ -3061,6 +3244,29 @@ export const fr: Translations = {
       lateAnswerTip: 'Rédiger cette réponse comme message de suivi',
       lateAnswerHint:
         "Cette invite n'attend plus de réponse. Choisissez une option pour la rédiger comme message de suivi."
+    },
+    mcpSetup: {
+      installTitle: server => `Ajouter le serveur MCP ${server} ?`,
+      enableTitle: server => `Activer le serveur MCP ${server} ?`,
+      authorizeTitle: server => `Autoriser le serveur MCP ${server} ?`,
+      installAction: 'Installer',
+      enableAction: 'Activer',
+      authorizeAction: 'Autoriser',
+      decline: 'Pas maintenant',
+      declined: 'Refusé',
+      installed: server => `${server} installé`,
+      enabled: server => `${server} activé`,
+      authorized: server => `${server} autorisé`,
+      failed: server => `Échec de la configuration de ${server}`,
+      unanswered: 'Aucune réponse',
+      toolCount: count => (count === 1 ? '1 outil' : `${count} outils`),
+      notInCatalog: server => `« ${server} » ne figure pas dans le catalogue MCP`,
+      catalogSource: 'Issu du catalogue approuvé par Nous',
+      envRequired: "Renseignez d'abord les identifiants requis",
+      sendFailed: "Impossible d'envoyer la réponse de configuration MCP",
+      reloadFailed:
+        'Serveur enregistré, mais le rechargement des outils MCP a échoué — ils seront chargés à la prochaine session',
+      gatewayDisconnected: "La Gateway Hermes n'est pas connectée"
     },
     tool: {
       copyCode: 'Copier le code',
@@ -3325,7 +3531,7 @@ export const fr: Translations = {
     sidebar: {
       title: 'Barre latérale',
       description: 'Affiche la barre latérale mobile.',
-      toggle: 'Afficher/Masquer la barre latérale'
+      toggle: open => `${open ? 'Afficher' : 'Masquer'} la barre latérale`
     }
   }
 }
