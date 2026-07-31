@@ -1,12 +1,26 @@
 import { describe, expect, it } from 'vitest'
 
-import { approvalReplaySessionId, gatewayEventRequiresSessionId, resolveGatewayEventSessionId } from './gateway-events'
+import {
+  approvalReplaySessionId,
+  gatewayEventRequiresSessionId,
+  isBlockingPromptEvent,
+  resolveGatewayEventSessionId
+} from './gateway-events'
 
 describe('gateway event routing', () => {
   it('rehydrates pending approvals on reconnect ready and resumed session info', () => {
     expect(approvalReplaySessionId('gateway.ready', 'active-1', null)).toBe('active-1')
     expect(approvalReplaySessionId('session.info', 'active-1', 'routed-1')).toBe('routed-1')
     expect(approvalReplaySessionId('message.delta', 'active-1', 'routed-1')).toBeNull()
+  })
+
+  it('identifies every blocking prompt event so interrupted turns cannot resurrect input UI', () => {
+    expect(isBlockingPromptEvent('approval.request')).toBe(true)
+    expect(isBlockingPromptEvent('clarify.request')).toBe(true)
+    expect(isBlockingPromptEvent('secret.request')).toBe(true)
+    expect(isBlockingPromptEvent('sudo.request')).toBe(true)
+    expect(isBlockingPromptEvent('message.complete')).toBe(false)
+    expect(isBlockingPromptEvent(undefined)).toBe(false)
   })
 
   it('drops only unscoped subagent events (genuinely background work)', () => {
