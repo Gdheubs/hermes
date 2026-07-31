@@ -5282,7 +5282,7 @@ class GatewaySlashCommandsMixin:
         provider = getattr(agent, "provider", None) if agent and agent is not _AGENT_PENDING_SENTINEL else None
         base_url = getattr(agent, "base_url", None) if agent and agent is not _AGENT_PENDING_SENTINEL else None
         api_key = getattr(agent, "api_key", None) if agent and agent is not _AGENT_PENDING_SENTINEL else None
-        if not provider and getattr(self, "_session_db", None) is not None:
+        if (not provider or not base_url) and getattr(self, "_session_db", None) is not None:
             try:
                 _entry_for_billing = await self.async_session_store.get_or_create_session(source)
                 persisted = await self._session_db.get_session(_entry_for_billing.session_id) or {}
@@ -5293,12 +5293,15 @@ class GatewaySlashCommandsMixin:
             except Exception:
                 persisted = {}
                 persisted_route = {}
+            # Only fill gaps — a live agent may already carry the provider while
+            # missing just the base_url (the widened guard above lets that case
+            # reach here), so never clobber an already-resolved provider/base_url.
             if persisted_route.get("billing_provider"):
-                provider = persisted_route["billing_provider"]
-                base_url = persisted_route.get("billing_base_url")
+                provider = provider or persisted_route["billing_provider"]
+                base_url = base_url or persisted_route.get("billing_base_url")
             else:
-                provider = persisted.get("billing_provider")
-                base_url = persisted.get("billing_base_url")
+                provider = provider or persisted.get("billing_provider")
+                base_url = base_url or persisted.get("billing_base_url")
             # billing_provider (and the dominant accounted route) both lag a
             # freshly-activated fallback, so consult the persisted live-routing
             # snapshot before /usage gives up and shows the config default (#75535).
