@@ -2075,7 +2075,7 @@ export const en: Translations = {
       ageMin: 'm'
     },
     dateDivider: {
-      today: 'Earlier today',
+      today: 'Today',
       yesterday: 'Yesterday',
       thisWeek: 'Earlier this week',
       lastWeek: 'Last week',
