@@ -3367,6 +3367,7 @@ def _detect_active_update_ancestor() -> tuple[int, str, str] | None:
             )
 
         def _has_serve_command(args: list[str]) -> bool:
+            """Recognize Desktop's serve command after its profile selector."""
             index = 0
             while index < len(args):
                 part = args[index]
