@@ -215,6 +215,8 @@ def _flush_session_db_after_tool_progress(
     messages: list,
     *,
     stage: str,
+    storage_env=None,
+    budget_config=None,
 ) -> bool:
     """Persist tool progress, carrying ready delegation evidence once per batch.
 
@@ -233,6 +235,8 @@ def _flush_session_db_after_tool_progress(
                 messages,
                 num_tool_msgs=completed_batch_size,
                 turn_id=str(getattr(agent, "_active_turn_id", "") or ""),
+                storage_env=storage_env,
+                budget_config=budget_config,
             )
         except Exception as exc:
             logger.warning("Delegation tool-boundary preparation failed: %s", exc)
@@ -878,6 +882,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 agent,
                 messages,
                 stage=f"cancelled tool result {tc.function.name}",
+                storage_env=get_active_env(effective_task_id),
+                budget_config=_tool_budget,
             )
         return
 
@@ -1582,6 +1588,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             agent,
             messages,
             stage=f"tool result {name}",
+            storage_env=get_active_env(effective_task_id),
+            budget_config=_tool_budget,
         ):
             return
 
@@ -1723,6 +1731,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     agent,
                     messages,
                     stage=f"cancelled tool result {skipped_name}",
+                    storage_env=get_active_env(effective_task_id),
+                    budget_config=_tool_budget,
                 ):
                     return
             break
@@ -1755,6 +1765,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent,
                 messages,
                 stage=f"invalid tool arguments {function_name}",
+                storage_env=get_active_env(effective_task_id),
+                budget_config=_tool_budget,
             ):
                 return
             continue
@@ -2372,6 +2384,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             agent,
             messages,
             stage=f"tool result {function_name}",
+            storage_env=get_active_env(effective_task_id),
+            budget_config=_tool_budget,
         ):
             return
 
@@ -2443,6 +2457,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     agent,
                     messages,
                     stage=f"skipped tool result {skipped_name}",
+                    storage_env=get_active_env(effective_task_id),
+                    budget_config=_tool_budget,
                 ):
                     return
             break
