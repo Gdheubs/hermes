@@ -1426,9 +1426,15 @@ export function useSessionActions({
 
       try {
         await Promise.all(
-          [...runtimeIdsToClose].map(runtimeId =>
-            requestGateway('session.close', { session_id: runtimeId }).catch(() => undefined)
-          )
+          [...runtimeIdsToClose].map(async runtimeId => {
+            try {
+              await closeRuntimeForSessionBoundary(runtimeId)
+            } catch (error) {
+              // Deletion remains best-effort when the gateway/runtime is already
+              // unavailable, but a skipped memory finalization must not be silent.
+              console.warn('Failed to finalize a desktop session before deletion', error)
+            }
+          })
         )
 
         await deleteSession(storedSessionId, removed?.profile)
@@ -1485,9 +1491,9 @@ export function useSessionActions({
     },
     [
       activeSessionIdRef,
+      closeRuntimeForSessionBoundary,
       copy,
       navigate,
-      requestGateway,
       runtimeIdByStoredSessionIdRef,
       selectedStoredSessionId,
       selectedStoredSessionIdRef,
