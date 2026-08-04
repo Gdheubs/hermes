@@ -663,6 +663,11 @@ class TestResolveIdentityBlockClassification:
         agent.load_soul_identity = True
         agent.skip_context_files = False
         agent.context_compressor = None
+        # No profile-scoped home: _agent_home must resolve to None so the
+        # resolver falls back to the ambient home these tests configure
+        # (a bare MagicMock would fabricate a nonexistent db-derived home
+        # and flip `checkable` — see #50233 home scoping).
+        agent._session_db = None
         return agent
 
     @pytest.fixture(autouse=True)
