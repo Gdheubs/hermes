@@ -762,7 +762,7 @@ def lookup_models_dev_context(
     if override_ctx is not None:
         return override_ctx
 
-    mdev_provider_id = PROVIDER_TO_MODELS_DEV.get(_mdev_provider_id(provider))
+    mdev_provider_id = _mdev_provider_id(provider)
     if not mdev_provider_id:
         return _default_override_context(provider)
 
@@ -1112,7 +1112,7 @@ def _get_provider_models(
     ``allow_network`` defaults to False — this is called from hot paths
     (vision routing, image routing, capability checks) and must never block.
     """
-    mdev_provider_id = PROVIDER_TO_MODELS_DEV.get(_mdev_provider_id(provider))
+    mdev_provider_id = _mdev_provider_id(provider)
     if not mdev_provider_id:
         return None
 
