@@ -594,8 +594,8 @@ class ManagedLlmStream(Iterator[Any]):
         return self
 
     def _prime_completed_response(self) -> None:
-        """Run one lazy provider step while preserving a genuine first chunk."""
-        if self.final_response is not None or self._closed or self._prefetched_chunks:
+        """Advance once while preserving a genuine first chunk."""
+        if self._closed or self._prefetched_chunks:
             return
         try:
             self._prefetched_chunks.append(next(self))
@@ -724,6 +724,7 @@ class ManagedLlmStream(Iterator[Any]):
         if self._closed:
             return
         self._closed = True
+        self._prefetched_chunks.clear()
         try:
             loop = self._loop
             self._loop = None
