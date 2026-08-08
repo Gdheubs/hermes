@@ -357,7 +357,7 @@ class TestResolveAnthropicToken:
 
     def test_prefers_refreshable_claude_code_credentials_over_static_anthropic_token(self, monkeypatch, tmp_path):
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-static-token")
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-mytoken")
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         cred_file = tmp_path / ".claude" / ".credentials.json"
         cred_file.parent.mkdir(parents=True)
@@ -369,6 +369,81 @@ class TestResolveAnthropicToken:
             }
         }))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+
+        assert resolve_anthropic_token() == "cc-auto-token"
+
+    def test_pin_anthropic_token_makes_static_token_win_over_refreshable_creds(self, monkeypatch, tmp_path):
+        """agent.pin_anthropic_token: true inverts the default preference —
+        the static env token must win even when a refreshable Claude Code
+        credential is present, for setups where a separate interactive
+        `claude` login shares the same credential slot Hermes reads by
+        default (e.g. macOS Keychain, which isn't scoped by
+        CLAUDE_CONFIG_DIR)."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-mytoken")
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        cred_file = tmp_path / ".claude" / ".credentials.json"
+        cred_file.parent.mkdir(parents=True)
+        cred_file.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "cc-auto-token",
+                "refreshToken": "refresh-token",
+                "expiresAt": int(time.time() * 1000) + 3600_000,
+            }
+        }))
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"agent": {"pin_anthropic_token": True}},
+        )
+
+        assert resolve_anthropic_token() == "sk-ant-oat01-mytoken"
+
+    def test_pin_anthropic_token_default_false_preserves_refresh_preference(self, monkeypatch, tmp_path):
+        """Default (unset / false) must be unaffected by the new pin option —
+        pure regression guard that adding the opt-in didn't change the
+        existing default behavior."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-mytoken")
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        cred_file = tmp_path / ".claude" / ".credentials.json"
+        cred_file.parent.mkdir(parents=True)
+        cred_file.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "cc-auto-token",
+                "refreshToken": "refresh-token",
+                "expiresAt": int(time.time() * 1000) + 3600_000,
+            }
+        }))
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"agent": {"pin_anthropic_token": False}},
+        )
+
+        assert resolve_anthropic_token() == "cc-auto-token"
+
+    def test_pin_anthropic_token_config_load_failure_falls_back_to_default(self, monkeypatch, tmp_path):
+        """A config-load exception must degrade to the safe default (False —
+        prefer refresh), not propagate and break token resolution entirely."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-mytoken")
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        cred_file = tmp_path / ".claude" / ".credentials.json"
+        cred_file.parent.mkdir(parents=True)
+        cred_file.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "cc-auto-token",
+                "refreshToken": "refresh-token",
+                "expiresAt": int(time.time() * 1000) + 3600_000,
+            }
+        }))
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+
+        def _raise():
+            raise RuntimeError("config load boom")
+
+        monkeypatch.setattr("hermes_cli.config.load_config", _raise)
 
         assert resolve_anthropic_token() == "cc-auto-token"
 
