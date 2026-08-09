@@ -1553,6 +1553,10 @@ export interface Translations {
     results: string
     pinned: string
     sessions: string
+    viewSessions: string
+    viewProjects: string
+    viewProfiles: string
+    viewAria: string
     cronJobs: string
     groupAriaGrouped: string
     groupAriaUngrouped: string
