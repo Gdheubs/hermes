@@ -208,6 +208,25 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+def test_turn_log_records_length_without_message_body(caplog):
+    agent = _FakeAgent()
+    private_body = "call 15551234567 about private details"
+
+    with caplog.at_level("INFO", logger="agent.turn_context"):
+        _build(agent, user_message=private_body)
+
+    records = [
+        record.message
+        for record in caplog.records
+        if record.name == "agent.turn_context"
+        and record.message.startswith("conversation turn:")
+    ]
+    assert len(records) == 1
+    assert private_body not in records[0]
+    assert "15551234567" not in records[0]
+    assert f"msg_len={len(private_body)}" in records[0]
+
+
 # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
 #
 # The prologue is the ONLY place the per-turn synchronous
@@ -405,4 +424,3 @@ def test_prologue_does_not_title_machine_driven_runs(platform):
     overwritten or never read.
     """
     assert not _title_turn(platform).called
-
