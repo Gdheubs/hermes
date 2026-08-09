@@ -499,12 +499,14 @@ export function _resetCodingStatusForTests(): void {
 // repo is in reach. That is a no-op and not an error, because a worktree only
 // exists inside a repo.
 //
-// On a remote gateway, the candidate cwd is whatever the backend reported for
-// the focused session / project. The renderer's local `repoStatus` probe can
-// only validate paths that exist on the LOCAL filesystem, so it always returns
-// null for VPS-only paths (#81724 — ⌘⇧B was a silent no-op). Trust the
-// candidate here and let the backend's `git worktree add` surface a clean 400
-// if the path is not actually a repo on the VPS.
+// On a remote gateway, the candidate cwd is whatever the backend reported
+// for the focused session / project. `desktopGit()` already returns the
+// REST bridge there, so the `isGitRepoPath` probe would be backend-routed
+// too — but the probe was the thing that made ⌘⇧B a silent no-op in the
+// first place (a VPS-only path looked like "not a repo" under the old
+// local-only gate, #81724). Trust the candidate here and let the backend's
+// `git worktree add` surface a clean 400 if the path is not actually a
+// repo on the VPS.
 export async function resolveWorktreeRepoPath(): Promise<string> {
   const runtimeId = $focusedRuntimeId.get()
   const scope = $projectScope.get()
