@@ -51,20 +51,26 @@ function ownedLock(over: any = {}) {
 }
 
 // A fake SshConnection whose exec() is matched against an ordered list of
-// [regex|fn, response|fn] rules. First match wins; unmatched commands return ''.
+// [regex|fn, response|fn] rules. Lifecycle commands are wrapped in a
+// Fish-safe base64 launcher, so rules inspect the decoded POSIX payload.
 function fakeSsh(rules: any[] = []) {
   const calls: string[] = []
+  const rawCalls: string[] = []
 
   return {
     calls,
+    rawCalls,
     async exec(cmd) {
-      calls.push(cmd)
+      rawCalls.push(cmd)
+      const encoded = /base64\.b64decode\('([A-Za-z0-9+/=]+)'\)/.exec(cmd)?.[1]
+      const payload = encoded ? Buffer.from(encoded, 'base64').toString('utf8') : cmd
+      calls.push(payload)
 
       for (const [matcher, resp] of rules) {
-        const hit = typeof matcher === 'function' ? matcher(cmd) : matcher.test(cmd)
+        const hit = typeof matcher === 'function' ? matcher(payload) : matcher.test(payload)
 
         if (hit) {
-          const out = typeof resp === 'function' ? resp(cmd) : resp
+          const out = typeof resp === 'function' ? resp(payload) : resp
 
           if (out instanceof Error) {
             throw out
@@ -150,17 +156,18 @@ test('locateHermes throws a hermes-not-found error with an install hint', async 
   )
 })
 
-test('locateHermes uses a login shell for the command -v probe', async () => {
+test('locateHermes sends its login-shell probe through a Fish-safe launcher', async () => {
   const ssh = fakeSsh([
     [/command -v hermes/, '/x/hermes'],
     [/\[ -x/, 'OK']
   ])
 
   await locateHermes(ssh, '')
-  assert.ok(
-    ssh.calls.some(c => /bash -lc/.test(c)),
-    'must probe in a login shell (PATH pitfall)'
-  )
+  const executableProbe = ssh.rawCalls.find(c => /base64\.b64decode/.test(c))
+
+  assert.match(executableProbe, /^python3 -c "/)
+  assert.match(executableProbe, /base64\.b64decode\('/)
+  assert.doesNotMatch(executableProbe, /\/x\/hermes/)
 })
 
 test('probeRemotePlatform accepts Linux and macOS', async () => {
@@ -574,8 +581,6 @@ test('connect() respawns when the lockfile protocolVersion is incompatible', asy
 })
 
 test('connect() fresh spawn writes hermesHome + protocolVersion into the lockfile', async () => {
-  const writes: string[] = []
-
   const ssh = fakeSsh([
     [/uname/, 'Linux\nx86_64'],
     [/\[ -x/, 'OK'],
@@ -586,19 +591,11 @@ test('connect() fresh spawn writes hermesHome + protocolVersion into the lockfil
     [/printf '%s\\n'/, ''],
     [/setsid/, '700\n'],
     [/kill -0 700/, 'ALIVE'],
-    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=45500\n'],
-    [
-      /printf '%s' '/,
-      c => {
-        writes.push(c)
-
-        return ''
-      }
-    ]
+    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=45500\n']
   ])
 
   await connect(connectDeps(ssh, { adoptServedToken: async () => 'fresh' }))
-  const lockWrite = writes.find(c => c.includes('schemaVersion')) || ''
+  const lockWrite = ssh.calls.find(c => c.includes('schemaVersion')) || ''
   assert.match(lockWrite, new RegExp(`"protocolVersion":${PROTOCOL_VERSION}`))
   assert.match(lockWrite, /"hermesHome":"\/home\/alice\/\.hermes"/)
 })
@@ -664,6 +661,29 @@ test('connect() respawns when the dashboard is wedged (alive pid, probe fails)',
   assert.equal(result.reused, false)
   assert.equal(result.pid, 999)
   assert.equal(result.remotePort, 43000)
+})
+
+test('connect runs every POSIX lifecycle payload through a Fish-safe POSIX launcher', async () => {
+  const ssh = fakeSsh([
+    [/uname/, 'Linux\nx86_64'],
+    [/\[ -x/, 'OK'],
+    [/cat .*lock\.json/, ''],
+    [/grep -q ssh-session-token-file/, 'YES\n'],
+    [/python3 -c/, ''],
+    [/setsid/, '999\n'],
+    [/kill -0 999/, 'ALIVE'],
+    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=43000\n']
+  ])
+
+  const result = await connect(connectDeps(ssh, { adoptServedToken: async () => 'served-token' }))
+
+  assert.equal(result.reused, false)
+  assert.ok(ssh.calls.length > 0)
+
+  for (const command of ssh.rawCalls) {
+    assert.match(command, /^python3 -c "/, `must use a Fish-safe launcher: ${command}`)
+    assert.match(command, /os\.execvp\('sh',\['sh','-lc',base64\.b64decode\(/)
+  }
 })
 
 test('connect() aborts on an unsupported remote platform before doing anything else', async () => {
@@ -832,24 +852,26 @@ test('spawnRemoteDashboard streams the token over stdin, not argv/env', async ()
     calls,
     async exec(cmd, opts?) {
       calls.push(cmd)
+      const encoded = /base64\.b64decode\('([A-Za-z0-9+/=]+)'\)/.exec(cmd)?.[1]
+      const payload = encoded ? Buffer.from(encoded, 'base64').toString('utf8') : cmd
 
       if (opts?.stdinData) {
         stdinCalls.push(opts.stdinData)
       }
 
-      if (/grep -q ssh-session-token-file/.test(cmd)) {
+      if (/grep -q ssh-session-token-file/.test(payload)) {
         return 'YES\n'
       }
 
-      if (/python3 -c/.test(cmd)) {
+      if (/python3 -c/.test(payload)) {
         return ''
       }
 
-      if (/setsid|nohup/.test(cmd)) {
+      if (/setsid|nohup/.test(payload)) {
         return '4242\n'
       }
 
-      if (/printf '%s\\n'/.test(cmd)) {
+      if (/printf '%s\\n'/.test(payload)) {
         return ''
       }
 
@@ -883,20 +905,22 @@ test('spawnRemoteDashboard upload uses exclusive-create and O_NOFOLLOW', async (
     calls,
     async exec(cmd, opts?) {
       calls.push(cmd)
+      const encoded = /base64\.b64decode\('([A-Za-z0-9+/=]+)'\)/.exec(cmd)?.[1]
+      const payload = encoded ? Buffer.from(encoded, 'base64').toString('utf8') : cmd
 
-      if (/grep -q ssh-session-token-file/.test(cmd)) {
+      if (/grep -q ssh-session-token-file/.test(payload)) {
         return 'YES\n'
       }
 
-      if (/python3 -c/.test(cmd)) {
+      if (/python3 -c/.test(payload)) {
         return ''
       }
 
-      if (/setsid|nohup/.test(cmd)) {
+      if (/setsid|nohup/.test(payload)) {
         return '4242\n'
       }
 
-      if (/printf '%s\\n'/.test(cmd)) {
+      if (/printf '%s\\n'/.test(payload)) {
         return ''
       }
 
@@ -910,8 +934,15 @@ test('spawnRemoteDashboard upload uses exclusive-create and O_NOFOLLOW', async (
     token: 'tk',
     ownershipId: OWNERSHIP_ID
   })
-  const uploadCmd = calls.find(c => /python3 -c/.test(c))
-  assert.ok(uploadCmd, 'must use python3 -c for token upload')
+
+  const payloads = calls.map(command => {
+    const encoded = /base64\.b64decode\('([A-Za-z0-9+/=]+)'\)/.exec(command)?.[1]
+
+    return encoded ? Buffer.from(encoded, 'base64').toString('utf8') : command
+  })
+
+  const uploadCmd = payloads.find(command => /O_EXCL/.test(command))
+  assert.ok(uploadCmd, 'must use a Fish-safe wrapper for token upload')
   assert.match(uploadCmd, /O_EXCL/, 'upload must use O_EXCL to reject existing files')
   assert.match(uploadCmd, /O_NOFOLLOW/, 'upload must use O_NOFOLLOW to reject symlinks')
   assert.match(uploadCmd, /O_WRONLY/, 'upload must open write-only')
