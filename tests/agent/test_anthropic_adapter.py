@@ -393,7 +393,7 @@ class TestResolveAnthropicToken:
         }))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         monkeypatch.setattr(
-            "hermes_cli.config.load_config",
+            "hermes_cli.config.load_config_readonly",
             lambda: {"agent": {"pin_anthropic_token": True}},
         )
 
@@ -417,7 +417,7 @@ class TestResolveAnthropicToken:
         }))
         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
         monkeypatch.setattr(
-            "hermes_cli.config.load_config",
+            "hermes_cli.config.load_config_readonly",
             lambda: {"agent": {"pin_anthropic_token": False}},
         )
 
@@ -443,9 +443,77 @@ class TestResolveAnthropicToken:
         def _raise():
             raise RuntimeError("config load boom")
 
-        monkeypatch.setattr("hermes_cli.config.load_config", _raise)
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", _raise)
 
         assert resolve_anthropic_token() == "cc-auto-token"
+
+    def test_pin_anthropic_token_check_skipped_when_no_static_token_present(self, monkeypatch, tmp_path):
+        """Perf regression guard: _pin_static_anthropic_token() (and its
+        config read) must only be evaluated when there's actually a static
+        env token (#1/#2) to weigh against a refreshable credential — not
+        unconditionally at the top of resolve_anthropic_token(). With
+        neither ANTHROPIC_TOKEN nor CLAUDE_CODE_OAUTH_TOKEN set, the config
+        read must never happen at all."""
+        monkeypatch.delenv("ANTHROPIC_TOKEN", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        cred_file = tmp_path / ".claude" / ".credentials.json"
+        cred_file.parent.mkdir(parents=True)
+        cred_file.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "cc-auto-token",
+                "refreshToken": "refresh-token",
+                "expiresAt": int(time.time() * 1000) + 3600_000,
+            }
+        }))
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+
+        def _fail_if_called():
+            raise AssertionError(
+                "_pin_static_anthropic_token() must not be called (and must "
+                "not read config) when no static env token is present"
+            )
+
+        monkeypatch.setattr(
+            "agent.anthropic_adapter._pin_static_anthropic_token", _fail_if_called
+        )
+
+        assert resolve_anthropic_token() == "cc-auto-token"
+
+    def test_pin_anthropic_token_uses_readonly_config_loader(self, monkeypatch, tmp_path):
+        """_pin_static_anthropic_token() must use load_config_readonly(),
+        not the deepcopy load_config() — callers only read the flag, never
+        mutate it, and load_config_readonly() skips the ~265us deepcopy
+        load_config() otherwise pays on every cache hit (this helper runs
+        on every Anthropic token resolution once a static env token is
+        present)."""
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setenv("ANTHROPIC_TOKEN", "«redacted:sk-…»")
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        cred_file = tmp_path / ".claude" / ".credentials.json"
+        cred_file.parent.mkdir(parents=True)
+        cred_file.write_text(json.dumps({
+            "claudeAiOauth": {
+                "accessToken": "cc-auto-token",
+                "refreshToken": "refresh-token",
+                "expiresAt": int(time.time() * 1000) + 3600_000,
+            }
+        }))
+        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+
+        def _fail_if_mutable_load_called():
+            raise AssertionError(
+                "_pin_static_anthropic_token() must use load_config_readonly(), "
+                "not the deepcopy load_config()"
+            )
+
+        monkeypatch.setattr("hermes_cli.config.load_config", _fail_if_mutable_load_called)
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"agent": {"pin_anthropic_token": True}},
+        )
+
+        assert resolve_anthropic_token() == "«redacted:sk-…»"
 
 
 

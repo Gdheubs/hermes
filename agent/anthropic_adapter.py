@@ -1369,11 +1369,14 @@ def _pin_static_anthropic_token() -> bool:
     long-lived setup-token to win regardless.
 
     Cheap import — loads lazily so we don't pay for it on every request
-    unless the user opts in. Falls back to False (safe default) on any
-    config-load failure.
+    unless the user opts in. Uses ``load_config_readonly()`` (not
+    ``load_config()``): callers only need to read the flag, never mutate
+    it, and the readonly variant skips the deepcopy ``load_config()``
+    otherwise pays on every cache hit. Falls back to False (safe default)
+    on any config-load failure.
     """
     try:
-        from hermes_cli.config import load_config as _load_cfg
+        from hermes_cli.config import load_config_readonly as _load_cfg
         val = ((_load_cfg() or {}).get("agent") or {}).get("pin_anthropic_token")
         return bool(val)
     except Exception:
@@ -1411,12 +1414,15 @@ def resolve_anthropic_token() -> Optional[str]:
             creds_loaded = True
         return creds
 
-    pin_static = _pin_static_anthropic_token()
-
     # 1. Hermes-managed OAuth/setup token env var
     token = _getenv("ANTHROPIC_TOKEN").strip()
     if token:
-        if not pin_static:
+        # pin_static is only relevant when there's actually a static token
+        # to weigh against a refreshable credential -- resolve it lazily
+        # here rather than unconditionally at the top of this function, so
+        # the config read (and the load_config_readonly() call inside it)
+        # is skipped entirely for the common case of no env token at all.
+        if not _pin_static_anthropic_token():
             preferred = _prefer_refreshable_claude_code_token(token, _read_creds())
             if preferred:
                 return preferred
@@ -1425,7 +1431,7 @@ def resolve_anthropic_token() -> Optional[str]:
     # 2. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens)
     cc_token = _getenv("CLAUDE_CODE_OAUTH_TOKEN").strip()
     if cc_token:
-        if not pin_static:
+        if not _pin_static_anthropic_token():
             preferred = _prefer_refreshable_claude_code_token(cc_token, _read_creds())
             if preferred:
                 return preferred
