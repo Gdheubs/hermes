@@ -1992,7 +1992,7 @@ class MCPServerTask:
         "_pending_call_context",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
-        "initialize_result", "_ping_unsupported",
+        "initialize_result", "_mcp_session_id", "_ping_unsupported",
         "_reconnect_retries", "_session_proven", "_was_parked",
     )
 
@@ -2015,6 +2015,7 @@ class MCPServerTask:
         self._sampling: Optional[SamplingHandler] = None
         self._elicitation: Optional[ElicitationHandler] = None
         self._registered_tool_names: list[str] = []
+        self._mcp_session_id: Optional[str] = None
         self._reconnect_retries: int = 0
         # Rapid-drop budget (#62212): a freshly (re)established session is
         # UNPROVEN until it demonstrates real health — it survived at least
@@ -3048,6 +3049,7 @@ class MCPServerTask:
                             session.initialize(), timeout=float(connect_timeout)
                         )
                         self.session = session
+                        self._mcp_session_id = None  # SSE transport: no session-id exposed
                         await self._discover_tools()
                         self._ready.set()
                         # Session is live again: clear any breaker state from a
@@ -3107,6 +3109,7 @@ class MCPServerTask:
                                 session.initialize(), timeout=float(connect_timeout)
                             )
                             self.session = session
+                            self._mcp_session_id = _get_session_id()
                             await self._discover_tools()
                             self._ready.set()
                             # Session is live again: clear any breaker state from
@@ -3154,6 +3157,7 @@ class MCPServerTask:
                             session.initialize(), timeout=float(connect_timeout)
                         )
                         self.session = session
+                        self._mcp_session_id = _get_session_id()
                         await self._discover_tools()
                         self._ready.set()
                         # Session is live again: clear any breaker state from a

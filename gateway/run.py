@@ -3325,6 +3325,8 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     openai-codex.
     """
     cfg = config if config is not None else _load_gateway_config()
+    from hermes_cli.config import _expand_env_vars
+    cfg = _expand_env_vars(cfg)
     model_cfg = cfg.get("model", {})
     if isinstance(model_cfg, str):
         return model_cfg

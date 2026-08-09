@@ -925,9 +925,25 @@ def _transcribe_command_stt(
 
     try:
         with tempfile.TemporaryDirectory(prefix=f"hermes-cmd-stt-{provider_name}-") as tmpdir:
+            # Normalize audio for command providers that require specific formats
+            # (e.g. Tencent 16k_zh). Gated by per-provider config flag so
+            # engines that accept arbitrary containers are unaffected. (#81811)
+            _input_path = str(audio.resolve())
+            _normalize = (
+                str(config.get("normalize", False)).lower() in ("true", "1", "yes")
+            )
+            if _normalize:
+                _converted, _norm_err = _transcode_audio_for_stt(str(audio), tmpdir)
+                if _norm_err:
+                    logger.warning(
+                        "command STT provider '%s': audio normalize failed: %s",
+                        provider_name, _norm_err,
+                    )
+                elif _converted:
+                    _input_path = _converted
             output_path = Path(tmpdir) / f"transcript.{output_format}"
             placeholders = {
-                "input_path": str(audio.resolve()),
+                "input_path": _input_path,
                 "output_path": str(output_path),
                 "output_dir": str(output_path.parent),
                 "format": output_format,

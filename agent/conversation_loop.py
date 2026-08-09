@@ -257,17 +257,16 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
             {"role": "user", "content": text, "api_content": correction}
         )
     else:
-        entry: Dict[str, Any] = {
-            "role": "assistant",
-            "content": visible or checkpoint,
-            "api_content": checkpoint,
-        }
+        placeholder = {"role": "assistant", "content": visible or ""}
         if not visible:
-            # Nothing reached the screen — this row carries no assistant prose
-            # at all, only the cut-off notice for the model.
-            entry["display_kind"] = "hidden"
-        messages.append(entry)
-        messages.append({"role": "user", "content": text})
+            placeholder["display_kind"] = "hidden"
+        correction = (
+            "[Context from the interrupted assistant response]\n"
+            f"{checkpoint}\n\n"
+            f"{text}"
+        )
+        messages.append(placeholder)
+        messages.append({"role": "user", "content": text, "api_content": correction})
 
     agent._current_streamed_assistant_text = ""
     agent._stream_needs_break = True
@@ -1824,6 +1823,16 @@ def run_conversation(
             # Bookkeeping, never a provider field — only the chat-completions
             # transport strips underscore keys, so drop it centrally here.
             api_msg.pop("_row_id", None)
+            # Guard: drop legacy ghost rows so pre-fix history
+            # cannot keep poisoning new turns (#81841).
+            _ghost = api_msg.get("content")
+            if (
+                api_msg.get("display_kind") == "hidden"
+                and api_msg.get("role") == "assistant"
+                and isinstance(_ghost, str)
+                and _ghost.strip() == "[This response was interrupted by a user correction.]"
+            ):
+                continue
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks

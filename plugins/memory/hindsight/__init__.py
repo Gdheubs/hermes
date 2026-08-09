@@ -559,7 +559,7 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
 def _embedded_profile_env_path(config: dict[str, Any]):
     from pathlib import Path
 
-    return Path.home() / ".hindsight" / "profiles" / f"{_embedded_profile_name(config)}.env"
+    return get_hermes_home() / "hindsight" / "profiles" / f"{_embedded_profile_name(config)}.env"
 
 
 def _secure_write_profile_env(profile_env, content: str) -> None:
