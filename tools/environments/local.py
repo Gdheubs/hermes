@@ -346,7 +346,19 @@ _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 # to a different Python version overwrites it and breaks the gateway). The
 # Hermes venv stays reachable via PATH (its bin dir is first), so stripping
 # these markers is safe and only prevents the cross-project clobber (#23473).
-_ACTIVE_VENV_MARKER_VARS = ("VIRTUAL_ENV", "CONDA_PREFIX")
+#
+# Conda activation is an atomic set. Stripping only CONDA_PREFIX while leaving
+# CONDA_SHLVL set produces a depth counter with no prefix: conda's shell init
+# then crashes in ``_get_deactivate_scripts`` with
+# ``TypeError: expected str, bytes or os.PathLike object, not NoneType`` (#82255).
+# CONDA_PROMPT_MODIFIER is part of the same set and is stripped for the same
+# reason. CONDA_DEFAULT_ENV bleed-through is tracked separately (#58382).
+_ACTIVE_VENV_MARKER_VARS = (
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "CONDA_SHLVL",
+    "CONDA_PROMPT_MODIFIER",
+)
 
 
 def _is_hermes_internal_secret(key: str) -> bool:
