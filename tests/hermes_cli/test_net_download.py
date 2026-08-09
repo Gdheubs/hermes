@@ -54,6 +54,17 @@ class TestDetectProxy:
 
 
 class TestMacOSSystemProxy:
+    @pytest.fixture(autouse=True)
+    def _darwin(self, monkeypatch):
+        """Simulate a macOS host for all proxy-parsing tests.
+
+        `_macos_system_proxy` early-returns None when `platform.system()`
+        is not "Darwin", so on Linux CI runners the parsing assertions must
+        force Darwin or they fail before touching subprocess at all.
+        (test_non_darwin_returns_none deliberately overrides this fixture.)
+        """
+        monkeypatch.setattr("hermes_cli.net_download.platform.system", lambda: "Darwin")
+
     def _fake_run(self, output, returncode=0):
         def fake_run(args, **kwargs):
             return type("R", (), {"returncode": returncode, "stdout": output})()
