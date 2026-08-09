@@ -2821,9 +2821,10 @@ class CLICommandsMixin:
         import shlex
 
         from cli import _DIM, _RST, _cprint
-        from agent.executive.flag import resolve_v2_enabled
+        from agent.executive.flag import CONFIG_UNSET, resolve_v2_enabled
         from agent.executive.objective_engine import ObjectiveEngine, PermissionError_
         from agent.executive.dryrun import render_dry_run
+        from hermes_cli.config import read_raw_config
 
         try:
             parts = shlex.split((cmd or "").strip())
@@ -2840,18 +2841,37 @@ class CLICommandsMixin:
             _cprint("  Usage: /objective [--dry-run] <objective>")
             return
 
-        if not resolve_v2_enabled():
+        # Resolve explicit user config from raw config.yaml, not merged
+        # DEFAULT_CONFIG, so an absent key still falls through to the legacy
+        # internal env bridge while an explicit false beats that bridge.
+        executive_v2_config_value = CONFIG_UNSET
+        try:
+            raw_config = read_raw_config()
+            agent_config = (
+                raw_config.get("agent") if isinstance(raw_config, dict) else None
+            )
+            if (
+                isinstance(agent_config, dict)
+                and "executive_v2_enabled" in agent_config
+            ):
+                executive_v2_config_value = agent_config["executive_v2_enabled"]
+        except Exception:
+            executive_v2_config_value = CONFIG_UNSET
+
+        agent = getattr(self, "_agent", None) or getattr(self, "agent", None)
+        if not resolve_v2_enabled(
+            agent,
+            config_value=executive_v2_config_value,
+        ):
             _cprint(
-                f"  {_DIM}Executive v2 is disabled. Set "
-                "HERMES_EXECUTIVE_V2_ENABLED=1 or "
-                "agent._executive_v2_enabled = True to enable.{_RST}"
+                f"  {_DIM}Executive v2 is disabled. Enable it with: "
+                f"hermes config set agent.executive_v2_enabled true{_RST}"
             )
             return
 
         # Determine user_id from current agent if available.
         user_id = "cli-user"
         try:
-            agent = getattr(self, "_agent", None) or getattr(self, "agent", None)
             if agent is not None and getattr(agent, "session_id", None):
                 user_id = str(agent.session_id)
         except Exception:

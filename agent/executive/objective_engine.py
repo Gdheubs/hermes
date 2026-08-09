@@ -13,7 +13,7 @@ import logging
 from typing import Any
 
 from .contract import build_execution_contract_v1
-from .flag import resolve_v2_enabled
+from .flag import CONFIG_UNSET, resolve_v2_enabled
 from .normalizer import normalize_objective
 from .capability_discovery_p0_p1 import discover_capabilities_p0_p1
 from .state_storage import ObjectiveStateStorage
@@ -49,10 +49,15 @@ class ObjectiveEngine:
         enabled: bool | None = None,
         storage: ObjectiveStateStorage | None = None,
         agent: Any | None = None,
+        executive_v2_config_value: Any = CONFIG_UNSET,
     ) -> None:
         self._user_id = user_id
         self._enabled = (
-            enabled if enabled is not None else resolve_v2_enabled(agent)
+            enabled if enabled is not None
+            else resolve_v2_enabled(
+                agent,
+                config_value=executive_v2_config_value,
+            )
         )
         self._storage = storage or ObjectiveStateStorage()
         self._states: dict[str, ObjectiveStateData] = {}
@@ -128,8 +133,8 @@ class ObjectiveEngine:
         """
         if not self._enabled:
             raise PermissionError_(
-                "Executive v2 is disabled. Set HERMES_EXECUTIVE_V2_ENABLED=1 "
-                "or agent._executive_v2_enabled = True to enable."
+                "Executive v2 is disabled. Enable it with: "
+                "hermes config set agent.executive_v2_enabled true"
             )
         if not objective_text or not objective_text.strip():
             raise ValueError("objective_text must be non-empty")
