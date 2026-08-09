@@ -137,6 +137,7 @@ import {
   TEXT_PREVIEW_SOURCE_MAX_BYTES
 } from './hardening'
 import { cursorPointInWindow } from './hud-cursor'
+import { HUD_WINDOW_TITLE, wireHudWindowTitle } from './hud-title'
 import { buildHudWindowUrl } from './hud-url'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
@@ -9326,6 +9327,9 @@ function broadcastHudState(open) {
 function spawnHudWindow(sessionId, profile) {
   const win = new BrowserWindow({
     ...hudBounds(),
+    // Distinct from the main window's "Hermes": the one handle tiling window
+    // managers can match on to keep the HUD floating/pinned (see hud-title.ts).
+    title: HUD_WINDOW_TITLE,
     minWidth: 380,
     minHeight: 160,
     frame: false,
@@ -9375,6 +9379,9 @@ function spawnHudWindow(sessionId, profile) {
   // every chat window does.
   streamThrottle.register(win)
   wireCommonWindowHandlers(win, zoomWiringForWindowKind('chat'))
+
+  // Re-assert the title and stop the page's <title> from overwriting it.
+  wireHudWindowTitle(win)
 
   // Remember where the user parks and sizes it (debounced — these fire many
   // times mid-drag).
