@@ -8357,6 +8357,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             None if reasoning_config is None else dict(reasoning_config)
         )
 
+    def _rehydrate_session_reasoning_override(self, session_entry) -> None:
+        """Copy a durable override from an already-loaded routing entry."""
+        session_key = str(getattr(session_entry, "session_key", "") or "")
+        persisted = getattr(session_entry, "reasoning_override", None)
+        if not session_key or persisted is None:
+            return
+        state = self._session_state(session_key)
+        if state.conversation.reasoning_override is None:
+            state.conversation.reasoning_override = dict(persisted)
+
     def _resolve_session_service_tier(
         self,
         source=None,
@@ -16747,6 +16757,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        self._rehydrate_session_reasoning_override(session_entry)
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
         ).strip()
