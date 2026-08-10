@@ -25,8 +25,10 @@ Design notes:
 
 * No ``shell=True`` anywhere; every subprocess call is an argv list.
 * Proxy env is injected into the *child* env, never mutated on the parent.
-* Mirrors are opt-in by default via ``allow_mirrors`` — installers that
-  must not be redirected (e.g. anything checksum-pinned) can disable them.
+* Mirrors are opt-in by default via ``allow_mirrors`` — callers that
+  download content which will later be executed (install scripts, pinned
+  binaries) must never let a third-party mirror supply it unless they
+  explicitly opt in; the default keeps mirrors off.
 * All functions are pure-ish and take an explicit ``env`` so tests can
   inject a fake environment and a fake ``curl`` via ``curl_cmd``.
 """
@@ -208,7 +210,7 @@ def fetch_with_fallback(
     *,
     timeout: int = 120,
     env: Optional[Dict[str, str]] = None,
-    allow_mirrors: bool = True,
+    allow_mirrors: bool = False,
     curl_cmd: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """Download with the proxy-aware official-then-mirror strategy.

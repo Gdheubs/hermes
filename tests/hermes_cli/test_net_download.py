@@ -184,17 +184,39 @@ class TestFetchWithFallback:
         )
         assert ok is True
 
-    def test_official_fails_mirror_succeeds(self, tmp_path):
+    def test_official_fails_mirror_succeeds_when_opted_in(self, tmp_path):
         dest = tmp_path / "out.sh"
         url = "https://raw.githubusercontent.com/x/y/main/z.sh"
         curl = TestCurlDownload()._fake_curl_script(
             tmp_path, fail_urls=(url,), output="mirror-content"
         )
-        ok, detail = fetch_with_fallback(url, str(dest), curl_cmd=curl)
+        # Mirrors are opt-in: the mirror path only runs when the caller
+        # explicitly passes allow_mirrors=True.
+        ok, detail = fetch_with_fallback(url, str(dest), curl_cmd=curl, allow_mirrors=True)
         assert ok is True
         assert dest.read_text() == "mirror-content"
 
-    def test_all_fail_returns_summary(self, tmp_path):
+    def test_official_fails_no_mirror_by_default(self, tmp_path):
+        """Security contract: executed-content fetches must not fall back to
+        third-party mirrors unless the caller opts in. The default keeps
+        mirrors off, so an official-URL failure is a hard failure."""
+        dest = tmp_path / "out.sh"
+        url = "https://raw.githubusercontent.com/x/y/main/z.sh"
+        mirror1 = f"https://ghfast.top/{url}"
+        mirror2 = f"https://gh-proxy.com/{url}"
+        curl = TestCurlDownload()._fake_curl_script(
+            tmp_path, fail_urls=(url, mirror1, mirror2), output="mirror-content"
+        )
+        ok, detail = fetch_with_fallback(url, str(dest), curl_cmd=curl)
+        assert ok is False
+        assert url in detail
+        # Mirrors must NOT be attempted (and therefore must not appear in the
+        # failure summary) with the default allow_mirrors=False.
+        assert mirror1 not in detail
+        assert mirror2 not in detail
+        assert not dest.exists() or dest.read_text() == ""
+
+    def test_all_fail_returns_summary_when_opted_in(self, tmp_path):
         dest = tmp_path / "out.sh"
         url = "https://raw.githubusercontent.com/x/y/main/z.sh"
         mirror1 = f"https://ghfast.top/{url}"
@@ -202,7 +224,8 @@ class TestFetchWithFallback:
         curl = TestCurlDownload()._fake_curl_script(
             tmp_path, fail_urls=(url, mirror1, mirror2), output="x"
         )
-        ok, detail = fetch_with_fallback(url, str(dest), curl_cmd=curl)
+        ok, detail = fetch_with_fallback(url, str(dest), curl_cmd=curl, allow_mirrors=True)
         assert ok is False
         assert url in detail
         assert mirror1 in detail
+        assert mirror2 in detail
