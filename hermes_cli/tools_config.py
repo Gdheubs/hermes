@@ -1585,6 +1585,28 @@ def _run_cua_driver_installer(
                     "mirrors are disabled for executed scripts): "
                     f"{detail[:300]}"
                 )
+                # Actionable failure UX: the user must be able to reproduce
+                # and fix the network problem in seconds, not guess.
+                _print_info(
+                    "    Retry manually: curl -fsSL --connect-timeout 10 --max-time 120 "
+                    f"'{install_url}' -o /tmp/cua-driver-install.sh"
+                )
+                if fetch_env:
+                    _proxy = (
+                        fetch_env.get("HTTPS_PROXY")
+                        or fetch_env.get("HTTP_PROXY")
+                        or fetch_env.get("ALL_PROXY")
+                    )
+                    if _proxy:
+                        _print_info(f"    Proxy in use: {_proxy} — verify it is up and allow GitHub")
+                    else:
+                        _print_info(
+                            "    No proxy detected — check your network/proxy and retry; "
+                            "on macOS enable it in System Settings or export HTTPS_PROXY"
+                        )
+                _print_info(
+                    "    Docs: https://github.com/trycua/cua/blob/main/libs/cua-driver/README.md"
+                )
                 try:
                     os.remove(script_path)
                 except OSError:
