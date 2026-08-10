@@ -4,7 +4,7 @@ import { useEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
-import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
+import { focusedSessionTabAnchor, noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
 import {
   getAllSessionMessages,
   getLatestSessionMessages,
@@ -69,6 +69,7 @@ vi.mock('@/store/profile', async importOriginal => ({
 
 vi.mock('@/components/pane-shell/tree/store', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
+  focusedSessionTabAnchor: vi.fn(() => 'workspace'),
   noteActiveTreeGroup: vi.fn(),
   revealTreePane: vi.fn()
 }))
@@ -1417,7 +1418,7 @@ describe('branchStoredSession desktop source tagging', () => {
     expect(switchedGatewayRequest).not.toHaveBeenCalled()
   })
 
-  it('does not reveal a completed tile branch into a newer profile intent', async () => {
+  it('does not reveal a completed tile branch after focus moves to another tile', async () => {
     const branchRpc = deferred<{
       info: { cwd: string; fast: boolean; model: string; provider: string }
       message_count: number
@@ -1454,6 +1455,7 @@ describe('branchStoredSession desktop source tagging', () => {
       storedSession({ id: 'foreground-stored', profile: 'default' }),
       storedSession({ id: 'tile-stored', profile: 'work' })
     ])
+    vi.mocked(focusedSessionTabAnchor).mockReturnValue('session-tile:tile-stored')
     vi.mocked(revealTreePane).mockClear()
 
     const requestGateway = vi.fn(async (method: string) => {
@@ -1480,9 +1482,9 @@ describe('branchStoredSession desktop source tagging', () => {
     const result = branchCurrentSession!(undefined, 'tile-runtime')
 
     await waitFor(() => expect(requestGateway).toHaveBeenCalledWith('session.branch', expect.any(Object)))
-    $activeGatewayProfile.set('other')
+    vi.mocked(focusedSessionTabAnchor).mockReturnValue('session-tile:other-existing')
     $sessionTiles.set([{ storedSessionId: 'other-existing' }])
-    const otherTilesBeforeCompletion = $sessionTiles.get()
+    const tilesBeforeCompletion = $sessionTiles.get()
 
     branchRpc.resolve({
       session_id: 'branch-runtime-stale',
@@ -1500,23 +1502,19 @@ describe('branchStoredSession desktop source tagging', () => {
 
     await expect(result).resolves.toBe(true)
 
-    const otherTilesAfterCompletion = $sessionTiles.get()
+    const tilesAfterCompletion = $sessionTiles.get()
     const revealedAfterCompletion = vi.mocked(revealTreePane).mock.calls
-
-    $activeGatewayProfile.set('default')
 
     const childPersistedForInvocationProfile = $sessionTiles
       .get()
       .some(tile => tile.storedSessionId === 'branch-stored-stale')
 
-    for (const profile of ['default', 'other']) {
-      $activeGatewayProfile.set(profile)
-      closeSessionTile('branch-stored-stale')
-    }
+    closeSessionTile('branch-stored-stale')
 
-    $activeGatewayProfile.set('default')
-
-    expect(otherTilesAfterCompletion).toEqual(otherTilesBeforeCompletion)
+    expect(tilesAfterCompletion).toEqual([
+      ...tilesBeforeCompletion,
+      expect.objectContaining({ storedSessionId: 'branch-stored-stale' })
+    ])
     expect(revealedAfterCompletion).toEqual([])
     expect(childPersistedForInvocationProfile).toBe(true)
     expect($currentCwd.get()).toBe('/foreground/workspace')
