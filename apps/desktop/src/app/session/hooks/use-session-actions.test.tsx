@@ -5,7 +5,13 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
-import { getAllSessionMessages, getLatestSessionMessages, getSession, type HermesGateway, type SessionInfo } from '@/hermes'
+import {
+  getAllSessionMessages,
+  getLatestSessionMessages,
+  getSession,
+  type HermesGateway,
+  type SessionInfo
+} from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile } from '@/store/profile'
@@ -1037,9 +1043,7 @@ function BranchHarness({
   busy?: boolean
   gatewayRef?: MutableRefObject<HermesGateway | null>
   navigate?: ReturnType<typeof vi.fn>
-  onCurrentReady?: (
-    branchCurrentSession: (messageId?: string, targetSessionId?: string) => Promise<boolean>
-  ) => void
+  onCurrentReady?: (branchCurrentSession: (messageId?: string, targetSessionId?: string) => Promise<boolean>) => void
   onReady: (branchStoredSession: (storedSessionId: string, sessionProfile?: string | null) => Promise<boolean>) => void
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   selectedStoredSessionId?: string | null
@@ -1366,9 +1370,7 @@ describe('branchStoredSession desktop source tagging', () => {
 
     const sourceGatewayRequest = vi.fn(async (_method: string, _params?: Record<string, unknown>) => branchResponse)
 
-    const switchedGatewayRequest = vi.fn(
-      async (_method: string, _params?: Record<string, unknown>) => branchResponse
-    )
+    const switchedGatewayRequest = vi.fn(async (_method: string, _params?: Record<string, unknown>) => branchResponse)
 
     let activeGatewayRequest = sourceGatewayRequest
 
