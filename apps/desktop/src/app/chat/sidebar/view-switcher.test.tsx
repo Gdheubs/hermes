@@ -45,6 +45,11 @@ describe('resolveSidebarView', () => {
   it('maps the all-profiles scope to the Profiles view', () => {
     expect(resolveSidebarView('project', true)).toBe('profiles')
     expect(resolveSidebarView('date', true)).toBe('profiles')
+    expect(resolveSidebarView('profile', true)).toBe('profiles')
+  })
+
+  it('maps the all-profiles grouping to the Profiles view', () => {
+    expect(resolveSidebarView('profile', false)).toBe('profiles')
   })
 })
 
@@ -85,11 +90,12 @@ describe('SidebarViewSwitcher', () => {
     expect($sidebarGrouping.get()).toBe('date')
   })
 
-  it('switching to Profiles enables the all-profiles scope', () => {
+  it('switching to Profiles enables the all-profiles scope grouped by owner', () => {
     render(<SidebarViewSwitcher multiProfile />)
 
     fireEvent.click(screen.getByRole('button', { name: 'Profiles' }))
 
     expect($showAllProfiles.get()).toBe(true)
+    expect($sidebarGrouping.get()).toBe('profile')
   })
 })

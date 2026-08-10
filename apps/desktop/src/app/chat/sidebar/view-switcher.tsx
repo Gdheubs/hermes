@@ -3,7 +3,7 @@ import { useStore } from '@nanostores/react'
 import { SegmentedControl, type SegmentedControlOption } from '@/components/ui/segmented-control'
 import { useI18n } from '@/i18n'
 import { Clock, FolderOpen, Users } from '@/lib/icons'
-import { $sidebarGrouping, setSidebarGrouping } from '@/store/layout'
+import { $sidebarGrouping, setSidebarGrouping, type SidebarGrouping } from '@/store/layout'
 import { $showAllProfiles, setShowAllProfiles } from '@/store/profile'
 import { $projectScope, ALL_PROJECTS, exitProjectScope } from '@/store/projects'
 
@@ -24,8 +24,11 @@ export type SidebarView = 'sessions' | 'projects' | 'profiles'
  * Which of the three views the current store state is showing. `status` is a
  * flat-list grouping, so it still belongs to the Sessions view.
  */
-export function resolveSidebarView(grouping: 'date' | 'project' | 'status', showAllProfiles: boolean): SidebarView {
-  if (showAllProfiles) {
+export function resolveSidebarView(grouping: SidebarGrouping, showAllProfiles: boolean): SidebarView {
+  // `profile` is the all-profiles scope's own grouping (group by owner). The
+  // flat scope can't hold it, so seeing it is the Profiles view no matter what
+  // showAllProfiles says.
+  if (grouping === 'profile' || showAllProfiles) {
     return 'profiles'
   }
 
@@ -48,7 +51,11 @@ export function SidebarViewSwitcher({ multiProfile }: SidebarViewSwitcherProps) 
 
   const onViewChange = (next: SidebarView) => {
     if (next === 'profiles') {
-      setShowAllProfiles(true)
+      // Grouping by owner is the store's native "every profile, grouped by
+      // profile" mode: it flips the all-profiles scope on and records the
+      // grouping so the rail and the Filters menu agree (see
+      // setSidebarGrouping).
+      setSidebarGrouping('profile')
 
       return
     }
