@@ -1562,10 +1562,12 @@ def _run_cua_driver_installer(
         # also goes through the proxy.
         #
         # Security: this script is executed via /bin/bash below, so it must
-        # NEVER be supplied by a third-party mirror. `allow_mirrors=False`
-        # keeps the fetch official-only (explicit proxy → system proxy →
-        # direct), matching the documented "mirrors opt-in by default"
-        # contract. Mirror fallback is for non-executed payloads that opt in.
+        # NEVER be supplied by a third-party mirror. `content_class="executed"`
+        # (the default) permanently disables mirrors at the API level — even
+        # an accidental allow_mirrors=True is ignored — keeping the fetch
+        # official-only (explicit proxy → system proxy → direct), matching the
+        # documented "mirrors opt-in by default" contract. Mirror fallback is
+        # for non-executed payloads that opt in.
         try:
             from hermes_cli.net_download import fetch_with_fallback, proxy_env_for
         except ImportError:  # pragma: no cover - defensive; net_download is local
@@ -1574,7 +1576,8 @@ def _run_cua_driver_installer(
         fetch_env = proxy_env_for(_cua_driver_env()) if proxy_env_for else _cua_driver_env()
         if fetch_with_fallback is not None:
             ok, detail = fetch_with_fallback(
-                install_url, script_path, timeout=120, env=fetch_env, allow_mirrors=False,
+                install_url, script_path, timeout=120, env=fetch_env,
+                content_class="executed", allow_mirrors=False,
             )
             if not ok:
                 _print_warning(

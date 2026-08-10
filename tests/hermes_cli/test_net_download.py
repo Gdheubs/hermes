@@ -202,8 +202,12 @@ class TestFetchWithFallback:
             tmp_path, fail_urls=(url,), output="mirror-content"
         )
         # Mirrors are opt-in: the mirror path only runs when the caller
-        # explicitly passes allow_mirrors=True.
-        ok, detail = fetch_with_fallback(url, str(dest), curl_cmd=curl, allow_mirrors=True)
+        # explicitly passes allow_mirrors=True (and only for non-executed
+        # data-class content — executed content can never use mirrors).
+        ok, detail = fetch_with_fallback(
+            url, str(dest), curl_cmd=curl,
+            content_class="data", allow_mirrors=True,
+        )
         assert ok is True
         assert dest.read_text() == "mirror-content"
 
@@ -235,8 +239,64 @@ class TestFetchWithFallback:
         curl = TestCurlDownload()._fake_curl_script(
             tmp_path, fail_urls=(url, mirror1, mirror2), output="x"
         )
-        ok, detail = fetch_with_fallback(url, str(dest), curl_cmd=curl, allow_mirrors=True)
+        ok, detail = fetch_with_fallback(
+            url, str(dest), curl_cmd=curl,
+            content_class="data", allow_mirrors=True,
+        )
         assert ok is False
         assert url in detail
         assert mirror1 in detail
         assert mirror2 in detail
+
+    def test_executed_class_ignores_allow_mirrors_true(self, tmp_path):
+        """Security contract: content_class='executed' (the default) must
+        permanently disable mirrors at the API level — even a caller that
+        mistakenly passes allow_mirrors=True must not be able to route
+        executed-content bytes through a third-party mirror."""
+        dest = tmp_path / "out.sh"
+        url = "https://raw.githubusercontent.com/x/y/main/z.sh"
+        mirror1 = f"https://ghfast.top/{url}"
+        mirror2 = f"https://gh-proxy.com/{url}"
+        curl = TestCurlDownload()._fake_curl_script(
+            tmp_path, fail_urls=(url, mirror1, mirror2), output="mirror-content"
+        )
+        # Explicitly asking for mirrors on executed content is ignored:
+        ok, detail = fetch_with_fallback(
+            url, str(dest), curl_cmd=curl,
+            content_class="executed", allow_mirrors=True,
+        )
+        assert ok is False
+        assert url in detail
+        assert mirror1 not in detail
+        assert mirror2 not in detail
+        assert not dest.exists() or dest.read_text() == ""
+
+    def test_data_class_opt_in_mirror(self, tmp_path):
+        """content_class='data' keeps mirrors opt-in: allow_mirrors=True
+        works for non-executed payloads (model weights, metadata)."""
+        dest = tmp_path / "out.bin"
+        url = "https://raw.githubusercontent.com/x/y/main/weights.bin"
+        curl = TestCurlDownload()._fake_curl_script(
+            tmp_path, fail_urls=(url,), output="data-bytes"
+        )
+        ok, detail = fetch_with_fallback(
+            url, str(dest), curl_cmd=curl,
+            content_class="data", allow_mirrors=True,
+        )
+        assert ok is True
+        assert dest.read_text() == "data-bytes"
+
+    def test_data_class_default_no_mirror(self, tmp_path):
+        """Even data content defaults to mirrors off (allow_mirrors=None)."""
+        dest = tmp_path / "out.bin"
+        url = "https://raw.githubusercontent.com/x/y/main/weights.bin"
+        mirror1 = f"https://ghfast.top/{url}"
+        curl = TestCurlDownload()._fake_curl_script(
+            tmp_path, fail_urls=(url, mirror1), output="data-bytes"
+        )
+        ok, detail = fetch_with_fallback(
+            url, str(dest), curl_cmd=curl, content_class="data",
+        )
+        assert ok is False
+        assert url in detail
+        assert mirror1 not in detail

@@ -29,6 +29,21 @@ Design notes:
   download content which will later be executed (install scripts, pinned
   binaries) must never let a third-party mirror supply it unless they
   explicitly opt in; the default keeps mirrors off.
+
+Content-class contract
+^^^^^^^^^^^^^^^^^^^^^^
+
+Every fetch declares the *class* of the content it transports via
+``content_class``. The class decides whether mirrors may ever be tried —
+**independently of what the caller happens to pass** — so a future call site
+cannot accidentally re-enable mirrors for executed content:
+
+* ``content_class="executed"`` (default) — bytes that will be executed or
+  imported (shell scripts, binaries, wheels). Mirrors are **always disabled**;
+  passing ``allow_mirrors=True`` logs a warning and is ignored.
+* ``content_class="data"`` — non-executed payloads (model weights, metadata).
+  Mirrors remain opt-in via ``allow_mirrors=True``; the default stays off.
+
 * All functions are pure-ish and take an explicit ``env`` so tests can
   inject a fake environment and a fake ``curl`` via ``curl_cmd``.
 """
@@ -210,15 +225,32 @@ def fetch_with_fallback(
     *,
     timeout: int = 120,
     env: Optional[Dict[str, str]] = None,
-    allow_mirrors: bool = False,
+    content_class: str = "executed",
+    allow_mirrors: Optional[bool] = None,
     curl_cmd: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """Download with the proxy-aware official-then-mirror strategy.
 
+    ``content_class`` is the security contract (see module docstring):
+    ``"executed"`` (default) permanently disables mirrors — a third-party
+    mirror must never supply bytes that will be executed or imported, so an
+    accidental ``allow_mirrors=True`` is warned about and ignored. ``"data"``
+    keeps mirrors strictly opt-in via ``allow_mirrors=True``.
+
     Tries the official URL first (with proxy), then each mirror candidate
-    in order. Returns ``(True, '')`` on success or ``(False, detail)`` with
-    a summary of every attempt.
+    in order (only when the content class + allow_mirrors permit). Returns
+    ``(True, '')`` on success or ``(False, detail)`` with a summary of every
+    attempt.
     """
+    if content_class == "executed" and allow_mirrors:
+        logger.warning(
+            "fetch_with_fallback: allow_mirrors=True ignored for content_class='executed' "
+            "(supply-chain safety: mirrors must never supply executed content)"
+        )
+        allow_mirrors = False
+    if allow_mirrors is None:
+        allow_mirrors = False
+
     attempts: List[Tuple[str, str]] = []
     ok, detail = curl_download(url, dest, timeout=timeout, env=env, curl_cmd=curl_cmd)
     if ok:
