@@ -1602,7 +1602,33 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _deliver_adapters_for_job(job: dict, adapters=None, profile_adapters=None):
+    """Resolve the effective live-adapter dict for a cron delivery.
+
+    Prefers the owning profile's adapter map (``profile_adapters``) when the
+    job belongs to a secondary profile under multiplex, so delivery uses that
+    profile's live bot/chat instead of the default profile's shared
+    ``adapters`` dict. Falls back to the shared ``adapters`` dict for the
+    default profile / non-multiplex path (existing behavior unchanged).
+
+    Mirrors the lookup in gateway/authz_mixin (``_profile_adapters[profile]``),
+    but keyed off the job's active profile home resolved at delivery time.
+    """
+    if profile_adapters:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            profile = get_active_profile_name() or "default"
+            if profile != "default":
+                profile_map = profile_adapters.get(profile)
+                if isinstance(profile_map, dict) and profile_map:
+                    return profile_map
+        except Exception:
+            logger.debug("profile-adapters resolution failed; falling back to shared adapters", exc_info=True)
+    return adapters or {}
+
+
+def _deliver_result(job: dict, content: str, adapters=None, loop=None,
+                    profile_adapters=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1610,6 +1636,14 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     use the live adapter first — this supports E2EE rooms (e.g. Matrix) where
     the standalone HTTP path cannot encrypt.  Falls back to standalone send if
     the adapter path fails or is unavailable.
+
+    ``profile_adapters`` (optional) is the gateway's per-profile adapter map
+    (Gateway._profile_adapters: ``{profile_name: {platform: adapter}}``) for
+    multiplex mode. When provided and the job's profile has a live adapter
+    entry, delivery routes through that profile's adapter instead of the
+    shared ``adapters`` dict (the default profile's), so a secondary-profile
+    cron job delivers from the correct bot/chat. Falls back to the shared
+    ``adapters`` dict for the default profile / non-multiplex path.
 
     Returns None on success, or an error string on failure.
     """
@@ -1687,6 +1721,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         logger.error("Job '%s': %s", job["id"], msg)
         return msg
 
+    # Under multiplex, delivery must use the job-owning profile's live adapter
+    # (its bot/chat), not the shared default-profile ``adapters`` dict — the
+    # gateway's per-profile adapter map is threaded through via
+    # ``profile_adapters``. Resolve it once here; both the transport lookup and
+    # the DeliveryRouter below consume it.
+    delivery_adapters = _deliver_adapters_for_job(
+        job, adapters=adapters, profile_adapters=profile_adapters
+    )
+
     delivery_errors = []
 
     for target in targets:
@@ -1731,7 +1774,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         from gateway.delivery import resolve_delivery_transport
 
-        transport = resolve_delivery_transport(platform, config, adapters)
+        transport = resolve_delivery_transport(platform, config, delivery_adapters)
         if transport is not None:
             pconfig = transport.config
             runtime_adapter = transport.adapter
@@ -1941,7 +1984,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 if text_to_send:
                     from agent.async_utils import safe_schedule_threadsafe
 
-                    router = DeliveryRouter(config, adapters)
+                    router = DeliveryRouter(config, delivery_adapters)
                     route_target = DeliveryTarget(
                         platform=platform,
                         chat_id=str(chat_id),
@@ -4538,7 +4581,7 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
 
 def run_one_job(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
-    extra_prompt: Optional[str] = None,
+    extra_prompt: Optional[str] = None, profile_adapters=None,
 ) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
@@ -4618,9 +4661,20 @@ def run_one_job(
             # still triggers teardown before propagating.
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
-            raise
-        finally:
+            # Restore the previous secret scope before propagating: this
+            # failure path never reaches the delivery block whose finally
+            # resets it, so without this a leaked scope would contaminate the
+            # next job running on the same worker thread.
             reset_secret_scope(_scope_token)
+            raise
+        # NOTE: the profile secret scope is intentionally NOT reset here — it
+        # must stay installed through _deliver_result below, which reads the
+        # job profile's credentials via load_gateway_config -> _getenv (e.g.
+        # TELEGRAM_BOT_TOKEN). Resetting it before delivery made multiplexed
+        # jobs deliver with NO scope, so the owning profile's .env was ignored
+        # and delivery used the default profile's/empty token (wrong bot/chat,
+        # lost thread). The reset now happens in the delivery block's finally,
+        # once run AND delivery are both complete.
 
         # Everything from here through delivery runs with the agent still live
         # (deferred teardown). Wrap it ALL in a try/finally so that if any step
@@ -4704,7 +4758,10 @@ def run_one_job(
                     and not _resolve_delivery_targets(job)
                 )
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    delivery_error = _deliver_result(
+                        job, deliver_content, adapters=adapters, loop=loop,
+                        profile_adapters=profile_adapters,
+                    )
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
@@ -4714,6 +4771,12 @@ def run_one_job(
             # their subprocesses/clients (#10200).
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
+            # Reset the profile secret scope now that run AND delivery are both
+            # complete. Kept installed through _deliver_result above so the
+            # job profile's credentials (e.g. TELEGRAM_BOT_TOKEN) resolve
+            # correctly under multiplex; torn down here so a scope never leaks
+            # into the next job on this worker thread.
+            reset_secret_scope(_scope_token)
 
         # Treat empty final_response as a soft failure so last_status
         # is not "ok" — the agent ran but produced nothing useful.
@@ -4850,6 +4913,7 @@ def tick(
     sync: bool = True,
     *,
     can_dispatch=None,
+    profile_adapters=None,
 ):
     """
     Check and run all due jobs.
@@ -4961,7 +5025,10 @@ def tick(
             module-level ``run_one_job`` so ``tick`` and external providers
             (Chronos ``fire_due``) use the identical execute→save→deliver→mark
             body."""
-            return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
+            return run_one_job(
+                job, adapters=adapters, loop=loop, verbose=verbose,
+                profile_adapters=profile_adapters,
+            )
 
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
