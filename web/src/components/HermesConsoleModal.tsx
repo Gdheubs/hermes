@@ -370,29 +370,40 @@ export function HermesConsoleModal({ open, onClose }: HermesConsoleModalProps) {
     term.open(host);
     term.focus();
 
-    // Touch scrolling (#81119): same fix as the chat page — let the browser
-    // own vertical panning on .xterm-viewport and swallow the touchmove in
-    // the capture phase so xterm's preventDefault never cancels it.
-    const consoleViewport = host.querySelector<HTMLElement>(".xterm-viewport");
+    // Touch scrolling (#81119): same fix as the chat page. @xterm/xterm
+    // 6.0.0 binds no touch handlers on .xterm-viewport — its only touch
+    // listener lives on the document inside the unused Gesture class — and
+    // content touches bubble through the screen/scrollable-element path,
+    // not the viewport. Attach to the host element instead and translate
+    // one-finger vertical drags into term.scrollLines, since 6.0.0 wires
+    // no native touch scroll.
+    host.style.touchAction = "pan-y";
+    let touchDragLastY: number | null = null;
     let touchScrollCleanup: (() => void) | null = null;
-    if (consoleViewport) {
-      consoleViewport.style.touchAction = "pan-y";
-      const swallowTouchMove = (ev: TouchEvent) => {
-        if (ev.touches.length !== 1) return;
-        ev.stopPropagation();
-      };
-      consoleViewport.addEventListener("touchmove", swallowTouchMove, {
-        capture: true,
-        passive: true,
-      });
-      touchScrollCleanup = () => {
-        consoleViewport.removeEventListener(
-          "touchmove",
-          swallowTouchMove,
-          true,
-        );
-      };
-    }
+    const swallowTouchMove = (ev: TouchEvent) => {
+      if (ev.touches.length !== 1) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      const y = ev.touches[0].clientY;
+      if (touchDragLastY !== null && touchDragLastY !== y) {
+        term.scrollLines(touchDragLastY > y ? 1 : -1);
+      }
+      touchDragLastY = y;
+    };
+    const resetTouchDrag = () => {
+      touchDragLastY = null;
+    };
+    host.addEventListener("touchmove", swallowTouchMove, {
+      capture: true,
+      passive: false,
+    });
+    host.addEventListener("touchstart", resetTouchDrag, { capture: true });
+    host.addEventListener("touchcancel", resetTouchDrag, { capture: true });
+    touchScrollCleanup = () => {
+      host.removeEventListener("touchmove", swallowTouchMove, true);
+      host.removeEventListener("touchstart", resetTouchDrag, true);
+      host.removeEventListener("touchcancel", resetTouchDrag, true);
+    };
 
     const fitTerminal = () => {
       if (!host.isConnected || host.clientWidth <= 0 || host.clientHeight <= 0) {

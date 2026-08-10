@@ -825,30 +825,46 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     };
     host.addEventListener("keydown", _imeCompositionGuard, true);
     // ── Touch scrolling (Android / touch devices) ──────────────────────
-    // xterm.js attaches touch handlers to .xterm-viewport that call
-    // preventDefault() on touchmove, which swallows the swipe gesture so
-    // the scrollback can't be scrolled by touch (#81119). Let the browser
-    // own vertical panning (touch-action: pan-y) and swallow the touchmove
-    // in the capture phase — before xterm's target-phase handler runs — so
-    // that preventDefault() is never reached and native scrolling survives.
-    const xtermViewport = host.querySelector<HTMLElement>(".xterm-viewport");
+    // In @xterm/xterm 6.0.0 the ONLY touch handler is the document-level
+    // listener inside the vendored Gesture class, and Gesture.addTarget has
+    // no callers — the gesture path is dead code. Nothing is bound on
+    // .xterm-viewport, and content touches bubble through .xterm-screen →
+    // .xterm-scrollable-element → .xterm, never through the viewport, so a
+    // listener there would never fire. We therefore attach to the host
+    // element (the container wrapping the screen path) and translate
+    // one-finger vertical drags into term.scrollLines ourselves, since
+    // 6.0.0 wires no native touch scroll (#81119).
+    host.style.touchAction = "pan-y";
+    let touchDragLastY: number | null = null;
     let touchScrollCleanup: (() => void) | null = null;
-    if (xtermViewport) {
-      xtermViewport.style.touchAction = "pan-y";
-      const swallowTouchMove = (ev: TouchEvent) => {
-        // One-finger drag is a scroll gesture; multi-touch (pinch-zoom) and
-        // taps are left alone.
-        if (ev.touches.length !== 1) return;
-        ev.stopPropagation();
-      };
-      xtermViewport.addEventListener("touchmove", swallowTouchMove, {
-        capture: true,
-        passive: true,
-      });
-      touchScrollCleanup = () => {
-        xtermViewport.removeEventListener("touchmove", swallowTouchMove, true);
-      };
-    }
+    const swallowTouchMove = (ev: TouchEvent) => {
+      // One-finger drag is a scroll gesture; multi-touch (pinch-zoom) and
+      // taps are left alone.
+      if (ev.touches.length !== 1) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      const y = ev.touches[0].clientY;
+      if (touchDragLastY !== null && touchDragLastY !== y) {
+        term.scrollLines(touchDragLastY > y ? 1 : -1);
+      }
+      touchDragLastY = y;
+    };
+    const resetTouchDrag = () => {
+      touchDragLastY = null;
+    };
+    host.addEventListener("touchmove", swallowTouchMove, {
+      capture: true,
+      passive: false,
+    });
+    // Reset the drag baseline between gestures (multi-touch, tap, new
+    // touch after a pointer lift).
+    host.addEventListener("touchstart", resetTouchDrag, { capture: true });
+    host.addEventListener("touchcancel", resetTouchDrag, { capture: true });
+    touchScrollCleanup = () => {
+      host.removeEventListener("touchmove", swallowTouchMove, true);
+      host.removeEventListener("touchstart", resetTouchDrag, true);
+      host.removeEventListener("touchcancel", resetTouchDrag, true);
+    };
 
     const textarea = term.textarea;
     if (textarea) {

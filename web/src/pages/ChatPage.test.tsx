@@ -31,6 +31,7 @@ class FakeTerminal {
   };
   unicode = { activeVersion: "" };
   refresh = vi.fn();
+  scrollLines = vi.fn();
 
   constructor(options: Record<string, unknown>) {
     this.options = options;
@@ -78,11 +79,15 @@ class FakeTerminal {
   scrollToBottom() {}
 
   open(host: HTMLElement) {
-    // Mimic xterm.js: a scrollable .xterm-viewport child is created so
-    // the touch-scroll handler can locate it (#81119).
+    // Mimic xterm.js's DOM: the .xterm-viewport (overlay scrollbar) is a
+    // sibling of .xterm-screen inside the host, and content touches bubble
+    // through the screen path, never the viewport (#81119).
     const viewport = document.createElement("div");
     viewport.className = "xterm-viewport";
     host.appendChild(viewport);
+    const screen = document.createElement("div");
+    screen.className = "xterm-screen";
+    host.appendChild(screen);
   }
 
   paste() {}
@@ -284,7 +289,7 @@ describe("ChatPage", () => {
     expect(maybeReloadForLoopbackWsAuthFailure).toHaveBeenCalledWith(4401);
   });
 
-  it("lets touch swipes scroll the xterm scrollback natively (#81119)", async () => {
+  it("lets touch swipes scroll the xterm scrollback (#81119)", async () => {
     const { default: ChatPage } = await import("./ChatPage");
 
     await render(
@@ -297,47 +302,52 @@ describe("ChatPage", () => {
       ".hermes-chat-xterm-host",
     ) as HTMLElement | null;
     expect(host).not.toBeNull();
-    const viewport = host!.querySelector<HTMLElement>(".xterm-viewport");
-    expect(viewport).not.toBeNull();
-    // The terminal pane explicitly opts in to native vertical panning so the
-    // browser owns the scroll gesture.
-    expect(viewport!.style.touchAction).toBe("pan-y");
 
-    // Simulate xterm.js's own target-phase handler, which would call
-    // preventDefault() on touchmove and swallow the swipe. The capture-phase
-    // listener must stop propagation before that handler fires.
-    const xtermTouchMove = vi.fn((ev: Event) => ev.preventDefault());
-    viewport!.addEventListener("touchmove", xtermTouchMove);
+    // The fix binds touch handling on the host (the element wrapping the
+    // terminal's screen path): xterm 6.0.0 attaches no touch handlers to
+    // .xterm-viewport — its only touch listener is on the document inside
+    // the unused Gesture class — and content touches bubble through
+    // .xterm-screen, never through the viewport.
+    expect(host!.style.touchAction).toBe("pan-y");
 
-    const child = document.createElement("div");
-    viewport!.appendChild(child);
+    const terminal = FakeTerminal.instances[FakeTerminal.instances.length - 1];
+    const screen = host!.querySelector<HTMLElement>(".xterm-screen");
+    expect(screen).not.toBeNull();
 
-    const dispatch = () => {
+    const makeTouchMove = (clientY: number) => {
       const ev = new Event("touchmove", { bubbles: true, cancelable: true });
       Object.defineProperty(ev, "touches", {
         configurable: true,
-        value: [{ identifier: 1 }],
+        value: [{ clientY }],
       });
-      child.dispatchEvent(ev);
       return ev;
     };
-    const ev = dispatch();
 
-    expect(xtermTouchMove).not.toHaveBeenCalled();
-    expect(ev.defaultPrevented).toBe(false);
+    // A one-finger upward drag on the screen element must be intercepted by
+    // the host's capture-phase handler: default prevented (so nothing else
+    // can swallow the gesture) and translated into a scroll down.
+    const ev1 = makeTouchMove(200);
+    screen!.dispatchEvent(ev1);
+    expect(ev1.defaultPrevented).toBe(true);
 
-    // A direct touchmove on the viewport itself (no child) must also be
-    // intercepted — xterm's preventDefault is bound on the viewport.
-    viewport!.removeEventListener("touchmove", xtermTouchMove);
-    viewport!.addEventListener("touchmove", xtermTouchMove);
-    const ev2 = new Event("touchmove", { bubbles: true, cancelable: true });
-    Object.defineProperty(ev2, "touches", {
+    const ev2 = makeTouchMove(150);
+    screen!.dispatchEvent(ev2);
+    expect(ev2.defaultPrevented).toBe(true);
+    expect(terminal.scrollLines).toHaveBeenLastCalledWith(1);
+
+    // The delta is relative to the previous move, not to the screen origin.
+    const ev3 = makeTouchMove(120);
+    screen!.dispatchEvent(ev3);
+    expect(terminal.scrollLines).toHaveBeenLastCalledWith(1);
+
+    // Fingers moving apart (pinch-zoom) must be left alone.
+    const pinch = new Event("touchmove", { bubbles: true, cancelable: true });
+    Object.defineProperty(pinch, "touches", {
       configurable: true,
-      value: [{ identifier: 1 }],
+      value: [{ clientY: 100 }, { clientY: 300 }],
     });
-    viewport!.dispatchEvent(ev2);
-    expect(xtermTouchMove).not.toHaveBeenCalled();
-    expect(ev2.defaultPrevented).toBe(false);
+    screen!.dispatchEvent(pinch);
+    expect(pinch.defaultPrevented).toBe(false);
   });
 
   it("refits and repaints the terminal after a viewport resize (#81119)", async () => {
