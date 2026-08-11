@@ -757,6 +757,7 @@ def _execution_trusting_prefixes() -> tuple[str, ...]:
     """
     try:
         from hermes_constants import (
+            get_default_hermes_root,
             get_hermes_home,
             get_process_hermes_home,
             get_subprocess_home,
@@ -767,6 +768,26 @@ def _execution_trusting_prefixes() -> tuple[str, ...]:
     else:
         raw_homes = {str(get_hermes_home()), str(get_process_hermes_home())}
         user_home = get_subprocess_home() or os.path.expanduser("~")
+        # Sibling profiles under the shared root: every profile gateway
+        # executes its OWN <home>/cron and <home>/scripts as the same OS
+        # user, so a messaging session in ANY profile must not plant
+        # payloads in another profile's execution-trusting roots — nor in
+        # the default profile's roots at the root level. (The existing
+        # cross-profile soft guard covers skills/plugins/cron/memories
+        # only — NOT scripts — and is bypassable via cross_profile=True;
+        # this block is flag-independent and covers scripts too.)
+        try:
+            root = str(get_default_hermes_root())
+            raw_homes.add(root)
+            profiles_dir = os.path.join(root, "profiles")
+            for name in sorted(os.listdir(profiles_dir)):
+                if name.startswith("."):
+                    continue
+                candidate = os.path.join(profiles_dir, name)
+                if os.path.isdir(candidate):
+                    raw_homes.add(candidate)
+        except OSError:  # pragma: no cover - enumeration is best-effort
+            pass
     # Keep BOTH spellings of each home: the raw form (what the env var
     # says, and what cron/jobs.py's module-level CRON_DIR anchors on) and
     # the resolved form (what Path.resolve()-based resolution and the OS

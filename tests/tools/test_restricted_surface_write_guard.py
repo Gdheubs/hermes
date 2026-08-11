@@ -268,6 +268,56 @@ class TestExecutionTrustingRootsFollowActiveHome(unittest.TestCase):
             finally:
                 hermes_constants.reset_hermes_home_override(token)
 
+    def test_sibling_profile_roots_blocked(self):
+        # A messaging session in one profile must not plant payloads in
+        # another profile's execution-trusting roots (scripts is not even
+        # covered by the cross-profile soft guard, and cron is bypassable
+        # via cross_profile=True), nor in the default profile's roots at
+        # the shared root level.
+        with _bind_key("agent:A:telegram:dm:1"), \
+                tempfile.TemporaryDirectory() as root:
+            profile_a = os.path.join(root, "profiles", "A")
+            profile_b = os.path.join(root, "profiles", "B")
+            os.makedirs(profile_a)
+            os.makedirs(profile_b)
+            with patch.object(
+                    hermes_constants, "get_default_hermes_root",
+                    return_value=Path(root)), \
+                    patch.dict(os.environ, {"HERMES_HOME": profile_a}):
+                self.assertIsNotNone(
+                    _check_sensitive_messaging_path(
+                        os.path.join(profile_b, "scripts", "x.sh")
+                    )
+                )
+                self.assertIsNotNone(
+                    _check_sensitive_messaging_path(
+                        os.path.join(profile_b, "cron", "jobs.json")
+                    )
+                )
+                # Default profile's execution roots at the shared root
+                self.assertIsNotNone(
+                    _check_sensitive_messaging_path(
+                        os.path.join(root, "cron", "jobs.json")
+                    )
+                )
+                self.assertIsNotNone(
+                    _check_sensitive_messaging_path(
+                        os.path.join(root, "scripts", "x.sh")
+                    )
+                )
+                # Own profile still blocked (regression)
+                self.assertIsNotNone(
+                    _check_sensitive_messaging_path(
+                        os.path.join(profile_a, "scripts", "x.sh")
+                    )
+                )
+                # Unrelated root paths stay writable
+                self.assertIsNone(
+                    _check_sensitive_messaging_path(
+                        os.path.join(root, "notes.md")
+                    )
+                )
+
     def test_ssh_anchored_to_os_user_home_not_hermes_home(self):
         with _bind_key("agent:main:telegram:dm:1"), \
                 tempfile.TemporaryDirectory() as tmp, \
