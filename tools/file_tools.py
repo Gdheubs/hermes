@@ -680,9 +680,9 @@ def _get_hermes_config_resolved() -> str | None:
 # terminal, browser, or code-execution tools, so toolset filtering alone
 # cannot stop composition across tools: a `file` write that lands in an
 # execution-trusting directory is later executed by another subsystem as
-# the agent user. Writes to ~/.hermes/cron/ (job scheduling),
-# ~/.hermes/scripts/ (job payloads) and ~/.ssh/ (key material) are
-# therefore denied for any session whose platform is a messaging surface.
+# the agent user. Writes to the active cron/ (job scheduling) and scripts/
+# (job payloads) roots and to ~/.ssh/ (key material) are therefore denied
+# for any session whose platform is a messaging surface.
 #
 # Platform detection follows the session-scoped capability doctrine
 # (AGENTS.md: "surface capability is a property of the SESSION"): the
@@ -696,16 +696,122 @@ def _get_hermes_config_resolved() -> str | None:
 # the guard never fires for them. Subagent sessions run in
 # ThreadPoolExecutor workers, which copy contextvars — the session key,
 # and therefore this guard, propagates to delegated children.
-_RESTRICTED_SURFACE_WRITE_PREFIXES = tuple(
-    os.path.normpath(_expand_tilde(p)) for p in (
-        "~/.hermes/cron/",
-        "~/.hermes/scripts/",
-        "~/.ssh/",
-    )
-)
+#
+# The execution-trusting roots are resolved PER CALL from the live active
+# Hermes home (get_hermes_home(): context override → HERMES_HOME env →
+# platform default) — never frozen at import. Cron jobs and scripts are
+# stored and executed under the active profile home (cron/jobs.py,
+# cron/scheduler.py, per-profile isolation #4707), and the default home is
+# platform-native (%LOCALAPPDATA%\hermes on Windows vs ~/.hermes on
+# POSIX), so literal ~/.hermes prefixes would miss custom HERMES_HOME,
+# profile, and Windows deployments. ~/.ssh stays anchored to the OS-user
+# home that ~ expansion follows in file tools (get_subprocess_home()),
+# independently of HERMES_HOME.
 
 
-def _session_platform() -> str | None:
+def _guard_case_normalize(path: str) -> str:
+    """Platform case/separator semantics for guard comparisons.
+
+    Windows: strip extended-length prefixes (``\\\\?\\\\``, ``\\\\.\\\\``,
+    ``\\\\??\\\\``) that the OS accepts and that would defeat
+    string-prefix comparison, then normcase (lowercase + backslash
+    separators) and canonicalize separators to forward slashes so the
+    child-boundary check is separator-agnostic. macOS: casefold — default
+    APFS volumes are case-insensitive, so ``~/.HERMES/SCRIPTS`` resolves
+    to the same directory as ``~/.hermes/scripts``. Other POSIX systems:
+    identity — case is significant on those filesystems, and a
+    different-case path is a genuinely different directory.
+    """
+    if os.name == "nt":
+        for prefix in ("\\\\?\\", "\\\\.\\", "\\??\\"):
+            if path.startswith(prefix):
+                path = path[len(prefix):]
+                break
+        return os.path.normcase(path).replace("\\", "/")
+    if sys.platform == "darwin":
+        return path.casefold()
+    return path
+
+
+def _normalize_guard_path(path: str) -> str:
+    """Normalize a path for execution-trusting-prefix comparison."""
+    return _guard_case_normalize(os.path.normpath(path))
+
+
+def _execution_trusting_prefixes() -> tuple[str, ...]:
+    """Execution-trusting write roots of the LIVE active Hermes home.
+
+    Cron jobs and scripts are stored and executed under the active profile
+    home — ``get_hermes_home()/cron`` and ``get_hermes_home()/scripts``
+    (cron/jobs.py, tools/cronjob_tools.py) — so the guard follows the same
+    dynamic resolution instead of freezing literal ``~/.hermes`` paths at
+    import (see cron/scheduler.py: do not freeze the home at import or
+    anchor at the shared default root). Both the context-scoped home
+    (``get_hermes_home()``) and the process env home
+    (``get_process_hermes_home()``) are protected: a session scoped to
+    another profile via ``set_hermes_home_override`` must not be able to
+    write the roots of the home whose cron the local ticker executes.
+    ``~/.ssh`` stays anchored to the OS-user home that ``~`` expansion
+    follows in file tools (``get_subprocess_home()``), which is
+    independent of ``HERMES_HOME``.
+    """
+    try:
+        from hermes_constants import (
+            get_hermes_home,
+            get_process_hermes_home,
+            get_subprocess_home,
+        )
+    except Exception:  # pragma: no cover - resolution chain unavailable
+        raw_homes = {os.path.expanduser("~/.hermes")}
+        user_home = os.path.expanduser("~")
+    else:
+        raw_homes = {str(get_hermes_home()), str(get_process_hermes_home())}
+        user_home = get_subprocess_home() or os.path.expanduser("~")
+    # Keep BOTH spellings of each home: the raw form (what the env var
+    # says, and what cron/jobs.py's module-level CRON_DIR anchors on) and
+    # the resolved form (what Path.resolve()-based resolution and the OS
+    # see — e.g. macOS /var is a symlink to /private/var). Writes through
+    # either spelling land in the same physical directory. The .ssh root
+    # stays anchored to the OS-user home ONLY — never to HERMES_HOME.
+    homes: set[str] = set()
+    for home in raw_homes:
+        homes.add(home)
+        try:
+            homes.add(str(Path(home).resolve()))
+        except (OSError, ValueError, RuntimeError):  # pragma: no cover
+            pass
+    ssh_homes: set[str] = {user_home}
+    try:
+        ssh_homes.add(str(Path(user_home).resolve()))
+    except (OSError, ValueError, RuntimeError):  # pragma: no cover
+        pass
+    raw = [os.path.join(home, root) for home in homes for root in ("cron", "scripts")]
+    raw.extend(os.path.join(home, ".ssh") for home in ssh_homes)
+    return tuple(_normalize_guard_path(p) for p in raw)
+
+
+def _canonical_guard_candidate(filepath: str) -> str | None:
+    """Canonical form of a path whose parent exists.
+
+    The OS resolves what string normalization cannot see: on Windows,
+    8.3 short names, junctions and extended-length prefixes; on every
+    platform, symlinked directories. Canonicalizing through the existing
+    parent directory (``Path.resolve`` on the parent) lets the guard
+    compare what ``open()`` will actually reach. Returns ``None`` when the
+    parent chain does not exist — the write cannot land in an existing
+    execution-trusting root through a path whose parents are missing.
+    """
+    try:
+        p = Path(filepath)
+        parent = p.parent
+        if not parent.exists():
+            return None
+        return str(parent.resolve(strict=True) / p.name)
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def _messaging_platform_from_key() -> str | None:
     """Messaging-platform token of the current session, or None.
 
     The platform token is read from the gateway session key
@@ -738,7 +844,7 @@ def _session_platform() -> str | None:
 
 def _check_sensitive_messaging_path(filepath: str, task_id: str = "default") -> str | None:
     """Block writes to execution-trusting dirs from messaging-platform sessions."""
-    platform = _session_platform()
+    platform = _messaging_platform_from_key()
     if platform is None:
         return None
     try:
@@ -746,12 +852,20 @@ def _check_sensitive_messaging_path(filepath: str, task_id: str = "default") -> 
     except (OSError, ValueError):
         resolved = os.path.normpath(_expand_tilde(filepath))
     normalized = os.path.normpath(_expand_tilde(filepath))
-    # Prefixes are normpath'd at module load (no trailing separator), so
-    # compare exact-or-direct-child — this also keeps the guard correct on
-    # Windows, where expanduser/normpath produce backslash separators.
-    for prefix in _RESTRICTED_SURFACE_WRITE_PREFIXES:
-        for candidate in (resolved, normalized):
-            if candidate == prefix or candidate.startswith(prefix + os.sep):
+    canonical = _canonical_guard_candidate(normalized)
+    candidates = (resolved, normalized)
+    if canonical:
+        candidates = candidates + (canonical,)
+    # Prefixes are resolved from the live active Hermes home per call (no
+    # trailing separator; separators canonicalized to "/"), so compare
+    # exact-or-direct-child after the same platform normalization on both
+    # sides — this keeps the guard correct on Windows (backslash
+    # separators, extended-length prefixes, case-insensitive) and on
+    # case-insensitive macOS volumes.
+    for prefix in _execution_trusting_prefixes():
+        for candidate in candidates:
+            candidate_norm = _normalize_guard_path(candidate)
+            if candidate_norm == prefix or candidate_norm.startswith(prefix + "/"):
                 return (
                     f"BLOCKED: write to {filepath} targets an execution-trusting "
                     "path (cron/, scripts/, .ssh/) and is not allowed from a "
