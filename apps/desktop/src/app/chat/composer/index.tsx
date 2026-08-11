@@ -757,6 +757,29 @@ export function ChatBar({
       return
     }
 
+    if (event.key !== 'Enter') {
+      if (event.key === 'Escape') {
+        // Editing a queued turn → Esc cancels the edit, restoring the prior draft.
+        if (queueEdit) {
+          event.preventDefault()
+          exitQueuedEdit('cancel')
+
+          return
+        }
+
+        // Otherwise Esc interrupts the running turn (Stop-button parity) — unless
+        // the turn is parked waiting on the user, where Esc must not discard the
+        // pending prompt. An explicit halt, so it parks the queue too.
+        if (busy && !awaitingInput) {
+          event.preventDefault()
+          triggerHaptic('cancel')
+          void Promise.resolve(haltRun())
+        }
+      }
+
+      return
+    }
+
     // Resolve Enter from the live DOM, not render-derived composer state. In
     // multiline-first mode plain Enter is an explicit editor newline,
     // Cmd/Ctrl+Enter takes the existing send/queue path, and Shift+Enter owns
@@ -767,6 +790,7 @@ export function ChatBar({
     const liveCanSteer =
       busy &&
       !compacting &&
+      !queueEdit &&
       !!onSteer &&
       attachments.length === 0 &&
       trimmedEditorText.length > 0 &&
@@ -862,24 +886,6 @@ export function ChatBar({
       return
     }
 
-    if (event.key === 'Escape') {
-      // Editing a queued turn → Esc cancels the edit, restoring the prior draft.
-      if (queueEdit) {
-        event.preventDefault()
-        exitQueuedEdit('cancel')
-
-        return
-      }
-
-      // Otherwise Esc interrupts the running turn (Stop-button parity) — unless
-      // the turn is parked waiting on the user, where Esc must not discard the
-      // pending prompt. An explicit halt, so it parks the queue too.
-      if (busy && !awaitingInput) {
-        event.preventDefault()
-        triggerHaptic('cancel')
-        void Promise.resolve(haltRun())
-      }
-    }
   }
 
   const handleEditorKeyUp = () => {

@@ -10,6 +10,7 @@ import { $composerEnterSends } from '@/store/composer-prefs'
 import { ChatBar } from './index'
 
 const queueCurrentDraftMock = vi.hoisted(() => vi.fn(() => true))
+const queueStateMock = vi.hoisted(() => ({ queueEdit: null as { entryId: string } | null }))
 
 vi.mock('@assistant-ui/react', () => ({
   ComposerPrimitive: {
@@ -135,7 +136,7 @@ vi.mock('./hooks/use-composer-queue', () => ({
     editingQueuedPrompt: null,
     exitQueuedEdit: vi.fn(() => false),
     queueCurrentDraft: queueCurrentDraftMock,
-    queueEdit: null,
+    queueEdit: queueStateMock.queueEdit,
     queuedPrompts: [],
     sendQueuedNow: vi.fn(),
     stepQueuedEdit: vi.fn(() => false)
@@ -215,6 +216,7 @@ function renderChatBar(props: Partial<Parameters<typeof ChatBar>[0]> = {}) {
 afterEach(() => {
   cleanup()
   queueCurrentDraftMock.mockClear()
+  queueStateMock.queueEdit = null
   $composerEnterSends.set(true)
   mainComposerScope.clear()
 })
@@ -301,5 +303,18 @@ describe('ChatBar composer Enter mode', () => {
 
     expect(onSteer).toHaveBeenCalledWith('nudge')
     expect(onSubmit).not.toHaveBeenCalled()
+  })
+
+  it('keeps Shift+Enter as a newline while editing a queued prompt', () => {
+    $composerEnterSends.set(false)
+    queueStateMock.queueEdit = { entryId: 'queued-1' }
+    const { editor, onSteer, onSubmit } = renderChatBar({ busy: true })
+
+    editor.textContent = 'edit queued prompt'
+    fireEvent.keyDown(editor, { key: 'Enter', shiftKey: true })
+
+    expect(onSteer).not.toHaveBeenCalled()
+    expect(onSubmit).not.toHaveBeenCalled()
+    expect(editor.innerHTML).toContain('<br>')
   })
 })
