@@ -18,6 +18,7 @@ import { setSessionYolo } from '@/lib/yolo-session'
 import { normalizeChoices, setClarifyRequest } from '@/store/clarify'
 import { migrateSessionDraft } from '@/store/composer'
 import { clearQueuedPrompts, migrateQueuedPrompts } from '@/store/composer-queue'
+import type { GatewayRequester, GatewayRequestLease } from '@/store/gateway'
 import { $pinnedSessionIds } from '@/store/layout'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import {
@@ -116,6 +117,7 @@ import {
 interface SessionActionsOptions {
   activeSessionId: string | null
   activeSessionIdRef: MutableRefObject<string | null>
+  bindGatewayRequest: (gateway: HermesGateway, profile: string) => GatewayRequestLease
   busyRef: MutableRefObject<boolean>
   creatingSessionRef: MutableRefObject<boolean>
   ensureSessionState: (sessionId: string, storedSessionId?: string | null) => ClientSessionState
@@ -282,6 +284,7 @@ function normalizeNewChatWorkspaceTarget(target: NewChatWorkspaceTarget): NewCha
 export function useSessionActions({
   activeSessionId,
   activeSessionIdRef,
+  bindGatewayRequest,
   busyRef,
   creatingSessionRef,
   ensureSessionState,
@@ -1410,7 +1413,7 @@ export function useSessionActions({
       parentStoredId: null | string,
       cwd?: string,
       profile?: null | string,
-      sourceGateway?: HermesGateway | null,
+      sourceRequest?: GatewayRequester,
       uiIntent?: BranchUiIntent
     ): Promise<boolean> => {
       creatingSessionRef.current = true
@@ -1433,11 +1436,11 @@ export function useSessionActions({
         let branched: SessionCreateResponse
 
         if (sourceSessionId) {
-          if (!sourceGateway) {
+          if (!sourceRequest) {
             throw new Error('Hermes gateway unavailable')
           }
 
-          branched = await sourceGateway.request<SessionCreateResponse>('session.branch', {
+          branched = await sourceRequest<SessionCreateResponse>('session.branch', {
             session_id: sourceSessionId,
             count: branchMessages.length
           })
@@ -1491,7 +1494,9 @@ export function useSessionActions({
 
         // The branch opens as its own tile in the parent's worktree, not as the
         // primary session — keep its runtime out of the main composer atoms.
-        const runtimeInfo = applyRuntimeInfo(branched.info, { foreground: false })
+        const resolvedUiIntent = targetUiIntent ?? captureBranchUiIntent()
+        const runtimeInfoOwner = profile?.trim() || resolvedUiIntent.profile
+        const runtimeInfo = applyRuntimeInfo(branched.info, { foreground: false, profile: runtimeInfoOwner })
         patchSessionWorkspace(routedSessionId, runtimeInfo?.cwd)
 
         if (runtimeInfo) {
@@ -1502,8 +1507,6 @@ export function useSessionActions({
         // If the user moved elsewhere while either lookup/RPC was pending, do
         // not publish it into the newer profile's tile set or steal focus. The
         // inactive placement resumes its runtime when that profile is revisited.
-        const resolvedUiIntent = targetUiIntent ?? captureBranchUiIntent()
-
         const openedInActiveProfile = openSessionTileForProfile(
           routedSessionId,
           resolvedUiIntent.profile,
@@ -1641,25 +1644,43 @@ export function useSessionActions({
       // /profile only retargets new chats, so a branch of an existing thread
       // must stay on that thread's backend (cache hit for an open session).
       const parentStoredId = isForeground ? selectedStoredSessionIdRef.current : targetState!.storedSessionId
-      // Pin both transport and UI intent before profile resolution yields. A
-      // profile switch during that lookup must not reroute the runtime-scoped
-      // RPC or publish its eventual child into the newer layout.
+      // Pin transport, source profile, and UI intent before profile resolution
+      // yields. The command lease keeps a background source registered across
+      // the production profile-switch pruning policy; its requester reconnects
+      // and retries only on this exact owner.
       const sourceGateway = gatewayRef.current
       const uiIntent = captureBranchUiIntent()
-      const profile = await resolveSessionProfile(parentStoredId)
+      let sourceLease: GatewayRequestLease | null = null
 
-      return forkBranch(
-        branchMessages,
-        sessionId,
-        parentStoredId,
-        isForeground ? $currentCwd.get().trim() : targetState!.cwd.trim(),
-        profile,
-        sourceGateway,
-        uiIntent
-      )
+      try {
+        if (!sourceGateway) {
+          throw new Error('Hermes gateway unavailable')
+        }
+
+        sourceLease = bindGatewayRequest(sourceGateway, uiIntent.profile)
+        const resolvedProfile = await resolveSessionProfile(parentStoredId)
+        const profile = normalizeProfileKey(resolvedProfile ?? uiIntent.profile)
+
+        return await forkBranch(
+          branchMessages,
+          sessionId,
+          parentStoredId,
+          isForeground ? $currentCwd.get().trim() : targetState!.cwd.trim(),
+          profile,
+          sourceLease.request,
+          uiIntent
+        )
+      } catch (err) {
+        notifyError(err, copy.branchFailed)
+
+        return false
+      } finally {
+        sourceLease?.release()
+      }
     },
     [
       activeSessionIdRef,
+      bindGatewayRequest,
       busyRef,
       captureBranchUiIntent,
       copy,

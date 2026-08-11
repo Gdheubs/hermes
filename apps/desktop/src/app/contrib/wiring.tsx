@@ -274,7 +274,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     setMessages
   })
 
-  const { connectionRef, gateway, gatewayRef, requestGateway } = useGatewayRequest()
+  const { bindGatewayRequest, connectionRef, gateway, gatewayRef, requestGateway } = useGatewayRequest()
 
   const { loadMoreMessagingForPlatform, loadMoreSessions, refreshCronJobs, refreshMessagingSessions, refreshSessions } =
     useSessionListActions({ profileScope })
@@ -456,6 +456,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   } = useSessionActions({
     activeSessionId,
     activeSessionIdRef,
+    bindGatewayRequest,
     busyRef,
     creatingSessionRef,
     ensureSessionState,
