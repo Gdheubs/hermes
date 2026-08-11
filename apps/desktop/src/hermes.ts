@@ -717,9 +717,16 @@ export function setSessionUnreadRemote(id: string, unread: boolean, profile?: st
   })
 }
 
-export function searchSessions(query: string): Promise<SessionSearchResponse> {
+export function searchSessions(query: string, profile?: string): Promise<SessionSearchResponse> {
+  const params = new URLSearchParams({ q: query })
+
+  if (profile) {
+    params.set('profile', profile)
+  }
+
   return window.hermesDesktop.api<SessionSearchResponse>({
-    path: `/api/sessions/search?q=${encodeURIComponent(query)}`
+    ...(profile ? { profile } : {}),
+    path: `/api/sessions/search?${params.toString()}`
   })
 }
 
