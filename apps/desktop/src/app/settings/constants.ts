@@ -383,6 +383,9 @@ export const FIELD_LABELS: Record<string, string> = defineFieldCopy({
     showReasoning: 'Reasoning Blocks'
   },
   desktop: {
+    composer: {
+      enterSends: 'Enter Sends Message'
+    },
     repoScanEnabled: 'Automatic Repository Discovery',
     repoScanRoots: 'Repository Discovery Roots',
     repoScanExcludePaths: 'Excluded Repository Paths'
@@ -549,6 +552,10 @@ export const FIELD_DESCRIPTIONS: Record<string, string> = defineFieldCopy({
     showReasoning: 'Show reasoning sections when the backend provides them.'
   },
   desktop: {
+    composer: {
+      enterSends:
+        'Turn off for multiline-first input: Enter inserts a newline, Ctrl/Cmd+Enter sends or queues, and Shift+Enter steers a running turn.'
+    },
     repoScanEnabled: 'Scan local folders for Git repositories to show in Projects.',
     repoScanRoots: 'Folders to scan. Leave empty to scan your home directory.',
     repoScanExcludePaths: 'Folders and their descendants to skip during repository discovery.'
@@ -633,7 +640,13 @@ export const SECTIONS: DesktopConfigSection[] = [
     id: 'chat',
     label: 'Chat',
     icon: MessageCircle,
-    keys: ['display.personality', 'timezone', 'display.show_reasoning', 'agent.image_input_mode']
+    keys: [
+      'desktop.composer.enter_sends',
+      'display.personality',
+      'timezone',
+      'display.show_reasoning',
+      'agent.image_input_mode'
+    ]
   },
   {
     id: 'appearance',

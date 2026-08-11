@@ -3188,6 +3188,11 @@ DEFAULT_CONFIG = {
     # Hermes Desktop (Electron app) launch options. These only affect
     # `hermes desktop`; they do not touch the CLI/gateway.
     "desktop": {
+        "composer": {
+            # Preserve Enter-to-send by default. When false, Enter inserts a
+            # newline, Ctrl/Cmd+Enter sends or queues, and Shift+Enter steers.
+            "enter_sends": True,
+        },
         # Git repository discovery for the Desktop Projects sidebar. Empty
         # roots preserve the historical bounded scan of the user's home.
         "repo_scan_enabled": True,
