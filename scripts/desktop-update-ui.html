@@ -1,0 +1,333 @@
+<!doctype html>
+<!--
+  Hermes Desktop update progress UI.
+
+  Served by scripts/desktop-update.ps1's in-process loopback HTTP server and
+  displayed in an Edge app-mode window (chromeless). The page polls
+  /progress (JSON) and renders phase state + the live hand-off log.
+
+  Contract with desktop-update.ps1 (keep in sync):
+    GET /          -> this file
+    GET /progress  -> {"status":"running|done|error","phase":"<id>",
+                       "message":"...","lines":["..."]}
+  Phase ids: prepare, wait-desktop, wait-venv, update, rebuild.
+
+  Single self-contained file on purpose: no external assets, no CDN, works
+  from a cold checkout with no network beyond the loopback socket.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Hermes Update</title>
+    <style>
+      :root {
+        --bg: #0f1115;
+        --panel: #161a21;
+        --panel-edge: #232a35;
+        --text: #e6e1d6;
+        --dim: #8a8577;
+        --gold: #d7a94b;
+        --gold-soft: rgba(215, 169, 75, 0.14);
+        --ok: #7dc383;
+        --err: #e07a6a;
+        --mono: 'Cascadia Mono', Consolas, 'Courier New', monospace;
+      }
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        background: var(--bg);
+        color: var(--text);
+        font-family: 'Segoe UI', system-ui, sans-serif;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+        user-select: none;
+      }
+
+      header {
+        padding: 18px 22px 14px;
+        display: flex;
+        align-items: baseline;
+        gap: 10px;
+      }
+      .caduceus {
+        color: var(--gold);
+        font-size: 22px;
+      }
+      h1 {
+        font-size: 17px;
+        font-weight: 600;
+        letter-spacing: 0.2px;
+      }
+      .sub {
+        color: var(--dim);
+        font-size: 12px;
+        margin-left: auto;
+      }
+
+      .bar {
+        height: 2px;
+        background: var(--panel-edge);
+        position: relative;
+        overflow: hidden;
+      }
+      .bar::after {
+        content: '';
+        position: absolute;
+        top: 0;
+        left: -35%;
+        width: 35%;
+        height: 100%;
+        background: linear-gradient(90deg, transparent, var(--gold), transparent);
+        animation: sweep 1.6s ease-in-out infinite;
+      }
+      @keyframes sweep {
+        to {
+          left: 100%;
+        }
+      }
+      body.done .bar::after,
+      body.error .bar::after {
+        animation: none;
+        content: none;
+      }
+      body.done .bar {
+        background: var(--ok);
+      }
+      body.error .bar {
+        background: var(--err);
+      }
+
+      main {
+        flex: 1;
+        display: flex;
+        min-height: 0;
+        gap: 14px;
+        padding: 16px 22px;
+      }
+
+      .phases {
+        width: 240px;
+        flex-shrink: 0;
+      }
+      .phase {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 7px 10px;
+        border-radius: 6px;
+        font-size: 13px;
+        color: var(--dim);
+      }
+      .phase .dot {
+        width: 16px;
+        text-align: center;
+        font-family: var(--mono);
+        font-size: 13px;
+      }
+      .phase.active {
+        color: var(--text);
+        background: var(--gold-soft);
+      }
+      .phase.active .dot {
+        color: var(--gold);
+        animation: pulse 1.2s ease-in-out infinite;
+      }
+      .phase.done {
+        color: var(--text);
+      }
+      .phase.done .dot {
+        color: var(--ok);
+      }
+      .phase.failed .dot {
+        color: var(--err);
+      }
+      @keyframes pulse {
+        50% {
+          opacity: 0.35;
+        }
+      }
+
+      .log {
+        flex: 1;
+        background: var(--panel);
+        border: 1px solid var(--panel-edge);
+        border-radius: 8px;
+        padding: 10px 12px;
+        overflow-y: auto;
+        font-family: var(--mono);
+        font-size: 11.5px;
+        line-height: 1.55;
+        color: var(--dim);
+        white-space: pre-wrap;
+        word-break: break-all;
+        user-select: text;
+      }
+      .log .ln.err {
+        color: var(--err);
+      }
+
+      footer {
+        padding: 12px 22px 14px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        border-top: 1px solid var(--panel-edge);
+      }
+      #status {
+        font-size: 13px;
+        color: var(--dim);
+        flex: 1;
+      }
+      body.done #status {
+        color: var(--ok);
+      }
+      body.error #status {
+        color: var(--err);
+      }
+      .brand {
+        font-size: 11px;
+        color: var(--dim);
+        letter-spacing: 0.4px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <span class="caduceus">&#9764;</span>
+      <h1>Updating Hermes</h1>
+      <span class="sub">Hermes restarts automatically when this finishes</span>
+    </header>
+    <div class="bar"></div>
+    <main>
+      <div class="phases" id="phases"></div>
+      <div class="log" id="log"></div>
+    </main>
+    <footer>
+      <span id="status">Starting&hellip;</span>
+      <span class="brand">Nous Research</span>
+    </footer>
+
+    <script>
+      ;(function () {
+        'use strict'
+
+        var PHASES = [
+          { id: 'prepare', label: 'Preparing update' },
+          { id: 'wait-desktop', label: 'Closing Hermes' },
+          { id: 'wait-venv', label: 'Releasing install lock' },
+          { id: 'update', label: 'Installing update' },
+          { id: 'rebuild', label: 'Rebuilding desktop app' }
+        ]
+
+        var phasesEl = document.getElementById('phases')
+        var logEl = document.getElementById('log')
+        var statusEl = document.getElementById('status')
+
+        PHASES.forEach(function (p) {
+          var row = document.createElement('div')
+          row.className = 'phase'
+          row.id = 'phase-' + p.id
+          row.innerHTML = '<span class="dot">&#9675;</span><span>' + p.label + '</span>'
+          phasesEl.appendChild(row)
+        })
+
+        var renderedLines = 0
+        var lastStatus = 'running'
+        var failures = 0
+
+        function setPhaseStates(activeId, status) {
+          var reached = true
+          PHASES.forEach(function (p) {
+            var el = document.getElementById('phase-' + p.id)
+            var dot = el.querySelector('.dot')
+            el.className = 'phase'
+            if (p.id === activeId) {
+              reached = false
+              if (status === 'error') {
+                el.className = 'phase failed'
+                dot.innerHTML = '&#10007;'
+              } else if (status === 'done') {
+                el.className = 'phase done'
+                dot.innerHTML = '&#10003;'
+              } else {
+                el.className = 'phase active'
+                dot.innerHTML = '&#9684;'
+              }
+            } else if (reached) {
+              el.className = 'phase done'
+              dot.innerHTML = '&#10003;'
+            } else {
+              dot.innerHTML = '&#9675;'
+            }
+          })
+        }
+
+        function appendLines(lines) {
+          if (!lines || lines.length <= renderedLines) {
+            return
+          }
+          var atBottom = logEl.scrollTop + logEl.clientHeight >= logEl.scrollHeight - 8
+          for (var i = renderedLines; i < lines.length; i++) {
+            var ln = document.createElement('div')
+            ln.className = /(!\||error|failed|aborted)/i.test(lines[i]) ? 'ln err' : 'ln'
+            ln.textContent = lines[i]
+            logEl.appendChild(ln)
+          }
+          renderedLines = lines.length
+          if (atBottom) {
+            logEl.scrollTop = logEl.scrollHeight
+          }
+        }
+
+        function apply(state) {
+          lastStatus = state.status || 'running'
+          document.body.className = lastStatus === 'done' ? 'done' : lastStatus === 'error' ? 'error' : ''
+          setPhaseStates(state.phase || 'prepare', lastStatus)
+          appendLines(state.lines)
+          if (lastStatus === 'done') {
+            statusEl.textContent = state.message || 'Update complete — restarting Hermes…'
+          } else if (lastStatus === 'error') {
+            statusEl.textContent = state.message || 'Update failed. Hermes will restart on the previous version.'
+          } else {
+            statusEl.textContent = state.message || 'Working…'
+          }
+        }
+
+        function poll() {
+          fetch('/progress?ts=' + Date.now(), { cache: 'no-store' })
+            .then(function (r) {
+              return r.json()
+            })
+            .then(function (state) {
+              failures = 0
+              apply(state)
+            })
+            .catch(function () {
+              failures += 1
+              // The server dies when the hand-off script exits. That is the normal
+              // end of life for this page: surface what the last known state implied
+              // instead of an alarming network error.
+              if (failures >= 5) {
+                if (lastStatus === 'done') {
+                  statusEl.textContent = 'Restarting Hermes…'
+                } else if (lastStatus !== 'error') {
+                  statusEl.textContent = 'Updater closed. If Hermes does not restart, reopen it manually.'
+                }
+              }
+            })
+        }
+
+        poll()
+        setInterval(poll, 400)
+      })()
+    </script>
+  </body>
+</html>

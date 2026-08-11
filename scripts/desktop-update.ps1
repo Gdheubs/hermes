@@ -25,6 +25,15 @@
 #     [-RelaunchExe <path>] Hermes.exe to start when done (omit = no relaunch)
 #     [-NoUi]               headless (tests); default shows a progress window
 #     [-NoMarkerCleanup]    leave .hermes-update-in-progress in place (tests)
+#     [-SelfTestUi]         serve the progress UI with simulated phases and
+#                           exit (manual QA / CI smoke; no update is run)
+#
+# PROGRESS UI: the primary surface is scripts/desktop-update-ui.html rendered
+# in an Edge app-mode window (chromeless; msedge ships on every Win10/11 box,
+# so no WebView2 SDK DLLs and no frozen binary). The script serves the page
+# plus a /progress JSON endpoint from an in-process loopback TCP listener.
+# When Edge or the listener is unavailable it degrades to the previous
+# WinForms window, then to log-only — the update itself never depends on UI.
 #
 # SAFETY POSTURE: both preflight gates FAIL CLOSED. A Desktop that never
 # exits, or a venv shim that never unlocks, aborts the hand-off without
@@ -41,13 +50,20 @@
 # own it (a handoff partner that rewrote it keeps its claim).
 
 param(
-    [Parameter(Mandatory = $true)][string]$InstallRoot,
+    [string]$InstallRoot = "",
     [string]$Branch = "main",
     [int]$DesktopPid = 0,
     [string]$RelaunchExe = "",
     [switch]$NoUi,
-    [switch]$NoMarkerCleanup
+    [switch]$NoMarkerCleanup,
+    [switch]$SelfTestUi
 )
+
+if (-not $SelfTestUi -and -not $InstallRoot) {
+    # Mandatory in spirit; relaxed in the signature only so -SelfTestUi can run
+    # without a checkout (the UI smoke test needs no install to point at).
+    throw "-InstallRoot is required"
+}
 
 $ErrorActionPreference = "Continue"
 # Foreground helpers: the script is spawned via `cmd start /min`, so its
@@ -69,17 +85,135 @@ try {
     [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
     $OutputEncoding = [System.Text.Encoding]::UTF8
 } catch {}
-$HermesHome = Split-Path -Parent $InstallRoot
+$HermesHome = if ($InstallRoot) { Split-Path -Parent $InstallRoot } else { $env:TEMP }
 $MarkerPath = Join-Path $HermesHome ".hermes-update-in-progress"
 $LogDir = Join-Path $HermesHome "logs"
 $LogPath = Join-Path $LogDir "desktop-update-handoff.log"
 $ResultPath = Join-Path $HermesHome ".hermes-update-result.json"
 $script:Ui = $null
 
+# ── Progress UI: loopback server + Edge app-mode shell ─────────────────────
+# State shared with the poller thread. Synchronized so the listener thread
+# reads a consistent snapshot while the main thread appends lines.
+$script:UiState = [hashtable]::Synchronized(@{
+    status  = "running"      # running | done | error
+    phase   = "prepare"      # prepare | wait-desktop | wait-venv | update | rebuild
+    message = "Starting update..."
+    lines   = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
+})
+$script:UiServer = $null     # @{ Listener; Runspace; PowerShell; Port; EdgeProc }
+
+function Set-UiPhase([string]$Phase, [string]$Message) {
+    $script:UiState.phase = $Phase
+    if ($Message) { $script:UiState.message = $Message }
+}
+
+function Get-UiHtmlPath {
+    # Lives next to this script in the checkout. Missing file = fall back to
+    # WinForms (old checkouts mid-update, partial syncs).
+    $p = Join-Path $PSScriptRoot "desktop-update-ui.html"
+    if (Test-Path -LiteralPath $p) { return $p }
+    return $null
+}
+
+function Find-EdgeExe {
+    foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA)) {
+        if (-not $root) { continue }
+        $p = Join-Path $root "Microsoft\Edge\Application\msedge.exe"
+        if (Test-Path -LiteralPath $p) { return $p }
+    }
+    return $null
+}
+
+function Start-UiServer([string]$HtmlPath) {
+    # In-process HTTP on a loopback ephemeral port, served from a dedicated
+    # runspace so the main thread never blocks on Accept. Plain TcpListener
+    # instead of HttpListener: no URL ACL / netsh reservation semantics to
+    # trip over, and two GET routes don't need more.
+    try {
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+        $listener.Start()
+        $port = ([System.Net.IPEndPoint]$listener.LocalEndpoint).Port
+
+        $rs = [runspacefactory]::CreateRunspace()
+        $rs.Open()
+        $rs.SessionStateProxy.SetVariable("Listener", $listener)
+        $rs.SessionStateProxy.SetVariable("State", $script:UiState)
+        $rs.SessionStateProxy.SetVariable("HtmlBytes", [System.IO.File]::ReadAllBytes($HtmlPath))
+
+        $ps = [powershell]::Create()
+        $ps.Runspace = $rs
+        [void]$ps.AddScript({
+            function Send-Response($Stream, [string]$Status, [string]$ContentType, [byte[]]$Body) {
+                $head = "HTTP/1.1 $Status`r`nContent-Type: $ContentType`r`nContent-Length: $($Body.Length)`r`nCache-Control: no-store`r`nConnection: close`r`n`r`n"
+                $headBytes = [System.Text.Encoding]::ASCII.GetBytes($head)
+                $Stream.Write($headBytes, 0, $headBytes.Length)
+                $Stream.Write($Body, 0, $Body.Length)
+                $Stream.Flush()
+            }
+            while ($true) {
+                try { $client = $Listener.AcceptTcpClient() } catch { break }  # Stop() ends the loop
+                try {
+                    $client.ReceiveTimeout = 2000
+                    $stream = $client.GetStream()
+                    $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::ASCII, $false, 1024, $true)
+                    $request = $reader.ReadLine()
+                    # Drain headers so the client doesn't see a reset mid-send.
+                    while ($true) { $h = $reader.ReadLine(); if ($null -eq $h -or $h -eq "") { break } }
+                    if ($request -match "^GET /progress") {
+                        $snapshot = @{
+                            status  = $State.status
+                            phase   = $State.phase
+                            message = $State.message
+                            lines   = @($State.lines.ToArray())
+                        } | ConvertTo-Json -Compress
+                        Send-Response $stream "200 OK" "application/json; charset=utf-8" ([System.Text.Encoding]::UTF8.GetBytes($snapshot))
+                    } elseif ($request -match "^GET / ") {
+                        Send-Response $stream "200 OK" "text/html; charset=utf-8" $HtmlBytes
+                    } else {
+                        Send-Response $stream "404 Not Found" "text/plain" ([System.Text.Encoding]::ASCII.GetBytes("not found"))
+                    }
+                } catch {
+                    # Per-connection failure: drop it, keep serving.
+                } finally {
+                    try { $client.Close() } catch {}
+                }
+            }
+        })
+        [void]$ps.BeginInvoke()
+
+        return @{ Listener = $listener; Runspace = $rs; PowerShell = $ps; Port = $port; EdgeProc = $null }
+    } catch {
+        try { if ($listener) { $listener.Stop() } } catch {}
+        return $null
+    }
+}
+
+function Stop-UiServer {
+    if (-not $script:UiServer) { return }
+    try { $script:UiServer.Listener.Stop() } catch {}
+    try { $script:UiServer.PowerShell.Stop() } catch {}
+    try { $script:UiServer.Runspace.Close() } catch {}
+    # Closing Edge is cosmetic; if the user closed it already this is a no-op,
+    # and if it lingers the page shows the terminal state until they close it.
+    try {
+        if ($script:UiServer.EdgeProc -and -not $script:UiServer.EdgeProc.HasExited) {
+            $script:UiServer.EdgeProc.CloseMainWindow() | Out-Null
+        }
+    } catch {}
+    $script:UiServer = $null
+}
+
 function Write-HandoffLog([string]$Message) {
     $line = "{0:yyyy-MM-ddTHH:mm:ssK} {1}" -f (Get-Date), $Message
     try { Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 } catch {}
     Write-Host $line
+    # Feed the web UI regardless of which shell rendered (Edge polls /progress;
+    # cap retained lines so a huge pip install can't grow the JSON unboundedly).
+    try {
+        [void]$script:UiState.lines.Add($Message)
+        while ($script:UiState.lines.Count -gt 400) { $script:UiState.lines.RemoveAt(0) }
+    } catch {}
     if ($script:Ui) {
         try {
             $script:Ui.Box.AppendText($Message + "`r`n")
@@ -90,6 +224,41 @@ function Write-HandoffLog([string]$Message) {
 
 function Show-ProgressWindow {
     if ($NoUi) { return }
+
+    # ── Primary: repo-owned HTML in an Edge app-mode window ────────────────
+    # Chromeless (--app), so it reads as a native progress dialog, not a
+    # browser. Serving over loopback HTTP (not file://) keeps fetch() inside
+    # the page's origin without any browser flag overrides.
+    $htmlPath = Get-UiHtmlPath
+    $edge = Find-EdgeExe
+    if ($htmlPath -and $edge) {
+        $server = Start-UiServer $htmlPath
+        if ($server) {
+            try {
+                # Dedicated tiny profile dir: guarantees a NEW WINDOW + process
+                # we own (a default-profile launch delegates to an existing
+                # Edge and returns instantly, leaving nothing to close), and
+                # avoids touching the user's real browser profile.
+                $edgeProfile = Join-Path $env:TEMP ("hermes-update-ui-{0}" -f $PID)
+                $edgeArgs = @(
+                    "--app=http://127.0.0.1:$($server.Port)/",
+                    "--user-data-dir=$edgeProfile",
+                    "--no-first-run", "--no-default-browser-check",
+                    "--disable-features=msImplicitSignin",
+                    "--window-size=760,480"
+                )
+                $server.EdgeProc = Start-Process -FilePath $edge -ArgumentList $edgeArgs -PassThru
+                $script:UiServer = $server
+                Write-HandoffLog "progress UI: Edge app window on 127.0.0.1:$($server.Port)"
+                return
+            } catch {
+                try { $server.Listener.Stop() } catch {}
+                # fall through to WinForms
+            }
+        }
+    }
+
+    # ── Fallback: legacy WinForms window (Edge missing/failed) ─────────────
     try {
         Add-Type -AssemblyName System.Windows.Forms | Out-Null
         Add-Type -AssemblyName System.Drawing | Out-Null
@@ -135,6 +304,13 @@ function Show-ProgressWindow {
 }
 
 function Close-ProgressWindow {
+    if ($script:UiServer) {
+        # Let the page render the terminal state before the server dies: the
+        # poller runs every 400ms, so two beats is enough. The page also
+        # handles the server vanishing gracefully (shows last known state).
+        Start-Sleep -Milliseconds 900
+        Stop-UiServer
+    }
     if ($script:Ui) {
         try { $script:Ui.Form.Close() } catch {}
         $script:Ui = $null
@@ -308,6 +484,35 @@ function Invoke-StreamedHermes([string]$Exe, [string[]]$HermesArgs, [string]$Tag
 
 $finalCode = 1
 $finalMsg = "update did not complete"
+
+# ── -SelfTestUi: drive the progress UI through simulated phases ────────────
+# Manual QA / smoke for the Edge shell without running a real update. Exits
+# before the marker/desktop/venv machinery — touches nothing.
+if ($SelfTestUi) {
+    Show-ProgressWindow
+    Write-HandoffLog "SELF-TEST: progress UI simulation (no update will run)"
+    $simPhases = @(
+        @{ id = "prepare";      msg = "Preparing update..." },
+        @{ id = "wait-desktop"; msg = "Waiting for Hermes to close..." },
+        @{ id = "wait-venv";    msg = "Waiting for the install lock..." },
+        @{ id = "update";       msg = "Running hermes update..." },
+        @{ id = "rebuild";      msg = "Rebuilding the desktop app..." }
+    )
+    foreach ($p in $simPhases) {
+        Set-UiPhase $p.id $p.msg
+        for ($i = 1; $i -le 6; $i++) {
+            Write-HandoffLog ("{0}| simulated output line {1}" -f $p.id, $i)
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    $script:UiState.status = "done"
+    $script:UiState.message = "Self-test complete."
+    Write-HandoffLog "SELF-TEST: terminal state rendered; closing in 5s"
+    Start-Sleep -Seconds 5
+    Stop-UiServer
+    exit 0
+}
+
 try {
     New-Item -ItemType Directory -Path $LogDir -Force -ErrorAction SilentlyContinue | Out-Null
     Remove-Item -LiteralPath $ResultPath -Force -ErrorAction SilentlyContinue
@@ -327,6 +532,7 @@ try {
 
     # -- 1. Wait for the Desktop to exit (FAIL CLOSED) ----------------------
     if ($DesktopPid -gt 0) {
+        Set-UiPhase "wait-desktop" "Waiting for Hermes to close..."
         $deadline = (Get-Date).AddSeconds(30)
         while ((Get-Date) -lt $deadline) {
             $proc = Get-Process -Id $DesktopPid -ErrorAction SilentlyContinue
@@ -346,6 +552,7 @@ try {
     }
 
     # -- 2. Wait for the venv shim to unlock (FAIL CLOSED) ------------------
+    Set-UiPhase "wait-venv" "Waiting for the install lock to release..."
     $shim = Join-Path $InstallRoot "venv\Scripts\hermes.exe"
     if (Test-Path -LiteralPath $shim) {
         $unlocked = $false
@@ -385,6 +592,7 @@ try {
         exit $finalCode
     }
     $updateArgs = @("update", "--yes", "--gateway", "--force", "--branch", $Branch)
+    Set-UiPhase "update" "Installing update (this can take a few minutes)..."
     Write-HandoffLog ("running: hermes " + ($updateArgs -join " "))
     $res = Invoke-StreamedHermes $hermesExe $updateArgs "update"
     Write-HandoffLog "hermes update exit code: $($res.Code)"
@@ -405,6 +613,7 @@ try {
     $desktopBuildFailed = $false
     if ($res.Code -eq 0 -and $res.Output -match "Desktop build failed") {
         Write-HandoffLog "hermes update reported a desktop build failure (non-fatal there, fatal here); retrying build"
+        Set-UiPhase "rebuild" "Rebuilding the desktop app..."
         $rebuild = Invoke-StreamedHermes $hermesExe @("desktop", "--force-build", "--build-only") "rebuild"
         Write-HandoffLog "desktop rebuild exit code: $($rebuild.Code)"
         if ($rebuild.Code -ne 0) { $desktopBuildFailed = $true }
@@ -422,6 +631,10 @@ try {
     }
     exit $finalCode
 } finally {
+    # Push the terminal state to the web UI before tearing it down so the
+    # user sees "complete"/"failed", not a page that just vanishes.
+    $script:UiState.status = if ($finalCode -eq 0) { "done" } else { "error" }
+    $script:UiState.message = $finalMsg
     Write-Result ($finalCode -eq 0) $finalCode $finalMsg
     Remove-MarkerIfOwned
     Close-ProgressWindow
