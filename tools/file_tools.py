@@ -673,6 +673,94 @@ def _get_hermes_config_resolved() -> str | None:
     return _hermes_config_resolved
 
 
+# ---------------------------------------------------------------------------
+# Sensitive-path write guard for messaging platforms
+# ---------------------------------------------------------------------------
+# Sessions on messaging platforms (Telegram/Discord/Slack/...) run without
+# terminal, browser, or code-execution tools, so toolset filtering alone
+# cannot stop composition across tools: a `file` write that lands in an
+# execution-trusting directory is later executed by another subsystem as
+# the agent user. Writes to ~/.hermes/cron/ (job scheduling),
+# ~/.hermes/scripts/ (job payloads) and ~/.ssh/ (key material) are
+# therefore denied for any session whose platform is a messaging surface.
+#
+# Platform detection follows the session-scoped capability doctrine
+# (AGENTS.md: "surface capability is a property of the SESSION"): the
+# platform token is read from the gateway session key
+# (agent[:<profile>]:<platform>:..., see gateway/session.py
+# build_session_key) — never from process env — and validated against the
+# canonical gateway.config.Platform enum, so only positively-identified
+# messaging surfaces are restricted (malformed or unregistered tokens and
+# the LOCAL platform are never treated as messaging). CLI/desktop/serve
+# sessions bind session-id keys instead and retain the terminal tool, so
+# the guard never fires for them. Subagent sessions run in
+# ThreadPoolExecutor workers, which copy contextvars — the session key,
+# and therefore this guard, propagates to delegated children.
+_RESTRICTED_SURFACE_WRITE_PREFIXES = tuple(
+    os.path.normpath(_expand_tilde(p)) for p in (
+        "~/.hermes/cron/",
+        "~/.hermes/scripts/",
+        "~/.ssh/",
+    )
+)
+
+
+def _session_platform() -> str | None:
+    """Messaging-platform token of the current session, or None.
+
+    The platform token is read from the gateway session key
+    (``agent[:<profile>]:<platform>:...``, see gateway/session.py
+    build_session_key) and validated against gateway.config.Platform.
+    Returns None when the session is not a gateway session (CLI/serve bind
+    session-id keys), when the key is malformed, or when the token does not
+    resolve to a real platform — only a positively-identified messaging
+    surface is returned.
+    """
+    try:
+        import tools.approval as _approval
+        key = _approval.get_current_session_key()
+    except Exception:
+        return None
+    if not key or not key.startswith("agent:"):
+        return None
+    parts = key.split(":")
+    if len(parts) < 3:
+        return None
+    try:
+        from gateway.config import Platform
+        member = Platform(parts[2])
+    except Exception:
+        return None
+    if member is Platform.LOCAL:
+        return None
+    return member.value
+
+
+def _check_sensitive_messaging_path(filepath: str, task_id: str = "default") -> str | None:
+    """Block writes to execution-trusting dirs from messaging-platform sessions."""
+    platform = _session_platform()
+    if platform is None:
+        return None
+    try:
+        resolved = str(_resolve_path_for_task(filepath, task_id))
+    except (OSError, ValueError):
+        resolved = os.path.normpath(_expand_tilde(filepath))
+    normalized = os.path.normpath(_expand_tilde(filepath))
+    # Prefixes are normpath'd at module load (no trailing separator), so
+    # compare exact-or-direct-child — this also keeps the guard correct on
+    # Windows, where expanduser/normpath produce backslash separators.
+    for prefix in _RESTRICTED_SURFACE_WRITE_PREFIXES:
+        for candidate in (resolved, normalized):
+            if candidate == prefix or candidate.startswith(prefix + os.sep):
+                return (
+                    f"BLOCKED: write to {filepath} targets an execution-trusting "
+                    "path (cron/, scripts/, .ssh/) and is not allowed from a "
+                    f"{platform} platform session. Complete the change from a "
+                    "local (CLI/desktop) session instead."
+                )
+    return None
+
+
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     try:
@@ -2114,6 +2202,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
+    restricted_err = _check_sensitive_messaging_path(path, task_id)
+    if restricted_err:
+        return tool_error(restricted_err)
     protected_err = _check_protected_instruction_write([path], task_id)
     if protected_err:
         return tool_error(protected_err)
@@ -2245,6 +2336,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)
+        restricted_err = _check_sensitive_messaging_path(_p, task_id)
+        if restricted_err:
+            return tool_error(restricted_err)
         if not cross_profile:
             cross_warning = _check_cross_profile_path(_p, task_id)
             if cross_warning:
