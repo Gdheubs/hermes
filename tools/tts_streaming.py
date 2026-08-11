@@ -329,7 +329,6 @@ class GeminiStreamer(StreamingTTSProvider):
         )
 
     def stream(self, text: str) -> Iterator[bytes]:
-        import base64
         import json as _json
 
         import requests
@@ -352,6 +351,29 @@ class GeminiStreamer(StreamingTTSProvider):
             or DEFAULT_GEMINI_TTS_BASE_URL
         ).strip().rstrip("/")
 
+        # The Interactions API is the only Gemini TTS transport with real
+        # streaming (gemini-3.1-flash-tts-preview; gemini-3.6-flash is a
+        # text/multimodal model, not TTS).  Anything else keeps the legacy
+        # streamGenerateContent SSE transport unchanged.
+        if "3.1" in model:
+            yield from self._stream_interactions(
+                base_url, model, voice, text, api_key,
+            )
+            return
+
+        yield from self._stream_generate_content(
+            base_url, model, voice, text, api_key,
+        )
+
+    def _stream_generate_content(
+        self, base_url: str, model: str, voice: str, text: str, api_key: str,
+    ) -> Iterator[bytes]:
+        """Legacy ``:streamGenerateContent?alt=sse`` transport (24 kHz PCM)."""
+        import base64
+        import json as _json
+
+        import requests
+
         payload = {
             "contents": [{"parts": [{"text": text}]}],
             "generationConfig": {
@@ -370,19 +392,30 @@ class GeminiStreamer(StreamingTTSProvider):
         def _sse_chunks() -> Iterator[bytes]:
             with requests.post(
                 url,
-                params={"alt": "sse", "key": api_key},
+                params={"alt": "sse"},
+                headers={"x-goog-api-key": api_key},
                 json=payload,
                 timeout=60,
                 stream=True,
+                # Never follow redirects: requests preserves custom headers
+                # (including x-goog-api-key) across origins, which would leak
+                # the credential to a redirected-to host (#73964).
+                allow_redirects=False,
             ) as response:
                 response.raise_for_status()
                 for line in response.iter_lines(decode_unicode=True):
-                    if not line or not line.startswith("data: "):
+                    if not line or not line.startswith("data:"):
+                        continue
+                    raw = line[len("data:"):].lstrip()
+                    try:
+                        event = _json.loads(raw)
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(event, dict):
                         continue
                     try:
-                        event = _json.loads(line[len("data: "):])
                         parts = event["candidates"][0]["content"]["parts"]
-                    except (ValueError, KeyError, IndexError, TypeError):
+                    except (KeyError, IndexError, TypeError):
                         continue
                     for part in parts:
                         inline = part.get("inlineData") or part.get("inline_data") or {}
@@ -390,11 +423,85 @@ class GeminiStreamer(StreamingTTSProvider):
                         if not b64:
                             continue
                         try:
-                            yield base64.b64decode(b64)
+                            yield base64.b64decode(b64, validate=True)
                         except (ValueError, TypeError) as exc:
                             logger.warning("Gemini SSE: bad base64 audio: %s", exc)
 
         yield from _capped(_sse_chunks(), "Gemini streaming TTS")
+
+    def _stream_interactions(
+        self, base_url: str, model: str, voice: str, text: str, api_key: str,
+    ) -> Iterator[bytes]:
+        """Gemini 3.1 TTS Interactions transport (``POST /interactions``).
+
+        The only Gemini TTS model family with true streaming: the server
+        emits ``step.delta`` SSE events whose ``delta`` carries base64 PCM
+        (24 kHz mono s16le) as it is generated.  The API key rides in the
+        ``x-goog-api-key`` header — never in the URL, which would leak into
+        logs on HTTP errors (#73964).
+        """
+        import base64
+        import json as _json
+
+        import requests
+
+        url = f"{base_url}/interactions"
+        payload = {
+            "model": model,
+            "input": text,
+            "stream": True,
+            "response_format": {"type": "audio"},
+            "generation_config": {
+                "speech_config": [{"voice": voice}],
+            },
+        }
+
+        def _sse_chunks() -> Iterator[bytes]:
+            with requests.post(
+                url,
+                params={"alt": "sse"},
+                headers={
+                    "x-goog-api-key": api_key,
+                    "Accept": "text/event-stream",
+                },
+                json=payload,
+                timeout=120,
+                stream=True,
+                # Never follow redirects: requests preserves custom headers
+                # (including x-goog-api-key) across origins, which would leak
+                # the credential to a redirected-to host (#73964).
+                allow_redirects=False,
+            ) as response:
+                response.raise_for_status()
+                for line in response.iter_lines(decode_unicode=True):
+                    if not line or not line.startswith("data:"):
+                        continue
+                    raw = line[len("data:"):].lstrip()
+                    try:
+                        event = _json.loads(raw)
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    # The SDK wraps each event in {"data": <event>}; the raw
+                    # SSE may also carry the event at the top level.
+                    inner = event.get("data", event)
+                    if not isinstance(inner, dict):
+                        continue
+                    if inner.get("event_type") != "step.delta":
+                        continue
+                    delta = inner.get("delta")
+                    if not isinstance(delta, dict) or delta.get("type") != "audio":
+                        continue
+                    b64 = delta.get("data", "")
+                    if not b64:
+                        continue
+                    try:
+                        yield base64.b64decode(b64, validate=True)
+                    except (ValueError, TypeError) as exc:
+                        logger.warning("Gemini interactions: bad base64 audio: %s", exc)
+
+        yield from _capped(_sse_chunks(), "Gemini 3.1 streaming TTS")
 
 
 @register("xai")

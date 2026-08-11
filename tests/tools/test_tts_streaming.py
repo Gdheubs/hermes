@@ -915,3 +915,155 @@ def test_sync_pipeline_cleans_temp_files(monkeypatch):
     assert created, "expected temp files to be created via mkstemp"
     leftovers = [p for p in created if os.path.exists(p)]
     assert not leftovers, f"temp files not cleaned: {leftovers}"
+
+
+# ── Gemini 3.1 Interactions streaming transport ──────────────────────────
+#
+# gemini-3.1-flash-tts-preview is the only Gemini TTS model with true
+# streaming (gemini-3.6-flash is text/multimodal, not TTS).  The streamer
+# selects the Interactions transport when the configured model is a 3.1 TTS
+# model and keeps the legacy streamGenerateContent SSE transport otherwise.
+# The API key rides in the x-goog-api-key header on BOTH transports — never
+# in the request URL, which lands in logs on HTTP errors (#73964).
+
+import base64 as _b64
+import json as _json
+
+
+def _sse_context(events):
+    """Fake ``requests.post`` response context streaming SSE ``data:`` lines."""
+    resp = MagicMock()
+    resp.iter_lines.return_value = iter(
+        "data: " + _json.dumps(ev) for ev in events
+    )
+    resp.__enter__.return_value = resp
+    return resp
+
+
+def _audio_event(b64_data: str) -> dict:
+    return {
+        "data": {
+            "event_type": "step.delta",
+            "delta": {"type": "audio", "data": b64_data, "sample_rate": 24000},
+        }
+    }
+
+
+class TestGeminiInteractionsStreamer:
+    def test_31_hits_interactions_endpoint_with_header_auth(self, monkeypatch):
+        captured = {}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured["kwargs"] = kwargs
+            return _sse_context([_audio_event(_b64.b64encode(b"\x01\x02").decode())])
+
+        monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+        with patch("requests.post", side_effect=fake_post) as mock_post:
+            streamer = ts.GeminiStreamer(
+                {"gemini": {"model": "gemini-3.1-flash-tts-preview"}},
+                {"model": "gemini-3.1-flash-tts-preview"},
+            )
+            list(streamer.stream("Hello there"))
+
+        assert mock_post.call_count == 1
+        assert captured["url"].endswith("/interactions")
+        params = captured["kwargs"].get("params", {})
+        assert "key" not in params
+        assert params.get("alt") == "sse"
+        assert captured["kwargs"]["headers"]["x-goog-api-key"] == "g-key"
+        body = captured["kwargs"]["json"]
+        assert body["model"] == "gemini-3.1-flash-tts-preview"
+        assert body["stream"] is True
+        assert body["response_format"]["type"] == "audio"
+        assert body["generation_config"]["speech_config"][0]["voice"] == "Kore"
+
+    def test_31_yields_pcm_from_step_delta_audio_events(self, monkeypatch):
+        chunk1 = _b64.b64encode(b"\x01\x02\x03\x04").decode()
+        chunk2 = _b64.b64encode(b"\x05\x06").decode()
+        with patch("requests.post", return_value=_sse_context([
+            {"data": {"event_type": "interaction.created"}},
+            _audio_event(chunk1),
+            {"data": {"event_type": "interaction.status_update"}},
+            _audio_event(chunk2),
+            {"data": {"event_type": "interaction.completed"}},
+        ])):
+            streamer = ts.GeminiStreamer(
+                {"gemini": {"model": "gemini-3.1-flash-tts-preview"}},
+                {"model": "gemini-3.1-flash-tts-preview"},
+            )
+            out = list(streamer.stream("Speak now"))
+
+        assert out == [b"\x01\x02\x03\x04", b"\x05\x06"]
+
+    def test_31_ignores_non_audio_step_deltas(self, monkeypatch):
+        with patch("requests.post", return_value=_sse_context([
+            {"data": {"event_type": "step.delta", "delta": {"type": "text", "text": "hi"}}},
+            {"data": {"event_type": "step.delta", "delta": {"type": "thought", "text": "..."}}},
+        ])):
+            streamer = ts.GeminiStreamer(
+                {"gemini": {"model": "gemini-3.1-flash-tts-preview"}},
+                {"model": "gemini-3.1-flash-tts-preview"},
+            )
+            assert list(streamer.stream("Say it")) == []
+
+    def test_25_keeps_legacy_transport_with_header_auth(self, monkeypatch):
+        captured = {}
+
+        def fake_post(url, **kwargs):
+            captured["url"] = url
+            captured["kwargs"] = kwargs
+            return _sse_context([_audio_event(_b64.b64encode(b"\x00\x00").decode())])
+
+        monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+        with patch("requests.post", side_effect=fake_post):
+            streamer = ts.GeminiStreamer({}, {})
+            list(streamer.stream("Legacy"))
+
+        assert "streamGenerateContent" in captured["url"]
+        assert "interactions" not in captured["url"]
+        assert "key" not in captured["kwargs"].get("params", {})
+        assert captured["kwargs"]["headers"]["x-goog-api-key"] == "g-key"
+
+    def test_31_does_not_follow_redirects(self, monkeypatch):
+        """The API key header must never be forwarded cross-origin (#73964)."""
+        captured = {}
+
+        def fake_post(url, **kwargs):
+            captured["kwargs"] = kwargs
+            return _sse_context([_audio_event(_b64.b64encode(b"\x00\x00").decode())])
+
+        monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+        with patch("requests.post", side_effect=fake_post):
+            streamer = ts.GeminiStreamer(
+                {"gemini": {"model": "gemini-3.1-flash-tts-preview"}},
+                {"model": "gemini-3.1-flash-tts-preview"},
+            )
+            list(streamer.stream("Redirect?"))
+        assert captured["kwargs"].get("allow_redirects") is False
+
+    def test_25_does_not_follow_redirects(self, monkeypatch):
+        captured = {}
+
+        def fake_post(url, **kwargs):
+            captured["kwargs"] = kwargs
+            return _sse_context([_audio_event(_b64.b64encode(b"\x00\x00").decode())])
+
+        monkeypatch.setenv("GEMINI_API_KEY", "g-key")
+        with patch("requests.post", side_effect=fake_post):
+            streamer = ts.GeminiStreamer({}, {})
+            list(streamer.stream("Redirect?"))
+        assert captured["kwargs"].get("allow_redirects") is False
+
+    def test_31_survives_malformed_sse_events(self, monkeypatch):
+        with patch("requests.post", return_value=_sse_context([
+            [],  # non-object JSON must not crash the stream
+            "not json at all",
+            {"data": {"event_type": "interaction.created"}},
+            _audio_event(_b64.b64encode(b"\x0a\x0b").decode()),
+        ])):
+            streamer = ts.GeminiStreamer(
+                {"gemini": {"model": "gemini-3.1-flash-tts-preview"}},
+                {"model": "gemini-3.1-flash-tts-preview"},
+            )
+            assert list(streamer.stream("Robust?")) == [b"\x0a\x0b"]

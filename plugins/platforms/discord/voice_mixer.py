@@ -44,7 +44,7 @@ the mixer's output cannot echo back into transcription.
 
 import logging
 import threading
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import discord
 
@@ -153,6 +153,150 @@ class MixerChild:
         return samples
 
 
+class StreamingMixerChild:
+    """Incremental 24 kHz mono s16le speech source for :class:`VoiceMixer`.
+
+    Provider chunks may split int16 samples arbitrarily.  Complete samples are
+    converted immediately to Discord-native 48 kHz stereo s16le (an exact 2x
+    rate expansion) and retained in a bounded buffer until the audio thread
+    drains 20 ms frames.  An empty-but-open stream returns silence rather than
+    EOF so discord.py keeps polling while the provider is between chunks.
+
+    Lifecycle: ``write`` while open, then ``finish`` (producer done; buffered
+    audio still drains on the sender thread) or ``abort`` (drop everything).
+    The one-shot ``on_drained`` callback fires exactly once, when the child
+    reaches its terminal state — either after the buffer drains naturally or
+    immediately on abort — so owners can release resources (e.g. the voice
+    receiver echo guard) only when no more audio can be emitted.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        gain: float = 1.0,
+        max_buffer_bytes: int = 16 * 1024 * 1024,
+        on_drained: "Optional[Callable[['StreamingMixerChild'], None]]" = None,
+    ) -> None:
+        self.name = name
+        self.gain = float(gain)
+        self.is_speech = True
+        self._max_buffer_bytes = max(FRAME_SIZE, int(max_buffer_bytes))
+        self._buffer = bytearray()
+        self._input_carry = bytearray()
+        self._lock = threading.Lock()
+        self._input_finished = False
+        self._aborted = False
+        self._finished = False
+        self._drained_notified = False
+        self._on_drained = on_drained
+
+    @property
+    def finished(self) -> bool:
+        with self._lock:
+            return self._finished
+
+    @property
+    def drained(self) -> bool:
+        """True when no more frames will ever be emitted and the one-shot
+        ``on_drained`` callback has not yet fired (owner may act on it)."""
+        with self._lock:
+            return self._finished and not self._drained_notified
+
+    def write(self, pcm_24k_mono: bytes) -> None:
+        if not pcm_24k_mono:
+            return
+        np = _require_numpy()
+        with self._lock:
+            if self._aborted:
+                return
+            if self._input_finished:
+                raise RuntimeError("streaming speech is already finished")
+            data = bytes(self._input_carry) + bytes(pcm_24k_mono)
+            even = len(data) & ~1
+            self._input_carry[:] = data[even:]
+            if not even:
+                return
+            mono = np.frombuffer(data[:even], dtype=np.int16)
+            # 24k mono -> 48k stereo: duplicate each sample once in time and
+            # duplicate both rate-expanded samples across the two channels.
+            converted = np.repeat(np.repeat(mono, 2), 2).astype(np.int16).tobytes()
+            if len(self._buffer) + len(converted) > self._max_buffer_bytes:
+                raise BufferError("streaming speech buffer limit exceeded")
+            self._buffer.extend(converted)
+
+    def finish(self) -> None:
+        with self._lock:
+            self._input_carry.clear()  # incomplete int16 sample is not audio
+            self._input_finished = True
+
+    def abort(self) -> None:
+        self._abort_silent()
+        self._notify_drained()
+
+    def _abort_silent(self) -> None:
+        """Abort without firing ``on_drained``.
+
+        Used by the mixer itself (``stop_speech`` / ``cleanup``), which
+        already owns the aggregate state and must not re-enter it through the
+        callback.
+        """
+        with self._lock:
+            self._aborted = True
+            self._input_finished = True
+            self._input_carry.clear()
+            self._buffer.clear()
+            self._finished = True
+
+    def _notify_drained(self) -> None:
+        with self._lock:
+            if self._drained_notified:
+                return
+            self._drained_notified = True
+            cb = self._on_drained
+        if cb is not None:
+            cb(self)
+
+    def fire_drained_cb(self) -> None:
+        """Fire the one-shot drained callback if the child is terminal.
+
+        Called by the mixer AFTER releasing its own lock, so the callback can
+        safely re-enter the mixer or run sender-thread side effects.
+        """
+        with self._lock:
+            if not self._finished or self._drained_notified:
+                return
+            self._drained_notified = True
+            cb = self._on_drained
+        if cb is not None:
+            cb(self)
+
+    def read_frame(self) -> "Optional[np.ndarray]":
+        np = _require_numpy()
+        with self._lock:
+            if self._finished or self._aborted:
+                return None
+            if len(self._buffer) >= FRAME_SIZE:
+                chunk = bytes(self._buffer[:FRAME_SIZE])
+                del self._buffer[:FRAME_SIZE]
+            elif self._input_finished:
+                if not self._buffer:
+                    # Natural drain: terminal state.  The callback fires via
+                    # fire_drained_cb() (called by the mixer after releasing
+                    # its lock) — never inline, to avoid lock re-entrancy.
+                    self._finished = True
+                    return None
+                chunk = bytes(self._buffer)
+                self._buffer.clear()
+                chunk += b"\x00" * (FRAME_SIZE - len(chunk))
+            else:
+                chunk = SILENCE_FRAME
+        samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+        if self.gain != 1.0:
+            samples *= self.gain
+        return samples
+
+
 class VoiceMixer(discord.AudioSource):
     """A continuous ``discord.AudioSource`` that mixes N child streams.
 
@@ -176,7 +320,7 @@ class VoiceMixer(discord.AudioSource):
     ):
         self._lock = threading.Lock()
         self._ambient: Optional[MixerChild] = None
-        self._speech: List[MixerChild] = []
+        self._speech: List[Union[MixerChild, StreamingMixerChild]] = []
         self._ambient_gain = float(ambient_gain)
         self._duck_gain = float(duck_gain)
         self._speech_gain = float(speech_gain)
@@ -230,6 +374,52 @@ class VoiceMixer(discord.AudioSource):
             if self._ambient is not None:
                 self._ambient.gain = self._duck_gain
 
+    def begin_streaming_speech(
+        self,
+        *,
+        gain: Optional[float] = None,
+        max_buffer_bytes: int = 16 * 1024 * 1024,
+        on_drained: "Optional[Callable[[StreamingMixerChild], None]]" = None,
+    ) -> StreamingMixerChild:
+        """Attach and return an open incremental speech child.
+
+        ``on_drained`` fires once when the child reaches its terminal state
+        (natural drain or abort), after the mixer has removed the child and
+        released the duck if it was the last speech source.
+        """
+        def _child_drained(child: StreamingMixerChild) -> None:
+            self._streaming_child_drained(child)
+            if on_drained is not None:
+                on_drained(child)
+
+        child = StreamingMixerChild(
+            "streaming-speech",
+            gain=self._speech_gain if gain is None else float(gain),
+            max_buffer_bytes=max_buffer_bytes,
+            on_drained=_child_drained,
+        )
+        with self._lock:
+            self._speech.append(child)
+            self._speech_active = True
+            self._duck_release_left = 0
+            if self._ambient is not None:
+                self._ambient.gain = self._duck_gain
+        return child
+
+    def _streaming_child_drained(self, child: StreamingMixerChild) -> None:
+        """Remove *child* and release the duck when no speech children remain.
+
+        Runs from the sender thread (natural drain) or the producer thread
+        (abort); always under the mixer lock, never re-entrant.
+        """
+        with self._lock:
+            try:
+                self._speech.remove(child)
+            except ValueError:
+                pass
+            if not self._speech and self._speech_active:
+                self._begin_duck_release_locked()
+
     @property
     def speech_active(self) -> bool:
         with self._lock:
@@ -238,6 +428,11 @@ class VoiceMixer(discord.AudioSource):
     def stop_speech(self) -> None:
         """Drop any in-flight speech immediately and release the duck."""
         with self._lock:
+            for child in self._speech:
+                if isinstance(child, StreamingMixerChild):
+                    # Silent abort: the mixer owns the aggregate state here;
+                    # no drained callback (would re-enter the lock).
+                    child._abort_silent()
             self._speech.clear()
             self._begin_duck_release_locked()
 
@@ -262,13 +457,18 @@ class VoiceMixer(discord.AudioSource):
 
             np = _require_numpy()
             acc: "Optional[np.ndarray]" = None
+            drained: List[StreamingMixerChild] = []
 
             # Speech children (drop exhausted ones; release duck when last ends)
             if self._speech:
-                still_live: List[MixerChild] = []
+                still_live: List[Union[MixerChild, StreamingMixerChild]] = []
                 for child in self._speech:
                     frame = child.read_frame()
                     if frame is None:
+                        # Terminal streaming children fire their drained
+                        # callback AFTER this lock is released.
+                        if isinstance(child, StreamingMixerChild) and child.drained:
+                            drained.append(child)
                         continue
                     acc = frame if acc is None else acc + frame
                     still_live.append(child)
@@ -292,15 +492,24 @@ class VoiceMixer(discord.AudioSource):
                     acc = amb if acc is None else acc + amb
 
             if acc is None:
-                return SILENCE_FRAME
+                frame_out = SILENCE_FRAME
+            else:
+                np.clip(acc, -32768, 32767, out=acc)
+                frame_out = acc.astype(np.int16).tobytes()
 
-            np.clip(acc, -32768, 32767, out=acc)
-            return acc.astype(np.int16).tobytes()
+        # Drained callbacks run outside the mixer lock: they may re-enter the
+        # mixer (duck release) or touch adapter state on the sender thread.
+        for child in drained:
+            child.fire_drained_cb()
+        return frame_out
 
     def cleanup(self) -> None:  # called by discord.py when playback stops
         with self._lock:
             self._closed = True
             self._ambient = None
+            for child in self._speech:
+                if isinstance(child, StreamingMixerChild):
+                    child._abort_silent()
             self._speech.clear()
 
 

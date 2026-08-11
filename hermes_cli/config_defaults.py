@@ -1986,6 +1986,7 @@ DEFAULT_CONFIG = {
         # this is implemented in plugins/platforms/discord/voice_mixer.py.
         "voice_fx": {
             "enabled": False,         # master switch for the mixer subsystem
+            "streaming_tts": False,   # incremental PCM TTS in live VC (opt-in)
             "ambient_enabled": True,  # play the idle "thinking" bed while tools run
             "ambient_path": "",       # custom loop audio file; "" = synthesised pad
             "ambient_gain": 0.18,     # idle bed loudness, 0.0–1.0
