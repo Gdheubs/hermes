@@ -695,6 +695,66 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_python_c_inline_path_literal_not_blocked(self):
+        """A `python3 -c` inline snippet containing a path-shaped string
+        literal (e.g. ``os.path.expanduser('~/.hermes/scripts')``) must NOT
+        be blocked. ``_iter_command_segments`` tokenizes the payload as if it
+        were shell text, so the quoted literal lands as its own segment and
+        looks like an absolute script path; before the fix the walk resolved
+        it to a *directory*, the bounded read failed closed on the
+        non-regular file, and the whole innocent command was hard-blocked.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        cmd = (
+            "which lark-cli; python3 -c \"\n"
+            "import sys, os\n"
+            "sys.path.insert(0, os.path.expanduser('~/.hermes/scripts'))\n"
+            "from hermes_send_card import build_card\n"
+            "print('import ok')\n"
+            "\" 2>&1; echo cleaned"
+        )
+        assert contains_gateway_lifecycle_command_or_referenced_script(cmd) is False
+
+    def test_directory_executable_not_blocked(self, tmp_path):
+        """Executing a directory path (``/some/dir`` as the command) is not a
+        script reference — the shell cannot exec a directory. It must not be
+        walked and fail the command closed."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        d = tmp_path / "not-a-script"
+        d.mkdir()
+        assert contains_gateway_lifecycle_command_or_referenced_script(str(d)) is False
+
+    def test_missing_script_path_not_blocked(self):
+        """A non-existent path is not a threat: the shell would fail to exec
+        it. The walk must skip it rather than fail closed."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                "/tmp/definitely-missing-hermes-script-98213.sh"
+            )
+            is False
+        )
+
+    def test_real_referenced_script_still_scanned(self, tmp_path):
+        """The is_file() gate must NOT weaken the guard: a real script file
+        referenced by path is still read and scanned for lifecycle commands."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        script = tmp_path / "ops.sh"
+        script.write_text("#!/bin/bash\nhermes gateway restart\n", encoding="utf-8")
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(str(script))
+            is True
+        )
+
+
     def test_nul_byte_in_path_token_does_not_crash_guard(self):
         """Residual #76762 class: when a NUL byte survives into the *path
         token itself* (tokenized binary-adjacent command text), ``os.open``

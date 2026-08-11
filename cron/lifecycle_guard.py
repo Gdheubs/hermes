@@ -397,7 +397,15 @@ def _iter_referenced_shell_scripts(
         if executable.strip("/"):
             if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
                 resolved = _resolve_terminal_script_path(executable, cwd)
-                if resolved is not None:
+                # Only a real regular file is an executable script reference.
+                # Path-shaped string literals inside `python3 -c` payloads
+                # (e.g. `os.path.expanduser('~/.hermes/scripts')`) are
+                # tokenized by _iter_command_segments and can look like
+                # absolute script paths; yielding a directory here makes the
+                # bounded read fail closed (non-regular file) and hard-blocks
+                # an innocent terminal command. A missing path is not a
+                # threat either — the shell would fail to exec it.
+                if resolved is not None and resolved.is_file():
                     yield resolved
 
 
