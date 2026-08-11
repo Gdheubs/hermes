@@ -5,6 +5,7 @@ background session) across gateway messenger platforms.
 """
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -81,6 +82,28 @@ class TestHandleBackgroundCommand:
         result = await runner._handle_background_command(event)
         assert "Usage:" in result
 
+    @pytest.mark.asyncio
+    async def test_passes_parent_and_complete_reply_context(self):
+        runner = _make_runner()
+        parent = MagicMock(session_id="parent-session")
+        runner.session_store.get_or_create_session.return_value = parent
+        runner._run_background_task = AsyncMock(return_value=None)
+        event = _make_event(text="/background inspect this")
+        decision_after_old_limit = "APPROVE_THE_REPORT_AFTER_CHARACTER_500"
+        event.reply_to_text = "q" * 700 + decision_after_old_limit
+        event.reply_to_is_own_message = True
+
+        result = await runner._handle_background_command(event)
+        await asyncio.sleep(0)
+
+        assert "Background" in result
+        kwargs = runner._run_background_task.await_args.kwargs
+        assert kwargs["parent_session_id"] == "parent-session"
+        assert kwargs["parent_session_key"] == runner._session_key_for_source(event.source)
+        assert kwargs["reply_to_text"] == event.reply_to_text
+        assert decision_after_old_limit in kwargs["reply_to_text"]
+        assert kwargs["reply_to_is_own_message"] is True
+
 
 # ---------------------------------------------------------------------------
 # _run_background_task
@@ -148,9 +171,21 @@ class TestRunBackgroundTask:
             mock_agent_instance.shutdown_memory_provider = MagicMock()
             mock_agent_instance.close = MagicMock()
             mock_agent_instance.run_conversation.return_value = mock_result
+            mock_session_db = MagicMock()
+            mock_agent_instance._session_db = mock_session_db
             MockAgent.return_value = mock_agent_instance
 
-            await runner._run_background_task("say hello", source, "bg_test")
+            decision_after_old_limit = "APPROVE_THE_REPORT_AFTER_CHARACTER_500"
+            complete_reply = "q" * 700 + decision_after_old_limit
+            await runner._run_background_task(
+                "say hello",
+                source,
+                "bg_test",
+                parent_session_id="parent-session",
+                parent_session_key="telegram:67890",
+                reply_to_text=complete_reply,
+                reply_to_is_own_message=True,
+            )
 
         # Should have sent the result
         mock_adapter.send.assert_called_once()
@@ -163,6 +198,20 @@ class TestRunBackgroundTask:
         assert agent_kwargs["checkpoint_max_snapshots"] == 8
         assert agent_kwargs["checkpoint_max_total_size_mb"] == 222
         assert agent_kwargs["checkpoint_max_file_size_mb"] == 3
+        assert agent_kwargs["parent_session_id"] == "parent-session"
+        assert agent_kwargs["gateway_session_key"] == "telegram:67890"
+        run_kwargs = mock_agent_instance.run_conversation.call_args.kwargs
+        assert run_kwargs["user_message"] == (
+            f'[Replying to your previous message: "{complete_reply}"]\n\nsay hello'
+        )
+        assert decision_after_old_limit in run_kwargs["user_message"]
+        mock_agent_instance._ensure_db_session.assert_called_once()
+        record_kwargs = mock_session_db.record_gateway_session_peer.call_args.kwargs
+        assert record_kwargs["session_key"] == "telegram:67890"
+        origin = json.loads(record_kwargs["origin_json"])
+        assert origin["execution_kind"] == "user_explicit_background"
+        assert origin["user_initiated"] is True
+        assert origin["command"] == "/background"
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
 

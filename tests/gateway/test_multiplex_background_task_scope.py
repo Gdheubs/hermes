@@ -29,6 +29,8 @@ class TestBackgroundTaskProfileScope:
 
         source = mock.MagicMock()
         source.profile = "test_profile"
+        decision_after_old_limit = "APPROVE_THE_REPORT_AFTER_CHARACTER_500"
+        complete_reply = "q" * 700 + decision_after_old_limit
 
         with mock.patch.object(
             GatewayRunner,
@@ -39,11 +41,23 @@ class TestBackgroundTaskProfileScope:
             scope.return_value.__exit__ = mock.MagicMock(return_value=False)
             asyncio.run(
                 runner._run_background_task(
-                    prompt="test", source=source, task_id="bg_test"
+                    prompt="test",
+                    source=source,
+                    task_id="bg_test",
+                    parent_session_id="parent",
+                    parent_session_key="telegram:chat",
+                    reply_to_text=complete_reply,
+                    reply_to_is_own_message=True,
                 )
             )
 
         scope.assert_called_once_with(Path("/fake/profile"))
         inner.assert_awaited_once()
+        forwarded = inner.await_args.kwargs
+        assert forwarded["parent_session_id"] == "parent"
+        assert forwarded["parent_session_key"] == "telegram:chat"
+        assert forwarded["reply_to_text"] == complete_reply
+        assert decision_after_old_limit in forwarded["reply_to_text"]
+        assert forwarded["reply_to_is_own_message"] is True
 
 
