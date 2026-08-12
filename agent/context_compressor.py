@@ -3162,14 +3162,18 @@ class ContextCompressor(ContextEngine):
                 len(result),
                 _MAX_TAIL_MESSAGE_FLOOR,
             )
-            # Same newest-turn-only thinking charge as the tail-cut walk
-            # (#73624) — this boundary decides which tool results stay
-            # prunable, and overcharging stale thinking shrinks that window.
+            # Match the tail-cut walk: generic thinking is newest-turn-only on
+            # non-Codex transports, but every retained turn is replayed by
+            # Codex Responses.
             _newest_asst_idx = _last_assistant_index(result)
+            _charge_all_thinking = self.api_mode == "codex_responses"
             for i in range(len(result) - 1, -1, -1):
                 msg = result[i]
                 msg_tokens = _estimate_msg_budget_tokens(
-                    msg, charge_stale_thinking=(i == _newest_asst_idx)
+                    msg,
+                    charge_stale_thinking=(
+                        _charge_all_thinking or i == _newest_asst_idx
+                    ),
                 )
                 if accumulated + msg_tokens > protect_tail_tokens and (len(result) - i) >= min_protect:
                     boundary = i
@@ -5543,16 +5547,21 @@ This compaction should PRIORITISE preserving all information related to the focu
         accumulated = 0
         cut_idx = n  # start from beyond the end
 
-        # Newest assistant turn: the only message whose generic thinking
-        # fields any transport still replays (#73624) — every older turn's
-        # reasoning/reasoning_content is stripped or padded at send time,
-        # so charging it here spends tail budget on bytes that never ship.
+        # Non-Codex transports replay generic thinking fields for the newest
+        # assistant turn only (#73624).  Codex Responses carries those fields
+        # across the full retained transcript, so its tail walk must charge
+        # them on stale turns too; otherwise preflight sees a large request
+        # while this walk protects the entire transcript as a tiny tail.
         _newest_asst_idx = _last_assistant_index(messages)
+        _charge_all_thinking = self.api_mode == "codex_responses"
 
         for i in range(n - 1, head_end - 1, -1):
             msg = messages[i]
             msg_tokens = _estimate_msg_budget_tokens(
-                msg, charge_stale_thinking=(i == _newest_asst_idx)
+                msg,
+                charge_stale_thinking=(
+                    _charge_all_thinking or i == _newest_asst_idx
+                ),
             )
             # Stop once we exceed the soft ceiling (unless we haven't hit min_tail yet)
             if accumulated + msg_tokens > soft_ceiling and (n - i) >= min_tail:
@@ -5580,7 +5589,10 @@ This compaction should PRIORITISE preserving all information related to the focu
             for j in range(n - 1, head_end - 1, -1):
                 raw_msg = messages[j]
                 raw_tok = _estimate_msg_budget_tokens(
-                    raw_msg, charge_stale_thinking=(j == _newest_asst_idx)
+                    raw_msg,
+                    charge_stale_thinking=(
+                        _charge_all_thinking or j == _newest_asst_idx
+                    ),
                 )
                 if raw_accumulated + raw_tok > raw_budget and (n - j) >= min_tail:
                     cut_idx = j
