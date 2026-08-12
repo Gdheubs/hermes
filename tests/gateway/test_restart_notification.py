@@ -169,6 +169,31 @@ async def test_sethome_preserves_thread_target_for_same_process_restart(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_startup_notification_prefers_restart_channel_over_home(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, adapter = make_restart_runner()
+    cfg = runner.config.platforms[Platform.TELEGRAM]
+    cfg.home_channel = HomeChannel(
+        platform=Platform.TELEGRAM, chat_id="daily-digest", name="Digest"
+    )
+    cfg.gateway_restart_channel = HomeChannel(
+        platform=Platform.TELEGRAM, chat_id="system-messages", name="Ops"
+    )
+    adapter.send = AsyncMock()
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert delivered == {("telegram", "system-messages", None)}
+    adapter.send.assert_called_once_with(
+        "system-messages",
+        "♻️ Gateway online — Hermes is back and ready.",
+    )
+
+
+@pytest.mark.asyncio
 async def test_send_home_channel_startup_notification_preserves_thread_metadata(
     tmp_path, monkeypatch
 ):
@@ -241,6 +266,52 @@ async def test_relay_fronted_logical_home_gets_startup_notification(tmp_path, mo
     )
     assert relay.send_for_platform.await_args.kwargs["metadata"]["user_id"] == "U123"
     assert relay.send_for_platform.await_args.kwargs["metadata"]["scope_id"] == "T123"
+
+
+@pytest.mark.asyncio
+async def test_relay_fronted_lifecycle_channel_preserves_owner_provenance(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    runner, _native = make_restart_runner()
+    relay = MagicMock()
+    relay.fronts_platform.side_effect = lambda platform: platform == Platform.SLACK
+    relay.send_for_platform = AsyncMock(
+        return_value=SendResult(success=True, message_id="lifecycle")
+    )
+    runner.adapters = {Platform.RELAY: relay}
+    runner.config.platforms = {
+        Platform.RELAY: PlatformConfig(enabled=True),
+        Platform.SLACK: PlatformConfig(
+            enabled=False,
+            home_channel=HomeChannel(
+                platform=Platform.SLACK,
+                chat_id="D123",
+                name="Owner DM",
+            ),
+            gateway_restart_channel=HomeChannel(
+                platform=Platform.SLACK,
+                chat_id="COPS",
+                name="Operations",
+                user_id="U123",
+                scope_id="T123",
+            ),
+        ),
+    }
+
+    delivered = await runner._send_home_channel_startup_notifications()
+
+    assert delivered == {("slack", "COPS", None)}
+    relay.send_for_platform.assert_awaited_once()
+    assert relay.send_for_platform.await_args.args[:3] == (
+        Platform.SLACK,
+        "COPS",
+        "♻️ Gateway online — Hermes is back and ready.",
+    )
+    metadata = relay.send_for_platform.await_args.kwargs["metadata"]
+    assert metadata["user_id"] == "U123"
+    assert metadata["scope_id"] == "T123"
 
 
 # ── _send_restart_notification ───────────────────────────────────────────

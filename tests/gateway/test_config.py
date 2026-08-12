@@ -83,6 +83,53 @@ class TestPlatformConfigRoundtrip:
         restored = PlatformConfig.from_dict(pc.to_dict())
         assert restored.gateway_restart_notification is False
 
+    def test_gateway_restart_channel_roundtrip(self):
+        pc = PlatformConfig(
+            enabled=True,
+            gateway_restart_channel=HomeChannel(
+                platform=Platform.SLACK,
+                chat_id="C-ops",
+                name="system-messages",
+            ),
+        )
+        restored = PlatformConfig.from_dict(pc.to_dict())
+
+        assert restored.gateway_restart_channel is not None
+        assert restored.gateway_restart_channel.platform == Platform.SLACK
+        assert restored.gateway_restart_channel.chat_id == "C-ops"
+
+    @pytest.mark.parametrize(
+        "malformed",
+        [
+            {"platform": "slck", "chat_id": "C-ops"},
+            {"platform": "slack"},
+            {"chat_id": "C-ops"},
+            "C-ops",
+        ],
+    )
+    def test_malformed_restart_channel_preserves_platform_config(
+        self, malformed, caplog
+    ):
+        restored = PlatformConfig.from_dict(
+            {
+                "enabled": True,
+                "token": "test-token",
+                "home_channel": {
+                    "platform": "slack",
+                    "chat_id": "C-home",
+                    "name": "Home",
+                },
+                "gateway_restart_channel": malformed,
+            }
+        )
+
+        assert restored.enabled is True
+        assert restored.token == "test-token"
+        assert restored.home_channel is not None
+        assert restored.home_channel.chat_id == "C-home"
+        assert restored.gateway_restart_channel is None
+        assert "Ignoring invalid gateway_restart_channel" in caplog.text
+
 
     def test_typing_status_text_resolved_from_extra(self):
         # Same bridge route as typing_indicator: the shared-key loop copies a
@@ -278,6 +325,125 @@ class TestGatewayConfigRoundtrip:
 
 
 class TestLoadGatewayConfig:
+    def test_top_level_restart_channel_reaches_platform_config(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "slack:\n"
+            "  gateway_restart_channel:\n"
+            "    platform: slack\n"
+            "    chat_id: C-ops\n"
+            "    name: system-messages\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        lifecycle_channel = config.platforms[Platform.SLACK].gateway_restart_channel
+        assert lifecycle_channel is not None
+        assert lifecycle_channel.chat_id == "C-ops"
+        assert lifecycle_channel.name == "system-messages"
+
+    def test_nested_restart_channel_reaches_platform_config(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    slack:\n"
+            "      gateway_restart_channel:\n"
+            "        platform: slack\n"
+            "        chat_id: C-ops\n"
+            "        name: system-messages\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        lifecycle_channel = config.platforms[Platform.SLACK].gateway_restart_channel
+        assert lifecycle_channel is not None
+        assert lifecycle_channel.chat_id == "C-ops"
+
+    def test_top_level_malformed_restart_channel_warns_and_falls_back(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "slack:\n  gateway_restart_channel: C-ops\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.SLACK].gateway_restart_channel is None
+        assert "Ignoring invalid gateway_restart_channel" in caplog.text
+
+    def test_malformed_restart_channel_falls_back_without_dropping_platform(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "platforms:\n"
+            "  slack:\n"
+            "    enabled: true\n"
+            "    home_channel:\n"
+            "      platform: slack\n"
+            "      chat_id: C-home\n"
+            "      name: Home\n"
+            "    gateway_restart_channel:\n"
+            "      platform: slck\n"
+            "      chat_id: C-ops\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        slack = config.platforms[Platform.SLACK]
+        assert slack.enabled is True
+        assert slack.home_channel is not None
+        assert slack.home_channel.chat_id == "C-home"
+        assert slack.gateway_restart_channel is None
+        assert "Ignoring invalid gateway_restart_channel" in caplog.text
+
+    def test_platforms_restart_channel_overrides_gateway_platforms_value(
+        self, tmp_path, monkeypatch
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    slack:\n"
+            "      gateway_restart_channel:\n"
+            "        platform: slack\n"
+            "        chat_id: C-nested\n"
+            "        name: Nested\n"
+            "platforms:\n"
+            "  slack:\n"
+            "    gateway_restart_channel:\n"
+            "      platform: slack\n"
+            "      chat_id: C-primary\n"
+            "      name: Primary\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        lifecycle_channel = config.platforms[Platform.SLACK].gateway_restart_channel
+        assert lifecycle_channel is not None
+        assert lifecycle_channel.chat_id == "C-primary"
+
     def test_shipped_template_does_not_enable_auto_reset(self, tmp_path, monkeypatch):
         """A fresh install seeded from cli-config.yaml.example must not
         auto-reset sessions.
