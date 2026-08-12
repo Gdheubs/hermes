@@ -65,6 +65,12 @@ CASES = {
     "root lockfile → frontend, not python": (["package-lock.json"], _lanes(frontend=True, npm_lock=True)),
     "nested lockfile → npm_lock": (["website/package-lock.json"], _lanes(site=True, npm_lock=True)),
     "website → site": (["website/docs/intro.md"], _lanes(site=True)),
+    # The published CIMD document is asserted about by the Python suite, so a
+    # lone edit there must not skip the lane that would catch a bad edit.
+    "cimd document → python + site": (
+        ["website/static/oauth/client-metadata.json"],
+        _lanes(python=True, site=True),
+    ),
     # SKILL.md reads like docs, but the skill-doc tests read skills/, so a
     # skill edit must still run Python.
     "skill md → python + site": (["skills/github/SKILL.md"], _lanes(python=True, site=True)),
