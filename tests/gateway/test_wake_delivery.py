@@ -125,3 +125,68 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
     assert calls["n"] == 2
 
 
+def test_session_turn_lock_serializes_same_session():
+    """Two _run_agent calls for the same session_id must not overlap (#84235)."""
+    from gateway.platforms.api_server import APIServerAdapter
+
+    adapter = APIServerAdapter.__new__(APIServerAdapter)
+    adapter._session_turn_locks = {}
+    adapter._session_turn_locks_guard = asyncio.Lock()
+
+    active = {"n": 0}
+    max_active = {"n": 0}
+    order = []
+
+    async def hold(label: str, delay: float):
+        async with adapter._hold_session_turn_lock("sess-1"):
+            active["n"] += 1
+            max_active["n"] = max(max_active["n"], active["n"])
+            order.append(f"{label}:start")
+            await asyncio.sleep(delay)
+            order.append(f"{label}:end")
+            active["n"] -= 1
+
+    async def run():
+        await asyncio.gather(hold("a", 0.05), hold("b", 0.01))
+
+    asyncio.run(run())
+    assert max_active["n"] == 1
+    assert order == ["a:start", "a:end", "b:start", "b:end"] or order == [
+        "b:start",
+        "b:end",
+        "a:start",
+        "a:end",
+    ]
+
+
+def test_session_turn_lock_allows_different_sessions_in_parallel():
+    from gateway.platforms.api_server import APIServerAdapter
+
+    adapter = APIServerAdapter.__new__(APIServerAdapter)
+    adapter._session_turn_locks = {}
+    adapter._session_turn_locks_guard = asyncio.Lock()
+
+    active = {"n": 0}
+    max_active = {"n": 0}
+    gate = asyncio.Event()
+
+    async def hold(session_id: str):
+        async with adapter._hold_session_turn_lock(session_id):
+            active["n"] += 1
+            max_active["n"] = max(max_active["n"], active["n"])
+            await gate.wait()
+            active["n"] -= 1
+
+    async def run():
+        t1 = asyncio.create_task(hold("sess-a"))
+        t2 = asyncio.create_task(hold("sess-b"))
+        for _ in range(50):
+            if max_active["n"] >= 2:
+                break
+            await asyncio.sleep(0.01)
+        gate.set()
+        await asyncio.gather(t1, t2)
+
+    asyncio.run(run())
+    assert max_active["n"] == 2
+
