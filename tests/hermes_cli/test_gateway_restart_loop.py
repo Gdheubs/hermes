@@ -746,6 +746,42 @@ class TestLifecycleGuardModule:
             is True
         )
 
+    def test_unstatable_path_does_not_abort_walk(self, tmp_path):
+        """An is_dir() OSError (EACCES on an unreadable ancestor,
+        ENAMETOOLONG on an over-long token) must NOT abort the referenced-
+        script walk. If the exception propagates, the caller falls back to
+        direct-scan and silently skips every remaining referenced script in
+        the same command — a fail-open regression (adversarial review,
+        #83633). The walk must treat an unstat-able candidate as
+        "not a directory" and keep going."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        # A script whose body contains a lifecycle command, referenced AFTER
+        # an unstat-able path in the same command string.
+        evil = tmp_path / "evil.sh"
+        evil.write_text("#!/bin/bash\nhermes gateway restart\n", encoding="utf-8")
+        # ENAMETOOLONG: path exceeds PATH_MAX (macOS 1024) — is_dir() raises
+        # OSError. Sibling reference must still be scanned.
+        long_path = "/" + "a" * 5000 + ".sh"
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                f"{long_path}; bash {evil}"
+            )
+            is True
+        )
+        # EACCES: /var/root is unreadable to non-root on macOS — is_dir()
+        # raises PermissionError. Sibling reference must still be scanned.
+        # (Skip when running as root, where /var/root is readable.)
+        import os as _os
+        if _os.geteuid() != 0:
+            assert (
+                contains_gateway_lifecycle_command_or_referenced_script(
+                    f"/var/root/blocker.sh; bash {evil}"
+                )
+                is True
+            )
+
     def test_missing_script_path_not_blocked(self):
         """A non-existent path is not a threat: the shell would fail to exec
         it. The walk must skip it rather than fail closed."""

@@ -409,7 +409,24 @@ def _iter_referenced_shell_scripts(
                 # (`bash myfifo` executes whatever the writer feeds it), so
                 # it must keep failing closed in the bounded read below
                 # rather than being skipped like a directory.
-                if resolved is not None and not resolved.is_dir():
+                #
+                # is_dir() can itself raise OSError for unstat-able paths
+                # (EACCES on an unreadable ancestor dir, ENAMETOOLONG on an
+                # over-long token). Treat those as "not a directory" and
+                # yield: _read_referenced_script's os.open already catches
+                # OSError and returns (None, False), and — critically — the
+                # walk keeps going so sibling script references later in the
+                # same command are still scanned. Letting the exception
+                # propagate would abort the whole walk and fall back to
+                # direct-scan, silently skipping every remaining referenced
+                # script (fail-open).
+                if resolved is None:
+                    continue
+                try:
+                    is_dir = resolved.is_dir()
+                except OSError:
+                    is_dir = False
+                if not is_dir:
                     yield resolved
 
 
