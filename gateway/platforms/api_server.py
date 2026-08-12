@@ -1455,12 +1455,13 @@ class APIServerAdapter(BasePlatformAdapter):
         # (the /v1/runs path tracks its own in-flight set via
         # _active_run_tasks).
         self._inflight_agent_runs: int = 0
-        # Per raw session_id mutex for _run_agent turns. Concurrent POSTs that
-        # share a session (user chat + wake self-post, burst inbound, etc.)
-        # previously raced two conversation loops on one SessionDB transcript
-        # (last-writer-wins / stale snapshots). Ephemeral fingerprint sessions
-        # still serialize when they share the derived id; empty ids skip the
-        # lock. Related: #84235.
+        # Per raw session_id mutex shared by _run_agent (chat/completions) and
+        # /v1/runs background tasks. Concurrent work that shares a session
+        # (user run + wake self-post, burst inbound, etc.) previously raced
+        # two conversation loops on one SessionDB transcript (last-writer-wins
+        # / stale snapshots / compression lock_contended). Ephemeral
+        # fingerprint sessions still serialize when they share the derived id;
+        # empty ids skip the lock. Related: #84235.
         self._session_turn_locks: Dict[str, asyncio.Lock] = {}
         self._session_turn_locks_guard = asyncio.Lock()
         # Every agent currently inside _run_agent(), i.e. exactly the turns
@@ -6184,12 +6185,12 @@ class APIServerAdapter(BasePlatformAdapter):
 
     @asynccontextmanager
     async def _hold_session_turn_lock(self, session_id: Optional[str]):
-        """Serialize ``_run_agent`` turns that share a non-empty session id.
+        """Serialize agent turns that share a non-empty session id.
 
-        Concurrent POSTs previously raced on the same SessionDB transcript,
-        so a later turn could act on a stale snapshot and re-execute work
-        (#84235). Waiting on this lock queues the second turn behind the
-        first instead of interleaving tool loops.
+        Used by ``_run_agent`` (chat/completions, session chat) and by
+        ``/v1/runs`` background tasks so a wake self-post cannot interleave
+        with an in-flight run on the same SessionDB transcript (#84235).
+        Waiting on this lock queues the second turn behind the first.
         """
         sid = (session_id or "").strip()
         if not sid:
@@ -6741,263 +6742,268 @@ class APIServerAdapter(BasePlatformAdapter):
         request_profile = _api_request_profile.get()
 
         async def _run_and_close():
-            try:
-                self._set_run_status(run_id, "running")
-                if run_id in self._stopping_run_ids:
-                    _put_event_if_active({
-                        "event": "run.cancelled",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                    })
+            # Hold the same per-session lock as _run_agent so /v1/runs cannot
+            # race wake self-posts (chat/completions) on the same SessionDB
+            # transcript. Acquire here — after HTTP 202 — so clients still get
+            # run_id immediately while the task waits if the session is busy.
+            async with self._hold_session_turn_lock(session_id):
+                try:
+                    self._set_run_status(run_id, "running")
+                    if run_id in self._stopping_run_ids:
+                        _put_event_if_active({
+                            "event": "run.cancelled",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                        })
+                        self._set_run_status(
+                            run_id,
+                            "cancelled",
+                            last_event="run.cancelled",
+                        )
+                        return
+                    with self._profile_scope(request_profile):
+                        agent = self._create_agent(
+                            ephemeral_system_prompt=ephemeral_system_prompt,
+                            session_id=session_id,
+                            stream_delta_callback=_text_cb,
+                            tool_progress_callback=event_cb,
+                            gateway_session_key=gateway_session_key,
+                            requested_model=agent_overrides.get("requested_model"),
+                            requested_provider=agent_overrides.get("requested_provider"),
+                            model_options=agent_overrides.get("model_options"),
+                            route=route,
+                        )
+                    self._active_run_agents[run_id] = agent
+
+                    def _approval_notify(approval_data: Dict[str, Any]) -> None:
+                        event = dict(approval_data or {})
+                        # Redact credentials from the command before it enters the
+                        # SSE/API event stream — same egress bug as #48456, second
+                        # transport: API/desktop clients would otherwise receive the
+                        # raw command Tirith flagged. Reuse the gateway seam.
+                        if "command" in event:
+                            from gateway.run import _redact_approval_command
+
+                            event["command"] = _redact_approval_command(event.get("command"))
+                        event.update({
+                            "event": "approval.request",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "choices": _approval_event_choices(
+                                smart_denied=bool(event.get("smart_denied")),
+                                allow_permanent=event.get("allow_permanent") is not False,
+                            ),
+                        })
+                        self._set_run_status(
+                            run_id,
+                            "waiting_for_approval",
+                            last_event="approval.request",
+                        )
+                        try:
+                            loop.call_soon_threadsafe(q.put_nowait, event)
+                        except Exception:
+                            pass
+
+                    def _run_sync():
+                        from gateway.session_context import clear_session_vars
+                        from tools.approval import (
+                            register_gateway_notify,
+                            reset_current_session_key,
+                            set_current_session_key,
+                            unregister_gateway_notify,
+                        )
+
+                        effective_task_id = session_id or run_id
+                        approval_token = None
+                        session_tokens = []
+                        with self._profile_scope(request_profile):
+                            try:
+                                # Bind approval/session identity for this API run via
+                                # contextvars so concurrent runs do not share process
+                                # environment state.
+                                approval_token = set_current_session_key(approval_session_key)
+                                session_tokens = self._bind_api_server_session(
+                                    # chat_id carries the raw session id (the
+                                    # X-Hermes-Session-Id equivalent) exactly like
+                                    # the other agent-entry routes bind it via
+                                    # _run_agent(). Without it,
+                                    # tools.async_delegation reads an empty
+                                    # HERMES_SESSION_CHAT_ID on /v1/runs and
+                                    # background delegations stay forced-sync
+                                    # (no wake target).
+                                    chat_id=session_id or "",
+                                    session_key=approval_session_key,
+                                    session_id=session_id or "",
+                                )
+                                register_gateway_notify(approval_session_key, _approval_notify)
+                                # /v1/runs runs its own agent lifecycle (no
+                                # TurnRunner, no _run_agent) — record turn process
+                                # ownership so stop/cancel can reap only the
+                                # background processes this run created (#76115).
+                                _publish_turn_process_ownership(agent, effective_task_id)
+                                r = agent.run_conversation(
+                                    user_message=user_message,
+                                    conversation_history=conversation_history,
+                                    task_id=effective_task_id,
+                                )
+                            finally:
+                                # Worker finished (interrupted or complete) —
+                                # clear turn ownership immediately so a later
+                                # stop/cancel can't reap background work this
+                                # run deliberately left running (same race-window
+                                # guard as gateway/run.py and _run_agent above).
+                                _clear_turn_process_ownership(agent)
+                                try:
+                                    unregister_gateway_notify(approval_session_key)
+                                finally:
+                                    if approval_token is not None:
+                                        try:
+                                            reset_current_session_key(approval_token)
+                                        except Exception:
+                                            pass
+                                    if session_tokens:
+                                        try:
+                                            clear_session_vars(session_tokens)
+                                        except Exception:
+                                            pass
+                            u = {
+                                "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
+                                "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
+                                "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
+                            }
+                            return r, u
+
+                    result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                    if run_id in self._stopping_run_ids:
+                        _put_event_if_active({
+                            "event": "run.cancelled",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                        })
+                        self._set_run_status(
+                            run_id,
+                            "cancelled",
+                            last_event="run.cancelled",
+                        )
+                    # Check for structured failure (non-retryable client errors like
+                    # 401/400 return failed=True instead of raising, so the except
+                    # block below never fires — issue #15561).
+                    elif isinstance(result, dict) and result.get("failed"):
+                        error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
+                        _put_event_if_active({
+                            "event": "run.failed",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "error": error_msg,
+                        })
+                        self._set_run_status(
+                            run_id,
+                            "failed",
+                            error=error_msg,
+                            last_event="run.failed",
+                        )
+                    else:
+                        final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                        # Undelivered steer text (accepted after the final response;
+                        # see turn_finalizer) rides on the terminal event/status so
+                        # the client can replay it as the next user turn.
+                        pending_steer = result.get("pending_steer") if isinstance(result, dict) else None
+                        completed_event = {
+                            "event": "run.completed",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "output": final_response,
+                            "usage": usage,
+                        }
+                        if pending_steer:
+                            completed_event["pending_steer"] = pending_steer
+                        _put_event_if_active(completed_event)
+                        self._set_run_status(
+                            run_id,
+                            "completed",
+                            output=final_response,
+                            usage=usage,
+                            last_event="run.completed",
+                            **({"pending_steer": pending_steer} if pending_steer else {}),
+                        )
+                except asyncio.CancelledError:
                     self._set_run_status(
                         run_id,
                         "cancelled",
                         last_event="run.cancelled",
-                    )
-                    return
-                with self._profile_scope(request_profile):
-                    agent = self._create_agent(
-                        ephemeral_system_prompt=ephemeral_system_prompt,
-                        session_id=session_id,
-                        stream_delta_callback=_text_cb,
-                        tool_progress_callback=event_cb,
-                        gateway_session_key=gateway_session_key,
-                        requested_model=agent_overrides.get("requested_model"),
-                        requested_provider=agent_overrides.get("requested_provider"),
-                        model_options=agent_overrides.get("model_options"),
-                        route=route,
-                    )
-                self._active_run_agents[run_id] = agent
-
-                def _approval_notify(approval_data: Dict[str, Any]) -> None:
-                    event = dict(approval_data or {})
-                    # Redact credentials from the command before it enters the
-                    # SSE/API event stream — same egress bug as #48456, second
-                    # transport: API/desktop clients would otherwise receive the
-                    # raw command Tirith flagged. Reuse the gateway seam.
-                    if "command" in event:
-                        from gateway.run import _redact_approval_command
-
-                        event["command"] = _redact_approval_command(event.get("command"))
-                    event.update({
-                        "event": "approval.request",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
-                            allow_permanent=event.get("allow_permanent") is not False,
-                        ),
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "waiting_for_approval",
-                        last_event="approval.request",
                     )
                     try:
-                        loop.call_soon_threadsafe(q.put_nowait, event)
+                        _put_event_if_active({
+                            "event": "run.cancelled",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                        })
                     except Exception:
                         pass
-
-                def _run_sync():
-                    from gateway.session_context import clear_session_vars
-                    from tools.approval import (
-                        register_gateway_notify,
-                        reset_current_session_key,
-                        set_current_session_key,
-                        unregister_gateway_notify,
-                    )
-
-                    effective_task_id = session_id or run_id
-                    approval_token = None
-                    session_tokens = []
-                    with self._profile_scope(request_profile):
-                        try:
-                            # Bind approval/session identity for this API run via
-                            # contextvars so concurrent runs do not share process
-                            # environment state.
-                            approval_token = set_current_session_key(approval_session_key)
-                            session_tokens = self._bind_api_server_session(
-                                # chat_id carries the raw session id (the
-                                # X-Hermes-Session-Id equivalent) exactly like
-                                # the other agent-entry routes bind it via
-                                # _run_agent(). Without it,
-                                # tools.async_delegation reads an empty
-                                # HERMES_SESSION_CHAT_ID on /v1/runs and
-                                # background delegations stay forced-sync
-                                # (no wake target).
-                                chat_id=session_id or "",
-                                session_key=approval_session_key,
-                                session_id=session_id or "",
-                            )
-                            register_gateway_notify(approval_session_key, _approval_notify)
-                            # /v1/runs runs its own agent lifecycle (no
-                            # TurnRunner, no _run_agent) — record turn process
-                            # ownership so stop/cancel can reap only the
-                            # background processes this run created (#76115).
-                            _publish_turn_process_ownership(agent, effective_task_id)
-                            r = agent.run_conversation(
-                                user_message=user_message,
-                                conversation_history=conversation_history,
-                                task_id=effective_task_id,
-                            )
-                        finally:
-                            # Worker finished (interrupted or complete) —
-                            # clear turn ownership immediately so a later
-                            # stop/cancel can't reap background work this
-                            # run deliberately left running (same race-window
-                            # guard as gateway/run.py and _run_agent above).
-                            _clear_turn_process_ownership(agent)
-                            try:
-                                unregister_gateway_notify(approval_session_key)
-                            finally:
-                                if approval_token is not None:
-                                    try:
-                                        reset_current_session_key(approval_token)
-                                    except Exception:
-                                        pass
-                                if session_tokens:
-                                    try:
-                                        clear_session_vars(session_tokens)
-                                    except Exception:
-                                        pass
-                        u = {
-                            "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                            "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                            "total_tokens": getattr(agent, "session_total_tokens", 0) or 0,
-                        }
-                        return r, u
-
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
-                if run_id in self._stopping_run_ids:
-                    _put_event_if_active({
-                        "event": "run.cancelled",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "cancelled",
-                        last_event="run.cancelled",
-                    )
-                # Check for structured failure (non-retryable client errors like
-                # 401/400 return failed=True instead of raising, so the except
-                # block below never fires — issue #15561).
-                elif isinstance(result, dict) and result.get("failed"):
-                    error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
-                    _put_event_if_active({
-                        "event": "run.failed",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "error": error_msg,
-                    })
+                    raise
+                except _ProviderAuthResolutionError as exc:
+                    # /v1/runs builds its own agent via _create_agent() and does
+                    # not route through _run_agent() (see that method's own
+                    # _ProviderAuthResolutionError branch), so it needs its own
+                    # handling to surface the same distinguished, controlled
+                    # message the other endpoints give a provider auth/credential
+                    # failure, instead of falling through to the generic
+                    # except-Exception branch below.
+                    logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
+                    error_msg = f"⚠️ Provider authentication failed: {exc}"
                     self._set_run_status(
                         run_id,
                         "failed",
                         error=error_msg,
                         last_event="run.failed",
                     )
-                else:
-                    final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                    # Undelivered steer text (accepted after the final response;
-                    # see turn_finalizer) rides on the terminal event/status so
-                    # the client can replay it as the next user turn.
-                    pending_steer = result.get("pending_steer") if isinstance(result, dict) else None
-                    completed_event = {
-                        "event": "run.completed",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "output": final_response,
-                        "usage": usage,
-                    }
-                    if pending_steer:
-                        completed_event["pending_steer"] = pending_steer
-                    _put_event_if_active(completed_event)
+                    try:
+                        _put_event_if_active({
+                            "event": "run.failed",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "error": error_msg,
+                        })
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    logger.exception("[api_server] run %s failed", run_id)
                     self._set_run_status(
                         run_id,
-                        "completed",
-                        output=final_response,
-                        usage=usage,
-                        last_event="run.completed",
-                        **({"pending_steer": pending_steer} if pending_steer else {}),
+                        "failed",
+                        error=_redact_api_error_text(exc),
+                        last_event="run.failed",
                     )
-            except asyncio.CancelledError:
-                self._set_run_status(
-                    run_id,
-                    "cancelled",
-                    last_event="run.cancelled",
-                )
-                try:
-                    _put_event_if_active({
-                        "event": "run.cancelled",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                    })
-                except Exception:
-                    pass
-                raise
-            except _ProviderAuthResolutionError as exc:
-                # /v1/runs builds its own agent via _create_agent() and does
-                # not route through _run_agent() (see that method's own
-                # _ProviderAuthResolutionError branch), so it needs its own
-                # handling to surface the same distinguished, controlled
-                # message the other endpoints give a provider auth/credential
-                # failure, instead of falling through to the generic
-                # except-Exception branch below.
-                logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
-                error_msg = f"⚠️ Provider authentication failed: {exc}"
-                self._set_run_status(
-                    run_id,
-                    "failed",
-                    error=error_msg,
-                    last_event="run.failed",
-                )
-                try:
-                    _put_event_if_active({
-                        "event": "run.failed",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "error": error_msg,
-                    })
-                except Exception:
-                    pass
-            except Exception as exc:
-                logger.exception("[api_server] run %s failed", run_id)
-                self._set_run_status(
-                    run_id,
-                    "failed",
-                    error=_redact_api_error_text(exc),
-                    last_event="run.failed",
-                )
-                try:
-                    _put_event_if_active({
-                        "event": "run.failed",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "error": _redact_api_error_text(exc),
-                    })
-                except Exception:
-                    pass
-            finally:
-                # If the asyncio wrapper is cancelled (for example via
-                # /stop), the executor thread can still be blocked waiting
-                # on an approval Event.  Unregistering here releases those
-                # waits immediately; the in-thread unregister is harmlessly
-                # idempotent on normal completion.
-                try:
-                    from tools.approval import unregister_gateway_notify
+                    try:
+                        _put_event_if_active({
+                            "event": "run.failed",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "error": _redact_api_error_text(exc),
+                        })
+                    except Exception:
+                        pass
+                finally:
+                    # If the asyncio wrapper is cancelled (for example via
+                    # /stop), the executor thread can still be blocked waiting
+                    # on an approval Event.  Unregistering here releases those
+                    # waits immediately; the in-thread unregister is harmlessly
+                    # idempotent on normal completion.
+                    try:
+                        from tools.approval import unregister_gateway_notify
 
-                    unregister_gateway_notify(approval_session_key)
-                except Exception:
-                    pass
-                # Sentinel: signal SSE stream to close
-                try:
-                    _put_event_if_active(None)
-                except Exception:
-                    pass
-                self._active_run_agents.pop(run_id, None)
-                self._active_run_tasks.pop(run_id, None)
-                self._run_approval_sessions.pop(run_id, None)
-                self._stopping_run_ids.discard(run_id)
+                        unregister_gateway_notify(approval_session_key)
+                    except Exception:
+                        pass
+                    # Sentinel: signal SSE stream to close
+                    try:
+                        _put_event_if_active(None)
+                    except Exception:
+                        pass
+                    self._active_run_agents.pop(run_id, None)
+                    self._active_run_tasks.pop(run_id, None)
+                    self._run_approval_sessions.pop(run_id, None)
+                    self._stopping_run_ids.discard(run_id)
 
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())

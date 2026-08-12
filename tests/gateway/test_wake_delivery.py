@@ -126,7 +126,7 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
 
 
 def test_session_turn_lock_serializes_same_session():
-    """Two _run_agent calls for the same session_id must not overlap (#84235)."""
+    """Same session_id must not overlap across _run_agent and /v1/runs (#84235)."""
     from gateway.platforms.api_server import APIServerAdapter
 
     adapter = APIServerAdapter.__new__(APIServerAdapter)
@@ -157,6 +157,19 @@ def test_session_turn_lock_serializes_same_session():
         "a:start",
         "a:end",
     ]
+
+
+def test_session_turn_lock_wired_into_run_agent_and_handle_runs():
+    """Both agent entry paths must acquire _hold_session_turn_lock."""
+    import inspect
+
+    from gateway.platforms.api_server import APIServerAdapter
+
+    run_agent_src = inspect.getsource(APIServerAdapter._run_agent)
+    handle_runs_src = inspect.getsource(APIServerAdapter._handle_runs)
+    assert "_hold_session_turn_lock" in run_agent_src
+    assert "_hold_session_turn_lock" in handle_runs_src
+    assert "async with self._hold_session_turn_lock(session_id)" in handle_runs_src
 
 
 def test_session_turn_lock_allows_different_sessions_in_parallel():
