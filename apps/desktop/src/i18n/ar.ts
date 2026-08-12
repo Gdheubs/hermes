@@ -1648,6 +1648,7 @@ export const ar = defineLocale({
       draftSession: 'مسودة — لم تُرسل بعد',
       finishedUnread: 'اكتملت وفيها جديد',
       hideTabBar: 'إخفاء شريط التبويبات',
+      showTabBar: 'إظهار شريط التبويبات',
       openInNewTab: 'فتح في تبويب جديد',
       openInSplit: 'فتح في تقسيم',
       ownedByProfile: profile => `مملوكة للملف الشخصي ${profile}`,
