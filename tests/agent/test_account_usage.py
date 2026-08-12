@@ -356,6 +356,36 @@ def test_kimi_usage_skips_legacy_and_custom_runtimes(monkeypatch, base_url):
     assert calls == []
 
 
+def test_kimi_usage_uses_effective_coding_plan_resolution(monkeypatch, kimi_usage_payload):
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, kimi_usage_payload),
+    )
+    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi-coding-plan-test")
+    monkeypatch.delenv("KIMI_BASE_URL", raising=False)
+
+    snapshot = account_usage.fetch_account_usage("kimi-coding")
+
+    assert snapshot is not None
+    assert calls[0]["url"] == "https://api.kimi.com/coding/v1/usages"
+
+
+def test_kimi_usage_skips_effective_legacy_resolution(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, {}),
+    )
+    monkeypatch.setenv("KIMI_API_KEY", "legacy-moonshot-key")
+    monkeypatch.delenv("KIMI_BASE_URL", raising=False)
+
+    assert account_usage.fetch_account_usage("kimi-coding") is None
+    assert calls == []
+
+
 def test_kimi_window_labels():
     assert account_usage._kimi_window_label({"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"}) == "5-hour"
     assert account_usage._kimi_window_label({"duration": 60, "timeUnit": "TIME_UNIT_MINUTE"}) == "Hourly"
