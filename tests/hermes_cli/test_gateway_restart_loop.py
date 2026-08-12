@@ -728,6 +728,24 @@ class TestLifecycleGuardModule:
         d.mkdir()
         assert contains_gateway_lifecycle_command_or_referenced_script(str(d)) is False
 
+    def test_fifo_referenced_script_fails_closed(self, tmp_path):
+        """A FIFO referenced as a script must STILL fail closed (ghosty-11
+        review on #83633). Unlike a directory, a FIFO can genuinely act as a
+        script source — ``bash myfifo`` executes whatever the writer feeds
+        it — so the directory-only exemption must not let it slip through.
+        The walk yields it and the bounded read's non-regular-file check
+        fails closed."""
+        import os
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        fifo = tmp_path / "script.fifo"
+        os.mkfifo(fifo)
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(str(fifo))
+            is True
+        )
+
     def test_missing_script_path_not_blocked(self):
         """A non-existent path is not a threat: the shell would fail to exec
         it. The walk must skip it rather than fail closed."""
@@ -742,7 +760,7 @@ class TestLifecycleGuardModule:
         )
 
     def test_real_referenced_script_still_scanned(self, tmp_path):
-        """The is_file() gate must NOT weaken the guard: a real script file
+        """The directory exemption must NOT weaken the guard: a real script file
         referenced by path is still read and scanned for lifecycle commands."""
         from cron.lifecycle_guard import (
             contains_gateway_lifecycle_command_or_referenced_script,

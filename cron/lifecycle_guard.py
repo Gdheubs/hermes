@@ -397,15 +397,19 @@ def _iter_referenced_shell_scripts(
         if executable.strip("/"):
             if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
                 resolved = _resolve_terminal_script_path(executable, cwd)
-                # Only a real regular file is an executable script reference.
-                # Path-shaped string literals inside `python3 -c` payloads
-                # (e.g. `os.path.expanduser('~/.hermes/scripts')`) are
-                # tokenized by _iter_command_segments and can look like
-                # absolute script paths; yielding a directory here makes the
-                # bounded read fail closed (non-regular file) and hard-blocks
-                # an innocent terminal command. A missing path is not a
-                # threat either — the shell would fail to exec it.
-                if resolved is not None and resolved.is_file():
+                # A directory is not an executable script reference — the
+                # shell would fail to exec it — and skipping it fixes the
+                # #83633 false positive where a path-shaped string literal
+                # inside a `python3 -c` payload (e.g.
+                # `os.path.expanduser('~/.hermes/scripts')`) resolved to a
+                # directory and hard-blocked an innocent command.
+                # Everything else still yields: regular files are scanned
+                # normally, and non-regular files (FIFOs, sockets) are NOT
+                # exempted here — a FIFO can genuinely act as a script source
+                # (`bash myfifo` executes whatever the writer feeds it), so
+                # it must keep failing closed in the bounded read below
+                # rather than being skipped like a directory.
+                if resolved is not None and not resolved.is_dir():
                     yield resolved
 
 
