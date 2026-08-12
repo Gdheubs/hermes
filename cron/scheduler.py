@@ -2030,6 +2030,7 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
                 "platform": platform_name,
                 "chat_id": chat_id,
                 "thread_id": _get_home_target_thread_id(platform_name),
+                "agent_id": _agent_id,
             }
         return {
             "platform": platform_name,

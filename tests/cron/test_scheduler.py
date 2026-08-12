@@ -198,6 +198,7 @@ class TestResolveDeliveryTarget:
             "platform": "discord",
             "chat_id": "home-parent",
             "thread_id": None,
+            "agent_id": None,
         }
 
     def test_telegram_cron_thread_id_overrides_home_thread_id(self, monkeypatch):
