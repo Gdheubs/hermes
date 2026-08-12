@@ -214,8 +214,15 @@ def _patched_receiver(decrypted_payload, **kwargs):
     fake_decoder.decode.return_value = b"\x00\x01" * 48  # 96 bytes PCM
     fake_discord = MagicMock()
     fake_discord.opus.Decoder.return_value = fake_decoder
+    fake_nacl_secret = SimpleNamespace(Aead=_FakeAead)
     patches = [
-        patch("nacl.secret.Aead", _FakeAead),
+        patch.dict(
+            sys.modules,
+            {
+                "nacl": SimpleNamespace(secret=fake_nacl_secret),
+                "nacl.secret": fake_nacl_secret,
+            },
+        ),
         patch.object(voice_receiver, "discord", fake_discord),
     ]
     if "dave_session" in kwargs:
