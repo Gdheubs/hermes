@@ -1,7 +1,6 @@
 import { atom, computed, type ReadableAtom } from 'nanostores'
 
 import type { HermesGitWorktree, HermesRepoStatus } from '@/global'
-import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
 import { desktopGit } from '@/lib/desktop-git'
 
 import {
@@ -95,9 +94,10 @@ export function repoStatusForCwd(cwd?: null | string): ReadableAtom<HermesRepoSt
  * Is this path a git repo? This function reads the probe cache, and probes on
  * demand when the cache has no entry for the path. Use it to validate any repo
  * that was picked out of candidate FOLDERS: a path in a project row is not
- * evidence that git can branch from it. On a remote gateway the probe runs
- * against the VPS path; if the path does not exist on the VPS the backend
- * returns null and this returns false.
+ * evidence that git can branch from it. `desktopGit()` returns the REST bridge
+ * on a remote gateway, so the probe runs against the VPS path; if the path does
+ * not exist on the VPS the backend returns null and this returns false. The
+ * probe is the single source of truth for repo-ness on local AND remote.
  */
 export async function isGitRepoPath(cwd: string): Promise<boolean> {
   const key = normalizeCwd(cwd)
@@ -499,14 +499,13 @@ export function _resetCodingStatusForTests(): void {
 // repo is in reach. That is a no-op and not an error, because a worktree only
 // exists inside a repo.
 //
-// On a remote gateway, the candidate cwd is whatever the backend reported
-// for the focused session / project. `desktopGit()` already returns the
-// REST bridge there, so the `isGitRepoPath` probe would be backend-routed
-// too — but the probe was the thing that made ⌘⇧B a silent no-op in the
-// first place (a VPS-only path looked like "not a repo" under the old
-// local-only gate, #81724). Trust the candidate here and let the backend's
-// `git worktree add` surface a clean 400 if the path is not actually a
-// repo on the VPS.
+// On a remote gateway the candidate cwd is whatever the backend reported for
+// the focused session / project, and `desktopGit()` already resolves to the
+// REST bridge there, so `isGitRepoPath` probes the VPS path directly — a real
+// repo returns non-null and the dialog opens, while a path that is not a repo
+// on the VPS returns null and stays a no-op. The probe is the single gate on
+// both backends; there is no remote-specific trust bypass, because the backend
+// is what decides "is this a repo" in the first place. (#81724)
 export async function resolveWorktreeRepoPath(): Promise<string> {
   const runtimeId = $focusedRuntimeId.get()
   const scope = $projectScope.get()
@@ -519,11 +518,7 @@ export async function resolveWorktreeRepoPath(): Promise<string> {
   for (const candidate of candidates) {
     const path = candidate.trim()
 
-    if (!path) {
-      continue
-    }
-
-    if (isDesktopFsRemoteMode() || (await isGitRepoPath(path))) {
+    if (path && (await isGitRepoPath(path))) {
       return path
     }
   }
