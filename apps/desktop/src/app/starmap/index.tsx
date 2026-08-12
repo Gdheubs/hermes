@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 
 import { PageLoader } from '@/components/page-loader'
 import { useI18n } from '@/i18n'
+import { openSessionTile } from '@/store/session-states'
 import { $starmapError, $starmapGraph, $starmapLoading, loadStarmapGraph } from '@/store/starmap'
 import type { StarmapGraph } from '@/types/hermes'
 
@@ -50,6 +51,12 @@ export function StarmapView({ onClose }: { onClose: () => void }) {
           graph={shown}
           imported={imported !== null}
           onImport={setImported}
+          onOpenSession={id => {
+            // Drill-down from a node: open the conversation as a tile stacked
+            // into the main zone, then close the map so it's readable.
+            openSessionTile(id, 'center')
+            onClose()
+          }}
           onResetMap={() => setImported(null)}
         />
       ) : null}

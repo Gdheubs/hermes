@@ -1091,6 +1091,40 @@ export interface Translations {
     importSuccess: (nodes: number) => string
     importedBadge: string
     resetToMine: string
+    sessionsTitle: string
+    sessionsLoading: string
+    sessionsEmpty: string
+    sessionsProviderOnly: string
+    sessionsSearchNote: string
+    openSession: string
+    viewSource: string
+    sourceTitle: string
+    sourceLoading: string
+    sourceEmpty: string
+    backToSessions: string
+    provenanceMenu: string
+    providerReadOnly: (provider: string) => string
+    recreate: string
+    recreating: string
+    recreateFailed: string
+    searchTitle: string
+    searchPlaceholder: string
+    searchRecent: string
+    searchSaved: string
+    searchSave: string
+    searchDeleteSaved: string
+    searchFiltersOnly: string
+    searchKind: string
+    searchKindAll: string
+    searchKindSkills: string
+    searchSource: string
+    searchSourceAll: string
+    searchSourceHermes: string
+    searchSourceImported: (source: string) => string
+    searchFrom: string
+    searchTo: string
+    searchCount: (n: number) => string
+    searchEmpty: string
   }
   agents: {
     close: string

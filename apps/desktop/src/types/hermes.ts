@@ -709,13 +709,25 @@ export interface StarmapNode {
   id: string
   label: string
   kind: 'memory' | 'skill'
-  memorySource?: 'memory' | 'profile'
+  /** 'memory' (MEMORY.md) | 'profile' (USER.md) | a memory-provider name
+   *  ('honcho', …) for nodes contributed by an external provider's
+   *  journey_cards(). Provider nodes are read-only in the journey. */
+  memorySource?: string
+  /** Where the knowledge originally came from: 'hermes' (born in a Hermes
+   *  conversation / file memory / skill) or an import source ('chatgpt', …).
+   *  Backend stamps provider nodes; absent (older backend) means 'hermes'. */
+  origin?: string
   timestamp?: null | number
   category: string
   useCount: number
   state: string
   createdBy: null | string
   pinned: boolean
+  /** Provider-side session this entry was derived from (e.g. a Honcho
+   *  conclusion's session). For Hermes-born sessions this doubles as the
+   *  Hermes session id; for imported history it only resolves in the
+   *  provider backend. Absent on skills and file-based memory chunks. */
+  sessionId?: string
 }
 
 /** A declared `related_skills` link; both endpoints are guaranteed to be nodes. */
@@ -731,7 +743,8 @@ export interface StarmapCluster {
 
 /** Freeform memory rendered as a card — never a graph node. */
 export interface StarmapMemoryCard {
-  source: 'memory' | 'profile'
+  /** 'memory' | 'profile' | a memory-provider name (see StarmapNode.memorySource). */
+  source: string
   timestamp?: null | number
   title: string
   body: string

@@ -3,6 +3,8 @@ import { atom, type WritableAtom } from 'nanostores'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { useThemeEpoch } from '@/hooks/use-theme-epoch'
+import { useI18n } from '@/i18n'
+import { Search } from '@/lib/icons'
 import { createDoubleTapDetector, isSmartZoomWheel } from '@/lib/trackpad-gestures'
 import type { StarmapGraph } from '@/types/hermes'
 
@@ -10,7 +12,9 @@ import { computePalette, memoryInkFor, resolveRgb, rgba } from './color'
 import { RING_OUTER, TILT, ZOOM_MAX, ZOOM_MIN } from './constants'
 import { clamp, distToSegmentSq, fitScale, fitViewport, nodeRadius } from './geometry'
 import { NodeContextMenu, type NodeMenuTarget } from './node-context-menu'
-import { drawScene, drawScramble } from './render'
+import { NodeSessionsDialog } from './node-sessions-dialog'
+import { drawScene, drawScramble, drawSearchPulse } from './render'
+import { SearchSidebar } from './search-sidebar'
 import { decodeShareCode, encodeShareCode, ShareCodeError } from './share-code'
 import { ShareControls } from './share-controls'
 import { buildSimulation } from './simulation'
@@ -99,15 +103,18 @@ export function StarMap({
   graph,
   imported = false,
   onImport,
+  onOpenSession,
   onResetMap
 }: {
   graph: StarmapGraph
   imported?: boolean
   onImport?: (graph: StarmapGraph) => void
+  onOpenSession?: (storedSessionId: string) => void
   onResetMap?: () => void
 }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
   const wrapRef = useRef<HTMLDivElement | null>(null)
+  const { t } = useI18n()
 
   const simRef = useRef<null | Simulation<SimNode, SimLink>>(null)
   const nodesRef = useRef<SimNode[]>([])
@@ -155,6 +162,13 @@ export function StarMap({
 
   const [selectedId, setSelectedId] = useState<null | string>(null)
   const [menuTarget, setMenuTarget] = useState<NodeMenuTarget | null>(null)
+  // Double-click drill-down: the node whose originating session(s) are shown.
+  const [sessionsTarget, setSessionsTarget] = useState<null | SimNode>(null)
+  // Search sidebar (toggled by the search icon). matchesRef feeds the canvas
+  // pulse layer without re-rendering the paint loop; the state mirror only
+  // drives the sidebar mount.
+  const [searchOpen, setSearchOpen] = useState(false)
+  const matchesRef = useRef<null | Set<string>>(null)
   const [size, setSize] = useState({ h: 0, w: 0 })
   // Increments on every theme repaint (shared hook) so the legend swatch and the
   // canvas palette re-resolve against the freshly-painted CSS custom properties.
@@ -223,6 +237,52 @@ export function StarMap({
     for (const bucket of Object.values(fadeRef.current)) {
       bucket.clear()
     }
+  }, [])
+
+  // Search-sidebar plumbing. Matches feed the canvas pulse via ref (paint loop
+  // reads it directly); focus centers the viewport on the node; the row menu
+  // reuses the exact context menu canvas nodes get.
+  const onMatchesChange = useCallback(
+    (ids: null | Set<string>) => {
+      matchesRef.current = ids
+      invalidate()
+    },
+    [invalidate]
+  )
+
+  const focusNode = useCallback(
+    (id: string) => {
+      const node = byIdRef.current.get(id)
+
+      if (!node) {
+        return
+      }
+
+      setSelectedId(id)
+      const { h, w } = sizeRef.current
+      const k = viewportRef.current.k
+      viewportRef.current = { k, x: w / 2 - node.x * k, y: h / 2 - node.y * k * TILT }
+      invalidate()
+    },
+    [invalidate]
+  )
+
+  const openNodeMenuAt = useCallback((id: string, x: number, y: number) => {
+    const node = byIdRef.current.get(id)
+
+    if (!node) {
+      return
+    }
+
+    setSelectedId(id)
+    setMenuTarget({
+      id: node.id,
+      kind: node.kind === 'memory' ? 'memory' : 'skill',
+      label: node.label,
+      memorySource: node.memorySource,
+      x,
+      y
+    })
   }, [])
 
   const memById = useMemo(() => {
@@ -616,6 +676,21 @@ export function StarMap({
         ctx.drawImage(staticCanvas, 0, 0)
         drawScramble({ ctx, dpr: dprRef.current, palette, rings: ringsRef.current, vp: viewportRef.current })
       }
+
+      // Search matches breathe on top of everything — they must stay visible
+      // over both composite orders. Animated, so it rides the live layer with
+      // the scramble (never the cached scene).
+      if (matchesRef.current && matchesRef.current.size > 0) {
+        drawSearchPulse({
+          ctx,
+          dpr: dprRef.current,
+          matches: matchesRef.current,
+          nodes: nodesRef.current,
+          now: performance.now(),
+          palette,
+          vp: viewportRef.current
+        })
+      }
     }
 
     const frame = (ts: number) => {
@@ -845,9 +920,18 @@ export function StarMap({
 
     // A click (press without movement) toggles a ring date, a node, or clears.
     if (drag.mode === 'pan' && !drag.moved) {
-      // Double tap (trackpad tap-to-click may never emit a dblclick) resets view.
+      // Double tap (trackpad tap-to-click may never emit a dblclick): on a
+      // node it drills into the sessions that produced it; on empty space it
+      // resets the view.
       if (doubleTapRef.current()) {
-        resetView()
+        if (drag.id) {
+          const node = byIdRef.current.get(drag.id) ?? null
+          setSelectedId(drag.id)
+          setSessionsTarget(node)
+        } else {
+          resetView()
+        }
+
         dragRef.current = { id: null, mode: 'none', moved: false, ring: null, sx: 0, sy: 0, vp: viewportRef.current }
 
         return
@@ -875,6 +959,22 @@ export function StarMap({
     hoveredLinkRef.current = null
     invalidate()
     endDrag()
+  }
+
+  // Native dblclick (real mice): mirror the double-tap path — a node opens
+  // the sessions drill-down, empty space resets. Without the node guard this
+  // would resetView right after endDrag's double-tap already opened the
+  // dialog, stomping the selection it just made.
+  const onDoubleClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const { x, y } = localXY(e)
+    const node = pickNode(x, y)
+
+    if (node) {
+      setSelectedId(node.id)
+      setSessionsTarget(node)
+    } else {
+      resetView()
+    }
   }
 
   const onContextMenu = (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -926,7 +1026,7 @@ export function StarMap({
       <canvas
         className="block touch-none select-none text-foreground"
         onContextMenu={onContextMenu}
-        onDoubleClick={resetView}
+        onDoubleClick={onDoubleClick}
         onMouseDown={onMouseDown}
         onMouseLeave={onMouseLeave}
         onMouseMove={onMouseMove}
@@ -941,8 +1041,52 @@ export function StarMap({
           setMenuTarget(null)
           setSelectedId(null)
         }}
+        onShowProvenance={id => {
+          // Same drill-down as double-click, reachable from the right-click
+          // menu so every node action lives in one place.
+          const node = byIdRef.current.get(id) ?? null
+          setSelectedId(id)
+          setSessionsTarget(node)
+        }}
         target={menuTarget}
       />
+
+      <NodeSessionsDialog
+        onClose={() => setSessionsTarget(null)}
+        onOpenSession={id => {
+          setSessionsTarget(null)
+          onOpenSession?.(id)
+        }}
+        target={sessionsTarget}
+      />
+
+      {/* Search toggle — top-right, under the panel close button. */}
+      <button
+        aria-label={t.starmap.searchTitle}
+        className={`absolute right-2 top-14 z-20 cursor-pointer rounded-md border p-1.5 backdrop-blur-md transition-colors [-webkit-app-region:no-drag] ${
+          searchOpen
+            ? 'border-(--ui-stroke-secondary) bg-(--ui-control-active-background) text-foreground'
+            : 'border-transparent text-muted-foreground hover:border-(--ui-stroke-secondary) hover:text-foreground'
+        }`}
+        onClick={() => setSearchOpen(open => !open)}
+        type="button"
+      >
+        <Search className="size-4" />
+      </button>
+
+      {/* Search sidebar — overlays the right edge, only when toggled on. */}
+      {searchOpen ? (
+        <div className="absolute inset-y-0 right-0 z-30">
+          <SearchSidebar
+            graph={graph}
+            memoryColor={memoryColor}
+            onClose={() => setSearchOpen(false)}
+            onFocusNode={focusNode}
+            onMatchesChange={onMatchesChange}
+            onNodeMenu={openNodeMenuAt}
+          />
+        </div>
+      ) : null}
 
       {/* Timeline scrubber — centered along the top, clear of the close button.
           z-20 lifts it above the titlebar's app-region drag layer (z-10) so the

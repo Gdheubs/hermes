@@ -6,15 +6,21 @@ import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { deleteLearningNode, editLearningNode, getLearningNode } from '@/hermes'
+import { useI18n } from '@/i18n'
 import { notifyError } from '@/store/notifications'
 import { evictStarmapNode, loadStarmapGraph } from '@/store/starmap'
 
 import { useOnProfileSwitch } from '../hooks/use-on-profile-switch'
 
+import { isProviderSource } from './sources'
+
 export interface NodeMenuTarget {
   id: string
   kind: 'memory' | 'skill'
   label: string
+  /** Memory nodes only: 'memory' | 'profile' | a provider name ('honcho', …).
+   *  Provider-backed nodes are read-only — the menu offers no Edit/Delete. */
+  memorySource?: string
   x: number
   y: number
 }
@@ -22,6 +28,8 @@ export interface NodeMenuTarget {
 interface NodeContextMenuProps {
   onClose: () => void
   onNodeRemoved: () => void
+  /** Open the provenance dialog ("Where this came from…") for this node. */
+  onShowProvenance: (id: string) => void
   target: NodeMenuTarget | null
 }
 
@@ -31,8 +39,11 @@ interface EditState {
   label: string
 }
 
-/** Right-click actions for a star-map node: edit (modal) or delete (confirm). */
-export function NodeContextMenu({ onClose, onNodeRemoved, target }: NodeContextMenuProps) {
+/** Right-click actions for a star-map node: provenance, edit (modal), delete (confirm).
+ *  Provider-backed memory nodes are read-only (their storage lives in the
+ *  provider's backend), so Edit/Delete are replaced by a hint. */
+export function NodeContextMenu({ onClose, onNodeRemoved, onShowProvenance, target }: NodeContextMenuProps) {
+  const { t } = useI18n()
   const [editing, setEditing] = useState<EditState | null>(null)
   const [deleting, setDeleting] = useState<Omit<NodeMenuTarget, 'x' | 'y'> | null>(null)
   const [loading, setLoading] = useState(false)
@@ -120,23 +131,41 @@ export function NodeContextMenu({ onClose, onNodeRemoved, target }: NodeContextM
           >
             <div className="truncate px-2 py-1 text-[0.68rem] text-muted-foreground">{target.label}</div>
             <button
-              className="block w-full cursor-pointer rounded-md px-2 py-1 text-left text-xs hover:bg-(--ui-control-active-background) hover:text-foreground disabled:opacity-50"
-              disabled={loading}
-              onClick={() => void openEdit()}
-              type="button"
-            >
-              Edit {noun}…
-            </button>
-            <button
-              className="block w-full cursor-pointer rounded-md px-2 py-1 text-left text-xs text-destructive hover:bg-destructive/10"
+              className="block w-full cursor-pointer rounded-md px-2 py-1 text-left text-xs hover:bg-(--ui-control-active-background) hover:text-foreground"
               onClick={() => {
-                setDeleting({ id: target.id, kind: target.kind, label: target.label })
+                onShowProvenance(target.id)
                 onClose()
               }}
               type="button"
             >
-              {target.kind === 'skill' ? 'Archive skill' : 'Delete memory'}
+              {t.starmap.provenanceMenu}
             </button>
+            {isProviderSource(target.memorySource) ? (
+              <div className="max-w-56 px-2 py-1 text-[0.68rem] text-muted-foreground">
+                {t.starmap.providerReadOnly(target.memorySource)}
+              </div>
+            ) : (
+              <>
+                <button
+                  className="block w-full cursor-pointer rounded-md px-2 py-1 text-left text-xs hover:bg-(--ui-control-active-background) hover:text-foreground disabled:opacity-50"
+                  disabled={loading}
+                  onClick={() => void openEdit()}
+                  type="button"
+                >
+                  Edit {noun}…
+                </button>
+                <button
+                  className="block w-full cursor-pointer rounded-md px-2 py-1 text-left text-xs text-destructive hover:bg-destructive/10"
+                  onClick={() => {
+                    setDeleting({ id: target.id, kind: target.kind, label: target.label })
+                    onClose()
+                  }}
+                  type="button"
+                >
+                  {target.kind === 'skill' ? 'Archive skill' : 'Delete memory'}
+                </button>
+              </>
+            )}
           </div>
         </>
       ) : null}

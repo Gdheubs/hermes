@@ -862,3 +862,66 @@ export function drawScramble({
   ctx.restore()
   ctx.globalAlpha = 1
 }
+
+// Search-match pulse: a breathing halo around every matched node, drawn live
+// each frame (same layer discipline as the scramble — it's animation, so it
+// stays out of the cached static scene). Reads the node's CURRENT world
+// position, so pulses track drags/zooms for free.
+export function drawSearchPulse({
+  ctx,
+  dpr,
+  matches,
+  nodes,
+  now,
+  palette,
+  vp
+}: {
+  ctx: CanvasRenderingContext2D
+  dpr: number
+  matches: Set<string>
+  nodes: SimNode[]
+  now: number
+  palette: Palette
+  vp: Viewport
+}): void {
+  if (matches.size === 0) {
+    return
+  }
+
+  const { memoryInk, skillInk } = palette
+  const projX = (wx: number) => wx * vp.k + vp.x
+  const projY = (wy: number) => wy * vp.k * TILT + vp.y
+
+  // One shared phase (~1.6s cycle) keeps a large result set reading as a
+  // single coordinated "these are your matches" signal instead of noise.
+  const phase = (now % 1600) / 1600
+  const swell = 0.5 - 0.5 * Math.cos(phase * Math.PI * 2) // 0→1→0, eased
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+
+  for (const n of nodes) {
+    if (!matches.has(n.id)) {
+      continue
+    }
+
+    const sx = projX(n.x)
+    const sy = projY(n.y)
+    const r = nodeRadius(n) + 3 + swell * 7
+    const ink = n.kind === 'memory' ? memoryInk : skillInk
+
+    // Outer breathing ring…
+    ctx.globalAlpha = 0.55 * (1 - swell) + 0.15
+    ctx.strokeStyle = rgba(ink, 1)
+    ctx.lineWidth = 1.6
+    shapePath(ctx, NODE_SHAPE[n.kind], sx, sy, r)
+    ctx.stroke()
+
+    // …and a steady inner glow so matches stay findable at the dim end.
+    ctx.globalAlpha = 0.35
+    ctx.lineWidth = 1
+    shapePath(ctx, NODE_SHAPE[n.kind], sx, sy, nodeRadius(n) + 2.5)
+    ctx.stroke()
+  }
+
+  ctx.globalAlpha = 1
+}
