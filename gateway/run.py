@@ -7341,6 +7341,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("[Gateway] reaction hook emit failed", exc_info=True)
 
+    async def _invoke_plugin_lifecycle(self, hook_name: str) -> None:
+        """Invoke await-aware plugin gateway lifecycle without breaking core."""
+        try:
+            from hermes_cli.lifecycle import invoke_hook_async
+
+            await invoke_hook_async(
+                hook_name,
+                callback_timeout=10.0,
+                gateway=self,
+                adapters=self.adapters,
+                profile_adapters=getattr(self, "_profile_adapters", {}),
+            )
+        except Exception:
+            logger.warning(
+                "Plugin lifecycle hook %s failed",
+                hook_name,
+                exc_info=True,
+            )
+
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:
         """React to an adapter failure after startup.
 
@@ -11805,6 +11824,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await self.hooks.emit("gateway:startup", {
             "platforms": [p.value for p in self.adapters.keys()],
         })
+        await GatewayRunner._invoke_plugin_lifecycle(self, "gateway_ready")
         
         if connected_count > 0:
             logger.info("Gateway running with %s platform(s)", connected_count)
@@ -13438,6 +13458,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await self._cleanup_agent_resources_off_loop(
                         _agent, context="shutdown idle-cache"
                     )
+
+            await GatewayRunner._invoke_plugin_lifecycle(self, "gateway_stopping")
 
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
