@@ -205,8 +205,17 @@ function VirtualizedReviewList({
   rows: ReviewFlatRow[]
   scrollRef: RefObject<HTMLDivElement | null>
 }) {
+  // Defensive clamp: see virtual-session-list.tsx for the full rationale.
+  // A non-finite/negative count reaches virtual-core's defaultRangeExtractor
+  // (`new Array(len)`) and throws `RangeError: Invalid array length`.
+  const rowCount = Number.isFinite(rows.length) ? Math.max(0, Math.trunc(rows.length)) : 0
+
+  if (process.env.NODE_ENV !== 'production' && rowCount !== rows.length) {
+    console.warn('[file-tree] clamped invalid rows.length', { length: rows.length, isArray: Array.isArray(rows) })
+  }
+
   const virtualizer = useVirtualizer({
-    count: rows.length,
+    count: rowCount,
     estimateSize: () => ROW_HEIGHT,
     getItemKey: index => rows[index]?.node.id ?? index,
     getScrollElement: () => scrollRef.current,

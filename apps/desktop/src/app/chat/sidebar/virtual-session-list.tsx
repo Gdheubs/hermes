@@ -64,8 +64,25 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   const dividerLabels = t.sidebar.dateDivider
   const scrollerRef = useRef<HTMLDivElement | null>(null)
 
+  // Defensive clamp: `listRows` is derived from a live session-refresh
+  // pipeline (sessions.changed → refreshSessions → mergeSessionPage →
+  // groupEntriesByRecency) that can race mid-render during a burst of
+  // change events. A non-finite or negative length here reaches
+  // @tanstack/virtual-core's defaultRangeExtractor, which does a bare
+  // `new Array(len)` and throws `RangeError: Invalid array length` — an
+  // uncaught render-time crash that only the top-level error boundary can
+  // catch, taking the whole shell down with it. Clamp at the source instead.
+  const rowCount = Number.isFinite(listRows.length) ? Math.max(0, Math.trunc(listRows.length)) : 0
+
+  if (process.env.NODE_ENV !== 'production' && rowCount !== listRows.length) {
+    console.warn('[virtual-session-list] clamped invalid listRows.length', {
+      length: listRows.length,
+      isArray: Array.isArray(listRows)
+    })
+  }
+
   const virtualizer = useVirtualizer({
-    count: listRows.length,
+    count: rowCount,
     estimateSize: () => ROW_ESTIMATE_PX,
     getItemKey: index => {
       const row = listRows[index]
