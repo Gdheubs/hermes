@@ -1526,6 +1526,7 @@ from hermes_cli.web_models import (  # noqa: F401
     CuratorPause,
     LearningNodeRef,
     LearningNodeEdit,
+    ProviderSessionMaterialize,
     DebugShareRequest,
     TTSSpeakRequest,
     OAuthSubmitBody,
@@ -4103,6 +4104,98 @@ async def update_learning_node(body: LearningNodeEdit):
     res = await asyncio.to_thread(_run)
     if not res.get("ok"):
         raise HTTPException(status_code=400, detail=res.get("message", "edit failed"))
+    return res
+
+
+@app.get("/api/learning/provider-session")
+async def get_learning_provider_session(
+    session_id: str, limit: int = 500, profile: Optional[str] = None
+):
+    """Source corpus behind a provider-contributed journey node.
+
+    Proxies the active memory provider's ``journey_session_messages`` hook —
+    the raw provider-side conversation a derived fact (e.g. a Honcho
+    conclusion) came from. Best-effort by the hook's contract: no provider,
+    unknown session, or backend down → empty message list, not an error.
+    """
+    def _read():
+        from plugins.memory import _get_active_memory_provider, load_memory_provider
+
+        name = _get_active_memory_provider()
+        if not name:
+            return None, []
+        provider = load_memory_provider(name)
+        if provider is None or not hasattr(provider, "journey_session_messages"):
+            return name, []
+        safe_limit = max(1, min(int(limit or 500), 2000))
+        raw = provider.journey_session_messages(session_id, limit=safe_limit) or []
+        from agent.learning_graph import _to_int_ts
+
+        messages = []
+        for m in raw:
+            if not isinstance(m, dict):
+                continue
+            content = str(m.get("content") or "")
+            if not content.strip():
+                continue
+            messages.append({
+                "content": content,
+                "peer": str(m.get("peer") or ""),
+                "timestamp": _to_int_ts(m.get("timestamp")),
+            })
+        return name, messages
+
+    try:
+        with _profile_scope(profile):
+            name, messages = await asyncio.to_thread(_read)
+    except Exception:
+        _log.exception("GET /api/learning/provider-session failed")
+        raise HTTPException(status_code=500, detail="Failed to load provider session")
+    return {"provider": name, "session_id": session_id, "messages": messages}
+
+
+@app.post("/api/learning/provider-session/materialize")
+async def materialize_learning_provider_session(body: ProviderSessionMaterialize):
+    """Recreate a provider-side conversation as a real Hermes session.
+
+    Journey drill-down action: the source corpus behind a provider node
+    (e.g. imported ChatGPT history in Honcho, or a Hermes conversation whose
+    row was deleted but whose sync copy survives in the provider) is shaped
+    by ``build_provider_session_import`` and written through the standard
+    session-import path. Import skips existing ids, so this is idempotent:
+    recreating an already-materialized conversation just returns its id with
+    ``created: false`` and the UI opens the existing session.
+    """
+    def _materialize():
+        from agent.learning_mutations import build_provider_session_import
+
+        with _profile_scope(body.profile):
+            built = build_provider_session_import(body.session_id)
+        if not built.get("ok"):
+            return built
+        result = _import_sessions_for_profile(body.profile, [built["session"]])
+        errors = result.get("errors") or []
+        if errors:
+            return {
+                "ok": False,
+                "message": str(errors[0].get("error", "import failed")),
+            }
+        return {
+            "ok": True,
+            "provider": built.get("provider"),
+            "session_id": built["session"]["id"],
+            "title": built["session"].get("title") or "",
+            "message_count": built.get("message_count", 0),
+            "created": bool(result.get("imported")),
+        }
+
+    try:
+        res = await asyncio.to_thread(_materialize)
+    except Exception:
+        _log.exception("POST /api/learning/provider-session/materialize failed")
+        raise HTTPException(status_code=500, detail="Failed to materialize provider session")
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res.get("message", "materialize failed"))
     return res
 
 

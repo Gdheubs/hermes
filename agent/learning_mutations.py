@@ -36,8 +36,17 @@ def _memories_dir() -> Path:
 def _parse_memory_id(node_id: str) -> tuple[str, int]:
     """``memory:<source>:<index>`` → (source, global_index)."""
     parts = node_id.split(":", 2)
-    if len(parts) != 3 or parts[0] != "memory" or parts[1] not in _MEMORY_FILES:
+    if len(parts) != 3 or parts[0] != "memory":
         raise ValueError(f"bad memory node id: {node_id!r}")
+    if parts[1] not in _MEMORY_FILES:
+        # Nodes contributed by an external memory provider (journey_cards)
+        # carry the provider name as their source. They are read-only here:
+        # their storage lives in the provider's backend, not in a §-file this
+        # module can rewrite.
+        raise ValueError(
+            f"this memory belongs to the '{parts[1]}' memory provider and is "
+            f"read-only in the journey — manage it with the provider's own tools"
+        )
     try:
         return parts[1], int(parts[2])
     except ValueError as exc:
@@ -184,6 +193,128 @@ def _edit_memory(node_id: str, content: str) -> dict[str, Any]:
     _write_memory(path, chunks)
 
     return {"ok": True, "message": f"updated memory in {path.name}"}
+
+
+# ── Materialize a provider session as a Hermes session ─────────────────────
+
+
+def build_provider_session_import(
+    session_id: str, limit: int = 2000
+) -> dict[str, Any]:
+    """Shape a provider-side conversation into an ``import_sessions`` payload.
+
+    The journey's "recreate this conversation" action: pulls the raw corpus
+    behind a provider-contributed node (``journey_session_messages``) and
+    returns a session dict ready for ``SessionDB.import_sessions`` — the same
+    validated path the dashboard's session-import uses, so limits, FK safety
+    and skip-existing idempotency all apply unchanged.
+
+    Design points:
+
+    - **Stable id** — the Hermes session id IS the provider session id. For
+      Hermes-born memories (per-session sync names the Honcho session after
+      the Hermes session) this resurrects a deleted conversation under its
+      original id; for imported history (``chatgpt-import-…``) the id is
+      deterministic, so recreating twice imports once and opens the same
+      session thereafter (import skips existing ids).
+    - **Role mapping** — providers that know which peer is the human send
+      ``role`` per message (the Honcho plugin does); otherwise the first
+      message's peer is assumed to be the user. Unattributed messages follow
+      the previous turn's role.
+    - **Alternation-safe** — consecutive same-role messages are merged so a
+      recreated session can be *continued* without violating the strict
+      user/assistant alternation contract.
+    - **Provenance preserved** — original message timestamps carry over;
+      ``started_at`` is the first message's time; ``source`` marks the
+      session as journey-recreated without hiding it from session lists.
+    """
+    sid = str(session_id or "").strip()
+    if not sid:
+        return {"ok": False, "message": "session_id is required"}
+
+    try:
+        from plugins.memory import _get_active_memory_provider, load_memory_provider
+    except Exception:
+        return {"ok": False, "message": "memory provider framework unavailable"}
+
+    provider_name = _get_active_memory_provider()
+    if not provider_name:
+        return {"ok": False, "message": "no active memory provider"}
+    provider = load_memory_provider(provider_name)
+    if provider is None or not hasattr(provider, "journey_session_messages"):
+        return {
+            "ok": False,
+            "message": f"provider '{provider_name}' does not expose session corpora",
+        }
+
+    safe_limit = max(1, min(int(limit or 2000), 10_000))
+    raw = provider.journey_session_messages(sid, limit=safe_limit) or []
+
+    from agent.learning_graph import _to_int_ts
+
+    shaped: list[dict[str, Any]] = []
+    first_peer: str | None = None
+    prev_role = "assistant"  # an unattributed opener defaults to user via first_peer
+    for m in raw:
+        if not isinstance(m, dict):
+            continue
+        content = str(m.get("content") or "")
+        if not content.strip():
+            continue
+        peer = str(m.get("peer") or "")
+        if first_peer is None and peer:
+            first_peer = peer
+        role = m.get("role")
+        if role not in ("user", "assistant"):
+            if peer and first_peer:
+                role = "user" if peer == first_peer else "assistant"
+            else:
+                role = "user" if prev_role == "assistant" else "assistant"
+        prev_role = role
+        ts = _to_int_ts(m.get("timestamp"))
+        if shaped and shaped[-1]["role"] == role:
+            # Merge consecutive same-role turns (alternation contract).
+            shaped[-1]["content"] += "\n\n" + content
+            if ts is not None and shaped[-1].get("timestamp") is None:
+                shaped[-1]["timestamp"] = ts
+        else:
+            shaped.append({"role": role, "content": content, "timestamp": ts})
+
+    if not shaped:
+        return {
+            "ok": False,
+            "message": (
+                "no source data available — the memory backend is unreachable "
+                "or no longer holds this session"
+            ),
+        }
+
+    timestamps = [m["timestamp"] for m in shaped if m.get("timestamp") is not None]
+    started_at = float(min(timestamps)) if timestamps else None
+
+    title = ""
+    for m in shaped:
+        if m["role"] == "user":
+            title = m["content"].strip().splitlines()[0].strip()
+            break
+    if len(title) > 72:
+        title = title[:72].rstrip() + "…"
+    if not title:
+        title = sid
+
+    session = {
+        "id": sid,
+        "source": f"journey:{provider_name}",
+        "title": title,
+        "messages": shaped,
+        **({"started_at": started_at} if started_at is not None else {}),
+    }
+    return {
+        "ok": True,
+        "provider": provider_name,
+        "session": session,
+        "message_count": len(shaped),
+    }
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
