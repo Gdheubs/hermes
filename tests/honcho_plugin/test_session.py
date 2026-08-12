@@ -1,6 +1,7 @@
 """Tests for plugins/memory/honcho/session.py — HonchoSession and helpers."""
 
 import sys
+import threading
 import time
 
 from datetime import datetime
@@ -80,6 +81,65 @@ def _install_fake_honcho_sdk(monkeypatch):
 
 
 class TestSessionPeerObservationConfig:
+    def test_concurrent_client_reads_cannot_restore_stale_client(self):
+        old_client = MagicMock(name="old_client")
+        new_client = MagicMock(name="new_client")
+        mgr = HonchoSessionManager()
+        first_read = threading.Event()
+        release_first = threading.Event()
+        calls = 0
+
+        def get_client():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_read.set()
+                assert release_first.wait(timeout=2)
+                return old_client
+            return new_client
+
+        with patch(
+            "plugins.memory.honcho.session.get_honcho_client",
+            side_effect=get_client,
+        ):
+            first = threading.Thread(target=lambda: mgr.honcho)
+            second = threading.Thread(target=lambda: mgr.honcho)
+            first.start()
+            assert first_read.wait(timeout=2)
+            second.start()
+            release_first.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert mgr._honcho is new_client
+
+    def test_config_driven_client_rebuild_clears_cached_sdk_objects(self):
+        old_client = MagicMock(name="old_client")
+        new_client = MagicMock(name="new_client")
+        old_peer = MagicMock(name="old_peer")
+        old_session = MagicMock(name="old_session")
+        new_peer = MagicMock(name="new_peer")
+        new_session = MagicMock(name="new_session")
+        new_client.peer.return_value = new_peer
+        new_client.session.return_value = new_session
+
+        mgr = HonchoSessionManager(honcho=old_client)
+        mgr._peers_cache["user"] = old_peer
+        mgr._sessions_cache["session"] = old_session
+
+        with patch(
+            "plugins.memory.honcho.session.get_honcho_client",
+            return_value=new_client,
+        ):
+            assert mgr._get_or_create_peer("user") is new_peer
+            assert mgr._sdk_session("session") is new_session
+
+        assert old_peer not in mgr._peers_cache.values()
+        assert old_session not in mgr._sessions_cache.values()
+        assert mgr._client_generation == 1
+
     def test_explicit_mismatch_updates_only_affected_peer(self, monkeypatch):
         _install_fake_honcho_sdk(monkeypatch)
         cfg = HonchoClientConfig(

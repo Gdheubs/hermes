@@ -25312,6 +25312,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         "honcho.environment",
         "honcho.base_url",
         "honcho.timeout",
+        "honcho.config_yaml_base_url",
+        "honcho.config_yaml_timeout",
+        "honcho.config_yaml_request_timeout",
         "honcho.peer_name",
         "honcho.ai_peer",
         "honcho.pin_peer_name",
@@ -25465,6 +25468,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         provider = cfg_get(cfg, "memory", "provider")
         if isinstance(provider, str) and provider.lower() == "honcho":
             out.update(cls._extract_honcho_cache_busting_config())
+            honcho_cfg = cfg.get("honcho")
+            if isinstance(honcho_cfg, dict):
+                out["honcho.config_yaml_base_url"] = honcho_cfg.get("base_url")
+                out["honcho.config_yaml_timeout"] = honcho_cfg.get("timeout")
+                out["honcho.config_yaml_request_timeout"] = honcho_cfg.get(
+                    "request_timeout"
+                )
         else:
             out.update(cls._empty_honcho_cache_busting_config())
 

@@ -348,6 +348,31 @@ class TestExtractCacheBustingConfig:
         assert explicit["honcho.observation_explicit"] is True
         assert explicit_signature != implicit_signature
 
+    def test_config_yaml_honcho_transport_settings_bust_signature(self):
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        before = GatewayRunner._extract_cache_busting_config(
+            {"memory": {"provider": "honcho"}}
+        )
+        after = GatewayRunner._extract_cache_busting_config(
+            {
+                "memory": {"provider": "honcho"},
+                "honcho": {
+                    "base_url": "https://honcho.example.com",
+                    "timeout": 12,
+                },
+            }
+        )
+
+        assert after["honcho.config_yaml_base_url"] == "https://honcho.example.com"
+        assert after["honcho.config_yaml_timeout"] == 12
+        assert GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", cache_keys=after
+        ) != GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", cache_keys=before
+        )
+
 
 class TestAgentCacheLifecycle:
     """End-to-end cache behavior with real AIAgent construction."""
