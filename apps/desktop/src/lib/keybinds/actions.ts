@@ -227,7 +227,7 @@ export interface KeybindReadonly {
   keys: readonly string[]
 }
 
-export const KEYBIND_READONLY: readonly KeybindReadonly[] = [
+export const DEFAULT_COMPOSER_READONLY: readonly KeybindReadonly[] = [
   { id: 'composer.send', category: 'composer', keys: ['enter'] },
   { id: 'composer.newline', category: 'composer', keys: ['shift+enter'] },
   { id: 'composer.steer', category: 'composer', keys: ['enter'] },
@@ -237,7 +237,28 @@ export const KEYBIND_READONLY: readonly KeybindReadonly[] = [
   { id: 'composer.slash', category: 'composer', keys: ['/'] },
   { id: 'composer.help', category: 'composer', keys: ['?'] },
   { id: 'composer.history', category: 'composer', keys: ['up', 'down'] },
-  { id: 'composer.cancel', category: 'composer', keys: ['escape'] },
+  { id: 'composer.cancel', category: 'composer', keys: ['escape'] }
+]
+
+export const MULTILINE_COMPOSER_READONLY: readonly KeybindReadonly[] = [
+  { id: 'composer.newline', category: 'composer', keys: ['enter'] },
+  { id: 'composer.send', category: 'composer', keys: ['mod+enter'] },
+  { id: 'composer.queue', category: 'composer', keys: ['mod+enter'] },
+  { id: 'composer.steer', category: 'composer', keys: ['shift+enter'] },
+  { id: 'composer.sendQueued', category: 'composer', keys: ['mod+shift+k'] },
+  { id: 'composer.mention', category: 'composer', keys: ['@'] },
+  { id: 'composer.slash', category: 'composer', keys: ['/'] },
+  { id: 'composer.help', category: 'composer', keys: ['?'] },
+  { id: 'composer.history', category: 'composer', keys: ['up', 'down'] },
+  { id: 'composer.cancel', category: 'composer', keys: ['escape'] }
+]
+
+export function composerReadonlyKeybinds(enterSends: boolean): readonly KeybindReadonly[] {
+  return enterSends ? DEFAULT_COMPOSER_READONLY : MULTILINE_COMPOSER_READONLY
+}
+
+export const KEYBIND_READONLY: readonly KeybindReadonly[] = [
+  ...DEFAULT_COMPOSER_READONLY,
   // Fixed, context-local shortcuts surfaced for discoverability.
   { id: 'view.terminalSelection', category: 'view', keys: ['mod+l'] },
   // Terminal clipboard. ⌘C/⌘V on macOS, Ctrl+Shift+C/V elsewhere — matching VS

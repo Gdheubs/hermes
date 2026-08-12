@@ -4,6 +4,7 @@ import { setTerminalFontFamilyFromConfig } from '@/app/right-sidebar/terminal/te
 import { getHermesConfig, getHermesConfigDefaults } from '@/hermes'
 import { BUILTIN_PERSONALITIES, normalizePersonalityValue, personalityNamesFromConfig } from '@/lib/chat-runtime'
 import { normalize } from '@/lib/text'
+import { applyComposerPrefsFromConfig } from '@/store/composer-prefs'
 import {
   getComposerSelectionGeneration,
   getCurrentModelSource,
@@ -111,6 +112,7 @@ export function useHermesConfig({ activeSessionIdRef }: HermesConfigOptions) {
         setSttEnabled(config.stt?.enabled !== false)
         setTerminalFontFamilyFromConfig(config.terminal?.font_family)
         applyAutoSpeakFromConfig(config)
+        applyComposerPrefsFromConfig(config)
         applyVoiceStopPhraseFromConfig(config)
         applyThinkingSoundFromConfig(config)
       } catch {
