@@ -84,6 +84,57 @@ def _hash_chat_id(value: str) -> str:
     return _hash_id(value)
 
 
+def session_key_for_log(session_key: object) -> str:
+    """Return a log-safe routing key without changing its runtime identity.
+
+    WhatsApp and WhatsApp Cloud DM keys contain phone-derived identifiers.
+    Other platforms can legitimately use comparable numeric IDs, so the
+    opt-in bare-phone redactor is restricted to the structured platform slot.
+    """
+    value = str(session_key)
+    parts = value.split(":")
+    if len(parts) < 3 or parts[2] not in {"whatsapp", "whatsapp_cloud"}:
+        return value
+
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(
+        value,
+        force=True,
+        redact_bare_phone_numbers=True,
+    )
+
+
+def log_safe_gateway_identity(platform: object, value: object) -> str:
+    """Return an identity suitable for a diagnostic log argument.
+
+    WhatsApp and WhatsApp Cloud use phone-derived identifiers for users and
+    chats.  Keep the platform scoping at this boundary: numeric identifiers
+    on other platforms remain useful diagnostics, while WhatsApp values are
+    either reversibly masked phone-shaped text or presence-only metadata.
+    This helper is for rendered logger arguments only; callers must continue
+    using the original value for routing, authorization, persistence, and
+    provider calls.
+    """
+    if value is None:
+        return "absent"
+    text = str(value)
+    platform_value = getattr(platform, "value", platform)
+    if str(platform_value or "").lower() not in {"whatsapp", "whatsapp_cloud"}:
+        return text
+
+    from agent.redact import redact_sensitive_text
+
+    redacted = redact_sensitive_text(
+        text,
+        force=True,
+        redact_bare_phone_numbers=True,
+    )
+    if redacted != text:
+        return redacted
+    return "present" if text else "absent"
+
+
 from .config import (
     Platform,
     GatewayConfig,
@@ -1309,10 +1360,11 @@ class SessionStore:
             return bool(self._has_active_processes_fn(session_key))
         except Exception as exc:
             logger.warning(
-                "has_active_processes_fn raised during %s for %s; keeping session alive: %s",
+                "has_active_processes_fn raised during %s for %s; keeping session alive "
+                "(error_type=%s)",
                 context,
-                session_key,
-                exc,
+                session_key_for_log(session_key),
+                type(exc).__name__,
             )
             return True
     
@@ -1363,7 +1415,9 @@ class SessionStore:
                                 self._entries[key] = SessionEntry.from_dict(entry_data)
                         except (ValueError, KeyError, TypeError) as e:
                             logger.warning(
-                                "Skipping invalid routing entry %r: %s", key, e
+                                "Skipping invalid routing entry %r: %s",
+                                session_key_for_log(key),
+                                e,
                             )
                     db_had_entries = bool(self._entries)
                 except Exception as e:
@@ -1397,14 +1451,18 @@ class SessionStore:
                         logger.warning(
                             "Skipping invalid session entry %r: "
                             "expected dict, got %s",
-                            key, type(entry_data).__name__,
+                            session_key_for_log(key), type(entry_data).__name__,
                         )
                         continue
                     try:
                         self._entries[key] = SessionEntry.from_dict(entry_data)
                         imported += 1
                     except (ValueError, KeyError, TypeError) as e:
-                        logger.warning("Skipping invalid session entry %r: %s", key, e)
+                        logger.warning(
+                            "Skipping invalid session entry %r: %s",
+                            session_key_for_log(key),
+                            e,
+                        )
                 if imported and db_had_entries:
                     logger.info(
                         "gateway.session: imported %d legacy sessions.json "
@@ -1463,7 +1521,7 @@ class SessionStore:
                             logger.debug(
                                 "gateway.session: recovery lookup failed for stale "
                                 "sessions.json entry %r -> %s: %s",
-                                key,
+                                session_key_for_log(key),
                                 entry.session_id,
                                 exc,
                             )
@@ -1483,7 +1541,7 @@ class SessionStore:
                         logger.warning(
                             "gateway.session: repointing stale sessions.json entry "
                             "%r from ended %s (end_reason=%r) to recovered %s",
-                            key,
+                            session_key_for_log(key),
                             entry.session_id,
                             row["end_reason"],
                             recovered_entry.session_id,
@@ -1495,7 +1553,7 @@ class SessionStore:
                     logger.warning(
                         "gateway.session: pruning stale sessions.json entry "
                         "%r -> %s (end_reason=%r); left by a crashed gateway",
-                        key, entry.session_id, row["end_reason"],
+                        session_key_for_log(key), entry.session_id, row["end_reason"],
                     )
                     stale_keys.append(key)
         except Exception as exc:
@@ -1737,8 +1795,8 @@ class SessionStore:
             except Exception as exc:
                 logger.warning(
                     "gateway.session: single-entry routing save failed for %r "
-                    "(%s); falling back to full index rewrite",
-                    session_key, exc,
+                    "(error_type=%s); falling back to full index rewrite",
+                    session_key_for_log(session_key), type(exc).__name__,
                 )
         if candidate_entry is not None:
             # DB upsert failed (or no DB): build the full snapshot now, carrying
@@ -1970,9 +2028,9 @@ class SessionStore:
             )
         except Exception as exc:
             logger.debug(
-                "Gateway session DB recovery failed for %s: %s",
-                session_key,
-                exc,
+                "Gateway session DB recovery failed for %s (error_type=%s)",
+                session_key_for_log(session_key),
+                type(exc).__name__,
             )
             if raise_on_lookup_error:
                 raise
@@ -2025,8 +2083,8 @@ class SessionStore:
                 "Gateway session DB recovery ignored %s for %s because "
                 "multiplex_profiles is disabled and the row belongs to a "
                 "different profile",
-                recovered.get("session_key"),
-                session_key,
+                session_key_for_log(recovered.get("session_key")),
+                session_key_for_log(session_key),
             )
             return None
         entry = self._create_entry_from_recovered_row(
@@ -2102,8 +2160,8 @@ class SessionStore:
                 "Gateway session DB recovery ignored %s for %s because "
                 "multiplex_profiles is disabled and the row belongs to a "
                 "different profile",
-                recovered.get("session_key"),
-                session_key,
+                session_key_for_log(recovered.get("session_key")),
+                session_key_for_log(session_key),
             )
             return None
         # Reopen only after the caller evaluates reset policy against durable
@@ -2165,9 +2223,17 @@ class SessionStore:
                     thread_id=source.thread_id,
                 )
             except Exception as exc:
-                logger.debug("Gateway session peer record failed for %s: %s", session_key, exc)
+                logger.debug(
+                    "Gateway session peer record failed for %s (error_type=%s)",
+                    session_key_for_log(session_key),
+                    type(exc).__name__,
+                )
         except Exception as exc:
-            logger.debug("Gateway session peer record failed for %s: %s", session_key, exc)
+            logger.debug(
+                "Gateway session peer record failed for %s (error_type=%s)",
+                session_key_for_log(session_key),
+                type(exc).__name__,
+            )
 
     def set_expiry_finalized(
         self, entry: SessionEntry, *, clear_model_override: bool = True
@@ -2226,7 +2292,7 @@ class SessionStore:
         if self._has_active_processes_safe(entry.session_key, context="expiry"):
             logger.debug(
                 "Session %s not expired — active background processes",
-                entry.session_key,
+                session_key_for_log(entry.session_key),
             )
             return False
 
@@ -2327,7 +2393,7 @@ class SessionStore:
         if self._has_active_processes_safe(session_key, context="reset"):
             logger.debug(
                 "Session reset skipped for %s — active background processes",
-                session_key,
+                session_key_for_log(session_key),
             )
             return None
 
@@ -2632,7 +2698,7 @@ class SessionStore:
                         "state.db but still live in sessions.json; dropping "
                         "stale entry and recovering/recreating the session "
                         "(#54878)",
-                        session_key, entry.session_id,
+                        session_key_for_log(session_key), entry.session_id,
                     )
                     self._entries.pop(session_key, None)
                     # If an expiry watcher (daily/idle reset) already finalized
