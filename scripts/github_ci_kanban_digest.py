@@ -78,7 +78,7 @@ class Check:
 
 def run_gh(args: list[str]) -> str:
     cmd = ["gh", *args]
-    return subprocess.run(cmd, text=True, capture_output=True, check=True).stdout
+    return subprocess.run(cmd, text=True, encoding="utf-8", capture_output=True, check=True).stdout
 
 
 def gh_json(runner: Runner, args: list[str]) -> Any:
@@ -89,7 +89,11 @@ def gh_json(runner: Runner, args: list[str]) -> Any:
 def infer_repo_from_git() -> Optional[str]:
     try:
         out = subprocess.run(
-            ["git", "remote", "get-url", "origin"], text=True, capture_output=True, check=True
+            ["git", "remote", "get-url", "origin"],
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            check=True,
         ).stdout.strip()
     except Exception:
         return None
