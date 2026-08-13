@@ -353,10 +353,10 @@ _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
 _SSH_OWNER_NONCE: Optional[str] = None
 
 
-def _apply_ssh_session_token(token: str) -> None:
+def _refresh_session_token_for_server_start(explicit_token: str = "") -> None:
+    """Rotate loopback credentials per server start unless explicitly pinned."""
     global _SESSION_TOKEN
-    if token:
-        _SESSION_TOKEN = token
+    _SESSION_TOKEN = explicit_token or _resolve_session_token()
 
 
 def _apply_ssh_owner_nonce(nonce: Optional[str]) -> None:
@@ -16068,6 +16068,217 @@ async def console_ws(ws: WebSocket) -> None:
                 pass
 
 
+_BROWSER_TERMINAL_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+
+
+def _browser_terminal_sessions() -> dict[str, Any]:
+    sessions = getattr(app.state, "browser_terminal_sessions", None)
+    if not isinstance(sessions, dict):
+        sessions = {}
+        app.state.browser_terminal_sessions = sessions
+    return sessions
+
+
+def _browser_terminal_shell_spec(env: Dict[str, str]) -> tuple[list[str], str]:
+    """Resolve the interactive shell used by browser-hosted Desktop terminals.
+
+    Mirrors the Electron shell preference on POSIX: explicit
+    HERMES_DESKTOP_SHELL, then $SHELL, then bash/zsh/sh from PATH. Termux's
+    canonical $SHELL points at its Bionic bash, so no glibc executable is ever
+    involved in the Android path.
+    """
+    candidates = [env.get("HERMES_DESKTOP_SHELL", ""), env.get("SHELL", "")]
+    candidates.extend(("bash", "zsh", "sh"))
+    resolved = ""
+    for raw in candidates:
+        value = str(raw or "").strip()
+        if not value:
+            continue
+        if os.path.isabs(value):
+            try:
+                if Path(value).is_file() and os.access(value, os.X_OK):
+                    resolved = value
+                    break
+            except OSError:
+                continue
+        else:
+            found = shutil.which(value, path=env.get("PATH"))
+            if found:
+                resolved = found
+                break
+    if not resolved:
+        raise FileNotFoundError("No interactive shell is available for browser-hosted Desktop")
+    name = Path(resolved).name
+    args = ["-il"] if ("bash" in name or "zsh" in name) else ["-i"]
+    return [resolved, *args], name
+
+
+def _browser_terminal_spawn_spec(
+    *,
+    cwd: Optional[str],
+    profile: Optional[str],
+) -> tuple[list[str], str, Dict[str, str], str]:
+    """Build argv/cwd/env for the Desktop shell PTY without crossing an await."""
+    from tools.environments.local import build_subprocess_env
+
+    env = build_subprocess_env(scrub_secrets=False, inherit_profile_home=True)
+    requested = (profile or "").strip()
+    if requested and requested.lower() != "current":
+        profile_dir = _resolve_profile_dir(requested)
+        env["HERMES_HOME"] = str(profile_dir)
+
+    try:
+        from hermes_cli.config import apply_terminal_config_to_env
+        apply_terminal_config_to_env(env=env)
+    except Exception:
+        _log.debug("Failed to apply terminal config to browser Desktop shell", exc_info=True)
+
+    # Match the native Desktop terminal hygiene: an npm-launched Hermes process
+    # must not leak npm configuration into the user's interactive shell, and a
+    # non-TTY parent must not force the PTY into monochrome/dumb-terminal mode.
+    for key in list(env):
+        if key == "npm_config_prefix" or key.startswith("npm_config_") or key.startswith("npm_package_"):
+            env.pop(key, None)
+    env.pop("NO_COLOR", None)
+    env.pop("FORCE_COLOR", None)
+    env.pop("COLORFGBG", None)
+    env["COLORTERM"] = "truecolor"
+    env.setdefault("LC_CTYPE", "UTF-8")
+    env["TERM"] = "xterm-256color"
+    env["TERM_PROGRAM"] = "Hermes"
+    env["HERMES_DESKTOP_TERMINAL"] = "1"
+
+    with _config_profile_scope(profile):
+        default_cwd = _fs_default_cwd()
+    raw_cwd = str(cwd or "").strip()
+    candidate = Path(raw_cwd or default_cwd).expanduser()
+    try:
+        candidate = candidate.resolve(strict=False)
+        if candidate.is_file():
+            candidate = candidate.parent
+        if not candidate.is_dir():
+            candidate = Path(default_cwd)
+    except (OSError, RuntimeError):
+        candidate = Path(default_cwd)
+
+    argv, shell_name = _browser_terminal_shell_spec(env)
+    return argv, str(candidate), env, shell_name
+
+
+def _browser_terminal_process_cwd(bridge: Any) -> Optional[str]:
+    """Best-effort live cwd for the PTY child (Linux/Android /proc contract)."""
+    try:
+        pid = int(bridge.pid)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if pid <= 0 or sys.platform not in {"linux", "android"}:
+        return None
+    try:
+        return os.readlink(f"/proc/{pid}/cwd") or None
+    except OSError:
+        return None
+
+
+def _browser_terminal_origin_reason(ws: "WebSocket") -> Optional[str]:
+    """Require a same-authority HTTP(S) Origin for the shell-capable route."""
+    origin = (ws.headers.get("origin") or "").strip()
+    if not origin:
+        return "origin_required"
+    parsed = urllib.parse.urlparse(origin)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return f"origin_mismatch origin={origin or '?'}"
+    host_header = (ws.headers.get("host") or "").strip()
+    if not host_header or parsed.netloc.lower() != host_header.lower():
+        return f"origin_mismatch origin={origin} host={host_header or '?'}"
+    return _ws_host_origin_reason(ws)
+
+
+@app.get("/api/terminal/cwd")
+async def browser_terminal_cwd(request: Request, id: str):
+    _require_token(request)
+    bridge = _browser_terminal_sessions().get(id)
+    return {"cwd": _browser_terminal_process_cwd(bridge) if bridge is not None else None}
+
+
+@app.websocket("/api/terminal")
+async def browser_terminal_ws(ws: WebSocket) -> None:
+    """Authenticated shell PTY used by the browser-hosted Desktop terminal rail.
+
+    This intentionally stays separate from /api/pty, whose child is the Hermes
+    TUI itself. The protocol is byte-compatible with the existing PTY bridge:
+    raw bytes are terminal output/input and ESC[RESIZE:<cols>;<rows>] is consumed
+    as a resize control frame. A single JSON `ready` frame precedes PTY output
+    so the renderer learns the resolved cwd/shell before exposing the session.
+    """
+    peer = ws.client.host if ws.client else "?"
+    bound_host = (getattr(app.state, "bound_host", "") or "").strip().lower()
+    if bound_host not in _LOOPBACK_HOSTS:
+        _log.warning("browser terminal refused non-loopback bind=%s peer=%s", bound_host or "?", peer)
+        await ws.close(code=4403, reason="browser terminal is loopback-only")
+        return
+
+    auth_reason, cred = _ws_auth_reason(ws)
+    mode = _ws_auth_mode()
+    if auth_reason is not None:
+        _log.warning(
+            "browser terminal auth rejected reason=%s mode=%s cred=%s peer=%s",
+            auth_reason, mode, cred, peer,
+        )
+        await ws.close(code=4401, reason=_ws_close_reason(f"auth: {auth_reason}"))
+        return
+    host_origin_reason = _browser_terminal_origin_reason(ws)
+    if host_origin_reason is not None:
+        await ws.close(code=4403, reason=_ws_close_reason(host_origin_reason))
+        return
+    client_reason = _ws_client_reason(ws)
+    if client_reason is not None:
+        await ws.close(code=4408, reason=_ws_close_reason(client_reason))
+        return
+
+    session_id = (ws.query_params.get("id") or "").strip()
+    if not _BROWSER_TERMINAL_ID_RE.fullmatch(session_id):
+        await ws.close(code=4400, reason="invalid terminal id")
+        return
+    sessions = _browser_terminal_sessions()
+    if session_id in sessions:
+        await ws.close(code=4409, reason="terminal id already active")
+        return
+
+    await ws.accept()
+    if not _PTY_BRIDGE_AVAILABLE:
+        await ws.send_json({"type": "error", "message": "Pseudo-terminal support is unavailable"})
+        await ws.close(code=1011)
+        return
+
+    profile = ws.query_params.get("profile") or None
+    raw_cwd = ws.query_params.get("cwd") or None
+    try:
+        cols = max(1, min(2000, int(ws.query_params.get("cols") or 80)))
+        rows = max(1, min(1000, int(ws.query_params.get("rows") or 24)))
+    except (TypeError, ValueError, OverflowError):
+        cols, rows = 80, 24
+
+    try:
+        argv, cwd, env, shell_name = _browser_terminal_spawn_spec(cwd=raw_cwd, profile=profile)
+        bridge = PtyBridge.spawn(argv, cwd=cwd, env=env, cols=cols, rows=rows)
+    except HTTPException as exc:
+        await ws.send_json({"type": "error", "message": str(exc.detail)})
+        await ws.close(code=1011)
+        return
+    except (PtyUnavailableError, FileNotFoundError, OSError) as exc:
+        await ws.send_json({"type": "error", "message": str(exc)})
+        await ws.close(code=1011)
+        return
+
+    sessions[session_id] = bridge
+    try:
+        await ws.send_json({"type": "ready", "id": session_id, "cwd": cwd, "shell": shell_name})
+        await _legacy_pump(ws, bridge)
+    finally:
+        if sessions.get(session_id) is bridge:
+            sessions.pop(session_id, None)
+
+
 @app.websocket("/api/pty")
 async def pty_ws(ws: WebSocket) -> None:
     peer = ws.client.host if ws.client else "?"
@@ -17947,7 +18158,7 @@ def start_server(
     ``ssh_session_token`` and ``ssh_owner_nonce`` are process-local Desktop SSH
     bootstrap state. Neither is persisted or exported to child processes.
     """
-    _apply_ssh_session_token(ssh_session_token or "")
+    _refresh_session_token_for_server_start(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
 
     # Raise RLIMIT_NOFILE for dashboard-mode starts that don't route through
