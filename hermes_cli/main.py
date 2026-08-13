@@ -1609,38 +1609,46 @@ to avoid false-positive reinstalls on every launch.
 
 
 def _workspace_root(dir: Path) -> Path:
-    """Return the nearest npm workspace root that owns *dir*.
+    """Return the npm workspace root for *dir*.
 
-    Workspace packages do not have to be direct children of the repository
-    root: Hermes includes nested members such as ``apps/desktop``. A package
-    with its own ``package-lock.json`` is always treated as standalone;
-    otherwise walk ancestors and use the nearest directory that contains both
-    the workspace ``package.json`` and its single ``package-lock.json``.
-
-    Used by ``_tui_need_npm_install``, ``_make_tui_argv``, and frontend build
-    helpers so lockfile/node_modules resolution and npm's install cwd stay
-    consistent. In particular, nested workspaces must install from the root
-    where npm hoists dev-tool shims such as ``vite`` and ``tsc``.
+    Keep this shared helper deliberately conservative: existing web/TUI build
+    paths rely on the historical direct-parent contract when deciding which
+    workspace closure npm must reify. Nested workspace discovery is needed by
+    Termux Desktop, but belongs in the Termux-only install helper below rather
+    than changing this shared resolver.
     """
-    if not (dir / "package.json").is_file():
-        return dir
-    if (dir / "package-lock.json").is_file():
-        return dir
-
-    for ancestor in dir.parents:
-        if (
-            (ancestor / "package.json").is_file()
-            and (ancestor / "package-lock.json").is_file()
-        ):
-            return ancestor
+    if (
+        (dir / "package.json").is_file()
+        and not (dir / "package-lock.json").is_file()
+        and (dir.parent / "package-lock.json").is_file()
+    ):
+        return dir.parent
     return dir
 
 
 def _termux_workspace_install_context(
     dir: Path, *, include_child_workspaces: bool = False
 ) -> tuple[Path, tuple[str, ...]]:
-    """Return Termux-only ``(cwd, npm_args)`` for installing deps for *dir* only."""
+    """Return Termux-only ``(cwd, npm_args)`` for installing deps for *dir*.
+
+    Native Termux also needs nested npm workspaces such as ``apps/desktop``.
+    If the shared direct-parent resolver does not find a root, walk ancestors
+    here only. This preserves the web/TUI install-closure semantics while still
+    letting the Android Desktop renderer use the repository lockfile/toolchain.
+    """
     ws_root = _workspace_root(dir)
+    if (
+        ws_root == dir
+        and (dir / "package.json").is_file()
+        and not (dir / "package-lock.json").is_file()
+    ):
+        for ancestor in dir.parents:
+            if (
+                (ancestor / "package.json").is_file()
+                and (ancestor / "package-lock.json").is_file()
+            ):
+                ws_root = ancestor
+                break
     if ws_root == dir:
         return dir, ()
 
