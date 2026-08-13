@@ -191,6 +191,50 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     return disabled
 
 
+def _cron_memory_provider_mode(job: dict, cfg: dict) -> str:
+    """Return tools-only provider access for an explicitly opted-in cron job.
+
+    Cron's normal denylist always includes the built-in ``memory`` tool because
+    ``skip_memory=True`` means local MEMORY.md/USER.md state is intentionally
+    absent. That baseline must *not* prevent a job from requesting external
+    provider tools. Only the job's raw toolset list can opt in, and an operator's
+    explicit ``agent.disabled_toolsets: [memory]`` remains authoritative.
+    """
+    raw_toolsets = job.get("enabled_toolsets")
+    if not isinstance(raw_toolsets, (list, tuple, set)) or not raw_toolsets:
+        return "off"
+
+    agent_cfg = (cfg or {}).get("agent") or {}
+    admin_disabled = agent_cfg.get("disabled_toolsets") or []
+    if "memory" in {str(name).strip() for name in admin_disabled}:
+        return "off"
+
+    from agent.memory_manager import memory_provider_tools_enabled
+
+    return "tools" if memory_provider_tools_enabled(list(raw_toolsets)) else "off"
+
+
+def _configure_cron_memory_surface(agent, *, provider_tools_only: bool) -> None:
+    """Keep cron's built-in memory hidden; expose opted-in provider tools only."""
+    tools = getattr(agent, "tools", None) or []
+    agent.tools = [
+        tool for tool in tools
+        if not (isinstance(tool, dict) and tool.get("function", {}).get("name") == "memory")
+    ]
+    if getattr(agent, "valid_tool_names", None) is not None:
+        agent.valid_tool_names.discard("memory")
+    agent._memory_store = None
+    agent._memory_enabled = False
+    agent._user_profile_enabled = False
+    agent._memory_nudge_interval = 0
+
+    if provider_tools_only:
+        from agent.memory_manager import inject_memory_provider_tools
+
+        added = inject_memory_provider_tools(agent, force=True)
+        logger.info("Cron provider-memory tools enabled (%d schema(s))", added)
+
+
 def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]:
     """Layer enabled MCP servers onto a per-job ``enabled_toolsets`` allowlist.
 
@@ -4123,6 +4167,9 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
+        _enabled_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
+        _disabled_toolsets = _resolve_cron_disabled_toolsets(_cfg)
+        _memory_provider_mode = _cron_memory_provider_mode(job, _cfg)
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -4142,8 +4189,8 @@ def run_job(
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
-            disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+            enabled_toolsets=_enabled_toolsets,
+            disabled_toolsets=_disabled_toolsets,
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
             # HERMES_HOME. When a workdir is configured, also inject project
@@ -4152,10 +4199,14 @@ def run_job(
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
             skip_memory=True,  # Cron system prompts would corrupt user representations
+            memory_provider_mode=_memory_provider_mode,
             skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
+        )
+        _configure_cron_memory_surface(
+            agent, provider_tools_only=_memory_provider_mode == "tools"
         )
         
         # Run the agent with an *inactivity*-based timeout: the job can run

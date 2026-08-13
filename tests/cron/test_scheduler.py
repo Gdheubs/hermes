@@ -9,7 +9,19 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import (
+    _configure_cron_memory_surface,
+    _cron_memory_provider_mode,
+    _resolve_origin,
+    _resolve_delivery_target,
+    _deliver_result,
+    _send_media_via_adapter,
+    run_job,
+    SILENT_MARKER,
+    _build_job_prompt,
+    _resolve_cron_enabled_toolsets,
+    _merge_mcp_into_per_job_toolsets,
+)
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -61,6 +73,46 @@ class TestPerJobToolsetMcpMerge:
         # _get_platform_tools args: (cfg, "cron")
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
+
+
+class TestCronProviderMemoryTools:
+    def test_tools_mode_requires_raw_per_job_memory_opt_in(self):
+        assert _cron_memory_provider_mode({}, {}) == "off"
+        assert _cron_memory_provider_mode(
+            {"enabled_toolsets": ["web", "memory"]}, {}
+        ) == "tools"
+        assert _cron_memory_provider_mode(
+            {"enabled_toolsets": ["web"]}, {}
+        ) == "off"
+
+    def test_admin_memory_denylist_wins_over_job_opt_in(self):
+        assert _cron_memory_provider_mode(
+            {"enabled_toolsets": ["memory"]},
+            {"agent": {"disabled_toolsets": ["memory"]}},
+        ) == "off"
+
+    def test_cron_surface_removes_builtin_memory_and_injects_provider_only(self):
+        agent = MagicMock()
+        agent.tools = [
+            {"type": "function", "function": {"name": "memory"}},
+            {"type": "function", "function": {"name": "terminal"}},
+        ]
+        agent.valid_tool_names = {"memory", "terminal"}
+        agent._memory_store = object()
+        agent._memory_enabled = True
+        agent._user_profile_enabled = True
+        agent._memory_nudge_interval = 10
+
+        with patch("agent.memory_manager.inject_memory_provider_tools", return_value=2) as inject:
+            _configure_cron_memory_surface(agent, provider_tools_only=True)
+
+        assert [tool["function"]["name"] for tool in agent.tools] == ["terminal"]
+        assert "memory" not in agent.valid_tool_names
+        assert agent._memory_store is None
+        assert agent._memory_enabled is False
+        assert agent._user_profile_enabled is False
+        assert agent._memory_nudge_interval == 0
+        inject.assert_called_once_with(agent, force=True)
 
 
 class TestResolveOrigin:

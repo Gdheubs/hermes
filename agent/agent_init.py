@@ -521,6 +521,7 @@ def init_agent(
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
     skip_memory: bool = False,
+    memory_provider_mode: Optional[str] = None,
     skip_background_review: bool = False,
     session_db=None,
     parent_session_id: str = None,
@@ -1710,14 +1711,13 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    # A flush/background agent may pass skip_memory=True to avoid spinning up an
-    # external memory *provider*, but if the caller also explicitly enables the
-    # "memory" toolset it still needs the built-in file-backed store — otherwise
-    # the memory tool dispatches with store=None and every call fails (#65429).
-    # So the built-in store is created unless memory is globally disabled, while
-    # the external-provider block below stays gated on skip_memory.
+    # A flush/background agent may pass skip_memory=True but explicitly request
+    # the built-in ``memory`` toolset; keep that established behavior. Cron's
+    # provider-only ``tools`` mode is the exception: it must not revive local
+    # MEMORY.md/USER.md state or its write nudge.
     _memory_toolset_requested = "memory" in (agent.enabled_toolsets or [])
-    if not skip_memory or _memory_toolset_requested:
+    _provider_tools_only = str(memory_provider_mode or "").strip().lower() == "tools"
+    if not skip_memory or (_memory_toolset_requested and not _provider_tools_only):
         try:
             mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
@@ -1735,17 +1735,34 @@ def init_agent(
     
 
 
-    # Memory provider plugin (external — one at a time, alongside built-in)
-    # Reads memory.provider from config to select which plugin to activate.
+    # Memory provider plugin (external — one at a time, alongside built-in).
+    # ``None`` preserves historic behavior: normal agents get full provider
+    # lifecycle and skip_memory agents get no provider. Cron can explicitly
+    # request ``tools`` mode; the manager then exposes only provider tools.
+    if memory_provider_mode is None:
+        _memory_provider_mode = "off" if skip_memory else "full"
+    else:
+        _memory_provider_mode = str(memory_provider_mode).strip().lower()
+    if _memory_provider_mode not in {"off", "full", "tools"}:
+        raise ValueError(
+            f"Invalid memory_provider_mode {memory_provider_mode!r}; "
+            "expected one of: off, full, tools"
+        )
+    agent._memory_provider_mode = _memory_provider_mode
     agent._memory_manager = None
-    if not skip_memory:
+    if _memory_provider_mode != "off":
         try:
-            _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
+            _provider_mem_config = _agent_cfg.get("memory", {})
+            _mem_provider_name = (
+                _provider_mem_config.get("provider", "")
+                if isinstance(_provider_mem_config, dict)
+                else ""
+            )
 
             if _mem_provider_name and _mem_provider_name.strip():
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
+                agent._memory_manager = _MemoryManager(mode=_memory_provider_mode)
                 _mp = _load_mem(_mem_provider_name)
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
