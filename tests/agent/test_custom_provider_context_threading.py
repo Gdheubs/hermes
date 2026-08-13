@@ -14,7 +14,7 @@ to sibling call paths that were missed.
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -335,8 +335,228 @@ class TestWebServerModelInfoCustomProviders:
 
 
 # ---------------------------------------------------------------------------
-# 5. get_custom_provider_context_length (existing helper — extended coverage)
+# 5. model_tools._resolve_active_context_length (tool-search gate)
 # ---------------------------------------------------------------------------
+
+class TestToolSearchGateCustomProviders:
+    """The tool-search context gate must honor custom_providers per-model
+    context_length overrides instead of sizing against generic metadata."""
+
+    def test_gate_passes_custom_providers_to_resolver(self):
+        from model_tools import _resolve_active_context_length
+
+        mock_config = {
+            "model": {
+                "model": MODEL,
+                "provider": "custom",
+                "base_url": BASE_URL,
+            },
+            "custom_providers": CUSTOM_PROVIDERS,
+        }
+        captured_kwargs = {}
+
+        def _capture(model, **kwargs):
+            captured_kwargs.update(kwargs)
+            return EXPECTED_CTX
+
+        with (
+            patch("hermes_cli.config.load_config", return_value=mock_config),
+            patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value=mock_config,
+            ),
+            patch(
+                "hermes_cli.config.get_compatible_custom_providers",
+                return_value=CUSTOM_PROVIDERS,
+            ),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={},
+            ),
+            patch(
+                "agent.model_metadata.get_cached_context_length",
+                return_value=None,
+            ),
+            patch(
+                "agent.model_metadata.get_model_context_length",
+                side_effect=_capture,
+            ),
+        ):
+            result = _resolve_active_context_length()
+
+        assert result == EXPECTED_CTX
+        assert captured_kwargs.get("custom_providers") == CUSTOM_PROVIDERS, (
+            "get_model_context_length was not called with custom_providers"
+        )
+        assert captured_kwargs.get("provider") == "custom"
+
+    def test_gate_falls_through_on_config_load_failure(self):
+        """Config-load failure must not break the gate — resolver still runs
+        with custom_providers=None (generic metadata)."""
+        from model_tools import _resolve_active_context_length
+
+        mock_config = {
+            "model": {
+                "model": MODEL,
+                "provider": "custom",
+                "base_url": BASE_URL,
+            },
+        }
+        with (
+            patch("hermes_cli.config.load_config", return_value=mock_config),
+            patch(
+                "hermes_cli.config.load_config_readonly",
+                side_effect=RuntimeError("config unavailable"),
+            ),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={},
+            ),
+            patch(
+                "agent.model_metadata.get_cached_context_length",
+                return_value=None,
+            ),
+            patch(
+                "agent.model_metadata.get_model_context_length",
+                return_value=EXPECTED_CTX,
+            ),
+        ):
+            result = _resolve_active_context_length()
+
+        assert result == EXPECTED_CTX
+
+
+# ---------------------------------------------------------------------------
+# 6. gateway /context inactive-agent fallback
+# ---------------------------------------------------------------------------
+
+class TestGatewayContextFallbackCustomProviders:
+    """The /context no-resident-agent fallback must resolve the configured
+    route identity + compatible custom_providers before calling the
+    resolver — passing only model_name falls through to generic metadata."""
+
+    def _make_mixin(self, session_db_row):
+        from gateway.slash_commands import GatewaySlashCommandsMixin
+
+        mixin = GatewaySlashCommandsMixin.__new__(GatewaySlashCommandsMixin)
+
+        class _SessionEntry:
+            session_id = "sess-test"
+            last_prompt_tokens = 0
+
+        session_store = MagicMock()
+        session_store.get_or_create_session = AsyncMock(
+            return_value=_SessionEntry()
+        )
+        session_store.load_transcript = AsyncMock(return_value=[])
+        mixin.async_session_store = session_store
+        mixin._running_agents = {}
+        mixin._agent_cache_lock = None
+        mixin._agent_cache = None
+
+        session_db = MagicMock()
+        if session_db_row is not None:
+            session_db.get_session = AsyncMock(return_value=session_db_row)
+        mixin._session_db = session_db
+
+        return mixin
+
+    def _make_event(self):
+        event = MagicMock()
+        event.source = "test-source"
+        event.get_command_args.return_value = ""
+        return event
+
+    def test_fallback_passes_provider_and_custom_providers(self):
+        mixin = self._make_mixin({"model": MODEL})
+        mixin._session_key_for_source = lambda source: "sess-test"
+        captured = {}
+
+        def _capture(model, **kwargs):
+            captured["model"] = model
+            captured.update(kwargs)
+            return EXPECTED_CTX
+
+        mock_config = {
+            "model": {
+                "provider": "custom",
+                "base_url": BASE_URL,
+            },
+            "custom_providers": CUSTOM_PROVIDERS,
+        }
+        with (
+            patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value=mock_config,
+            ),
+            patch(
+                "hermes_cli.config.get_compatible_custom_providers",
+                return_value=CUSTOM_PROVIDERS,
+            ),
+            # Force the shared non-resident resolver (upstream's
+            # _resolve_gateway_model_context) to fail so the PR's
+            # last-resort fallback block — the code under test — runs.
+            patch(
+                "gateway.run._resolve_gateway_model_context",
+                side_effect=RuntimeError("boom"),
+            ),
+            patch(
+                "agent.model_metadata.get_model_context_length",
+                side_effect=_capture,
+            ),
+        ):
+            result = asyncio_run(mixin._handle_context_command(self._make_event()))
+
+        assert isinstance(result, str)
+        assert captured.get("model") == MODEL
+        assert captured.get("provider") == "custom"
+        assert captured.get("custom_providers") == CUSTOM_PROVIDERS
+
+    def test_fallback_fails_open_when_config_loading_raises(self):
+        mixin = self._make_mixin({"model": MODEL})
+        mixin._session_key_for_source = lambda source: "sess-test"
+        captured = {}
+
+        def _capture(model, **kwargs):
+            captured["model"] = model
+            captured.update(kwargs)
+            return EXPECTED_CTX
+
+        with (
+            patch(
+                "hermes_cli.config.load_config_readonly",
+                side_effect=RuntimeError("config unavailable"),
+            ),
+            patch(
+                "hermes_cli.config.get_compatible_custom_providers",
+                side_effect=RuntimeError("config unavailable"),
+            ),
+            # Force the shared non-resident resolver to fail too, so the
+            # fallback block under test runs with a broken config path.
+            patch(
+                "gateway.run._resolve_gateway_model_context",
+                side_effect=RuntimeError("boom"),
+            ),
+            patch(
+                "agent.model_metadata.get_model_context_length",
+                side_effect=_capture,
+            ),
+        ):
+            result = asyncio_run(mixin._handle_context_command(self._make_event()))
+
+        # Config failure degrades to provider="" / custom_providers=None —
+        # the resolver still runs and /context still renders.
+        assert isinstance(result, str)
+        assert captured.get("model") == MODEL
+        assert captured.get("provider") == ""
+        assert captured.get("custom_providers") is None
+
+
+def asyncio_run(coro):
+    import asyncio
+
+    return asyncio.new_event_loop().run_until_complete(coro)
+
 
 class TestGetCustomProviderContextLengthExtended:
     """Extended coverage for the lookup helper used by all call sites."""
