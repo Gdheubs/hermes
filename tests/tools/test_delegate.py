@@ -912,6 +912,37 @@ class TestChildCredentialPoolResolution(unittest.TestCase):
 
 
 class TestChildCredentialLeasing(unittest.TestCase):
+    def test_run_single_child_cleans_task_keyed_terminal_environment(self):
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        child._subagent_id = "sa-terminal-cleanup"
+        child.session_id = "child-session-id"
+        child._credential_pool = None
+        child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        with (
+            patch("tools.terminal_tool.cleanup_vm") as cleanup_vm,
+            patch("tools.terminal_tool.clear_task_env_overrides") as clear_overrides,
+        ):
+            result = _run_single_child(
+                task_index=0,
+                goal="Use a terminal",
+                child=child,
+                parent_agent=_make_mock_parent(),
+            )
+
+        self.assertEqual(result["status"], "completed")
+        child.close.assert_called_once_with()
+        cleanup_vm.assert_called_once_with("sa-terminal-cleanup")
+        clear_overrides.assert_called_once_with("sa-terminal-cleanup")
+
     def test_run_single_child_acquires_and_releases_lease(self):
         from tools.delegate_tool import _run_single_child
 

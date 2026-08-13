@@ -87,10 +87,19 @@ class TestSessionIsolationKeying:
         _enable_isolation(monkeypatch)
         assert terminal_tool._resolve_container_task_id(None) == "default"
 
-    def test_local_backend_unaffected(self, monkeypatch):
+    def test_local_terminal_environments_key_shell_snapshots_by_session(self, monkeypatch):
         monkeypatch.setenv("TERMINAL_ENV", "local")
         monkeypatch.setenv("TERMINAL_CONTAINER_PERSISTENT", "false")
-        assert terminal_tool._resolve_container_task_id("tui:sess-1") == "default"
+        assert (
+            terminal_tool._resolve_terminal_environment_task_id(
+                "tui:sess-1", "local"
+            )
+            == "tui:sess-1"
+        )
+        assert (
+            terminal_tool._resolve_terminal_environment_task_id(None, "local")
+            == "default"
+        )
 
     def test_rl_override_isolation_still_wins(self, monkeypatch):
         """Image/env_type overrides keep their own key in BOTH modes."""

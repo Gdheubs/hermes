@@ -2958,6 +2958,18 @@ def _run_single_child(
         except Exception:
             logger.debug("Failed to close child agent after delegation")
 
+        # The delegated terminal is keyed by the subagent/task id passed to
+        # run_conversation, while AIAgent.close() cleans by child.session_id.
+        # Release the task-keyed local shell snapshot explicitly so exported
+        # child state and its cwd/alias records do not survive until idle reap.
+        try:
+            from tools.terminal_tool import cleanup_vm, clear_task_env_overrides
+
+            cleanup_vm(child_task_id)
+            clear_task_env_overrides(child_task_id)
+        except Exception:
+            logger.debug("Failed to clean child task environment after delegation")
+
         # The AIAgent turn boundary normally closes the child scope itself. This
         # fallback covers failures before that boundary starts, but must not pop
         # a scope while a timed-out child worker is still unwinding.
