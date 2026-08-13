@@ -17,6 +17,7 @@ from hermes_cli.net_download import (
     fetch_with_fallback,
     mirror_candidates,
     proxy_env_for,
+    resolve_dns_doh,
 )
 
 
@@ -300,3 +301,296 @@ class TestFetchWithFallback:
         assert ok is False
         assert url in detail
         assert mirror1 not in detail
+
+
+class TestResolveDnsDoh:
+    """DNS-over-HTTPS resolution (DNSPod doh.pub)."""
+
+    def _fake_run(self, output, returncode=0):
+        def fake_run(args, **kwargs):
+            return type("R", (), {"returncode": returncode, "stdout": output})()
+        return fake_run
+
+    def test_parses_a_records(self, monkeypatch):
+        out = (
+            '{"Status":0,"Answer":['
+            '{"name":"example.com.","type":1,"TTL":60,"data":"93.184.216.34"},'
+            '{"name":"example.com.","type":1,"TTL":60,"data":"93.184.216.35"}]}'
+        )
+        monkeypatch.setattr("hermes_cli.net_download.subprocess.run", self._fake_run(out))
+        assert resolve_dns_doh("example.com", curl_cmd="curl") == [
+            "93.184.216.34", "93.184.216.35",
+        ]
+
+    def test_filters_non_a_records_and_malformed(self, monkeypatch):
+        out = (
+            '{"Answer":['
+            '{"type":1,"data":"93.184.216.34"},'
+            '{"type":28,"data":"2606:2800:220:1:248:1893:25c8:1946"},'
+            '{"type":5,"data":"evil.example.net"},'
+            '{"type":1,"data":"not-an-ip"},'
+            '{"type":1,"data":"999.999.999.999"}]}'
+        )
+        monkeypatch.setattr("hermes_cli.net_download.subprocess.run", self._fake_run(out))
+        assert resolve_dns_doh("example.com", curl_cmd="curl") == ["93.184.216.34"]
+
+    def test_returns_empty_on_curl_failure(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.net_download.subprocess.run", self._fake_run("", returncode=7)
+        )
+        assert resolve_dns_doh("example.com", curl_cmd="curl") == []
+
+    def test_returns_empty_on_timeout(self, monkeypatch):
+        def boom(args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=args, timeout=5)
+        monkeypatch.setattr("hermes_cli.net_download.subprocess.run", boom)
+        assert resolve_dns_doh("example.com", curl_cmd="curl") == []
+
+    def test_returns_empty_on_invalid_json(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.net_download.subprocess.run", self._fake_run("not json")
+        )
+        assert resolve_dns_doh("example.com", curl_cmd="curl") == []
+
+    def test_missing_curl_returns_empty(self, monkeypatch):
+        monkeypatch.setattr("hermes_cli.net_download.shutil.which", lambda name: None)
+        assert resolve_dns_doh("example.com") == []
+
+    def test_doh_query_does_not_use_proxy(self, monkeypatch):
+        """The DoH query must not be routed through a proxy — the whole
+        point is to bypass poisoned resolution, and doh.pub is reachable
+        directly from CN. The child env must not gain a proxy either."""
+        captured = {}
+
+        def fake_run(args, **kwargs):
+            captured["args"] = args
+            captured["env"] = kwargs.get("env")
+            return type("R", (), {"returncode": 0, "stdout": '{"Answer":[]}'})()
+
+        monkeypatch.setattr("hermes_cli.net_download.subprocess.run", fake_run)
+        resolve_dns_doh(
+            "example.com", curl_cmd="curl",
+            env={"HTTPS_PROXY": "http://proxy:8080", "FOO": "bar"},
+        )
+        assert "-x" not in captured["args"]
+        assert any("doh.pub" in a for a in captured["args"])
+        assert any("application/dns-json" in a for a in captured["args"])
+        # env 未被修改（无代理注入），调用方 dict 原样透传
+        assert captured["env"] == {"HTTPS_PROXY": "http://proxy:8080", "FOO": "bar"}
+
+
+class TestCurlDownloadDnsFallback:
+    """DNS-pollution fallback inside curl_download."""
+
+    def _fake_curl_dns(self, tmp_path, doh_ips=("93.184.216.34",), output="dns-content"):
+        """fake curl that models a poisoned-DNS network:
+
+        - doh.pub URL          -> prints the DNS JSON with ``doh_ips``
+        - URL with --resolve   -> writes ``output`` to dest (fallback wins)
+        - anything else        -> exit 1 with a DNS error on stderr
+        """
+        script = tmp_path / "fake-curl-dns"
+        answers = ",".join(
+            f'{{"name":"h","type":1,"TTL":60,"data":"{ip}"}}' for ip in doh_ips
+        )
+        script.write_text(
+            "#!/bin/sh\n"
+            "url=''; dest=''; is_resolve=''; prev=''\n"
+            "for a in \"$@\"; do\n"
+            "  if [ \"$prev\" = \"-o\" ]; then dest=\"$a\"; prev=''; fi\n"
+            "  case \"$a\" in\n"
+            "    --resolve) is_resolve='1' ;;\n"
+            "    -o) prev='-o' ;;\n"
+            "    http*) url=\"$a\" ;;\n"
+            "  esac\n"
+            "done\n"
+            "case \"$url\" in\n"
+            "  *doh.pub*)\n"
+            f"    printf '%s' '{{\"Status\":0,\"Answer\":[{answers}]}}'\n"
+            "    exit 0 ;;\n"
+            "esac\n"
+            "if [ -n \"$is_resolve\" ]; then\n"
+            f"  printf '%s' '{output}' > \"$dest\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "echo 'Could not resolve host: example.com' >&2\n"
+            "exit 1\n"
+        )
+        script.chmod(0o755)
+        return str(script)
+
+    def test_dns_fallback_retries_with_resolve(self, tmp_path):
+        """Core path: direct fetch fails (poisoned DNS), DoH returns the
+        real IP, and the retry with --resolve lands the file."""
+        dest = tmp_path / "out.sh"
+        url = "https://huggingface.co/api/models"  # known-polluted host
+        ok, detail = curl_download(url, str(dest), curl_cmd=self._fake_curl_dns(tmp_path))
+        assert ok is True
+        assert dest.read_text() == "dns-content"
+
+    def test_first_ip_fails_second_succeeds(self, tmp_path):
+        """The fallback tries each DoH IP in order until one connects."""
+        dest = tmp_path / "out.sh"
+        url = "https://huggingface.co/api/models"
+        # 两个 IP：fake curl 对第一个 --resolve 失败、第二个成功
+        script = tmp_path / "fake-curl-multi"
+        script.write_text(
+            "#!/bin/sh\n"
+            "url=''; dest=''; resolve_ip=''; prev=''\n"
+            "for a in \"$@\"; do\n"
+            "  if [ \"$prev\" = \"-o\" ]; then dest=\"$a\"; prev=''; fi\n"
+            "  case \"$a\" in\n"
+            "    --resolve) resolve_ip='pending' ;;\n"
+            "    -o) prev='-o' ;;\n"
+            "    http*) url=\"$a\" ;;\n"
+            "  esac\n"
+            "  case \"$a\" in\n"
+            "    *:93.184.216.34) resolve_ip='10.0.0.1' ;;\n"
+            "    *:93.184.216.35) resolve_ip='10.0.0.2' ;;\n"
+            "  esac\n"
+            "done\n"
+            "case \"$url\" in\n"
+            "  *doh.pub*)\n"
+            "    printf '%s' '{\"Status\":0,\"Answer\":[{\"name\":\"h\",\"type\":1,\"TTL\":60,\"data\":\"93.184.216.34\"},{\"name\":\"h\",\"type\":1,\"TTL\":60,\"data\":\"93.184.216.35\"}]}'\n"
+            "    exit 0 ;;\n"
+            "esac\n"
+            "if [ \"$resolve_ip\" = '10.0.0.1' ]; then\n"
+            "  echo 'Connection refused' >&2\n"
+            "  exit 1\n"
+            "fi\n"
+            "if [ \"$resolve_ip\" = '10.0.0.2' ]; then\n"
+            "  printf 'second-ip-wins' > \"$dest\"\n"
+            "  exit 0\n"
+            "fi\n"
+            "echo 'Could not resolve host' >&2\n"
+            "exit 1\n"
+        )
+        script.chmod(0o755)
+        ok, detail = curl_download(url, str(dest), curl_cmd=str(script))
+        assert ok is True
+        assert dest.read_text() == "second-ip-wins"
+
+    def test_no_doh_query_on_success(self, tmp_path, monkeypatch):
+        """Regression guard: a working direct fetch must never trigger DoH."""
+        calls = []
+
+        def spy(*args, **kwargs):
+            calls.append(args)
+            return []
+
+        monkeypatch.setattr("hermes_cli.net_download.resolve_dns_doh", spy)
+        script = tmp_path / "ok-curl"
+        script.write_text(
+            "#!/bin/sh\nurl=''; dest=''; prev=''\n"
+            "for a in \"$@\"; do\n"
+            "  if [ \"$prev\" = \"-o\" ]; then dest=\"$a\"; prev=''; fi\n"
+            "  case \"$a\" in\n"
+            "    -o) prev='-o' ;;\n"
+            "    http*) url=\"$a\" ;;\n"
+            "  esac\n"
+            "done\n"
+            "printf 'ok' > \"$dest\"\n"
+            "exit 0\n"
+        )
+        script.chmod(0o755)
+        dest = tmp_path / "out.sh"
+        ok, detail = curl_download(
+            "https://raw.githubusercontent.com/x/y/main/z.sh",
+            str(dest), curl_cmd=str(script),
+        )
+        assert ok is True
+        assert calls == []
+
+    def test_http_error_does_not_trigger_doh(self, tmp_path, monkeypatch):
+        """A 404/403 (real server response) on a non-polluted host must not
+        be retried through a different resolver."""
+        calls = []
+
+        def spy(*args, **kwargs):
+            calls.append(args)
+            return []
+
+        monkeypatch.setattr("hermes_cli.net_download.resolve_dns_doh", spy)
+        script = tmp_path / "fail-curl"
+        script.write_text("#!/bin/sh\necho '404 Not Found' >&2\nexit 1\n")
+        script.chmod(0o755)
+        dest = tmp_path / "out.sh"
+        ok, detail = curl_download(
+            "https://example.com/foo.sh", str(dest), curl_cmd=str(script)
+        )
+        assert ok is False
+        assert calls == []
+        assert "404" in detail
+
+    def test_doh_failure_preserves_original_error(self, tmp_path, monkeypatch):
+        """When DoH itself fails, the original curl error must survive —
+        the fallback never masks the root cause."""
+        monkeypatch.setattr(
+            "hermes_cli.net_download.resolve_dns_doh",
+            lambda *a, **k: [],
+        )
+        script = tmp_path / "fail-curl"
+        script.write_text(
+            "#!/bin/sh\necho 'Could not resolve host: huggingface.co' >&2\nexit 1\n"
+        )
+        script.chmod(0o755)
+        dest = tmp_path / "out.sh"
+        ok, detail = curl_download(
+            "https://huggingface.co/api/models", str(dest), curl_cmd=str(script)
+        )
+        assert ok is False
+        assert "Could not resolve host" in detail
+
+    def test_dns_fallback_disabled(self, tmp_path, monkeypatch):
+        """dns_fallback=False must skip DoH entirely."""
+        calls = []
+
+        def spy(*args, **kwargs):
+            calls.append(args)
+            return []
+
+        monkeypatch.setattr("hermes_cli.net_download.resolve_dns_doh", spy)
+        script = tmp_path / "fail-curl"
+        script.write_text(
+            "#!/bin/sh\necho 'Could not resolve host: huggingface.co' >&2\nexit 1\n"
+        )
+        script.chmod(0o755)
+        dest = tmp_path / "out.sh"
+        ok, detail = curl_download(
+            "https://huggingface.co/api/models", str(dest),
+            curl_cmd=str(script), dns_fallback=False,
+        )
+        assert ok is False
+        assert calls == []
+
+
+class TestFetchWithFallbackDns:
+    """DNS fallback integrated with the official-then-mirror flow."""
+
+    def test_dns_fallback_succeeds_before_mirror(self, tmp_path):
+        """Official fails (poisoned DNS) → DoH fallback wins → mirrors are
+        never attempted, even when opted in."""
+        dest = tmp_path / "out.sh"
+        url = "https://huggingface.co/api/models"
+        curl = TestCurlDownloadDnsFallback()._fake_curl_dns(tmp_path)
+        ok, detail = fetch_with_fallback(
+            url, str(dest), curl_cmd=curl,
+            content_class="data", allow_mirrors=True,
+        )
+        assert ok is True
+        assert dest.read_text() == "dns-content"
+
+    def test_dns_fallback_disabled_uses_mirror_when_opted_in(self, tmp_path):
+        """dns_fallback=False + data/mirror opt-in → mirror still rescues."""
+        dest = tmp_path / "out.bin"
+        url = "https://raw.githubusercontent.com/x/y/main/weights.bin"
+        mirror1 = f"https://ghfast.top/{url}"
+        curl = TestCurlDownload()._fake_curl_script(
+            tmp_path, fail_urls=(url,), output="mirror-bytes"
+        )
+        ok, detail = fetch_with_fallback(
+            url, str(dest), curl_cmd=curl,
+            content_class="data", allow_mirrors=True, dns_fallback=False,
+        )
+        assert ok is True
+        assert dest.read_text() == "mirror-bytes"
