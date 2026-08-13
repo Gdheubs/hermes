@@ -178,17 +178,36 @@ export function transcriptGutterWidth(role: Role, userPrompt: string) {
   return role === 'user' ? composerPromptWidth(userPrompt) : 3
 }
 
+export function terminalFloor(value: number, minimum: number, termuxMode = false) {
+  const available = Math.max(1, value)
+
+  return termuxMode ? available : Math.max(minimum, available)
+}
+
 export function transcriptBodyWidth(totalCols: number, role: Role, userPrompt: string, termuxMode = false) {
   const horizontalReserve = termuxMode ? 2 : 4
   const available = Math.max(1, totalCols - transcriptGutterWidth(role, userPrompt) - horizontalReserve)
 
-  if (termuxMode) {
-    // On narrow / unusual aspect-ratio mobile panes, forcing a wide minimum
-    // width causes right-edge clipping and chopped words.
-    return available
-  }
+  // On narrow / unusual aspect-ratio mobile panes, forcing a wide minimum
+  // width causes right-edge clipping and chopped words.
+  return terminalFloor(available, 20, termuxMode)
+}
 
-  return Math.max(20, available)
+export function transcriptPaneColumns(
+  totalCols: number,
+  railCols: number,
+  petWidth = 0,
+  usePetGutter = false,
+  termuxMode = false
+) {
+  const petReserve = usePetGutter ? Math.max(0, petWidth) : 0
+  const available = Math.max(1, totalCols - Math.max(0, railCols) - petReserve)
+
+  // Desktop keeps the historical readability floor. Termux must never claim
+  // more cells than the physical terminal actually owns: Ink otherwise wraps
+  // the over-wide transcript, fires another resize/layout pass, and narrow
+  // Android terminals visibly bounce between two geometries.
+  return terminalFloor(available, 28, termuxMode)
 }
 
 export function stableComposerColumns(totalCols: number, promptWidth: number, termuxMode = false) {
