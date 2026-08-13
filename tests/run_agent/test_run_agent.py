@@ -1446,6 +1446,67 @@ class TestBuildAssistantMessage:
             "google": {"thought_signature": "abc123"}
         }
 
+    def test_repairs_glued_markdown_block_boundaries_before_persistence(self, agent):
+        """Provider/gateway text can arrive with markdown block boundaries glued.
+
+        A real desktop screenshot showed Hermes persisting `## Heading| table`
+        and `## Landed- item`, which makes GFM render the answer as one dense
+        paragraph. The storage boundary must restore those separators before
+        state.db/replay sees the assistant content.
+        """
+        raw = (
+            "Two flags were invented; fixed at `20aab9ea`.`elastic es` / "
+            "`elastic kb` are real shortcuts.\n\n"
+            "## Verified vs invented| Command | Flags | Verdict |\n"
+            "|---|---|---|| `elastic es cat indices` | `--index` | **match** |\n"
+            "Invalid flags were removed.## Landed- Install: `npm install -g @elastic/cli@0.3.0`\n"
+        )
+        msg = _mock_assistant_msg(content=raw)
+
+        result = agent._build_assistant_message(msg, "stop")
+        content = result["content"]
+
+        assert "20aab9ea`.\n\n`elastic es`" in content
+        assert "## Verified vs invented\n\n| Command | Flags | Verdict |" in content
+        assert "|---|---|---|\n| `elastic es cat indices`" in content
+        assert "Invalid flags were removed.\n\n## Landed\n\n- Install:" in content
+        assert "20aab9ea`.`elastic" not in content
+        assert "## Verified vs invented| Command" not in content
+        assert "|---|---|---|| `elastic" not in content
+        assert "## Landed- Install" not in content
+
+    def test_markdown_boundary_repair_leaves_fenced_code_body_unchanged(self, agent):
+        raw = (
+            "Before fence.## Real heading- real item\n\n"
+            "```md\n"
+            "## Literal heading| table\n"
+            "|---|---|| literal row\n"
+            "## Literal- list\n"
+            "```\n"
+        )
+        msg = _mock_assistant_msg(content=raw)
+
+        content = agent._build_assistant_message(msg, "stop")["content"]
+
+        assert "Before fence.\n\n## Real heading\n\n- real item" in content
+        assert "```md\n## Literal heading| table\n|---|---|| literal row\n## Literal- list\n```" in content
+
+    def test_repairs_glued_code_fence_opener_before_command(self, agent):
+        raw = (
+            'Run this locally: ```bashPYTHONPATH="$PWD" '
+            '/Users/patrykkopycinski/.hermes/hermes-agent/venv/bin/python '
+            '−m pytest tests/run_agent/test_run_agent.py::TestBuildAssistantMessage -q```'
+        )
+        msg = _mock_assistant_msg(content=raw)
+
+        content = agent._build_assistant_message(msg, "stop")["content"]
+
+        assert '```bash\nPYTHONPATH="$PWD" /Users/patrykkopycinski/.hermes/hermes-agent/venv/bin/python' in content
+        assert "−m pytest" in content
+        assert "-q\n```" in content
+        assert "```bashPYTHONPATH" not in content
+        assert "-q```" not in content
+
 
 
 

@@ -1608,6 +1608,64 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
 
 
 
+def _repair_glued_markdown_block_boundaries(text: str) -> str:
+    """Restore markdown block separators lost by streamed/interim reconstruction.
+
+    This is deliberately narrow and runs at the assistant-content storage
+    boundary. It repairs malformed shapes observed in real Hermes transcripts
+    where inline markdown survived but block boundaries were glued, e.g.
+    ``## Heading| table``, ``|---|| row``, ``sentence.## Heading``,
+    ``## Heading- list item``, and `````bashPYTHONPATH=...`` fence openers.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+
+    fence_lang = r"(?:bash|sh|shell|console|text|python|py|md|markdown|json|yaml|yml|ts|tsx|js|jsx)"
+    text = re.sub(
+        rf"(?<!\n)(```{fence_lang})(?=[A-Z_][A-Z0-9_]*=|/)",
+        r"\n\n\1\n",
+        text,
+    )
+    text = re.sub(
+        rf"(?<!\n)(```{fence_lang}\n)",
+        r"\n\n\1",
+        text,
+    )
+    text = re.sub(r"([^\n])```(?=\s*\S)", r"\1\n```\n\n", text)
+
+    fence_re = re.compile(r"(```.*?```)", re.DOTALL)
+
+    def repair_segment(segment: str) -> str:
+        if not segment:
+            return segment
+        segment = re.sub(r"(`[^`\n]+`)\.(`[^`\n]+`)", r"\1.\n\n\2", segment)
+        segment = re.sub(r"([.!?])(?=#{1,6}\s)", r"\1\n\n", segment)
+        segment = re.sub(
+            r"(?m)^(#{1,6}\s+[^\n|]+)\|(?=\s*[^\n]*\|)",
+            r"\1\n\n|",
+            segment,
+        )
+        segment = re.sub(
+            r"(?m)^(\|\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|)\|(?=\s*\S)",
+            r"\1\n|",
+            segment,
+        )
+        segment = re.sub(
+            r"(?m)^(#{1,6}\s+[^\n-]{1,80})-\s+(?=\S)",
+            r"\1\n\n- ",
+            segment,
+        )
+        return segment
+
+    parts = fence_re.split(text)
+    for idx, part in enumerate(parts):
+        if idx % 2 == 0:
+            parts[idx] = repair_segment(part)
+        else:
+            parts[idx] = re.sub(r"([^\n])```$", r"\1\n```", part)
+    return "".join(parts)
+
+
 def build_assistant_message(agent, assistant_message, finish_reason: str) -> dict:
     """Build a normalized assistant message dict from an API response message.
 
@@ -1666,6 +1724,7 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
     # compression, title generation.
     if isinstance(_san_content, str) and _san_content:
         _san_content = agent._strip_think_blocks(_san_content).strip()
+        _san_content = _repair_glued_markdown_block_boundaries(_san_content)
 
     # Defence-in-depth: redact credentials (PATs, API keys, Bearer tokens)
     # from assistant content BEFORE the message enters conversation history.
