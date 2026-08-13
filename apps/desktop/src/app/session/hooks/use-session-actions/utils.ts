@@ -6,6 +6,7 @@ import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-ima
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
+import { $removedSessionIds } from '@/store/projects'
 import {
   $cronSessions,
   $currentCwd,
@@ -1277,7 +1278,18 @@ export function sessionShouldHaveTranscript(session: SessionInfo | undefined): b
   return (session?.message_count ?? 0) > 0
 }
 
-function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
+function upsertResolvedSession(session: SessionInfo, storedSessionId: string, removedAtRequestStart: ReadonlySet<string>) {
+  const removed = $removedSessionIds.get()
+  const identities = [storedSessionId, session.id, session._lineage_root_id].filter(Boolean) as string[]
+
+  // A direct by-id request may have started just before an archive/delete. Its
+  // stale response must not undo the optimistic eviction while that mutation's
+  // tombstone is active — or after one was installed but before the backend
+  // snapshot caught up. Check every identity used by lineage-aware lookups.
+  if (session.archived || identities.some(id => removed.has(id) || removedAtRequestStart.has(id))) {
+    return
+  }
+
   const lineage = session._lineage_root_id ?? session.id
 
   setSessions(prev => [
@@ -1293,6 +1305,8 @@ function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
 }
 
 export async function resolveStoredSession(storedSessionId: string): Promise<SessionInfo | undefined> {
+  const removedAtRequestStart = $removedSessionIds.get()
+
   const cached = [...$sessions.get(), ...$cronSessions.get(), ...$messagingSessions.get()].find(session =>
     sessionMatchesStoredId(session, storedSessionId)
   )
@@ -1319,7 +1333,7 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
     // can legitimately carry another profile's row (see the branch tests).
     session.profile ||= normalizeProfileKey($activeGatewayProfile.get())
 
-    upsertResolvedSession(session, storedSessionId)
+    upsertResolvedSession(session, storedSessionId, removedAtRequestStart)
 
     return session
   } catch {
@@ -1346,7 +1360,7 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
       // forwarding, so that backend answers as its own "default").
       session.profile = profile
 
-      upsertResolvedSession(session, storedSessionId)
+      upsertResolvedSession(session, storedSessionId, removedAtRequestStart)
 
       return session
     } catch {
