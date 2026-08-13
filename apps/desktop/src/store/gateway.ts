@@ -34,7 +34,7 @@ interface Secondary {
   offState: () => void
   reconnectTimer: ReturnType<typeof setTimeout> | null
   reconnectAttempt: number
-  reconnecting: boolean
+  reconnecting: Promise<void> | null
   // While true the entry auto-reconnects on drop; pruning flips it off so a
   // deliberate close doesn't trigger the backoff loop.
   wantOpen: boolean
@@ -58,6 +58,7 @@ interface GatewayRegistryState {
   activeKey: string
   secondaries: Map<string, Secondary>
   $gateway: ReturnType<typeof atom<HermesGateway | null>>
+  $gatewayConnectionEpochs: ReturnType<typeof atom<Record<string, number>>>
 }
 
 const STATE_KEY = Symbol.for('hermes.desktop.gatewayRegistryState')
@@ -72,7 +73,11 @@ function createRegistryState(): GatewayRegistryState {
     // The active gateway instance, exposed for inline message-stream
     // components (inline ClarifyTool, model overlays) that call gateway
     // methods without the instance threaded down through props.
-    $gateway: atom<HermesGateway | null>(null)
+    $gateway: atom<HermesGateway | null>(null),
+    // Monotonic connection generation per profile. Unlike $gatewayState, this
+    // cannot collapse a real closed -> connecting -> open cycle into the same
+    // final "open" value before React renders.
+    $gatewayConnectionEpochs: atom<Record<string, number>>({})
   }
 }
 
@@ -87,6 +92,8 @@ function gatewayState(): GatewayRegistryState {
   if (import.meta.hot) {
     const store = globalThis as unknown as { [STATE_KEY]?: GatewayRegistryState }
     store[STATE_KEY] ??= createRegistryState()
+    // Shape migration for a live dev realm created before this field existed.
+    store[STATE_KEY].$gatewayConnectionEpochs ??= atom<Record<string, number>>({})
 
     return store[STATE_KEY]
   }
@@ -100,6 +107,7 @@ const g = gatewayState()
 // reload of this module hands back the SAME atom subscribers are already wired
 // to. (A fresh `atom()` per reload would orphan existing subscriptions.)
 export const $gateway = g.$gateway
+export const $gatewayConnectionEpochs = g.$gatewayConnectionEpochs
 
 export function configureGatewayRegistry(cfg: RegistryConfig): void {
   g.config = cfg
@@ -144,7 +152,17 @@ function reportGatewayState(profile: string, state: ConnectionState): void {
     markNativeNotifyBaseline()
   }
 
-  if (normKey(profile) === g.activeKey) {
+  const key = normKey(profile)
+
+  if (state === 'open') {
+    const epochs = g.$gatewayConnectionEpochs.get()
+    g.$gatewayConnectionEpochs.set({
+      ...epochs,
+      [key]: (epochs[key] ?? 0) + 1
+    })
+  }
+
+  if (key === g.activeKey) {
     setGatewayState(state)
   }
 }
@@ -196,24 +214,30 @@ function scheduleReconnect(entry: Secondary): void {
 }
 
 async function reconnectSecondary(entry: Secondary): Promise<void> {
-  if (entry.reconnecting || !entry.wantOpen || isOpen(entry.gateway)) {
+  if (entry.reconnecting) {
+    return entry.reconnecting
+  }
+
+  if (!entry.wantOpen || isOpen(entry.gateway)) {
     return
   }
 
-  entry.reconnecting = true
+  entry.reconnecting = (async () => {
+    try {
+      await openSecondary(entry)
+      entry.reconnectAttempt = 0
+    } catch {
+      // Transport failure → fall through to the backoff below.
+    } finally {
+      entry.reconnecting = null
 
-  try {
-    await openSecondary(entry)
-    entry.reconnectAttempt = 0
-  } catch {
-    // Transport failure → fall through to the backoff below.
-  } finally {
-    entry.reconnecting = false
-
-    if (entry.wantOpen && !isOpen(entry.gateway)) {
-      scheduleReconnect(entry)
+      if (entry.wantOpen && !isOpen(entry.gateway)) {
+        scheduleReconnect(entry)
+      }
     }
-  }
+  })()
+
+  return entry.reconnecting
 }
 
 function createSecondary(profile: string): Secondary {
@@ -226,7 +250,7 @@ function createSecondary(profile: string): Secondary {
     offState: () => {},
     reconnectTimer: null,
     reconnectAttempt: 0,
-    reconnecting: false,
+    reconnecting: null,
     wantOpen: true
   }
 

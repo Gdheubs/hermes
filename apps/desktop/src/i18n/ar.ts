@@ -2523,6 +2523,7 @@ export const ar = defineLocale({
     sessionUnavailable: 'الجلسة غير متاحة',
     createSessionFailed: 'فشل إنشاء الجلسة',
     promptFailed: 'فشل إرسال الرسالة',
+    deliveryNotConfirmed: 'تعذّر تأكيد التسليم. تمت استعادة رسالتك؛ أعد المحاولة عندما تكون مستعدًا.',
     providerCredentialRequired: 'مطلوب اعتماد المزود',
     emptySlashCommand: 'أمر slash فارغ',
     desktopCommands: 'أوامر سطح المكتب',

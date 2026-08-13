@@ -12733,6 +12733,106 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
         server._sessions.pop("sid-live", None)
 
 
+def test_session_activate_clears_stale_busy_state_after_prompt_worker_exits(monkeypatch):
+    class _DeadThread:
+        @staticmethod
+        def is_alive():
+            return False
+
+    agent = types.SimpleNamespace(model="model-stale")
+    session = _session(
+        agent=agent,
+        running=True,
+        inflight_turn={
+            "assistant": "stale partial",
+            "status": "streaming",
+            "user": "already completed",
+        },
+    )
+    session["_run_thread"] = _DeadThread()
+    server._sessions["sid-stale"] = session
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_session_info", lambda _agent: {"model": "model-stale"})
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "activate",
+                "method": "session.activate",
+                "params": {"session_id": "sid-stale"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid-stale", None)
+
+    assert resp["result"]["running"] is False
+    assert resp["result"]["status"] == "idle"
+    assert "inflight" not in resp["result"]
+    assert session["running"] is False
+    assert session.get("inflight_turn") is None
+
+
+def test_session_activate_preserves_live_prompt_worker(monkeypatch):
+    class _LiveThread:
+        @staticmethod
+        def is_alive():
+            return True
+
+    session = _session(
+        agent=types.SimpleNamespace(model="model-live"),
+        running=True,
+        inflight_turn={"assistant": "still working", "user": "live prompt"},
+    )
+    session["_run_thread"] = _LiveThread()
+    server._sessions["sid-live-worker"] = session
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_session_info", lambda _agent: {"model": "model-live"})
+    try:
+        resp = server.handle_request(
+            {
+                "id": "activate-live",
+                "method": "session.activate",
+                "params": {"session_id": "sid-live-worker"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid-live-worker", None)
+
+    assert resp["result"]["running"] is True
+    assert resp["result"]["inflight"]["user"] == "live prompt"
+    assert session["running"] is True
+
+
+def test_session_activate_preserves_running_before_worker_registration(monkeypatch):
+    session = _session(
+        agent=types.SimpleNamespace(model="model-registering"),
+        running=True,
+        inflight_turn={"user": "accepted prompt"},
+    )
+    session.pop("_run_thread", None)
+    server._sessions["sid-registering"] = session
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda _agent: {"model": "model-registering"},
+    )
+    try:
+        resp = server.handle_request(
+            {
+                "id": "activate-registering",
+                "method": "session.activate",
+                "params": {"session_id": "sid-registering"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid-registering", None)
+
+    assert resp["result"]["running"] is True
+    assert resp["result"]["inflight"]["user"] == "accepted prompt"
+    assert session["running"] is True
+
+
 def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     """A full client restart must recover an accepted next-turn prompt.
 
