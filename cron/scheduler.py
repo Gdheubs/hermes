@@ -57,6 +57,7 @@ from agent.delegation_context import (
     enter_non_dispatcher_owned_context,
     exit_non_dispatcher_owned_context,
 )
+from agent.memory_manager import memory_provider_tools_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -166,22 +167,30 @@ class CronPromptInjectionBlocked(Exception):
     """
 
 
-def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
+def _resolve_cron_disabled_toolsets(cfg: dict, enabled_toolsets: list[str] | None = None) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
-    Four protected toolsets are always disabled in cron context:
+    Three protected toolsets are always disabled in cron context:
       - ``cronjob`` — would let a cron-spawned agent schedule more cron jobs
       - ``messaging`` — interactive, needs a live gateway session
       - ``clarify`` — interactive, blocks waiting for user input
-      - ``memory`` — cron agents are constructed with ``skip_memory=True``, so
-        exposing this tool only gives the model an unbacked tool that fails
+
+    ``memory`` is also disabled *unless* the job explicitly opts in via
+    ``enabled_toolsets`` containing ``"memory"`` or a composite toolset that
+    resolves to it.  Cron agents default to ``skip_memory=True`` (no
+    MemoryStore), so exposing the memory tool only gives the model an
+    unbacked tool that fails at runtime with "Memory is not available."
+    Jobs that explicitly request memory get ``skip_memory=False`` and the
+    tool is left enabled (#33444).
 
     User-level ``agent.disabled_toolsets`` from config.yaml is layered on top
     so per-job ``enabled_toolsets`` cannot bypass policy that applies to
     ordinary agent runs (#25752 — LLM-supplied enabled_toolsets was widening
     past config.yaml's denylist).
     """
-    disabled = ["cronjob", "messaging", "clarify", "memory"]
+    disabled = ["cronjob", "messaging", "clarify"]
+    if not memory_provider_tools_enabled(enabled_toolsets):
+        disabled.append("memory")
     agent_cfg = (cfg or {}).get("agent") or {}
     user_disabled = agent_cfg.get("disabled_toolsets") or []
     for name in user_disabled:
@@ -4123,6 +4132,8 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
+        _cron_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
@@ -4142,8 +4153,8 @@ def run_job(
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
-            disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+            enabled_toolsets=_cron_toolsets,
+            disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg, _cron_toolsets),
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
             # HERMES_HOME. When a workdir is configured, also inject project
@@ -4151,7 +4162,7 @@ def run_job(
             # Without a workdir, keep cwd context discovery disabled.
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
-            skip_memory=True,  # Cron system prompts would corrupt user representations
+            skip_memory=not memory_provider_tools_enabled(_cron_toolsets),
             skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
             platform="cron",
             session_id=_cron_session_id,

@@ -550,17 +550,38 @@ class TestRunJobSessionPersistence:
             run_job(job)
 
         kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["enabled_toolsets"] == ["web", "terminal", "file"]
         assert "memory" in (kwargs["disabled_toolsets"] or []), (
-            "memory toolset should be disabled in cron to match skip_memory=True"
+            "memory toolset should be disabled in cron when not explicitly requested"
         )
 
-    def test_run_job_disables_memory_even_when_per_job_enables_it(self, tmp_path):
-        """Cron runs pass skip_memory=True, so memory must not be exposed.
+    @pytest.mark.parametrize("enabled_toolsets", [["memory"], ["coding"]])
+    def test_run_job_keeps_memory_enabled_for_memory_toolsets(self, tmp_path, enabled_toolsets):
+        """Direct and composite memory toolsets enable persistent memory in cron."""
+        job = {
+            "id": "memory-toolset-job",
+            "name": "test",
+            "prompt": "hello",
+            "enabled_toolsets": enabled_toolsets,
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            run_job(job)
 
-        A cron job can request the memory tool through enabled_toolsets, but
-        there is no MemoryStore injected for cron agents.  Keep memory in the
-        disabled set so AIAgent filters the unbacked tool out before the model
-        can call it and receive "Memory is not available" failures.
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["skip_memory"] is False
+        assert "memory" not in (kwargs["disabled_toolsets"] or [])
+
+    def test_run_job_enables_memory_when_per_job_enables_it(self, tmp_path):
+        """Cron jobs that explicitly request memory get skip_memory=False.
+
+        A cron job can opt into memory via ``enabled_toolsets: ["memory", ...]``.
+        When it does, ``skip_memory`` is False and ``memory`` is NOT in the
+        disabled set, so the memory tool is exposed with a real MemoryStore.
         """
         job = {
             "id": "memory-toolset-job",
@@ -572,9 +593,9 @@ class TestRunJobSessionPersistence:
             run_job(job)
 
         kwargs = mock_agent_cls.call_args.kwargs
-        assert kwargs["skip_memory"] is True
+        assert kwargs["skip_memory"] is False
         assert kwargs["enabled_toolsets"] == ["memory", "file"]
-        assert "memory" in kwargs["disabled_toolsets"]
+        assert "memory" not in (kwargs["disabled_toolsets"] or [])
 
     def test_tick_skips_due_jobs_while_dispatch_is_paused(self, tmp_path):
         """The drain gate runs before advancing a due job's schedule."""
