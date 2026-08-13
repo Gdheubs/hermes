@@ -201,6 +201,33 @@ _OMLX_057_STREAM_ABORT = (
     "reduce context length."
 )
 
+# oMLX 0.5.7, PRE-STREAM 400 — the same guard rejecting before the stream
+# opens.  Here the prefill-aware body builder runs, so the wrapper prefix and
+# the structured ``code``/``omlx_code`` survive.  Captured alongside the
+# stream abort above (same reporter, same engine build), which is what makes
+# the pair useful: it isolates the streaming exit as the only thing that
+# strips the structure.  Trailing "..." is the reporter's own elision of the
+# remediation sentence and is kept, so this fixture deliberately carries NO
+# context-overflow token at all.
+_OMLX_057_PREFILL_400_MESSAGE = (
+    "oMLX prefill memory guard rejected this prompt: Prefill context too "
+    "large for available memory (preflight safety guard, kv_len=51311, "
+    "min_chunk=32): predicted peak would require ~78.57 GB (current 71.22 GB "
+    "+ KV 3.28 GB + min-chunk transient 4.08 GB) but prefill safety cap is "
+    "77.76 GB (90% of metal_cap ceiling 86.40 GB). ..."
+)
+
+_OMLX_057_PREFILL_400_BODY = {
+    "error": {
+        "message": _OMLX_057_PREFILL_400_MESSAGE,
+        "type": "invalid_request_error",
+        "param": None,
+        "code": "prefill_memory_exceeded",
+        "omlx_code": "prefill_memory_exceeded",
+        "estimated_bytes": 84368206439,
+    }
+}
+
 
 # ── Test: Full classification pipeline ─────────────────────────────────
 
@@ -846,6 +873,35 @@ class TestClassifyApiError:
         # Nor is it a credential problem.
         assert result.should_rotate_credential is False
         # A wedged local memory wall recovers via a roomier provider.
+        assert result.should_fallback is True
+
+    def test_400_omlx_057_prefill_memory_exceeded_is_overloaded(self):
+        # Verbatim pre-stream capture (issue #52261), paired with the streaming
+        # abort above from the same engine build.  ``str(error)`` is the OpenAI
+        # SDK's rendering of an ``openai.BadRequestError``, i.e. the whole body
+        # repr — which embeds ``'type': 'invalid_request_error'``.  That literal
+        # is why _REQUEST_VALIDATION_PATTERNS excludes it from its own match;
+        # without that exclusion this 400 would be a non-retryable format_error
+        # before any memory or overflow check ran.
+        #
+        # This body carries NO context-overflow token (the reporter elided the
+        # remediation sentence), so on an unguarded classifier it does not even
+        # reach the overflow branch — it falls all the way through 400 handling
+        # to the non-retryable format_error default.  Wrong in a different
+        # direction from the streaming shape, and from the same rejection.
+        e = MockAPIError(
+            "Error code: 400 - " + repr(_OMLX_057_PREFILL_400_BODY),
+            status_code=400,
+            body=_OMLX_057_PREFILL_400_BODY,
+        )
+        result = classify_api_error(
+            e, provider="custom", model="qw36-27b-8bit-mtp:agent",
+            approx_tokens=63337, context_length=256000,
+        )
+        assert result.reason == FailoverReason.overloaded
+        # A memory wall is transient; a format_error would strand the turn.
+        assert result.retryable is True
+        assert result.should_compress is False
         assert result.should_fallback is True
 
     # ── Server disconnect + large session ──
