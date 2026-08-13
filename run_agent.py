@@ -7896,6 +7896,7 @@ class AIAgent:
         invocation paths (concurrent, sequential, inline).
         """
         from tools.delegate_tool import (
+            _SELECTION_UNSET,
             _strip_model_hidden_task_fields,
             delegate_task as _delegate_task,
         )
@@ -7917,6 +7918,8 @@ class AIAgent:
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
+            model=function_args.get("model", _SELECTION_UNSET),
+            reasoning_effort=function_args.get("reasoning_effort", _SELECTION_UNSET),
             background=(not _is_subagent),
             parent_agent=self,
         )
