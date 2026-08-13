@@ -155,13 +155,14 @@ def test_memory_list_honors_configured_limits(monkeypatch, capsys):
         encoding="utf-8",
     )
     (memory_dir / "MEMORY.md").write_text("remember me", encoding="utf-8")
+    (memory_dir / "USER.md").write_text("likes tea", encoding="utf-8")
     monkeypatch.setattr(sys, "argv", ["hermes", "memory", "list"])
 
     main_mod.main()
 
     out = capsys.readouterr().out
     assert "11/17 chars" in out
-    assert "0/11 chars" in out
+    assert "9/11 chars" in out
 
     monkeypatch.setattr(
         sys,
@@ -173,6 +174,17 @@ def test_memory_list_honors_configured_limits(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Deleted. 0% — 0/17 chars" in out
     assert (memory_dir / "MEMORY.md").read_text(encoding="utf-8") == ""
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hermes", "memory", "delete", "user", "likes", "--yes"],
+    )
+    main_mod.main()
+
+    out = capsys.readouterr().out
+    assert "Deleted. 0% — 0/11 chars" in out
+    assert (memory_dir / "USER.md").read_text(encoding="utf-8") == ""
 
 
 def test_memory_show_memory(monkeypatch, capsys):
