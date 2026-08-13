@@ -22,6 +22,7 @@ cleanly on missing-arch assets, and the upgrade path uses
 from __future__ import annotations
 
 import json
+import os
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
