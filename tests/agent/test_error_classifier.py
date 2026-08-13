@@ -177,6 +177,31 @@ class TestClassify402:
 
 
 
+# ── Captured oMLX prefill-memory-guard rejections (issue #52261) ───────
+#
+# Verbatim provider text from field reports on the issue thread, kept as
+# module constants so every assertion below runs against exactly the same
+# bytes the reporter captured.  Do not reflow or "tidy" these strings — the
+# classifier matches substrings, so a reflow silently changes what is tested.
+
+# oMLX 0.5.7, MID-STREAM abort.  Raised as a base ``openai.APIError`` from
+# ``openai/_streaming.py:95``: that class carries no ``status_code`` at all,
+# and the chat streaming generator's own ``except Exception`` handler builds
+# ``{"error": {"message": str(e), "type": "server_error"}}`` without the
+# ``isinstance(e, PrefillMemoryExceededError)`` discrimination the pre-stream
+# path uses, so the structured ``prefill_memory_exceeded`` code is dropped
+# too.  Classification therefore rests entirely on this message text.
+# Reported by tkaufmann; the first code-less capture from a reporter other
+# than the original 13.5 GB build, which is why it is pinned separately.
+_OMLX_057_STREAM_ABORT = (
+    "Prefill context too large for available memory (pre-chunk guard at 192 "
+    "tokens, kv_len=37056): predicted peak would exceed prefill safety cap "
+    "77.8GB (90% of metal_cap ceiling 86.4GB). Raise kernel "
+    "iogpu.wired_limit_mb in Terminal (currently caps Metal at 86.40 GB), or "
+    "reduce context length."
+)
+
+
 # ── Test: Full classification pipeline ─────────────────────────────────
 
 class TestClassifyApiError:
@@ -793,6 +818,35 @@ class TestClassifyApiError:
         )
         assert result.reason == FailoverReason.billing
         assert result.retryable is False
+
+    def test_streaming_omlx_057_prefill_abort_without_status_or_code(self):
+        # Verbatim mid-stream capture (issue #52261): base ``openai.APIError``
+        # with NO http status and NO structured code, so neither the 400 route
+        # nor the error-code route can fire — only _classify_by_message can.
+        # The single overflow token in the text is "context length", from the
+        # trailing remediation hint, so unguarded main reads a memory rejection
+        # as a window overflow, compresses, and reports the session
+        # uncompressible at 37,629 tokens two minutes later.
+        #
+        # The window figures are the reporter's corrected ones: the model's own
+        # window is 262,144, but Hermes could not read it (the value is nested
+        # under ``text_config`` in config.json) and fell back to 256,000, which
+        # is the number the compression decision was actually taken against.
+        # Either way 37,629 tokens is nowhere near the ceiling — the request was
+        # rejected on a GPU memory peak, not on context.
+        e = Exception(_OMLX_057_STREAM_ABORT)
+        result = classify_api_error(
+            e, provider="custom", model="qw36-27b-8bit-mtp:agent",
+            approx_tokens=37629, context_length=256000,
+        )
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+        # The whole point: compression cannot lower a prefill memory peak.
+        assert result.should_compress is False
+        # Nor is it a credential problem.
+        assert result.should_rotate_credential is False
+        # A wedged local memory wall recovers via a roomier provider.
+        assert result.should_fallback is True
 
     # ── Server disconnect + large session ──
 
