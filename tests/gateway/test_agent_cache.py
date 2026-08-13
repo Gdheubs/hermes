@@ -298,6 +298,7 @@ class TestExtractCacheBustingConfig:
         config_path = tmp_path / "honcho.json"
         runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
         monkeypatch.setattr(honcho_client, "resolve_config_path", lambda: config_path)
+        monkeypatch.setattr(honcho_client, "resolve_active_host", lambda: "hermes")
         monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
 
         config_path.write_text("{}", encoding="utf-8")
@@ -313,6 +314,45 @@ class TestExtractCacheBustingConfig:
         )
 
         assert after[cache_key] == expected
+        assert after_signature != before_signature
+
+    def test_active_host_change_busts_signature(self, monkeypatch, tmp_path):
+        from gateway.run import GatewayRunner
+        from plugins.memory.honcho import client as honcho_client
+
+        config_path = tmp_path / "honcho.json"
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        active_host = "hermes_alpha"
+        monkeypatch.setattr(honcho_client, "resolve_config_path", lambda: config_path)
+        monkeypatch.setattr(
+            honcho_client, "resolve_active_host", lambda: active_host
+        )
+        monkeypatch.setattr(GatewayRunner, "_HONCHO_CACHE_BUSTING_MEMO", {})
+        config_path.write_text(
+            json.dumps(
+                {
+                    "hosts": {
+                        "hermes_alpha": {"workspace": "shared"},
+                        "hermes_beta": {"workspace": "shared"},
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        before = GatewayRunner._extract_honcho_cache_busting_config()
+        before_signature = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", cache_keys=before
+        )
+
+        active_host = "hermes_beta"
+        after = GatewayRunner._extract_honcho_cache_busting_config()
+        after_signature = GatewayRunner._agent_config_signature(
+            "m", runtime, [], "", cache_keys=after
+        )
+
+        assert before["honcho.active_host"] == "hermes_alpha"
+        assert after["honcho.active_host"] == "hermes_beta"
         assert after_signature != before_signature
 
     def test_explicit_observation_policy_busts_signature_when_values_match_defaults(

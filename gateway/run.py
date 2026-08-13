@@ -25307,6 +25307,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     )
 
     _HONCHO_CACHE_BUSTING_KEYS = (
+        "honcho.active_host",
         "honcho.workspace_id",
         "honcho.api_key_fingerprint",
         "honcho.environment",
@@ -25350,7 +25351,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         "honcho.session_peer_prefix",
         "honcho.sessions",
     )
-    _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, int | None], dict[str, Any]] = {}
+    _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, int | None, str], dict[str, Any]] = {}
 
     @classmethod
     def _empty_honcho_cache_busting_config(cls) -> dict[str, Any]:
@@ -25360,14 +25361,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _extract_honcho_cache_busting_config(cls) -> dict[str, Any]:
         """Extract effective Honcho behavior settings, memoized by config mtime."""
         try:
-            from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
+            from plugins.memory.honcho.client import (
+                HonchoClientConfig,
+                resolve_active_host,
+                resolve_config_path,
+            )
 
             path = resolve_config_path()
+            active_host = resolve_active_host()
             try:
                 mtime_ns = path.stat().st_mtime_ns
             except OSError:
                 mtime_ns = None
-            memo_key = (str(path), mtime_ns)
+            memo_key = (str(path), mtime_ns, active_host)
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
                 return dict(cached)
@@ -25383,6 +25389,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     hcfg.api_key.encode("utf-8")
                 ).hexdigest()
             values = {
+                "honcho.active_host": active_host,
                 "honcho.workspace_id": hcfg.workspace_id,
                 "honcho.api_key_fingerprint": api_key_fingerprint,
                 "honcho.environment": hcfg.environment,
