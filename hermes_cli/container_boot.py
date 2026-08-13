@@ -136,11 +136,12 @@ def reconcile_profile_gateways(
     # for every profile. Named slots must still be registered (so explicit
     # lifecycle management remains available), but booting them from their
     # persisted run intent would create additional multiplex owners.
-    from utils import is_truthy_value
+    # Keep the boot reconciler aligned with the gateway that will own these
+    # slots. The runtime resolver gives a recognized environment override
+    # precedence over config.yaml and otherwise preserves the configured value.
+    from gateway.config import load_gateway_config
 
-    multiplex_profiles = is_truthy_value(
-        os.environ.get("GATEWAY_MULTIPLEX_PROFILES"),
-    )
+    multiplex_profiles = load_gateway_config().multiplex_profiles
 
     # Default profile — always register, even if nothing has ever
     # populated the root profile dir. The slot exists so
