@@ -793,6 +793,49 @@ function Install-Uv {
     }
 }
 
+function Install-VisualCRedistributable {
+    # @electron-internal/extract-zip@1.0.5 ( Electron 41.10.4 dependency)
+    # requires native DLL extraction which fails without VC++ runtime:
+    # ERR_DLOPEN_FAILED: Failed to load dll.dll → Could not find module
+    # '...\dist\dll.dll' (actually missing VCRUNTIME140_1.dll / MSVCP140.dll)
+    # Reviewer @egilewski requirement: provision prerequisite before npm ci
+    $vcRegistryKey = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*"
+    $vcEntry = Get-Item -Path $vcRegistryKey -ErrorAction SilentlyContinue | Where-Object {
+        $_.GetValue("DisplayName") -like "*Visual C++*2015-2022*x64*"
+    }
+    
+    if ($vcEntry) {
+        Write-Success "Visual C++ 2015-2022 Redistributable (x64) already installed"
+        return $true
+    }
+    
+    Write-Info "Installing Visual C++ 2015-2022 Redistributable (x64)... (required by @electron-internal/extract-zip)"
+    $vcUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+    $vcInstaller = "$env:TEMP\vc_redist.x64.exe"
+    
+    try {
+        Invoke-WebRequest -Uri $vcUrl -OutFile $vcInstaller -UseBasicParsing
+        Write-Info "Downloading VC++ redistributable complete, starting silent install..."
+        
+        $process = Start-Process -FilePath $vcInstaller -ArgumentList "/install", "/quiet", "/norestart" -Wait -PassThru -RedirectStandardOutput "$env:TEMP\vc_install.log"
+        $exitCode = $process.ExitCode
+        
+        if ($exitCode -eq 0 -or $exitCode -eq 3010) {
+            Write-Success "VC++ Redistributable installed successfully (exit code: $exitCode)"
+            Remove-Item -Path $vcInstaller -Force -ErrorAction SilentlyContinue
+            return $true
+        } else {
+            Write-Warn "VC++ installation returned exit code: $exitCode"
+            Write-Info "Check log: $env:TEMP\vc_install.log"
+            return $false
+        }
+    } catch {
+        Write-Err "Failed to install VC++ Redistributable: $_"
+        if (Test-Path $vcInstaller) { Remove-Item -Path $vcInstaller -Force -ErrorAction SilentlyContinue }
+        return $false
+    }
+}
+
 # Refresh $env:Path from the User + Machine registry hives.  Stage drivers
 # invoke each stage in a fresh powershell process, but those processes
 # inherit env from the parent driver shell, NOT from the registry.  When
@@ -4083,6 +4126,7 @@ function Write-Completion {
 # or arrange to provide answers another way."
 $InstallStages = @(
     @{ Name = "uv";               Title = "Installing uv package manager";        Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-Uv" }
+    @{ Name = "vc-redist";        Title = "Installing Visual C++ Redistributable (x64)"; Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-VcRedist" }
     @{ Name = "python";           Title = "Verifying Python $PythonVersion";      Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-Python" }
     @{ Name = "git";              Title = "Installing Git";                       Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-Git" }
     @{ Name = "node";             Title = "Detecting Node.js";                    Category = "prereqs";      NeedsUserInput = $false; Worker = "Stage-Node" }
@@ -4121,6 +4165,7 @@ $InstallStages += @(
 # (the default-invocation case where Main runs everything in one
 # process), and throws cleanly if uv truly isn't installed yet.
 function Stage-Uv               { if (-not (Install-Uv))     { throw "uv installation failed" } }
+function Stage-VcRedist         { if (-not (Install-VisualCRedistributable)) { throw "VC++ Redistributable installation failed" } }
 function Stage-Python           { Resolve-UvCmd; if (-not (Test-Python))    { throw "Python $PythonVersion not available" } }
 function Stage-Git              {
     if (-not (Install-Git)) {

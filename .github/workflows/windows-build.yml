@@ -1,0 +1,74 @@
+name: Windows Build Validation
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'apps/desktop/**'
+      - 'scripts/install.ps1'
+      - 'package-lock.json'
+      - '.github/workflows/windows-build.yml'
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Setup Node.js 22"
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: "Install Visual C++ Redistributable"
+        shell: powershell
+        run: |
+          Write-Host "=== Installing Visual C++ 2015-2022 x64 redistributable ==="
+          $vcUrl = "https://aka.ms/vs/17/release/vc_redist.x64.exe"
+          $installPath = "$env:TEMP\vc_redist.exe"
+          Invoke-WebRequest -Uri $vcUrl -OutFile $installPath -ErrorAction Stop
+          Write-Host "Downloaded VC++ redistributable"
+          $logPath = "$env:TEMP\vc_install.log"
+          Start-Process $installPath -ArgumentList "/quiet /norestart" -Wait -RedirectStandardOutput $logPath
+          $key = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\" -ErrorAction SilentlyContinue | Where-Object { $_.GetValue("DisplayName") -like "*Visual C++*2015-2022*x64*" }
+          if ($key) { Write-Host "Found VC++ package" } else { Write-Warning "VC++ package not detected in registry" }
+          Write-Host "=== VC++ installation completed ==="
+
+      - name: "Install dependencies"
+        shell: powershell
+        run: npm ci
+
+      - name: "Run Windows packaging"
+        shell: powershell
+        run: |
+          Write-Host "=== Starting electron-builder Windows package ==="
+          npx electron-builder --win --dir
+          Write-Host "=== Windows packaging completed ==="
+
+      - name: "Validate Windows executable"
+        shell: powershell
+        run: |
+          $exePath = "${{ github.workspace }}\apps\desktop\release\win-unpacked\Hermes.exe"
+          if (-not (Test-Path $exePath)) { Write-Error "FAILED Hermes.exe not found"; exit 1 }
+          $fileSize = (Get-Item $exePath).Length
+          Write-Host "Hermes.exe exists size $($fileSize / 1MB) MB"
+
+      - name: "Upload Windows artifact"
+        uses: actions/upload-artifact@v4
+        with:
+          name: hermes-windows-electron
+          path: apps/desktop/release/win-unpacked/
+          retention-days: 7
+
+      - name: "Post-validation summary"
+        shell: powershell
+        run: |
+          Write-Host "Windows build completed successfully"
+          Write-Host "Artifact uploaded apps/desktop/release/win-unpacked/"
