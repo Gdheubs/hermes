@@ -5,6 +5,8 @@ from agent.error_classifier import (
     ClassifiedError,
     FailoverReason,
     PROVIDER_STREAM_NON_JSON_ERROR_CODE,
+    _CONTEXT_OVERFLOW_PATTERNS,
+    _MEMORY_CEILING_PATTERNS,
     classify_api_error,
     _extract_status_code,
     _extract_error_body,
@@ -903,6 +905,42 @@ class TestClassifyApiError:
         assert result.retryable is True
         assert result.should_compress is False
         assert result.should_fallback is True
+
+    @pytest.mark.parametrize("shape,message", [
+        ("mid-stream", _OMLX_057_STREAM_ABORT),
+        ("pre-stream 400", _OMLX_057_PREFILL_400_MESSAGE),
+    ])
+    def test_omlx_057_wording_matches_more_than_one_memory_token(self, shape, message):
+        # The oMLX 0.5.6 → 0.5.7 rewording is the evidence for this assertion,
+        # not a hypothetical: "Prefill would require ~13.87 GB peak" became
+        # "predicted peak would require ~78.57 GB", and the pattern written
+        # against the first wording stopped matching the engine it was written
+        # for without anything failing.  Before the memory-accounting entries
+        # were added, the mid-stream shape matched exactly ONE token
+        # ("available memory") while _CONTEXT_OVERFLOW_PATTERNS matched exactly
+        # one of its own ("context length", from the remediation hint) — so a
+        # single further copy-edit on either side flips the classification.
+        #
+        # Scoped to the two 0.5.7 captures because those are the shapes we have
+        # two releases of wording for; it is not asserted as a property of every
+        # message in the list.
+        matched = [p for p in _MEMORY_CEILING_PATTERNS if p in message.lower()]
+        assert len(matched) >= 2, (
+            f"{shape} shape rests on a single memory token {matched!r}; "
+            "one provider copy-edit would reclassify it"
+        )
+
+    def test_memory_ceiling_tokens_stay_disjoint_from_overflow_tokens(self):
+        # The list's stated invariant: every memory-ceiling token names an
+        # allocation ceiling, never a token or window count.  Guards the entries
+        # added for the 0.5.7 wording against drifting into overflow language,
+        # which would silently divert genuine window overflows out of
+        # compression — the failure the whole guard exists to avoid causing.
+        for mem in _MEMORY_CEILING_PATTERNS:
+            for ovf in _CONTEXT_OVERFLOW_PATTERNS:
+                assert mem not in ovf and ovf not in mem, (
+                    f"memory token {mem!r} overlaps overflow token {ovf!r}"
+                )
 
     # ── Server disconnect + large session ──
 

@@ -453,7 +453,20 @@ _MEMORY_CEILING_PATTERNS = [
     "available memory",                  # "too large for available memory"
     "out of memory",
     "insufficient memory",
+    # Memory-accounting wording.  "prefill would require" was written against
+    # the oMLX build that reports "Prefill would require ~13.87 GB peak"; 0.5.7
+    # reworded the same sentence to "predicted peak would require ~78.57 GB"
+    # (pre-stream) and "predicted peak would exceed prefill safety cap 77.8GB"
+    # (mid-stream), so that entry silently stopped covering the release it was
+    # written for.  Both entries are kept — the older wording is still in the
+    # field — and the cap names below are added because they survive the verb
+    # change and appear in both 0.5.7 exits.  All of these name an allocation
+    # ceiling in BYTES, never a token or window count, so they remain disjoint
+    # from _CONTEXT_OVERFLOW_PATTERNS.
     "prefill would require",             # "Prefill would require ~13.87 GB peak"
+    "predicted peak would",              # "predicted peak would require/exceed"
+    "prefill safety cap",                # "prefill safety cap is 77.76 GB"
+    "metal_cap",                         # "90% of metal_cap ceiling 86.40 GB"
 ]
 
 # Structured error codes that unambiguously identify a local-inference memory/
