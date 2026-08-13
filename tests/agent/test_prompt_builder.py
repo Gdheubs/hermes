@@ -960,11 +960,21 @@ class TestToolUseEnforcementGuidance:
             model_lower = model.lower()
             assert not any(s in model_lower for s in TOOL_USE_ENFORCEMENT_SKIP_MODELS), model
 
-
-
-
-
-
+    def test_skip_models_does_not_mask_gpt56_mini_or_flash(self):
+        # Forward-looking: weaker -mini/-flash variants of a skipped family
+        # still NEED enforcement (they are not the over-amplified flagships),
+        # so the runtime skip guard suppresses the substring match when the
+        # model id carries a -mini/-flash suffix. Mirror that guard here so a
+        # future maintainer who drops it (or broadens the match to a prefix
+        # predicate) is caught. See system_prompt.py's _is_weaker_variant.
+        for model in ("gpt-5.6-mini", "gpt-5.6-flash", "gpt-5.7-mini"):
+            model_lower = model.lower()
+            is_weaker_variant = "-mini" in model_lower or "-flash" in model_lower
+            skipped = (
+                not is_weaker_variant
+                and any(s in model_lower for s in TOOL_USE_ENFORCEMENT_SKIP_MODELS)
+            )
+            assert not skipped, f"{model} must not be skipped (weaker variant)"
 
 
 class TestOpenAIModelExecutionGuidance:

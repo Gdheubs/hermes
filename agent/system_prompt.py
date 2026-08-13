@@ -282,9 +282,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             # "auto" or any unrecognised value — use hardcoded defaults,
             # but honor the skip list for models that over-fire on the
             # enforcement/verification prompts (#81670 — GPT-5.6 Sol, etc.).
+            # The skip set is a literal-substring match against flagship ids
+            # only: weaker -mini/-flash variants of a skipped family still
+            # need enforcement (they are not the over-amplified flagships), so
+            # the match is suppressed when the model id carries a -mini/-flash
+            # suffix. Add future over-amplified flagships here as they ship.
             model_lower = (agent.model or "").lower()
+            _is_weaker_variant = "-mini" in model_lower or "-flash" in model_lower
             _skip_enforcement = (
-                TOOL_USE_ENFORCEMENT_SKIP_MODELS
+                not _is_weaker_variant
                 and any(s in model_lower for s in TOOL_USE_ENFORCEMENT_SKIP_MODELS)
             )
             if _skip_enforcement:
