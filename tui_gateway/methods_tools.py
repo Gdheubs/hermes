@@ -543,11 +543,11 @@ def _(rid, params: dict) -> dict:
 
     try:
         from agent.skill_commands import (
-            scan_skill_commands,
             build_skill_invocation_message,
+            get_interactive_skill_commands,
         )
 
-        cmds = scan_skill_commands()
+        cmds = get_interactive_skill_commands()
         key = f"/{name}"
         if key in cmds:
             msg = build_skill_invocation_message(
@@ -1144,10 +1144,10 @@ def _(rid, params: dict) -> dict:
         pass
 
     try:
-        from agent.skill_commands import get_skill_commands
+        from agent.skill_commands import get_interactive_skill_commands
 
         _cmd_key = f"/{_cmd_base}"
-        if _cmd_key in get_skill_commands():
+        if _cmd_key in get_interactive_skill_commands():
             return _err(
                 rid, 4018, f"skill command: use command.dispatch for {_cmd_key}"
             )

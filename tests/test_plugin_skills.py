@@ -104,6 +104,134 @@ class TestPluginSkillRegistry:
         pm.remove_plugin_skill("p:x")
 
 
+class TestPluginSkillSlashCommands:
+    @pytest.fixture(autouse=True)
+    def _registered_plugin_skill(self, tmp_path, monkeypatch):
+        from agent import skill_commands
+        from hermes_cli import plugins as plugins_mod
+        from hermes_cli.plugins import PluginManager
+
+        self.pm = PluginManager()
+        self.pm._discovered = True
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", self.pm)
+
+        empty = tmp_path / "empty-skills"
+        empty.mkdir()
+        monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", empty)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+        skill_dir = tmp_path / "plugins" / "superpowers" / "skills" / "writing-plans"
+        skill_dir.mkdir(parents=True)
+        skill_md = skill_dir / "SKILL.md"
+        skill_md.write_text(
+            "---\nname: writing-plans\ndescription: Write a grounded plan.\n---\n"
+            "\n# Writing plans\n\nPlan carefully.\n"
+        )
+        self.pm._plugin_skills["superpowers:writing-plans"] = {
+            "path": skill_md,
+            "plugin": "superpowers",
+            "bare_name": "writing-plans",
+            "description": "Write a grounded plan.",
+            "frontmatter": {},
+        }
+
+        skill_commands._skill_commands = {}
+        skill_commands._skill_commands_platform = None
+        yield
+        skill_commands._skill_commands = {}
+        skill_commands._skill_commands_platform = None
+
+    def test_interactive_registry_exposes_qualified_plugin_skill(self):
+        from agent.skill_commands import get_interactive_skill_commands
+
+        commands = get_interactive_skill_commands()
+
+        assert commands["/superpowers:writing-plans"]["name"] == (
+            "superpowers:writing-plans"
+        )
+        assert commands["/superpowers:writing-plans"]["source"] == "plugin"
+
+    def test_interactive_registry_reads_description_from_skill_frontmatter(self):
+        self.pm._plugin_skills["superpowers:writing-plans"]["description"] = ""
+        self.pm._plugin_skills["superpowers:writing-plans"]["frontmatter"] = {}
+
+        from agent.skill_commands import get_interactive_skill_commands
+
+        commands = get_interactive_skill_commands()
+
+        assert commands["/superpowers:writing-plans"]["description"] == (
+            "Write a grounded plan."
+        )
+
+    def test_qualified_plugin_skill_builds_invocation_message(self):
+        from agent.skill_commands import build_skill_invocation_message
+
+        message = build_skill_invocation_message(
+            "/superpowers:writing-plans", "draft the protocol"
+        )
+
+        assert message is not None
+        assert '"superpowers:writing-plans" skill' in message
+        assert "Plan carefully." in message
+        assert "draft the protocol" in message
+        assert "plugins/superpowers/skills/writing-plans" in message
+
+    def test_qualified_plugin_skill_respects_disabled_config(self, monkeypatch):
+        monkeypatch.setattr(
+            "agent.skill_utils.get_disabled_skill_names",
+            lambda: {"superpowers:writing-plans"},
+        )
+
+        from agent.skill_commands import get_interactive_skill_commands
+
+        assert "/superpowers:writing-plans" not in get_interactive_skill_commands()
+
+    def test_qualified_plugin_skill_preserves_valid_underscores(self):
+        from agent.skill_commands import resolve_skill_command_key
+
+        original = self.pm._plugin_skills.pop("superpowers:writing-plans")
+        self.pm._plugin_skills["super_powers:writing_plans"] = {
+            **original,
+            "plugin": "super_powers",
+            "bare_name": "writing_plans",
+        }
+
+        assert resolve_skill_command_key("super_powers:writing_plans") == (
+            "/super_powers:writing_plans"
+        )
+
+    def test_tui_completes_and_dispatches_qualified_plugin_skill(self):
+        from tui_gateway import server
+
+        completed = server.handle_request(
+            {
+                "id": "complete",
+                "method": "complete.slash",
+                "params": {"text": "/superpowers:"},
+            }
+        )
+        rows = completed["result"]["items"]
+        row = next(item for item in rows if item["text"] == "superpowers:writing-plans")
+        assert row["kind"] == "skill"
+
+        dispatched = server.handle_request(
+            {
+                "id": "dispatch",
+                "method": "command.dispatch",
+                "params": {
+                    "name": "superpowers:writing-plans",
+                    "arg": "draft the protocol",
+                },
+            }
+        )
+        result = dispatched["result"]
+        assert result["type"] == "skill"
+        assert result["name"] == "superpowers:writing-plans"
+        assert result["display"] == (
+            "/superpowers:writing-plans draft the protocol"
+        )
+
+
 class TestPluginContextRegisterSkill:
     @pytest.fixture
     def ctx(self, tmp_path, monkeypatch):
