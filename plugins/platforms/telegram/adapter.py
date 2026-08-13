@@ -9616,14 +9616,8 @@ class TelegramAdapter(BasePlatformAdapter):
         coalesce on (and dispatch to) the recovered lane rather than the
         raw inbound ``message_thread_id`` Telegram may have attached.
         """
-        from gateway.session import build_session_key
         self._apply_topic_recovery(event)
-        return build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=event.source.profile,
-        )
+        return self._event_session_key(event)
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
@@ -9722,12 +9716,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _photo_batch_key(self, event: MessageEvent, msg: Message) -> str:
         """Return a batching key for Telegram photos/albums."""
-        from gateway.session import build_session_key
-        session_key = build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-        )
+        session_key = self._event_session_key(event)
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
             return f"{session_key}:album:{media_group_id}"
