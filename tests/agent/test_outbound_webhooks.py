@@ -300,6 +300,7 @@ class TestPayload:
         assert payload["extra"]["duration_ms"] == 42
         assert payload["delivery_id"] == "did_1234"
         assert payload["timestamp"].endswith("Z")
+        assert payload["schema_version"] == 1
 
     def test_unserialisable_values_stringified(self):
         body = outbound_webhooks._serialize_payload(

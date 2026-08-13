@@ -275,6 +275,21 @@ def _parse_single_target(index: int, raw: Any) -> Optional[WebhookTarget]:
         )
         return None
 
+    # Reject unknown config fields rather than silently accepting typos
+    # (e.g. ``event`` instead of ``events``, ``secrete`` instead of
+    # ``secret``) — a mistyped key otherwise disables auth/event filtering
+    # with no signal (#14 alignment: reject unknown fields).
+    _KNOWN_FIELDS = {
+        "url", "events", "name", "secret", "secret_env", "matcher", "timeout",
+    }
+    unknown = sorted(set(raw) - _KNOWN_FIELDS)
+    if unknown:
+        logger.warning(
+            "hooks.outbound[%d] has unknown field(s) %s — ignored. Known "
+            "fields: %s",
+            index, ", ".join(unknown), ", ".join(sorted(_KNOWN_FIELDS)),
+        )
+
     url = raw.get("url")
     if not isinstance(url, str) or not url.strip():
         logger.warning("hooks.outbound[%d] is missing a non-empty 'url'", index)
@@ -417,6 +432,7 @@ def _serialize_payload(
     except OSError:
         cwd = ""
     payload = {
+        "schema_version": 1,
         "hook_event_name": event,
         "tool_name": kwargs.get("tool_name"),
         "tool_input": kwargs.get("args") if isinstance(kwargs.get("args"), dict) else None,
