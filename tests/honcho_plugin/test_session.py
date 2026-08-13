@@ -81,6 +81,53 @@ def _install_fake_honcho_sdk(monkeypatch):
 
 
 class TestSessionPeerObservationConfig:
+    def test_new_session_blocks_concurrent_raw_key_recreation(self, monkeypatch):
+        mgr = HonchoSessionManager()
+        key = "telegram:12345"
+        old_session = HonchoSession(
+            key=key,
+            user_peer_id="user",
+            assistant_peer_id="assistant",
+            honcho_session_id="old-session",
+        )
+        fresh_session = HonchoSession(
+            key=f"{key}:new",
+            user_peer_id="user",
+            assistant_peer_id="assistant",
+            honcho_session_id="fresh-session",
+        )
+        mgr._cache[key] = old_session
+        reset_started = threading.Event()
+        release_reset = threading.Event()
+        reader_finished = threading.Event()
+        reader_result = []
+
+        def fake_get_or_create(requested_key):
+            if requested_key != key:
+                reset_started.set()
+                assert release_reset.wait(timeout=2)
+                return fresh_session
+            reader_result.append(mgr._cache[requested_key])
+            reader_finished.set()
+            return reader_result[-1]
+
+        monkeypatch.setattr(mgr, "_get_or_create", fake_get_or_create)
+        reset = threading.Thread(target=lambda: mgr.new_session(key))
+        reader = threading.Thread(target=lambda: mgr.get_or_create(key))
+
+        reset.start()
+        assert reset_started.wait(timeout=2)
+        reader.start()
+        assert not reader_finished.wait(timeout=0.1)
+        release_reset.set()
+        reset.join(timeout=2)
+        reader.join(timeout=2)
+
+        assert not reset.is_alive()
+        assert not reader.is_alive()
+        assert reader_result == [fresh_session]
+        assert mgr._cache[key] is fresh_session
+
     def test_concurrent_client_reads_cannot_restore_stale_client(self):
         old_client = MagicMock(name="old_client")
         new_client = MagicMock(name="new_client")

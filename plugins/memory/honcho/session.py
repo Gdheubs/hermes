@@ -648,6 +648,10 @@ class HonchoSessionManager:
         Returns:
             The session.
         """
+        with self._session_create_lock:
+            return self._get_or_create(key)
+
+    def _get_or_create(self, key: str) -> HonchoSession:
         with self._cache_lock:
             if key in self._cache:
                 logger.debug("Local session cache hit: %s", key)
