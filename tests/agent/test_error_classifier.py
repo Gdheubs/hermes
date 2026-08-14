@@ -310,6 +310,31 @@ _OMLX_057_PROCESS_MEMORY_ABORT_ASCII_ARROW = (
     _OMLX_057_PROCESS_MEMORY_ABORT.replace("→", "->")
 )
 
+# The SAME shape, CAPTURED AGAIN nine days later on a different host, with the
+# remediation tail reworded.  Both halves are captures: 2 Aug above, 11 Aug
+# here.
+#
+# Not a host difference.  engine_core.py on the first host carries an mtime one
+# day after its own 2 Aug capture, and the tail now comes from
+# describe_ceiling_binding(), which emits neither "loosen" nor "free system
+# memory" in any branch — so that host cannot reproduce its own earlier wording
+# today.  The engine reworded it.
+#
+# This is the same drift the memory-accounting entries in
+# _MEMORY_CEILING_PATTERNS were added for, caught a second time on a different
+# sentence: "loosen memory_guard_tier ... free system memory" became "Close
+# other apps to free RAM ... raise memory_guard_tier", and the bound cap moved
+# from a bare "ceiling" to a "dynamic ceiling" with the static cap reported
+# alongside it.  Pinned so the pair is on the record rather than only the
+# earlier half, and so a third copy-edit has something to fail against.
+_OMLX_057_PROCESS_MEMORY_ABORT_REWORDED = (
+    "Request aborted: process memory limit exceeded (usage 53.3 GB, abort "
+    "threshold (hard watermark) 57.4 GB, dynamic ceiling 60.4 GB). Close other "
+    "apps to free RAM (static cap is 90.00 GB but only 7.15 GB is reclaimable "
+    "right now), raise memory_guard_tier (safe → balanced → aggressive), or "
+    "reduce context length."
+)
+
 # oMLX 0.5.7, FOURTH shape — the model LOAD guard, reached before any prefill
 # happens at all, and the only one of the four that arrives as HTTP 507.
 # ``omlx/server.py`` maps both ``ModelTooLargeError`` and
@@ -1226,6 +1251,42 @@ class TestClassifyApiError:
         # Emphatically not a credential or billing problem.
         assert result.should_rotate_credential is False
         assert result.should_fallback is True
+
+    def test_omlx_057_process_memory_abort_reworded_tail_is_overloaded(self):
+        # The 11 Aug capture of the same guard, with the remediation tail
+        # reworded by the engine (see fixture).  This one already classified
+        # correctly before it was pinned — that is the point: it is a
+        # characterisation test, not a regression test, and it exists because
+        # the previous copy-edit to this engine's wording broke a pattern
+        # silently and nothing failed.
+        e = Exception(_OMLX_057_PROCESS_MEMORY_ABORT_REWORDED)
+        result = classify_api_error(
+            e, provider="custom", model="qw36-27b-8bit-mtp:agent",
+            approx_tokens=63337, context_length=256000,
+        )
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+        assert result.should_compress is False
+        assert result.should_rotate_credential is False
+        assert result.should_fallback is True
+
+    def test_omlx_057_process_memory_abort_wordings_actually_differ(self):
+        # Guards the premise of the fixture pair: if a later tidy-up collapses
+        # the two captures into one string, the drift they document disappears
+        # and the test above becomes a duplicate.  The 2 Aug tail says "loosen"
+        # and "free system memory"; the 11 Aug tail says neither.
+        earlier = _OMLX_057_PROCESS_MEMORY_ABORT.lower()
+        later = _OMLX_057_PROCESS_MEMORY_ABORT_REWORDED.lower()
+        for token in ("loosen", "free system memory"):
+            assert token in earlier
+            assert token not in later
+        # And both must still rest on more than one memory token, for the
+        # reason spelled out in the 0.5.6 -> 0.5.7 rewording test below.
+        for message in (earlier, later):
+            matched = [p for p in _MEMORY_CEILING_PATTERNS if p in message]
+            assert len(matched) >= 2, (
+                f"process-memory shape rests on a single memory token {matched!r}"
+            )
 
     def test_omlx_057_process_memory_abort_does_not_rest_on_the_arrow(self):
         # The tier separator is settled as U+2192 (see the fixture comment), so
