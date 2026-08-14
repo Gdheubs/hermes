@@ -14,6 +14,7 @@ from tools.discord_api.embeds import (
     EmbedValidationError,
     contains_mention,
     embed_to_plain_text,
+    validate_embeds,
 )
 
 
@@ -72,17 +73,31 @@ def test_field_count_capped_at_25():
 
 
 def test_total_character_budget_enforced():
-    # Title + description + a field that together exceed the 6000 total.
-    title = "x" * 3000
-    desc = "y" * 3000
-    field = EmbedField("z" * 100, "w" * 100)
+    # Each component stays within its individual limit, but the combined total
+    # exceeds the 6000-character aggregate budget. This exercises aggregate
+    # validation rather than per-component rejection.
+    title = "x" * 256  # within title limit (256)
+    desc = "y" * 4096  # within description limit (4096)
+    field = EmbedField("z" * 256, "w" * 1024)  # within field limits
+    # total = 256 + 4096 + 256 + 1024 = 5632... need to push over 6000
+    # Add a second field to exceed the aggregate:
+    field2 = EmbedField("a" * 256, "b" * 1024)
     with pytest.raises(EmbedValidationError):
-        Embed(title=title, description=desc, fields=[field])
+        Embed(title=title, description=desc, fields=[field, field2])
 
 
 def test_budget_ok_under_limit():
     # title 200 (<256) + description 3000 (<4096) = 3200 total (<6000).
     Embed(title="x" * 200, description="y" * 3000)
+
+
+# ── Field immutability ────────────────────────────────────────────────────────
+def test_fields_converted_to_tuple():
+    e = Embed(fields=[EmbedField("n", "v")])
+    assert isinstance(e.fields, tuple)
+    # Frozen dataclass: cannot mutate
+    with pytest.raises((AttributeError, TypeError)):
+        e.fields[0] = EmbedField("x", "y")
 
 
 # ── URL validation ───────────────────────────────────────────────────────────
@@ -93,10 +108,18 @@ def test_url_must_be_http():
         Embed(title="t", image_url="javascript:alert(1)")
     with pytest.raises(EmbedValidationError):
         EmbedAuthor("a", icon_url="not-a-url")
+    # Missing hostname
+    with pytest.raises(EmbedValidationError):
+        Embed(url="https://")
 
 
 def test_url_http_ok():
     Embed(url="https://example.com", image_url="http://example.com/i.png")
+
+
+def test_url_control_chars_rejected():
+    with pytest.raises(EmbedValidationError):
+        Embed(url="https://example.com\x00")
 
 
 # ── color / timestamp validation ─────────────────────────────────────────────
@@ -115,6 +138,21 @@ def test_timestamp_must_be_iso8601():
         Embed(timestamp="yesterday")
     Embed(timestamp="2026-08-14T10:00:00Z")
     Embed(timestamp="2026-08-14T10:00:00.123+00:00")
+
+
+def test_timestamp_invalid_calendar_date_rejected():
+    # Matches ISO-8601 pattern but is not a valid calendar date.
+    with pytest.raises(EmbedValidationError):
+        Embed(timestamp="2026-02-30T00:00:00Z")
+
+
+# ── Message-level batch validation ───────────────────────────────────────────
+def test_validate_embeds_count_limit():
+    embeds = [Embed(title=f"t{i}") for i in range(EMBED_LIMITS["per_message"])]
+    validate_embeds(embeds)  # exactly 10 → OK
+    embeds.append(Embed(title="t10"))
+    with pytest.raises(EmbedValidationError):
+        validate_embeds(embeds)
 
 
 # ── mention policy ───────────────────────────────────────────────────────────

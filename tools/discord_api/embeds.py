@@ -26,8 +26,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import List, Optional
+from datetime import datetime
+from typing import List, Optional, Sequence, Tuple
 
 __all__ = [
     "EMBED_LIMITS",
@@ -39,6 +39,7 @@ __all__ = [
     "embed_to_plain_text",
     "MENTION_PATTERNS",
     "contains_mention",
+    "validate_embeds",
 ]
 
 # ── Discord-documented embed limits (REST v10) ───────────────────────────────
@@ -58,6 +59,9 @@ _HTTP_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 _ISO_TS_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})$"
 )
+# Control characters (C0 + DEL, excluding tab/newline/carriage-return) that have
+# no place in a Discord payload URL.
+_URL_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 
 
 class EmbedValidationError(ValueError):
@@ -75,11 +79,32 @@ def _check_len(value: Optional[str], limit: int, what: str) -> Optional[str]:
 
 
 def _check_url(value: Optional[str], what: str) -> Optional[str]:
+    """Validate a URL: must use an http(s) scheme, have a non-empty hostname,
+    and contain no control characters. Preserves None handling and
+    EmbedValidationError behavior.
+    """
     if value is None:
         return None
-    if not isinstance(value, str) or not _HTTP_URL_RE.match(value):
+    if not isinstance(value, str):
         raise EmbedValidationError(
             f"embed {what} must be an http(s) URL, got {value!r}"
+        )
+    if _URL_CONTROL_RE.search(value):
+        raise EmbedValidationError(
+            f"embed {what} contains control characters, got {value!r}"
+        )
+    # Parse the URL for structural validation rather than relying on a
+    # prefix regex alone.
+    from urllib.parse import urlparse
+
+    parsed = urlparse(value)
+    if parsed.scheme.lower() not in ("http", "https"):
+        raise EmbedValidationError(
+            f"embed {what} must be an http(s) URL, got {value!r}"
+        )
+    if not parsed.hostname:
+        raise EmbedValidationError(
+            f"embed {what} must have a non-empty hostname, got {value!r}"
         )
     return value
 
@@ -127,7 +152,7 @@ class EmbedFooter:
 class Embed:
     """A validated Discord embed.
 
-    Enforces every documented limit at construction. ``fields`` are limited to
+    Enforces every documented limit at construction. ``fields`` are bounded to
     25 and the total character budget across title/description/fields/footer/
     author is capped at 6000.
     """
@@ -157,11 +182,26 @@ class Embed:
                 raise EmbedValidationError(
                     f"embed timestamp must be ISO-8601, got {self.timestamp!r}"
                 )
+            # Parse the validated timestamp to reject invalid calendar dates
+            # (e.g. 2026-02-30T00:00:00Z). Normalize trailing ``Z`` to ``+00:00``
+            # for fromisoformat compatibility on Python < 3.11.
+            normalized = self.timestamp
+            if normalized.endswith("Z"):
+                normalized = normalized[:-1] + "+00:00"
+            try:
+                datetime.fromisoformat(normalized)
+            except ValueError:
+                raise EmbedValidationError(
+                    f"embed timestamp is not a valid date/time, got {self.timestamp!r}"
+                )
         if self.color is not None:
             if not isinstance(self.color, int) or not (0 <= self.color <= 0xFFFFFF):
                 raise EmbedValidationError(
                     f"embed color must be a 24-bit int, got {self.color!r}"
                 )
+        # Convert the mutable list to an immutable tuple before validation so
+        # the frozen dataclass never exposes a mutable sequence externally.
+        object.__setattr__(self, "fields", tuple(self.fields))
         if len(self.fields) > EMBED_LIMITS["fields"]:
             raise EmbedValidationError(
                 f"embed has {len(self.fields)} fields, exceeds Discord limit "
@@ -210,6 +250,26 @@ class Embed:
                 for f in self.fields
             ]
         return payload
+
+
+# ── Message-level batch validation ───────────────────────────────────────────
+def validate_embeds(embeds: Sequence[Embed]) -> None:
+    """Enforce Discord's per-message embed limits.
+
+    A single message may carry at most EMBED_LIMITS["per_message"] (10) embeds,
+    and the combined character budget across all embeds is capped at
+    EMBED_LIMITS["total"] (6000) per embed — the aggregate limit applies per
+    individual embed, not across the whole message. This function validates
+    the count constraint and delegates per-embed validation (already enforced
+    at construction) so callers get one entry point for the full message.
+
+    Raises EmbedValidationError when the collection violates the count limit.
+    """
+    if len(embeds) > EMBED_LIMITS["per_message"]:
+        raise EmbedValidationError(
+            f"message has {len(embeds)} embeds, exceeds Discord limit "
+            f"{EMBED_LIMITS['per_message']}"
+        )
 
 
 # ── Mention policy ───────────────────────────────────────────────────────────
