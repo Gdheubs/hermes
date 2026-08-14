@@ -16,6 +16,10 @@ from agent.secret_scope import current_secret_scope
 from hermes_cli.config import load_config_readonly
 from hermes_cli.env_loader import get_secret_source_values
 from hermes_cli.profiles import get_profile_dir
+from hermes_constants import (
+    reset_hermes_home_override,
+    set_hermes_home_override,
+)
 
 
 
@@ -60,17 +64,20 @@ def _int_value(value: object, default: int) -> int:
 
 
 def _yaml_webhook(home: Path) -> dict:
-    """Read webhook platform config through the approved config-loading seam.
+    """Read one profile's webhook config through the canonical loader.
 
-    ``load_config_readonly`` is the canonical owner for behavioral reads; it
-    applies the managed-scope overlay, ``${ENV_VAR}`` expansion, profile-aware
-    pathing, and root-model normalization. A raw ``yaml.safe_load`` here would
-    trip the config-read-guard lint (raw reads only allowed in owner modules).
+    ``load_config_readonly`` follows the context-local Hermes-home override,
+    so explicit named-profile reads use that profile's ``config.yaml`` without
+    mutating process-wide environment state. The canonical loader still applies
+    the managed-scope overlay, ``${ENV_VAR}`` expansion, and root normalization.
     """
+    token = set_hermes_home_override(home)
     try:
         data = load_config_readonly() or {}
     except Exception:
         return {}
+    finally:
+        reset_hermes_home_override(token)
     platforms = _as_mapping(data).get("platforms")
     webhook = _as_mapping(_as_mapping(platforms).get("webhook"))
     extra = _as_mapping(webhook.get("extra"))

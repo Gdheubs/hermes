@@ -77,7 +77,52 @@ def test_effective_webhook_config_precedence(
     assert config.routes_path == home / "webhook_subscriptions.json"
 
 
-def test_named_profile_uses_its_own_yaml_and_profile_environment(isolated_profiles, monkeypatch):
+def test_named_profile_uses_its_own_yaml_without_env_override(
+    isolated_profiles,
+):
+    default_home = isolated_profiles / "home"
+    profile_home = default_home / "profiles" / "worker"
+    _write_yaml(
+        default_home,
+        "platforms:\n"
+        "  webhook:\n"
+        "    enabled: false\n"
+        "    extra:\n"
+        "      host: default.example\n"
+        "      port: 8001\n",
+    )
+    _write_yaml(
+        profile_home,
+        "platforms:\n"
+        "  webhook:\n"
+        "    enabled: true\n"
+        "    extra:\n"
+        "      host: worker-yaml.example\n"
+        "      port: 8002\n"
+        "      routes_path: worker-routes.json\n",
+    )
+
+    config = resolve_effective_webhook_config("worker")
+
+    assert config.enabled is True
+    assert config.host == "worker-yaml.example"
+    assert config.port == 8002
+    assert config.source_map["enabled"] == "yaml"
+    assert config.source_map["host"] == "yaml"
+    assert config.source_map["port"] == "yaml"
+    assert config.source_map["routes_path"] == "yaml"
+    assert config.routes_path == profile_home / "worker-routes.json"
+
+    # The context-local override must be restored after the named-profile read.
+    default_config = resolve_effective_webhook_config()
+    assert default_config.enabled is False
+    assert default_config.host == "default.example"
+    assert default_config.port == 8001
+
+
+def test_named_profile_environment_overrides_its_yaml_and_process_env(
+    isolated_profiles, monkeypatch
+):
     root = isolated_profiles
     default_home = root / "home"
     profile_home = default_home / "profiles" / "worker"

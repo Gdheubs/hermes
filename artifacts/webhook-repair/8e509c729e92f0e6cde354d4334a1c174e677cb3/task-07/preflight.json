@@ -1,0 +1,13 @@
+{
+  "branch": "wr/task-07-effective-config",
+  "expected_head": "371639a63b1bc64a6bf37599f9ea06b447c8a18a",
+  "head": "371639a63b1bc64a6bf37599f9ea06b447c8a18a",
+  "mode": "existing_pr",
+  "phase": "preflight",
+  "repository": "D:\\HERMES-TEMP\\webhook-revolution\\task-07-effective-config",
+  "schema_version": 1,
+  "status": "pass",
+  "task": 7,
+  "task_title": "Unify effective configuration and setup",
+  "timestamp": "2026-08-14T23:00:26Z"
+}
