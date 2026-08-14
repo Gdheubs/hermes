@@ -10,6 +10,7 @@ Covers:
 """
 
 import json
+import queue
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -325,6 +326,78 @@ class TestAsyncWriterThread:
         mgr = make_manager(write_frequency="async")
         mgr.shutdown()
         assert mgr._async_thread is None
+
+    def test_concurrent_flushes_do_not_duplicate_messages(self, make_manager):
+        mgr = make_manager(write_frequency="turn")
+        session = _make_session(key="concurrent-flush")
+        session.add_message("user", "only once")
+        mgr._peers_cache[session.user_peer_id] = MagicMock()
+        mgr._peers_cache[session.assistant_peer_id] = MagicMock()
+        honcho_session = MagicMock()
+        mgr._sessions_cache[session.honcho_session_id] = honcho_session
+
+        observation = queue.Queue()
+        results = queue.Queue()
+        errors = queue.Queue()
+        first_upload_started = threading.Event()
+        release_upload = threading.Event()
+        counter_lock = threading.Lock()
+        upload_count = 0
+        lock_entry_count = 0
+
+        class ObservableFlushLock:
+            def __init__(self):
+                self._lock = threading.Lock()
+
+            def __enter__(self):
+                nonlocal lock_entry_count
+                with counter_lock:
+                    lock_entry_count += 1
+                    if lock_entry_count == 2:
+                        observation.put("serialized")
+                self._lock.acquire()
+                return self
+
+            def __exit__(self, _exc_type, _exc_value, _traceback):
+                self._lock.release()
+
+        def blocking_add_messages(_messages):
+            nonlocal upload_count
+            with counter_lock:
+                upload_count += 1
+                if upload_count == 1:
+                    first_upload_started.set()
+                else:
+                    observation.put("duplicate")
+            release_upload.wait(timeout=2)
+
+        def flush():
+            try:
+                results.put(mgr._flush_session(session))
+            except BaseException as exc:
+                errors.put(exc)
+
+        mgr._flush_lock = ObservableFlushLock()
+        honcho_session.add_messages.side_effect = blocking_add_messages
+        first = threading.Thread(target=flush, daemon=True)
+        second = threading.Thread(target=flush, daemon=True)
+        first.start()
+        assert first_upload_started.wait(timeout=1)
+        second.start()
+
+        try:
+            outcome = observation.get(timeout=1)
+        finally:
+            release_upload.set()
+            first.join(timeout=1)
+            second.join(timeout=1)
+
+        assert outcome == "serialized"
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert errors.empty()
+        assert [results.get_nowait(), results.get_nowait()] == [True, True]
+        assert honcho_session.add_messages.call_count == 1
 
     def test_stop_async_writer_joins_thread_without_flushing(self, make_manager):
         mgr = make_manager(write_frequency="async")
