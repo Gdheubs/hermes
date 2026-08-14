@@ -67,6 +67,7 @@ import {
 } from '@/store/session'
 import { dropSessionState } from '@/store/session-states'
 import { pruneDelegateFallbackSubagents, pruneFinishedSessionSubagents, upsertSubagent } from '@/store/subagents'
+import { reportGuestTurnComplete } from '@/store/suggestion-providers/guest-claim'
 import { reportMcpToolResult } from '@/store/suggestion-providers/repair'
 import { invalidateSkillSuggestionIndex } from '@/store/suggestion-providers/skill'
 import { clearActiveSessionTodos } from '@/store/todos'
@@ -761,6 +762,9 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // session so a background turn finishing can't wipe the active chat's
         // prompt, and vice versa.
         clearAllPrompts(sessionId)
+        // Guest-claim invitation counts completed turns; it offers its pill
+        // after the second good one (and is a no-op on non-guest installs).
+        reportGuestTurnComplete(sessionId)
         clearClarifyRequest(undefined, sessionId)
         // Turn ended without a final `todo` update — drop a still-unfinished
         // list so "Tasks N/M" doesn't stay pinned above the composer with the

@@ -704,8 +704,12 @@ const ThreadMessageListInner: FC<ThreadMessageListProps> = ({
       >
         {renderEmpty ? (
           <div
-            className="mx-auto grid h-full w-full max-w-(--composer-width) grid-rows-[minmax(0,1fr)_auto] min-w-0 gap-(--conversation-turn-gap) px-6 py-8"
+            className="mx-auto grid h-full w-full grid-rows-[minmax(0,1fr)_auto] min-w-0 gap-(--conversation-turn-gap) px-6 py-8"
             data-slot="aui_thread-content"
+            // Inline so the stylesheet's aui_thread-content --composer-width cap
+            // can't clobber it: the empty state may render the brand hero at
+            // 1.2× the conversation measure; conversations keep the narrow one.
+            style={{ maxWidth: 'min(calc(var(--composer-width) * 1.2), 100%)' }}
           >
             {emptyPlaceholder}
           </div>

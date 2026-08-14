@@ -1,5 +1,7 @@
 import { type CSSProperties, useState } from 'react'
 
+import { IntroStarters } from '@/components/chat/intro-starters'
+import { useI18n } from '@/i18n'
 import { capitalize, normalize } from '@/lib/text'
 
 import introCopyJsonl from './intro-copy.jsonl?raw'
@@ -16,6 +18,15 @@ type IntroCopyRecord = IntroCopy & {
 export type IntroProps = {
   personality?: string
   seed?: number
+  /**
+   * Which empty-state composition to render:
+   * - 'guide' (default): a small friendly question + the category tabs and
+   *   starter prompts — the hand-hold toward a first prompt.
+   * - 'brand': the HERMES AGENT wordmark hero + one line of randomized
+   *   personality copy — main's intro, kept as a variant for surfaces that
+   *   want the brand moment instead of the guidance.
+   */
+  variant?: 'brand' | 'guide'
 }
 
 const NEUTRAL_PERSONALITIES = new Set(['', 'default', 'none', 'neutral'])
@@ -144,8 +155,6 @@ function pickCopy(copies: IntroCopy[], seed = 0): IntroCopy {
   return copies[Math.abs(seed) % copies.length] || FALLBACK_COPY[0]
 }
 
-const WORDMARK = 'HERMES AGENT'
-
 function resolveCopy(personality?: string, seed?: number): IntroCopy {
   const personalityKey = normalizeKey(personality)
 
@@ -156,16 +165,21 @@ function resolveCopy(personality?: string, seed?: number): IntroCopy {
   return pickCopy(copies, seed)
 }
 
-export function Intro({ personality, seed }: IntroProps) {
+const WORDMARK = 'HERMES AGENT'
+
+/** Brand variant — main's intro: centered wordmark hero + one line of
+ *  randomized personality copy. Sized at main × 1.2: fit-text scales the
+ *  wordmark to a rail capped at 120% of the conversation measure. */
+function IntroBrand({ personality, seed }: IntroProps) {
   const [mountSeed] = useState(() => Math.floor(Math.random() * 100000))
   const copy = resolveCopy(personality, mountSeed + (seed ?? 0))
 
   return (
     <div
-      className="pointer-events-none flex w-full min-w-0 flex-col items-center justify-center px-0.5 py-6 text-center text-muted-foreground sm:px-6 lg:px-8"
+      className="pointer-events-none flex w-full min-w-0 flex-col items-center justify-center py-6 text-center text-muted-foreground"
       data-slot="aui_intro"
     >
-      <div className="w-full min-w-0">
+      <div className="w-full min-w-0 max-w-[calc(var(--composer-width)*1.2)]">
         <p
           aria-label={WORDMARK}
           className="fit-text mx-auto mb-1 w-[calc(100%-1rem)] font-['Collapse'] font-bold uppercase leading-[0.9] tracking-[0.08em] text-midground mix-blend-plus-lighter dark:text-foreground/90"
@@ -181,4 +195,47 @@ export function Intro({ personality, seed }: IntroProps) {
       </div>
     </div>
   )
+}
+
+/** Guide variant — the first-run hand-hold: a small friendly time-aware
+ *  question over the category tabs + starter prompts. Deterministic (Claude's
+ *  move, not a slot machine): the greeting follows the clock, so it reads as
+ *  attentiveness rather than randomness. Bucket boundaries picked so "night"
+ *  starts where dinner ends and "late" is unambiguously burning-the-candle. */
+function greetingBucket(hour: number): 'afternoon' | 'evening' | 'lateNight' | 'morning' {
+  if (hour >= 5 && hour < 12) {
+    return 'morning'
+  }
+
+  if (hour >= 12 && hour < 18) {
+    return 'afternoon'
+  }
+
+  if (hour >= 18 && hour < 23) {
+    return 'evening'
+  }
+
+  return 'lateNight'
+}
+
+function IntroGuide() {
+  const { t } = useI18n()
+  const title = t.composer.starters.titles[greetingBucket(new Date().getHours())]
+
+  return (
+    <div
+      className="pointer-events-none flex w-full min-w-0 flex-col items-center text-muted-foreground"
+      data-slot="aui_intro"
+    >
+      <div className="flex w-full max-w-[34rem] min-w-0 flex-col gap-5 text-left">
+        <h2 className="m-0 text-[1.6rem] font-semibold tracking-tight text-foreground">{title}</h2>
+
+        <IntroStarters />
+      </div>
+    </div>
+  )
+}
+
+export function Intro({ personality, seed, variant = 'guide' }: IntroProps) {
+  return variant === 'brand' ? <IntroBrand personality={personality} seed={seed} /> : <IntroGuide />
 }

@@ -1824,6 +1824,23 @@ export interface Translations {
       done: string
       doneTip: string
     }
+    guestClaim: {
+      label: string
+      tip: string
+      working: string
+      workingTip: string
+      done: string
+      doneTip: string
+    }
+    starters: {
+      titles: {
+        morning: string
+        afternoon: string
+        evening: string
+        lateNight: string
+      }
+      categories: readonly { label: string; prompts: readonly string[] }[]
+    }
   }
 
   statusStack: {
@@ -2123,6 +2140,20 @@ export interface Translations {
       smartDescription: string
       off: string
       offDescription: string
+    }
+    guestAccount: {
+      title: string
+      chipLabel: string
+      chipTip: string
+      description: string
+      modelLabel: string
+      creditsLabel: string
+      historyNote: string
+      claimAction: string
+      claiming: string
+      claimedTitle: string
+      claimedMessage: string
+      claimFailed: string
     }
     statusbar: {
       unknown: string

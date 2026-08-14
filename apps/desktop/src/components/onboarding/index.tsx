@@ -11,6 +11,7 @@ import { Check, ChevronDown, ChevronLeft, KeyRound, Loader2 } from '@/lib/icons'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import { cn } from '@/lib/utils'
 import { $desktopBoot, type DesktopBootState } from '@/store/boot'
+import { $instantAccount, instantSuppressesOnboarding } from '@/store/instant-account'
 import {
   $desktopOnboarding,
   clearPendingProviderOAuth,
@@ -188,6 +189,7 @@ export function DesktopOnboardingOverlay({
   const { t } = useI18n()
   const onboarding = useStore($desktopOnboarding)
   const boot = useStore($desktopBoot)
+  const instantAccount = useStore($instantAccount)
   const ctxRef = useRef<OnboardingContext>({ requestGateway, onCompleted, profile })
   ctxRef.current = { requestGateway, onCompleted, profile }
 
@@ -266,6 +268,15 @@ export function DesktopOnboardingOverlay({
   // EXCEPTION: manual mode (user opened the selector from a working app to
   // add/switch a provider) shows the overlay regardless of configured state.
   if (onboarding.configured === true && !onboarding.manual) {
+    return null
+  }
+
+  // The instant-account path owns first-run while it's minting or ready: the
+  // composer is the first screen and the mint races the first keystroke in
+  // the background. Only 'failed'/'off' fall through to this overlay — the
+  // ladder's honest fallback, rendered exactly as if instant never existed.
+  // Manual mode still wins: Settings → Providers must always open.
+  if (instantSuppressesOnboarding(instantAccount.status) && !onboarding.manual) {
     return null
   }
 

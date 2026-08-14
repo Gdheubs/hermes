@@ -2168,6 +2168,65 @@ export const en: Translations = {
       done: 'Marked for scheduling',
       doneTip: 'Send it and the agent creates the job'
     },
+    guestClaim: {
+      label: 'Keep this setup',
+      tip: 'Link your free guest account so it stays yours',
+      working: 'Linking…',
+      workingTip: 'Click to cancel',
+      done: 'Setup saved',
+      doneTip: 'Your account is linked — nothing else to do'
+    },
+    // Empty-thread starters (T3 Chat shape): category chips + concrete asks.
+    // One click drops the prompt into the composer to edit — never sends.
+    // Every prompt leans on a real agent capability: files, terminal,
+    // browsing, schedules — not trivia a plain chat box could answer.
+    starters: {
+      // Time-aware greeting (deterministic, follows the clock — never random).
+      titles: {
+        morning: 'Good morning! What are we doing?',
+        afternoon: 'What should we do first?',
+        evening: 'What are we working on tonight?',
+        lateNight: 'Burning the midnight oil?'
+      },
+      categories: [
+        {
+          label: 'Build',
+          prompts: [
+            'Clone my repo, fix the failing test, and open a PR',
+            'Scaffold a Vite + TypeScript app and start the dev server',
+            'Find every TODO in this project and turn them into issues',
+            'Profile my script and make it faster'
+          ]
+        },
+        {
+          label: 'Research',
+          prompts: [
+            'Find flights to Tokyo in March and watch for price drops',
+            'Compare the top 3 password managers and recommend one',
+            'Read this paper and give me the five claims that matter',
+            'What changed in the latest release of my dependencies?'
+          ]
+        },
+        {
+          label: 'Automate',
+          prompts: [
+            'Every morning, summarize my inbox and today\u2019s calendar',
+            'Watch this product page and tell me when the price drops',
+            'Back up my notes folder to a zip every Friday',
+            'Alert me when CI fails on the main branch'
+          ]
+        },
+        {
+          label: 'Create',
+          prompts: [
+            'Generate a logo concept for my side project',
+            'Draft a launch tweet for what I shipped this week',
+            'Turn these bullet points into a one-page proposal',
+            'Make a diagram of how my app\u2019s auth flow works'
+          ]
+        }
+      ]
+    },
     snippets: {
       codeReview: {
         label: 'Code review',
@@ -2531,6 +2590,20 @@ export const en: Translations = {
       smartDescription: 'Automatically assess actions and ask when needed',
       off: 'Off',
       offDescription: 'Run without approval prompts'
+    },
+    guestAccount: {
+      title: 'Guest',
+      chipLabel: 'Guest',
+      chipTip: 'Running on a free Nous guest account',
+      description: 'Hermes set up a free guest account so you could start right away. No sign-up, nothing to configure.',
+      modelLabel: 'Model',
+      creditsLabel: 'Included credit',
+      historyNote: 'Your chats, memory, and skills live on this machine and stay yours either way.',
+      claimAction: 'Keep this setup',
+      claiming: 'Linking…',
+      claimedTitle: 'Account linked',
+      claimedMessage: 'Your guest setup is now yours — everything carried over.',
+      claimFailed: 'Could not link the account'
     },
     statusbar: {
       unknown: 'unknown',

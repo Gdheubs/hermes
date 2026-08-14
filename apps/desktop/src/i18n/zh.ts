@@ -2358,6 +2358,60 @@ export const zh: Translations = {
       done: '已标记为定时任务',
       doneTip: '发送后由智能体创建任务'
     },
+    guestClaim: {
+      label: '保留此设置',
+      tip: '关联你的免费访客账户，让它一直属于你',
+      working: '正在关联…',
+      workingTip: '点击取消',
+      done: '设置已保存',
+      doneTip: '账户已关联 — 无需其他操作'
+    },
+    starters: {
+      titles: {
+        morning: '早上好！今天做点什么？',
+        afternoon: '我们先做点什么？',
+        evening: '今晚我们做点什么？',
+        lateNight: '还在熬夜吗？做点什么？'
+      },
+      categories: [
+        {
+          label: '构建',
+          prompts: [
+            '克隆我的仓库，修复失败的测试并提交 PR',
+            '搭建一个 Vite + TypeScript 应用并启动开发服务器',
+            '找出项目里所有 TODO 并转成 issue',
+            '分析我的脚本性能并优化它'
+          ]
+        },
+        {
+          label: '研究',
+          prompts: [
+            '查找三月飞东京的航班，并帮我盯着降价',
+            '对比排名前三的密码管理器并给出推荐',
+            '读这篇论文，告诉我最重要的五个结论',
+            '我的依赖最新版本都改了什么？'
+          ]
+        },
+        {
+          label: '自动化',
+          prompts: [
+            '每天早上帮我总结收件箱和今天的日程',
+            '盯着这个商品页面，降价时告诉我',
+            '每周五把我的笔记文件夹备份成 zip',
+            '主分支 CI 失败时提醒我'
+          ]
+        },
+        {
+          label: '创作',
+          prompts: [
+            '为我的副业项目生成一个 logo 概念',
+            '为我这周发布的东西起草一条推文',
+            '把这些要点整理成一页提案',
+            '画一张我的应用鉴权流程图'
+          ]
+        }
+      ]
+    },
     snippets: {
       codeReview: {
         label: '代码审查',
@@ -2709,6 +2763,20 @@ export const zh: Translations = {
       smartDescription: '自动评估操作，并在需要时询问',
       off: '关闭',
       offDescription: '不显示审批提示，直接运行'
+    },
+    guestAccount: {
+      title: '访客',
+      chipLabel: '访客',
+      chipTip: '正在使用免费的 Nous 访客账户',
+      description: 'Hermes 已为你设置好免费访客账户，无需注册、无需配置，即刻开始。',
+      modelLabel: '模型',
+      creditsLabel: '包含额度',
+      historyNote: '你的对话、记忆和技能都保存在本机，无论如何都属于你。',
+      claimAction: '保留此设置',
+      claiming: '正在关联…',
+      claimedTitle: '账户已关联',
+      claimedMessage: '访客设置现已归你所有 — 一切都保留了下来。',
+      claimFailed: '无法关联账户'
     },
     statusbar: {
       unknown: '未知',
