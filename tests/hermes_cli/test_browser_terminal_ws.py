@@ -64,6 +64,7 @@ def test_browser_terminal_websocket_sends_ready_then_pty_bytes(monkeypatch, tmp_
         captured.update(argv=list(argv), cwd=cwd, env=env, cols=cols, rows=rows)
         return bridge
 
+    monkeypatch.setattr(web_server, "_BROWSER_DESKTOP_PTY_ENABLED", True)
     monkeypatch.setattr(web_server.PtyBridge, "spawn", fake_spawn)
     monkeypatch.setattr(web_server, "_PTY_BRIDGE_AVAILABLE", True)
     monkeypatch.setattr(
@@ -103,6 +104,7 @@ def test_browser_terminal_websocket_rejects_bad_session_id(monkeypatch, _isolate
 
     from hermes_cli import web_server
 
+    monkeypatch.setattr(web_server, "_BROWSER_DESKTOP_PTY_ENABLED", True)
     web_server.app.state.auth_required = False
     web_server.app.state.bound_host = "127.0.0.1"
     client = TestClient(web_server.app, base_url="http://127.0.0.1")
@@ -121,6 +123,7 @@ def test_browser_terminal_websocket_is_refused_on_non_loopback_bind(monkeypatch,
 
     from hermes_cli import web_server
 
+    monkeypatch.setattr(web_server, "_BROWSER_DESKTOP_PTY_ENABLED", True)
     monkeypatch.setattr(web_server.app.state, "bound_host", "0.0.0.0", raising=False)
     web_server.app.state.auth_required = False
     client = TestClient(web_server.app, base_url="http://127.0.0.1")
@@ -133,11 +136,12 @@ def test_browser_terminal_websocket_is_refused_on_non_loopback_bind(monkeypatch,
     assert exc.value.code == 4403
 
 
-def test_browser_terminal_websocket_requires_token_and_same_origin(_isolate_hermes_home):
+def test_browser_terminal_websocket_requires_token_and_same_origin(monkeypatch, _isolate_hermes_home):
     from starlette.testclient import TestClient
     from starlette.websockets import WebSocketDisconnect
     from hermes_cli import web_server
 
+    monkeypatch.setattr(web_server, "_BROWSER_DESKTOP_PTY_ENABLED", True)
     web_server.app.state.auth_required = False
     web_server.app.state.bound_host = "127.0.0.1"
     client = TestClient(web_server.app, base_url="http://127.0.0.1")
@@ -165,6 +169,28 @@ def test_browser_terminal_websocket_requires_token_and_same_origin(_isolate_herm
         ):
             pass
     assert exc.value.code == 4403
+
+
+
+def test_browser_terminal_websocket_is_disabled_pending_security_review(monkeypatch, _isolate_hermes_home):
+    from starlette.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    from hermes_cli import web_server
+
+    monkeypatch.setattr(web_server, "_BROWSER_DESKTOP_PTY_ENABLED", False)
+    web_server.app.state.auth_required = False
+    web_server.app.state.bound_host = "127.0.0.1"
+    client = TestClient(web_server.app, base_url="http://127.0.0.1")
+
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with client.websocket_connect(
+            f"/api/terminal?token={web_server._SESSION_TOKEN}&id=disabled-shell",
+            headers={"host": "127.0.0.1", "origin": "http://127.0.0.1"},
+        ):
+            pass
+    assert exc.value.code == 4403
+    assert "disabled pending security review" in (exc.value.reason or "")
 
 
 def test_browser_terminal_cwd_requires_session_token(_isolate_hermes_home):

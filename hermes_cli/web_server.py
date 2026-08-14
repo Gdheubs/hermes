@@ -16069,6 +16069,10 @@ async def console_ws(ws: WebSocket) -> None:
 
 
 _BROWSER_TERMINAL_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
+# The browser shell is a new local code-execution boundary. Keep it inert until
+# maintainers approve a credential handoff that is not recoverable by another
+# local app simply fetching the loopback SPA.
+_BROWSER_DESKTOP_PTY_ENABLED = False
 
 
 def _browser_terminal_sessions() -> dict[str, Any]:
@@ -16210,6 +16214,13 @@ async def browser_terminal_ws(ws: WebSocket) -> None:
     as a resize control frame. A single JSON `ready` frame precedes PTY output
     so the renderer learns the resolved cwd/shell before exposing the session.
     """
+    if not _BROWSER_DESKTOP_PTY_ENABLED:
+        await ws.close(
+            code=4403,
+            reason="browser Desktop terminal is disabled pending security review",
+        )
+        return
+
     peer = ws.client.host if ws.client else "?"
     bound_host = (getattr(app.state, "bound_host", "") or "").strip().lower()
     if bound_host not in _LOOPBACK_HOSTS:
