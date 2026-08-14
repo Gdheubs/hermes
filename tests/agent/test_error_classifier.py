@@ -263,6 +263,39 @@ _SYNTHETIC_PREFILL_400_NO_OVERFLOW_TOKEN = (
     "77.76 GB (90% of metal_cap ceiling 86.40 GB). ..."
 )
 
+# oMLX 0.5.7, THIRD shape — a different guard from the two above.  The prefill
+# guard rejects a prompt before admitting it; this is the PROCESS MEMORY
+# ENFORCER aborting a request already in flight because resident usage crossed
+# a watermark.  Different guard, different trigger, same engine, and the same
+# closing advice to reduce context length.
+#
+# Pinned because its unguarded failure mode is the worst of the three and is
+# NOT the overflow misroute the other two suffer: "process memory limit
+# exceeded" contains "limit exceeded", which is a _USAGE_LIMIT_PATTERNS entry
+# checked ahead of the overflow branch, and the body carries none of the
+# transient signals ("try again", "retry", "wait", …) that disambiguate a
+# usage limit toward rate_limit.  So an unguarded classifier calls a local
+# Metal watermark abort a BILLING failure — non-retryable, and reported to the
+# user as an account problem.  Three shapes, two guards, one engine; a memory
+# guard has to sit ahead of the overflow branch rather than beside it, and
+# ahead of the usage-limit branch too.
+#
+# The separator between the tier names is a "→" in the reporter's transcript.
+# Whether the engine emits U+2192 or ASCII "->" has not been established from
+# the raw log, so both forms are pinned below and asserted to classify
+# identically.  None of the matching keys ("memory limit exceeded",
+# "memory_guard_tier", "context length") involve the separator.
+_OMLX_057_PROCESS_MEMORY_ABORT = (
+    "Request aborted: process memory limit exceeded (usage 49.8 GB, abort "
+    "threshold (hard watermark) 49.2 GB, ceiling 51.8 GB). Reduce context "
+    "length, free system memory, or loosen memory_guard_tier "
+    "(safe → balanced → aggressive)."
+)
+
+_OMLX_057_PROCESS_MEMORY_ABORT_ASCII_ARROW = (
+    _OMLX_057_PROCESS_MEMORY_ABORT.replace("→", "->")
+)
+
 
 # ── Test: Full classification pipeline ─────────────────────────────────
 
@@ -989,6 +1022,46 @@ class TestClassifyApiError:
             p in _SYNTHETIC_PREFILL_400_NO_OVERFLOW_TOKEN.lower()
             for p in _CONTEXT_OVERFLOW_PATTERNS
         )
+
+    @pytest.mark.parametrize("arrow,message", [
+        ("unicode", _OMLX_057_PROCESS_MEMORY_ABORT),
+        ("ascii", _OMLX_057_PROCESS_MEMORY_ABORT_ASCII_ARROW),
+    ])
+    def test_omlx_057_process_memory_abort_is_overloaded(self, arrow, message):
+        # The third shape (see fixture): the process memory enforcer, not the
+        # prefill guard.  Arrives message-only, like the mid-stream abort.
+        #
+        # Unguarded, this is the worst-classified of the three — "limit
+        # exceeded" routes it to billing, non-retryable, before the overflow
+        # branch is ever reached — so a local Metal watermark abort surfaces as
+        # an account problem and strands the turn outright.
+        e = Exception(message)
+        result = classify_api_error(
+            e, provider="custom", model="qw36-27b-8bit-mtp:agent",
+            approx_tokens=63337, context_length=256000,
+        )
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+        # Compression cannot lower resident process memory either.
+        assert result.should_compress is False
+        # Emphatically not a credential or billing problem.
+        assert result.should_rotate_credential is False
+        assert result.should_fallback is True
+
+    def test_omlx_057_process_memory_abort_does_not_rest_on_the_arrow(self):
+        # The tier separator is the one byte in this capture that could not be
+        # confirmed against the raw log, so nothing is allowed to depend on it:
+        # the two spellings must be indistinguishable to the classifier, and
+        # every matching token must live outside the separator.
+        for message in (
+            _OMLX_057_PROCESS_MEMORY_ABORT,
+            _OMLX_057_PROCESS_MEMORY_ABORT_ASCII_ARROW,
+        ):
+            matched = [p for p in _MEMORY_CEILING_PATTERNS if p in message.lower()]
+            assert len(matched) >= 2, (
+                f"process-memory shape rests on a single memory token {matched!r}"
+            )
+            assert all("→" not in p and "->" not in p for p in matched)
 
     @pytest.mark.parametrize("shape,message", [
         ("mid-stream", _OMLX_057_STREAM_ABORT),
