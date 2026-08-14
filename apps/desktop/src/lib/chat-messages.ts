@@ -156,9 +156,20 @@ export function reasoningPart(text: string, timestamp?: number): ChatMessagePart
   return { type: 'reasoning', text, ...(timestamp !== undefined ? { timestamp } : {}) }
 }
 
-const MEDIA_LINE_RE = /(^|\n)[\t ]*[`"']?MEDIA:\s*(?<line>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)[`"']?[\t ]*(\n|$)/g
+// MEDIA 路径匹配:
+//  - 引号包裹(`` `...` `` / "..." / '...')显式声明边界, 支持任意字符(空格/括号)
+//  - 裸路径: LINE 匹配整行(支持空格, 锚定行尾); TAG 先试 markdown 链接上下文
+//    `](MEDIA:...)` (匹配到 `)` 前, 支持空格), 否则保持无空格路径(避免吞掉尾随文本)
+const MEDIA_LINE_RE = /(^|\n)[\t ]*[`"']?MEDIA:\s*(?<line>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|[^\n]+)[`"']?[\t ]*(\n|$)/g
 
-const MEDIA_TAG_RE = /[`"']?MEDIA:\s*(?<inline>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)[`"']?/g
+const MEDIA_TAG_RE = /[`"']?MEDIA:\s*(?<inline>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|[^)\n]+(?=\))|[^)\s\n]+)[`"']?/g
+
+// Markdown link/image wrapping a MEDIA path — `[label](MEDIA:path)` / `![alt](MEDIA:path)`.
+// Must be replaced WHOLE (before MEDIA_TAG_RE) so the media path becomes a single
+// `[Media: name](#media:…)` link instead of nesting a link inside a link destination,
+// which remark cannot parse. Quoted paths carry the full destination (spaces/parens);
+// bare paths run to the closing paren so spaced paths survive.
+const MD_LINK_MEDIA_RE = /!?\[([^\]]*)\]\(\s*MEDIA:\s*(`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|[^)\n]+?)\s*\)/g
 
 function unquoteMediaPath(value: string): string {
   const trimmed = value.trim()
@@ -175,6 +186,7 @@ function mediaLink(value: string): string {
 
 export function renderMediaTags(text: string): string {
   return text
+    .replace(MD_LINK_MEDIA_RE, (_match, _label, value: string) => mediaLink(value))
     .replace(
       MEDIA_LINE_RE,
       (_match, lead: string, value: string, trailer: string) => `${lead}${mediaLink(value)}${trailer}`

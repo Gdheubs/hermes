@@ -412,6 +412,42 @@ describe('renderMediaTags', () => {
 
     expect(text).toBe('ok\n[Audio: voice.mp3](#media:%2Ftmp%2Fvoice.mp3)')
   })
+
+  it('keeps the full path when a standalone MEDIA line contains spaces', () => {
+    // Regression: the old `\S+` matcher cut the path at the first space, so a
+    // macOS iCloud path ("Mobile Documents", "6 开发项目") produced a truncated
+    // "File: Mobile" link plus the rest of the path as plain text.
+    const input = 'MEDIA:/Users/me/Library/Mobile Documents/6 开发项目/a.png'
+    expect(renderMediaTags(input)).toBe(
+      '[Image: a.png](#media:%2FUsers%2Fme%2FLibrary%2FMobile%20Documents%2F6%20%E5%BC%80%E5%8F%91%E9%A1%B9%E7%9B%AE%2Fa.png)'
+    )
+  })
+
+  it('keeps the full path when a MEDIA tag sits inside a markdown link destination', () => {
+    // `[label](MEDIA:…)` must resolve to a single media link; the path must not
+    // be truncated at the first space nor swallow the closing paren.
+    expect(renderMediaTags('[截图](MEDIA:/tmp/path with space/shot.png)')).toBe(
+      '[Image: shot.png](#media:%2Ftmp%2Fpath%20with%20space%2Fshot.png)'
+    )
+  })
+
+  it('replaces markdown image syntax wrapping MEDIA with a single media link', () => {
+    // `![alt](MEDIA:…)` must not nest a link inside an image destination —
+    // remark cannot parse that and renders the whole thing as plain text.
+    expect(renderMediaTags('![回测进度板块](MEDIA:/tmp/path with space/shot.png)')).toBe(
+      '[Image: shot.png](#media:%2Ftmp%2Fpath%20with%20space%2Fshot.png)'
+    )
+    // No spaces: still must not swallow the closing paren.
+    expect(renderMediaTags('![clip](MEDIA:/tmp/clip.mp4)')).toBe(
+      '[Video: clip.mp4](#media:%2Ftmp%2Fclip.mp4)'
+    )
+  })
+
+  it('supports quoted MEDIA paths containing spaces and parens', () => {
+    expect(renderMediaTags('MEDIA:"/tmp/report (final).pdf"')).toBe(
+      '[File: report (final).pdf](#media:%2Ftmp%2Freport%20(final).pdf)'
+    )
+  })
 })
 
 describe('interleaved reasoning/text boundaries', () => {
