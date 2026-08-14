@@ -2,6 +2,8 @@ import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { atom } from 'nanostores'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { runTreeCloseWithFocusRecovery } from '@/components/pane-shell/tree/tree-focus'
+
 import { SessionActionsMenu } from './session-actions-menu'
 
 afterEach(cleanup)
@@ -14,8 +16,10 @@ vi.mock('@/components/pane-shell/tree/store', () => ({
   closeAllTreeTabs: vi.fn(),
   closeOtherTreeTabs: vi.fn(),
   closeTreeTabsToRight: vi.fn(),
+  treePaneGroupId: vi.fn(() => 'grp-session'),
   treeTabCloseTargets: vi.fn(() => null)
 }))
+vi.mock('@/components/pane-shell/tree/tree-focus', () => ({ runTreeCloseWithFocusRecovery: vi.fn() }))
 vi.mock('@/hermes', () => ({ renameSession: vi.fn() }))
 vi.mock('@/i18n', () => ({
   useI18n: () => ({
@@ -94,6 +98,16 @@ function renderMenu() {
   )
 }
 
+function renderTabMenu(onClose: () => void) {
+  return render(
+    <SessionActionsMenu onClose={onClose} sessionId="s1" surface="tab" tabPaneId="session-tile:s1" title="My session">
+      <button aria-label="Session actions" type="button">
+        ⋮
+      </button>
+    </SessionActionsMenu>
+  )
+}
+
 describe('SessionActionsMenu', () => {
   it('opens the dropdown on click without a tooltip on the kebab', async () => {
     renderMenu()
@@ -112,5 +126,19 @@ describe('SessionActionsMenu', () => {
     expect(await screen.findByRole('menu')).toBeTruthy()
     expect(screen.getByRole('menuitem', { name: /rename/i })).toBeTruthy()
     expect(screen.getByRole('menuitem', { name: /archive/i })).toBeTruthy()
+  })
+
+  it('routes a tab context-menu close through focus recovery', async () => {
+    const onClose = vi.fn()
+    renderTabMenu(onClose)
+
+    const trigger = screen.getByRole('button', { name: 'Session actions' })
+    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.pointerUp(trigger, { button: 0, pointerType: 'mouse' })
+    fireEvent.click(trigger)
+    fireEvent.click(await screen.findByRole('menuitem', { name: /^close$/i }))
+
+    expect(runTreeCloseWithFocusRecovery).toHaveBeenCalledWith('session-tile:s1', onClose, 'grp-session')
+    expect(onClose).not.toHaveBeenCalled()
   })
 })

@@ -2340,6 +2340,7 @@ export interface Translations {
     closeRunningBody: string
     closeRunningConfirm: string
     reload: string
+    closeTab: string
     closeOthers: string
     closeToRight: string
     closeAll: string

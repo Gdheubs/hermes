@@ -1,6 +1,9 @@
 import { act, render, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { clearTreeFocusRequest, requestTreeFocusAfterClose } from '@/components/pane-shell/tree/tree-focus'
+
+import { TERMINAL_RAIL_FOCUS_HANDOFF_ATTR } from './focus-handoff'
 import { useAgentTerminal } from './use-agent-terminal'
 
 const xterm = vi.hoisted(() => ({
@@ -93,8 +96,8 @@ vi.mock('./buffer', () => ({
   registerTerminalReader: terminalRegistrations.registerReader
 }))
 
-function Harness() {
-  const { hostRef } = useAgentTerminal({ active: false, id: 'agent-tab', procId: 'proc-1' })
+function Harness({ active = false }: { active?: boolean }) {
+  const { hostRef } = useAgentTerminal({ active, id: 'agent-tab', procId: 'proc-1' })
 
   return <div ref={hostRef} />
 }
@@ -152,5 +155,68 @@ describe('useAgentTerminal', () => {
     expect(resizeObserverConstructor).not.toHaveBeenCalled()
     expect(terminalRegistrations.registerWriter).not.toHaveBeenCalled()
     expect(terminalRegistrations.registerReader).not.toHaveBeenCalled()
+  })
+
+  it('focuses after becoming active while initial font preparation is pending', async () => {
+    const { rerender } = render(<Harness />)
+
+    await waitFor(() => expect(globalThis.document.fonts.load).toHaveBeenCalledTimes(3))
+    rerender(<Harness active />)
+
+    await act(async () => {
+      resolveFontLoad([])
+      await Promise.resolve()
+    })
+
+    await waitFor(() => expect(xterm.open).toHaveBeenCalledOnce())
+    await waitFor(() => expect(xterm.focus).toHaveBeenCalledOnce())
+  })
+
+  it('preserves a selected rail handoff after delayed active mounting', async () => {
+    const handoffTab = globalThis.document.createElement('button')
+    handoffTab.setAttribute('aria-selected', 'true')
+    handoffTab.setAttribute('data-terminal-rail-tab', 'agent-tab')
+    handoffTab.setAttribute(TERMINAL_RAIL_FOCUS_HANDOFF_ATTR, '')
+    globalThis.document.body.append(handoffTab)
+    handoffTab.focus()
+
+    try {
+      const { rerender } = render(<Harness />)
+
+      await waitFor(() => expect(globalThis.document.fonts.load).toHaveBeenCalledTimes(3))
+      rerender(<Harness active />)
+
+      await act(async () => {
+        resolveFontLoad([])
+        await Promise.resolve()
+      })
+
+      await waitFor(() => expect(xterm.refresh).toHaveBeenCalled())
+      expect(xterm.focus).not.toHaveBeenCalled()
+      expect(globalThis.document.activeElement).toBe(handoffTab)
+    } finally {
+      handoffTab.remove()
+    }
+  })
+
+  it('does not steal a deferred tree-close recovery after delayed active mounting', async () => {
+    const request = requestTreeFocusAfterClose('plugin-pane')
+
+    try {
+      const { rerender } = render(<Harness />)
+
+      await waitFor(() => expect(globalThis.document.fonts.load).toHaveBeenCalledTimes(3))
+      rerender(<Harness active />)
+
+      await act(async () => {
+        resolveFontLoad([])
+        await Promise.resolve()
+      })
+
+      await waitFor(() => expect(xterm.refresh).toHaveBeenCalled())
+      expect(xterm.focus).not.toHaveBeenCalled()
+    } finally {
+      clearTreeFocusRequest(request)
+    }
   })
 })

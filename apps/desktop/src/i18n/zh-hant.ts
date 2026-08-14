@@ -2442,6 +2442,7 @@ export const zhHant = defineLocale({
     minimize: '最小化',
     restore: '還原',
     reload: '重新載入',
+    closeTab: '關閉分頁',
     closeOthers: '關閉其他',
     closeToRight: '關閉右側',
     closeAll: '全部關閉',

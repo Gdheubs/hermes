@@ -10,7 +10,7 @@
  */
 
 import { useStore } from '@nanostores/react'
-import { type CSSProperties, Fragment, type ReactNode, type RefObject, useEffect, useRef, useState } from 'react'
+import { type CSSProperties, Fragment, type ReactNode, type RefObject, useCallback, useEffect, useRef, useState } from 'react'
 
 import { ActionsContextMenu, type MenuKit, renderActionItem } from '@/components/ui/actions-menu'
 import { Codicon } from '@/components/ui/codicon'
@@ -54,6 +54,7 @@ import {
   isSessionStripPane,
   noteActiveTreeGroup,
   reloadTreePane,
+  resolveRenderedTreeGroupSelection,
   restoreTreePane,
   SESSION_TILE_DRAG,
   setTreeGroupHeaderHidden,
@@ -68,11 +69,23 @@ import {
   selectTabRange,
   toggleTabSelected
 } from '../tab-selection'
+import { $treeFocusRequest, requestTreeFocusAfterRestore, runTreeCloseWithFocusRecovery } from '../tree-focus'
 
 import { type DoubleTapContext, startPaneDrag } from './drag-session'
 import { forceLoneHeaderForPanes } from './lone-header'
 import { useActiveTabVisible } from './tab-strip-scroll'
 import { paneChrome } from './track-model'
+
+const HORIZONTAL_TAB_KEY_DELTAS: Readonly<Record<string, number>> = { ArrowLeft: -1, ArrowRight: 1 }
+const VERTICAL_TAB_KEY_DELTAS: Readonly<Record<string, number>> = { ArrowDown: 1, ArrowUp: -1 }
+
+function paneTabId(groupId: string, paneId: string): string {
+  return `tree-tab-${encodeURIComponent(groupId)}-${encodeURIComponent(paneId)}`
+}
+
+function panePanelId(groupId: string, paneId: string): string {
+  return `tree-panel-${encodeURIComponent(groupId)}-${encodeURIComponent(paneId)}`
+}
 
 /** Right-click zone menu: the tab verbs (close this / others / to the right /
  *  all) plus the strip's own chrome toggles. Same items and icons as a session
@@ -86,6 +99,7 @@ function ZoneMenu({
   headerHidden,
   minimized,
   nodeId,
+  onToggleMinimized,
   targetPane
 }: {
   children: ReactNode
@@ -98,6 +112,7 @@ function ZoneMenu({
   headerHidden?: boolean
   minimized?: boolean
   nodeId: string
+  onToggleMinimized: () => void
   /** The right-clicked chip (else the active pane) — what the close-others /
    *  to-the-right / all verbs measure from. Called when the menu RENDERS, not
    *  on every zone re-render: resolving the siblings reads the layout tree,
@@ -124,22 +139,39 @@ function ZoneMenu({
         <kit.Separator />
         {paneTabCloseItems(kit, {
           counts: treeTabCloseTargets(targetId),
-          onClose: paneId !== undefined ? () => closeTabPane(paneId) : undefined,
-          onCloseAll: () => closeAllTreeTabs(targetId),
-          onCloseOthers: () => closeOtherTreeTabs(targetId),
-          onCloseToRight: () => closeTreeTabsToRight(targetId)
+          onClose:
+            paneId !== undefined
+              ? () => {
+                  runTreeCloseWithFocusRecovery(paneId, () => closeTabPane(paneId), nodeId)
+                }
+              : undefined,
+          onCloseAll: () => {
+            runTreeCloseWithFocusRecovery(targetId, () => closeAllTreeTabs(targetId), nodeId)
+          },
+          onCloseOthers: () => {
+            runTreeCloseWithFocusRecovery(targetId, () => closeOtherTreeTabs(targetId), nodeId)
+          },
+          onCloseToRight: () => {
+            runTreeCloseWithFocusRecovery(targetId, () => closeTreeTabsToRight(targetId), nodeId)
+          }
         })}
         <kit.Separator />
         {renderActionItem(kit, {
           icon: headerHidden ? 'eye' : 'eye-closed',
           label: headerHidden ? t.zones.showHeader : t.zones.hideHeader,
-          onSelect: () => setTreeGroupHeaderHidden(nodeId, !headerHidden)
+          onSelect: () => {
+            if (!headerHidden) {
+              requestTreeFocusAfterRestore(nodeId, targetId)
+            }
+
+            setTreeGroupHeaderHidden(nodeId, !headerHidden)
+          }
         })}
         {minimizable &&
           renderActionItem(kit, {
             icon: minimized ? 'chevron-down' : 'chevron-up',
             label: minimized ? t.zones.restore : t.zones.minimize,
-            onSelect: () => setTreeGroupMinimized(nodeId, !minimized)
+            onSelect: onToggleMinimized
           })}
       </>
     )
@@ -175,6 +207,7 @@ export function TreeGroup({
   // missing on an inactive tile tab whose zone-active was the uncloseable
   // workspace).
   const [menuPane, setMenuPane] = useState<string | undefined>(undefined)
+  const [pendingCloseFocus, setPendingCloseFocus] = useState<null | { paneId: string; requestId: number }>(null)
   const panes = useContributions('panes')
   // Coarse drag flag only (set once at drag start/end). The per-frame drop
   // HINT lives in ZoneDropOverlay so a moving pointer re-renders the tiny
@@ -187,6 +220,7 @@ export function TreeGroup({
   const narrow = useStore($narrowViewport)
   const newSessionTabAction = useStore($newSessionTabAction)
   const panesWithCloser = useStore($panesWithCloser)
+  const treeFocusRequest = useStore($treeFocusRequest)
   // Multi-tab selection (⌥/Ctrl-click, Shift-click) — null for every zone but
   // the one holding it, so this subscription is quiet during normal use.
   const tabSelection = useStore($tabSelection)
@@ -204,11 +238,13 @@ export function TreeGroup({
   // shown one (render-side — the tree keeps `active`).
   // Edit mode forces toggle-hidden panes visible so they can be rearranged
   // (mirrors tree-split's paneGone) — restores itself on exit.
-  const paneShown = (id: string) =>
-    Boolean(paneFor(id)) && (editMode || !hiddenPanes.has(id)) && !(narrow && paneChrome(paneFor(id)).collapsible)
+  const { activeId: renderedActiveId, shown } = resolveRenderedTreeGroupSelection(node, {
+    editMode,
+    hiddenPanes,
+    narrow
+  })
 
-  const shown = node.panes.filter(paneShown)
-  const activeId = shown.includes(node.active) ? node.active : (shown[0] ?? node.active)
+  const activeId = renderedActiveId ?? node.active
   const active = paneFor(activeId)
   const isEmpty = node.panes.length === 0
 
@@ -271,12 +307,63 @@ export function TreeGroup({
     tabCount: shown.length
   })
 
+  const focusTabControl = useCallback((paneId: string) => {
+    const tab = Array.from(ref.current?.querySelectorAll<HTMLElement>('[data-tree-tab]') ?? []).find(
+      element => element.dataset.treeTab === paneId
+    )
+
+    tab?.querySelector<HTMLElement>('[data-pane-tab-control="true"]')?.focus({ preventScroll: true })
+  }, [])
+
+  const restoreMinimizedPane = (paneId: string) => {
+    // The focused minimized control disappears synchronously. Reserve the root
+    // handoff before the layout restore so automatic nested focus cannot win.
+    requestTreeFocusAfterRestore(node.id, paneId)
+    restoreTreePane(paneId)
+  }
+
+  useEffect(() => {
+    if (!pendingCloseFocus) {
+      return
+    }
+
+    const request =
+      treeFocusRequest?.kind === 'close' && treeFocusRequest.id === pendingCloseFocus.requestId ? treeFocusRequest : null
+
+    // Another keyboard close superseded this one, or the root has already
+    // resolved it. Only the current request owns focus recovery.
+    if (!request) {
+      setPendingCloseFocus(null)
+
+      return
+    }
+
+    // A registered closer may show a confirmation first. Keep the intent until
+    // it settles, even if the pane disappears before the dialog closes.
+    if (request.status === 'pending' || shown.includes(pendingCloseFocus.paneId)) {
+      return
+    }
+
+    setPendingCloseFocus(null)
+
+    if (document.activeElement !== document.body) {
+      return
+    }
+
+    const focusTarget = shown.includes(activeId) ? activeId : shown[0]
+
+    if (focusTarget) {
+      focusTabControl(focusTarget)
+    }
+  }, [activeId, focusTabControl, pendingCloseFocus, shown, treeFocusRequest])
+
   // Drag handles preventDefault pointerdown (no native dblclick), so the
   // header + chips share a synthesized double-tap: restore if collapsed
   // (undoing the first tap's minimize toggle) and hide the chrome.
   const hideHeaderDoubleTap: DoubleTapContext = {
     key: `hide-header-${node.id}`,
     onDoubleTap: () => {
+      requestTreeFocusAfterRestore(node.id, activeId)
       setTreeGroupMinimized(node.id, false)
       setTreeGroupHeaderHidden(node.id, true)
     }
@@ -304,9 +391,69 @@ export function TreeGroup({
   // MAIN strands the whole app behind a strip.
   const minimizable = !shown.some(id => paneChrome(paneFor(id)).uncloseable)
 
-  // Middle-click / ⌘-click on a tab: one routing for every tab kind, the same
-  // one the zone menu's Close and ⌘W use.
-  const closeTab = (paneId: string) => closeTabPane(paneId)
+  const activateTab = (paneId: string) => {
+    clearTabSelection()
+
+    if (node.minimized) {
+      restoreMinimizedPane(paneId)
+
+      if (verticalCollapse) {
+        return
+      }
+    }
+
+    activateTreePane(node.id, paneId)
+  }
+
+  const onTabKeyDown = (event: React.KeyboardEvent<HTMLDivElement>, paneId: string) => {
+    if (event.altKey || event.ctrlKey || event.metaKey) {
+      return
+    }
+
+    const index = shown.indexOf(paneId)
+    const delta = (verticalCollapse ? VERTICAL_TAB_KEY_DELTAS : HORIZONTAL_TAB_KEY_DELTAS)[event.key]
+
+    const directDestinations: Readonly<Record<string, string | undefined>> = {
+      ' ': paneId,
+      End: shown.at(-1),
+      Enter: paneId,
+      Home: shown[0]
+    }
+
+    const destination =
+      delta === undefined ? directDestinations[event.key] : shown[(index + delta + shown.length) % shown.length]
+
+    if (!destination) {
+      return
+    }
+
+    event.preventDefault()
+    event.stopPropagation()
+
+    if (!verticalCollapse) {
+      focusTabControl(destination)
+    }
+
+    activateTab(destination)
+  }
+
+  // Every close gesture that can remove a pane enters the shared lifecycle.
+  // That includes middle/⌘ clicks, which never focus the close button and
+  // otherwise strand focus on body when they remove the currently focused tab.
+  const closeTab = (paneId: string) => {
+    if (!paneChrome(paneFor(paneId)).uncloseable) {
+      const { request } = runTreeCloseWithFocusRecovery(paneId, () => closeTabPane(paneId), node.id)
+
+      if (request) {
+        setPendingCloseFocus({ paneId, requestId: request.id })
+      }
+
+      return
+    }
+
+    setPendingCloseFocus(null)
+    closeTabPane(paneId)
+  }
 
   // A pane whose store owns Close keeps the gesture even when the pane itself
   // is uncloseable — the workspace tab empties to a fresh draft rather than
@@ -318,7 +465,15 @@ export function TreeGroup({
 
   // Collapse/restore a tool panel (or plain minimize elsewhere) — the header
   // chevron + tap gesture, routed so ⌃`/the titlebar toggle stay truthful.
-  const toggleCollapse = () => (node.minimized ? restoreTreePane(activeId) : collapseTreePane(activeId))
+  const toggleCollapse = () => {
+    if (node.minimized) {
+      restoreMinimizedPane(activeId)
+
+      return
+    }
+
+    runTreeCloseWithFocusRecovery(activeId, () => collapseTreePane(activeId), node.id)
+  }
 
   // Same menu on the header strip and the edit veil — one prop bag.
   const zoneMenu = {
@@ -327,6 +482,7 @@ export function TreeGroup({
     minimizable,
     minimized: node.minimized,
     nodeId: node.id,
+    onToggleMinimized: toggleCollapse,
     targetPane
   }
 
@@ -373,10 +529,11 @@ export function TreeGroup({
               // Strip line faces the content the zone collapsed away from.
               railSide === 'right' ? PANE_TAB_STRIP_LINE_LEFT : PANE_TAB_STRIP_LINE_RIGHT
             )}
-            onClick={() => restoreTreePane(activeId)}
+            onClick={() => restoreMinimizedPane(activeId)}
             title={t.zones.restore}
           >
             <div
+              aria-orientation="vertical"
               className="flex min-h-0 flex-col overflow-y-auto [-ms-overflow-style:none] [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
               role="tablist"
             >
@@ -385,18 +542,22 @@ export function TreeGroup({
 
                 return (
                   <PaneTab
-                    // Match the horizontal minimized strip: no tab is "active"
-                    // while collapsed (there's no content surface to merge into).
+                    // Keep visual active styling off while collapsed; its ARIA
+                    // selection still identifies the tab that will restore.
+                    aria-controls={panePanelId(node.id, paneId)}
                     aria-selected={paneId === activeId}
                     data-tree-tab={paneId}
+                    id={paneTabId(node.id, paneId)}
                     key={paneId}
                     onClick={event => {
                       event.stopPropagation()
-                      restoreTreePane(paneId)
+                      activateTab(paneId)
                     }}
                     onClose={closeable ? () => closeTab(paneId) : undefined}
+                    onKeyDown={event => onTabKeyDown(event, paneId)}
                     role="tab"
                     side={railSide}
+                    tabIndex={paneId === activeId ? 0 : -1}
                     vertical
                   >
                     <PaneTabLabel>{tabLabel(paneId)}</PaneTabLabel>
@@ -449,6 +610,7 @@ export function TreeGroup({
           >
             {shown.map(paneId => {
               const isActive = paneId === activeId && !node.minimized
+              const isAriaSelected = paneId === activeId
               const chrome = paneChrome(paneFor(paneId))
               const closeable = closeableTab(paneId)
               const title = paneFor(paneId)?.title ?? paneId
@@ -457,10 +619,13 @@ export function TreeGroup({
               const tab = (
                 <PaneTab
                   active={isActive}
-                  aria-selected={isActive}
+                  aria-controls={panePanelId(node.id, paneId)}
+                  aria-selected={isAriaSelected}
                   data-tree-tab={paneId}
+                  id={paneTabId(node.id, paneId)}
                   key={paneId}
                   onClose={closeable ? () => closeTab(paneId) : undefined}
+                  onKeyDown={event => onTabKeyDown(event, paneId)}
                   onPointerDown={e => {
                     // Chrome's tab-selection grammar, ahead of activate/drag:
                     // Shift-click ranges from the anchor, ⌥-click (Ctrl-click
@@ -489,15 +654,7 @@ export function TreeGroup({
                     // the active tab made double-click a minimize/restore/hide
                     // lottery. A plain click also collapses any multi-tab
                     // selection back to the one tab (Chrome semantics).
-                    const onTap = () => {
-                      clearTabSelection()
-
-                      if (node.minimized) {
-                        restoreTreePane(paneId)
-                      }
-
-                      activateTreePane(node.id, paneId)
-                    }
+                    const onTap = () => activateTab(paneId)
 
                     // Claim the press so the STRIP's own pane-drag handler
                     // (parent onPointerDown) can't also fire. startPaneDrag
@@ -546,6 +703,7 @@ export function TreeGroup({
                   role="tab"
                   selected={isSelected}
                   style={{ cursor: 'grab' }}
+                  tabIndex={paneId === activeId ? 0 : -1}
                 >
                   {chrome.tabLead ? (
                     <span className="ml-2 -mr-1 flex shrink-0 items-center">{chrome.tabLead()}</span>
@@ -607,45 +765,79 @@ export function TreeGroup({
               <DecodeText className="text-(--ui-text-quaternary)" cursor prefix={1} text="HERMES" />
             </div>
           ) : (
-            keptPanes.map(paneId => {
-              const pane = paneFor(paneId)
-              const isActive = paneId === activeId
+            <>
+              {keptPanes.map(paneId => {
+                const pane = paneFor(paneId)
+                const isActive = paneId === activeId
+                const hasTabPanel = headerVisible
 
-              return (
-                <div
-                  aria-hidden={!isActive || undefined}
-                  className={cn('absolute inset-0 overflow-auto', !isActive && 'pointer-events-none invisible')}
-                  key={paneId}
-                  {...hiddenPaneProps(!isActive)}
-                >
-                  {pane?.render ? (
-                    // Visibility flows to the pane so a kept-alive chat surface
-                    // can gate its hot (per-token) subscriptions while hidden;
-                    // the group id identifies the ZONE it lives in, for state
-                    // that is per-zone rather than per-tab (composer pop-out).
-                    // The reload epoch keys the CONTENT, not this layer: a
-                    // Reload remounts the contribution (effects re-run, state
-                    // resets) while the layer — and every other tab — stays.
-                    <PaneGroupContext.Provider value={node.id}>
-                      <PaneVisibleContext.Provider value={isActive}>
-                        <ContribBoundary id={pane.id} key={paneEpochs[paneId] ?? 0}>
-                          <ContribRender render={pane.render} />
-                        </ContribBoundary>
-                      </PaneVisibleContext.Provider>
-                    </PaneGroupContext.Provider>
-                  ) : (
-                    isActive && (
-                      <div className="p-3 font-mono text-[11px] text-(--ui-text-quaternary)">
-                        {t.zones.missingPane(paneId)}
-                      </div>
-                    )
-                  )}
-                </div>
-              )
-            })
+                return (
+                  <div
+                    aria-hidden={!isActive || undefined}
+                    aria-labelledby={hasTabPanel ? paneTabId(node.id, paneId) : undefined}
+                    className={cn('absolute inset-0 overflow-auto', !isActive && 'pointer-events-none invisible')}
+                    id={hasTabPanel ? panePanelId(node.id, paneId) : undefined}
+                    key={paneId}
+                    role={hasTabPanel ? 'tabpanel' : undefined}
+                    {...hiddenPaneProps(!isActive)}
+                  >
+                    {pane?.render ? (
+                      // Visibility flows to the pane so a kept-alive chat surface
+                      // can gate its hot (per-token) subscriptions while hidden;
+                      // the group id identifies the ZONE it lives in, for state
+                      // that is per-zone rather than per-tab (composer pop-out).
+                      // The reload epoch keys the CONTENT, not this layer: a
+                      // Reload remounts the contribution (effects re-run, state
+                      // resets) while the layer — and every other tab — stays.
+                      <PaneGroupContext.Provider value={node.id}>
+                        <PaneVisibleContext.Provider value={isActive}>
+                          <ContribBoundary id={pane.id} key={paneEpochs[paneId] ?? 0}>
+                            <ContribRender render={pane.render} />
+                          </ContribBoundary>
+                        </PaneVisibleContext.Provider>
+                      </PaneGroupContext.Provider>
+                    ) : (
+                      isActive && (
+                        <div className="p-3 font-mono text-[11px] text-(--ui-text-quaternary)">
+                          {t.zones.missingPane(paneId)}
+                        </div>
+                      )
+                    )}
+                  </div>
+                )
+              })}
+              {headerVisible &&
+                shown
+                  .filter(paneId => !keptPanes.includes(paneId))
+                  .map(paneId => (
+                    <div
+                      aria-hidden="true"
+                      aria-labelledby={paneTabId(node.id, paneId)}
+                      hidden
+                      id={panePanelId(node.id, paneId)}
+                      key={`placeholder-${paneId}`}
+                      role="tabpanel"
+                    />
+                  ))}
+            </>
           )}
         </div>
       )}
+
+      {/* A minimized strip still exposes tabs, so keep a hidden panel target
+          for every aria-controls relationship. Content stays unmounted while
+          minimized; these semantic placeholders vanish on restore. */}
+      {node.minimized &&
+        shown.map(paneId => (
+          <div
+            aria-hidden="true"
+            aria-labelledby={paneTabId(node.id, paneId)}
+            hidden
+            id={panePanelId(node.id, paneId)}
+            key={`minimized-panel-${paneId}`}
+            role="tabpanel"
+          />
+        ))}
 
       {/* Edit-mode veil: the BODY is a drag handle for the active pane. It
           starts below the header so tabs/headers stay directly interactive

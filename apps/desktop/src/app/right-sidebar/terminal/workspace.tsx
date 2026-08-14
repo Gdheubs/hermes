@@ -6,7 +6,8 @@ import { $backgroundStatusBySession } from '@/store/composer-status'
 import { seedAgentTerminalCommand, syncAgentTerminalSnapshot } from './agent-terminal-stream'
 import { setActiveTerminalId } from './buffer'
 import { AgentTerminalInstance, TerminalInstance } from './instance'
-import { $activeTerminalId, $terminals, ensureAgentTerminal } from './terminals'
+import { terminalPanelId, terminalTabId } from './tab-aria'
+import { $activeTerminalId, $terminals, ensureAgentTerminal, selectTerminal } from './terminals'
 
 interface TerminalWorkspaceProps {
   onAddSelectionToChat: (text: string, label?: string) => void
@@ -46,21 +47,35 @@ export function TerminalWorkspace({ onAddSelectionToChat }: TerminalWorkspacePro
 
   return (
     <>
-      {terminals.map(term =>
-        term.kind === 'agent' ? (
-          <AgentTerminalInstance active={term.id === activeId} id={term.id} key={term.id} procId={term.procId!} />
-        ) : (
-          <TerminalInstance
-            active={term.id === activeId}
-            cwd={term.cwd}
-            id={term.id}
+      {terminals.map(term => {
+        const active = term.id === activeId
+
+        return (
+          <div
+            aria-hidden={!active}
+            aria-labelledby={terminalTabId(term.id)}
+            data-terminal=""
+            data-terminal-id={term.id}
+            id={terminalPanelId(term.id)}
             key={term.id}
-            onAddSelectionToChat={onAddSelectionToChat}
-            restoreCwd={term.restoreCwd}
-            reviveBuffer={term.reviveBuffer}
-          />
+            onFocusCapture={() => selectTerminal(term.id)}
+            role="tabpanel"
+          >
+            {term.kind === 'agent' ? (
+              <AgentTerminalInstance active={active} id={term.id} procId={term.procId!} />
+            ) : (
+              <TerminalInstance
+                active={active}
+                cwd={term.cwd}
+                id={term.id}
+                onAddSelectionToChat={onAddSelectionToChat}
+                restoreCwd={term.restoreCwd}
+                reviveBuffer={term.reviveBuffer}
+              />
+            )}
+          </div>
         )
-      )}
+      })}
     </>
   )
 }

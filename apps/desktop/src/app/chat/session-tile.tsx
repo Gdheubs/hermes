@@ -27,7 +27,13 @@ import { ModelMenuPanel } from '@/app/shell/model-menu-panel'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { CenteredThreadSpinner } from '@/components/assistant-ui/thread/status'
 import { findGroupOfPane } from '@/components/pane-shell/tree/model'
-import { $layoutTree, closeTreePane, moveTreePane, setTreeGroupHeaderHidden } from '@/components/pane-shell/tree/store'
+import {
+  $layoutTree,
+  closeTreePane,
+  moveTreePane,
+  type PaneCloseResult,
+  setTreeGroupHeaderHidden
+} from '@/components/pane-shell/tree/store'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { transcribeAudio } from '@/hermes'
@@ -401,39 +407,134 @@ function tileDragPayload(storedSessionId: string): SessionDragPayload {
 // input) doesn't close silently.
 // ---------------------------------------------------------------------------
 
-/** Stored id awaiting close confirmation (null = no dialog). */
-const $confirmCloseTile = atom<null | string>(null)
+interface PendingSessionTileClose {
+  completion: Promise<void>
+  confirmed: boolean
+  id: number
+  phase: 'closing' | 'open'
+  reject: (reason: Error) => void
+  resolve: () => void
+  storedSessionId: string
+}
+
+/** Pending busy close (null = no dialog). Its promise is the pane closer's
+ * lifecycle contract: resolve only after the dialog has closed, reject on
+ * cancel, so tree focus never moves behind the modal. */
+const $confirmCloseTile = atom<PendingSessionTileClose | null>(null)
+let nextPendingSessionTileCloseId = 0
+
+function closeCanceledError(): Error {
+  return new Error('Session tab close canceled')
+}
+
+/** Start Dialog's close transition but keep the closer pending until Radix
+ * unmounts its focus scope. A new request stays blocked during that exit. */
+function startPendingSessionTileCloseExit() {
+  const pending = $confirmCloseTile.get()
+
+  if (pending?.phase === 'open') {
+    $confirmCloseTile.set({ ...pending, phase: 'closing' })
+  }
+}
+
+/** Finish the closer only after Dialog's focus scope has run close autofocus.
+ * The root focus coordinator can then observe body/stale focus and recover it. */
+function settlePendingSessionTileClose(expectedId?: number) {
+  const pending = $confirmCloseTile.get()
+
+  if (!pending || (expectedId !== undefined && pending.id !== expectedId)) {
+    return
+  }
+
+  $confirmCloseTile.set(null)
+
+  if (pending.confirmed) {
+    pending.resolve()
+  } else {
+    pending.reject(closeCanceledError())
+  }
+}
 
 /** The tile closer, gated: a quiet session closes immediately; a busy or
  *  input-blocked one asks first. One state read — the tile's runtime slice. */
-export function requestCloseSessionTile(storedSessionId: string): void {
+export function requestCloseSessionTile(storedSessionId: string): Promise<void> {
   const runtimeId = $sessionTiles.get().find(t => t.storedSessionId === storedSessionId)?.runtimeId
   const state = runtimeId ? $sessionStates.get()[runtimeId] : undefined
 
   if (state?.busy || state?.awaitingResponse || state?.needsInput) {
-    $confirmCloseTile.set(storedSessionId)
-  } else {
-    closeSessionTile(storedSessionId)
+    const existing = $confirmCloseTile.get()
+
+    if (existing) {
+      if (existing.storedSessionId === storedSessionId) {
+        return existing.completion
+      }
+
+      const blocked = Promise.reject(new Error('Another session tab close is awaiting confirmation'))
+
+      void blocked.catch(() => undefined)
+
+      return blocked
+    }
+
+    let reject!: (reason: Error) => void
+    let resolve!: () => void
+
+    const completion = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise
+      reject = rejectPromise
+    })
+
+    // A context-menu callback intentionally ignores the return value. Keep its
+    // cancel rejection observed while TreeGroup still receives the same promise.
+    void completion.catch(() => undefined)
+    $confirmCloseTile.set({
+      completion,
+      confirmed: false,
+      id: ++nextPendingSessionTileCloseId,
+      phase: 'open',
+      reject,
+      resolve,
+      storedSessionId
+    })
+
+    return completion
   }
+
+  closeSessionTile(storedSessionId)
+
+  return Promise.resolve()
 }
 
 /** Mounted once at the shell root: the "Close running tab?" confirmation. */
 export function SessionTileCloseConfirm() {
   const { t } = useI18n()
-  const storedSessionId = useStore($confirmCloseTile)
+  const pending = useStore($confirmCloseTile)
+  const pendingId = pending?.id
+
+  useEffect(
+    () => () => {
+      settlePendingSessionTileClose()
+    },
+    []
+  )
 
   return (
     <ConfirmDialog
       confirmLabel={t.zones.closeRunningConfirm}
       description={t.zones.closeRunningBody}
       destructive
-      onClose={() => $confirmCloseTile.set(null)}
+      key={pendingId ?? 'idle'}
+      onClose={startPendingSessionTileCloseExit}
+      onCloseAutoFocus={() => settlePendingSessionTileClose(pendingId)}
       onConfirm={() => {
-        if (storedSessionId) {
-          closeSessionTile(storedSessionId)
+        const current = $confirmCloseTile.get()
+
+        if (current) {
+          $confirmCloseTile.set({ ...current, confirmed: true })
+          closeSessionTile(current.storedSessionId)
         }
       }}
-      open={storedSessionId !== null}
+      open={pending?.phase === 'open'}
       title={t.zones.closeRunningTitle}
     />
   )
@@ -507,7 +608,7 @@ export function SessionTabMenu({
 }: {
   children: React.ReactElement
   /** Close this tab (tiles; the main tab passes nothing). */
-  onClose?: () => void
+  onClose?: () => PaneCloseResult
   /** Hide the zone's tab bar (main tab only — the sticky bar's off switch). */
   onHideTabBar?: () => void
   storedSessionId: string
@@ -519,24 +620,24 @@ export function SessionTabMenu({
   const pinned = pinnedSessionIds.includes(pinId)
 
   return (
-    <span className="contents" onContextMenu={event => event.stopPropagation()}>
-      <SessionContextMenu
-        onArchive={() => void sessionTileDelegate()?.archiveSession(storedSessionId)}
-        onBranch={() => void sessionTileDelegate()?.branchSession(storedSessionId)}
-        onClose={onClose}
-        onDelete={() => void sessionTileDelegate()?.deleteSession(storedSessionId)}
-        onHideTabBar={onHideTabBar}
-        onPin={() => (pinned ? unpinSession(pinId) : pinSession(pinId))}
-        pinned={pinned}
-        profile={profile}
-        sessionId={storedSessionId}
-        surface="tab"
-        tabPaneId={tabPaneId}
-        title={title}
-      >
+    <SessionContextMenu
+      onArchive={() => void sessionTileDelegate()?.archiveSession(storedSessionId)}
+      onBranch={() => void sessionTileDelegate()?.branchSession(storedSessionId)}
+      onClose={onClose}
+      onDelete={() => void sessionTileDelegate()?.deleteSession(storedSessionId)}
+      onHideTabBar={onHideTabBar}
+      onPin={() => (pinned ? unpinSession(pinId) : pinSession(pinId))}
+      pinned={pinned}
+      profile={profile}
+      sessionId={storedSessionId}
+      surface="tab"
+      tabPaneId={tabPaneId}
+      title={title}
+    >
+      <span className="contents" onContextMenu={event => event.stopPropagation()}>
         {children}
-      </SessionContextMenu>
-    </span>
+      </span>
+    </SessionContextMenu>
   )
 }
 

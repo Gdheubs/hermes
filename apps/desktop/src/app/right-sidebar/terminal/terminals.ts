@@ -1,11 +1,14 @@
 import { atom, computed } from 'nanostores'
 
+import { treePaneGroupId } from '@/components/pane-shell/tree/store'
+import { runTreeCloseWithFocusRecovery } from '@/components/pane-shell/tree/tree-focus'
 import { readKey, writeKey } from '@/lib/storage'
 import { $currentCwd } from '@/store/session'
 
 import { setTerminalTakeover } from '../store'
 
 import { seedAgentTerminalCommand } from './agent-terminal-stream'
+import { requestTerminalRailFocusHandoff, terminalRailTabHasFocus } from './focus-handoff'
 
 /** One in-app terminal tab. `id` is the renderer-side handle (distinct from the
  *  PTY session id the main process mints); each instance owns its own shell. */
@@ -301,6 +304,20 @@ export function closeTerminal(id: string): void {
   }
 }
 
+/** User-initiated terminal closes participate in the pane tree's focus
+ * lifecycle. The raw closer above remains available for external shell-exit
+ * events, which must still drop a dead terminal while another close dialog
+ * owns focus recovery. */
+export function closeTerminalWithFocusRecovery(id: string): boolean {
+  if (!$terminals.get().some(term => term.id === id)) {
+    return false
+  }
+
+  const { request } = runTreeCloseWithFocusRecovery('terminal', () => closeTerminal(id), treePaneGroupId('terminal'))
+
+  return request !== null
+}
+
 /** Close the read-only agent tab mirroring a background process. The agent
  *  drives this via the desktop-gated `close_terminal` tool → `terminal.close`.
  *  The process is NOT killed — only the view is dropped; `surfacedProcs` keeps
@@ -318,12 +335,59 @@ export function closeAgentTerminalByProc(procId: string): boolean {
   return true
 }
 
-export function closeActiveTerminal(): void {
+export function closeActiveTerminal(): boolean {
   const id = $activeTerminalId.get()
 
-  if (id) {
-    closeTerminal(id)
+  if (!id) {
+    return false
   }
+
+  const restoreRailFocus = $terminals.get().length > 1 && terminalRailTabHasFocus()
+  const closed = closeTerminalWithFocusRecovery(id)
+
+  if (closed && restoreRailFocus) {
+    requestTerminalRailFocusHandoff()
+  }
+
+  return closed
+}
+
+/** Close the terminal tab that owns DOM focus. Persistent xterm panels can
+ * retain focus while another action changes the selected rail tab, so deriving
+ * solely from `$activeTerminalId` can close the wrong terminal. `null` means
+ * focus is outside the terminal surface; rail focus intentionally falls back
+ * to the selected terminal because the rail has no per-instance panel id. */
+export function closeFocusedTerminal(): boolean | null {
+  if (typeof document === 'undefined' || !(document.activeElement instanceof Element)) {
+    return null
+  }
+
+  const focused = document.activeElement
+
+  if (!focused.closest('[data-terminal]')) {
+    return null
+  }
+
+  const focusedPanel = focused.closest<HTMLElement>('[data-terminal-id]')
+
+  if (focusedPanel) {
+    const focusedId = focusedPanel.dataset.terminalId
+
+    if (!focusedId || !$terminals.get().some(term => term.id === focusedId)) {
+      return false
+    }
+
+    const restoreRailFocus = $terminals.get().length > 1
+    const closed = closeTerminalWithFocusRecovery(focusedId)
+
+    if (closed && restoreRailFocus) {
+      requestTerminalRailFocusHandoff()
+    }
+
+    return closed
+  }
+
+  return closeActiveTerminal()
 }
 
 export function closeAllTerminals(): void {
@@ -336,6 +400,16 @@ export function closeAllTerminals(): void {
   setTerminalTakeover(false)
 }
 
+export function closeAllTerminalsWithFocusRecovery(): boolean {
+  if ($terminals.get().length === 0) {
+    return false
+  }
+
+  const { request } = runTreeCloseWithFocusRecovery('terminal', closeAllTerminals, treePaneGroupId('terminal'))
+
+  return request !== null
+}
+
 export function closeOtherTerminals(id: string): void {
   const keep = $terminals.get().find(term => term.id === id)
 
@@ -343,6 +417,20 @@ export function closeOtherTerminals(id: string): void {
     $terminals.set([keep])
     $activeTerminalId.set(keep.id)
   }
+}
+
+export function closeOtherTerminalsWithFocusRecovery(id: string): boolean {
+  if ($terminals.get().length < 2 || !$terminals.get().some(term => term.id === id)) {
+    return false
+  }
+
+  const { request } = runTreeCloseWithFocusRecovery(
+    'terminal',
+    () => closeOtherTerminals(id),
+    treePaneGroupId('terminal')
+  )
+
+  return request !== null
 }
 
 /** Record the latest serialized scrollback for a tab so it can be replayed on

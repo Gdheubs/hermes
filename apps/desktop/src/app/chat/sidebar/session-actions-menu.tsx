@@ -7,9 +7,12 @@ import {
   closeAllTreeTabs,
   closeOtherTreeTabs,
   closeTreeTabsToRight,
+  type PaneCloseResult,
   reloadTreePane,
+  treePaneGroupId,
   treeTabCloseTargets
 } from '@/components/pane-shell/tree/store'
+import { runTreeCloseWithFocusRecovery } from '@/components/pane-shell/tree/tree-focus'
 import {
   type ActionItemSpec,
   ActionsContextMenu,
@@ -101,7 +104,7 @@ interface SessionActions {
   onDelete?: () => void
   /** Close this surface (a tile tab) — omitted where nothing closes (sidebar
    *  rows, the main tab). */
-  onClose?: () => void
+  onClose?: () => PaneCloseResult
   /** TAB surfaces: the session is already a tab, so "Open in new tab" is
    *  nonsense there — sidebar rows/dropdowns keep it. */
   surface?: 'row' | 'tab'
@@ -282,6 +285,14 @@ function useSessionActions({
   // TAB — verbs that act on the strip (tabs only; a row isn't a tab).
   const closeTargets = surface === 'tab' && tabPaneId ? treeTabCloseTargets(tabPaneId) : null
 
+  const closeTab = (close: () => PaneCloseResult) => {
+    if (tabPaneId) {
+      runTreeCloseWithFocusRecovery(tabPaneId, close, treePaneGroupId(tabPaneId))
+    } else {
+      close()
+    }
+  }
+
   const tabItems: ActionItemSpec[] =
     surface === 'tab'
       ? [
@@ -305,7 +316,7 @@ function useSessionActions({
                   label: t.common.close,
                   onSelect: () => {
                     triggerHaptic('selection')
-                    onClose()
+                    closeTab(onClose)
                   }
                 })
               ]
@@ -318,7 +329,7 @@ function useSessionActions({
                   label: t.zones.closeOthers,
                   onSelect: () => {
                     triggerHaptic('selection')
-                    closeOtherTreeTabs(tabPaneId)
+                    closeTab(() => closeOtherTreeTabs(tabPaneId))
                   }
                 }),
                 spec({
@@ -327,7 +338,7 @@ function useSessionActions({
                   label: t.zones.closeToRight,
                   onSelect: () => {
                     triggerHaptic('selection')
-                    closeTreeTabsToRight(tabPaneId)
+                    closeTab(() => closeTreeTabsToRight(tabPaneId))
                   }
                 }),
                 spec({
@@ -336,7 +347,7 @@ function useSessionActions({
                   label: t.zones.closeAll,
                   onSelect: () => {
                     triggerHaptic('selection')
-                    closeAllTreeTabs(tabPaneId)
+                    closeTab(() => closeAllTreeTabs(tabPaneId))
                   }
                 })
               ]

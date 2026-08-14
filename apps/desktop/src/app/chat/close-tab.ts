@@ -1,8 +1,8 @@
 import { mainChatOccupied } from '@/app/open-session'
-import { closeActiveTerminal } from '@/app/right-sidebar/terminal/terminals'
+import { closeFocusedTerminal } from '@/app/right-sidebar/terminal/terminals'
 import { $workspaceIsPage } from '@/app/routes'
 import { closeFocusedSessionTab, closeFocusedToolTab } from '@/components/pane-shell/tree/store'
-import { isFocusWithin } from '@/lib/keybinds/combo'
+import { hasPendingTreeCloseFocusRecovery } from '@/components/pane-shell/tree/tree-focus'
 import { requestFreshSession } from '@/store/profile'
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 import { closeSessionTile, nextSessionTileForWorkspace } from '@/store/session-states'
@@ -67,21 +67,28 @@ export function closeWorkspaceTab(loadSessionIntoWorkspace?: (storedSessionId: s
  * with its own tab strip closes ITS tab instead of main's.
  */
 export function closeActiveTab(loadSessionIntoWorkspace?: (storedSessionId: string) => void): boolean {
-  if (isFocusWithin('[data-terminal]')) {
-    closeActiveTerminal()
+  // A busy/deferred tab close owns focus until its result settles. Both the
+  // renderer shortcut and macOS's native menu call this function, so guarding
+  // here prevents a second global close from replacing that pending recovery.
+  if (hasPendingTreeCloseFocusRecovery()) {
+    return false
+  }
 
-    return true
+  const terminalClose = closeFocusedTerminal()
+
+  if (terminalClose !== null) {
+    return terminalClose
   }
 
   // A closeable tab in the focused chat zone (a session tile that's the active
   // tab) closes outright; the uncloseable workspace tab falls through.
-  if (closeFocusedSessionTab()) {
+  if (closeFocusedSessionTab(true)) {
     return true
   }
 
   // A tool panel zone hosts no chat strip, so the chat rung skips it — but its
   // tabs close like any other. Without this ⌘W was dead over terminal / logs.
-  if (closeFocusedToolTab()) {
+  if (closeFocusedToolTab(true)) {
     return true
   }
 

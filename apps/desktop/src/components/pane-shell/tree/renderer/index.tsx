@@ -25,7 +25,9 @@ import { type ReactNode, useEffect } from 'react'
 
 import { useLayoutEditHotkey } from '../../edit-mode'
 import { publishWorkspaceGeometry } from '../../geometry'
-import { $layoutTree, trackActiveTreeGroup } from '../store'
+import { findGroup, type LayoutNode } from '../model'
+import { $collapsedTreeSides, $hiddenTreePanes, $layoutTree, trackActiveTreeGroup } from '../store'
+import { $treeFocusRequest, clearTreeFocusRequest } from '../tree-focus'
 import { ZoneEditor } from '../zone-editor'
 
 import { TreeEditBar } from './edit-bar'
@@ -33,16 +35,164 @@ import { FloatingPanes } from './floating-panes'
 import { NarrowOverlays } from './narrow-overlays'
 import { TreeNode } from './tree-node'
 
+function isVisible(element: HTMLElement): boolean {
+  for (let current: HTMLElement | null = element; current; current = current.parentElement) {
+    const style = window.getComputedStyle(current)
+
+    if (current.hidden || current.getAttribute('aria-hidden') === 'true' || style.display === 'none' || style.visibility === 'hidden') {
+      return false
+    }
+  }
+
+  return true
+}
+
+function closeTabControlIsVisible(paneId: string): boolean {
+  const tab = Array.from(document.querySelectorAll<HTMLElement>('[data-tree-tab]')).find(
+    element => element.dataset.treeTab === paneId
+  )
+
+  const closeControl = tab?.querySelector<HTMLElement>('[data-pane-tab-close="true"]')
+
+  return Boolean(closeControl && isVisible(closeControl))
+}
+
+function activeElementNeedsRecovery(): boolean {
+  const active = document.activeElement
+
+  return !(active instanceof HTMLElement) || active === document.body || !isVisible(active)
+}
+
+function focusTabControl(paneId: string): boolean {
+  const tab = Array.from(document.querySelectorAll<HTMLElement>('[data-tree-tab]')).find(
+    element => element.dataset.treeTab === paneId
+  )
+
+  const control = tab?.querySelector<HTMLElement>('[data-pane-tab-control="true"]')
+
+  if (!control || !isVisible(control)) {
+    return false
+  }
+
+  control.focus({ preventScroll: true })
+
+  return document.activeElement === control
+}
+
+function selectedTabControl(root: ParentNode = document): HTMLElement | undefined {
+  return Array.from(root.querySelectorAll<HTMLElement>('[data-pane-tab-control="true"]')).find(
+    control => control.getAttribute('aria-selected') === 'true' && isVisible(control)
+  )
+}
+
+function focusSelectedTabInGroup(groupId: string): boolean {
+  const group = Array.from(document.querySelectorAll<HTMLElement>('[data-tree-group]')).find(
+    element => element.dataset.treeGroup === groupId
+  )
+
+  const selectedTab = group && selectedTabControl(group)
+
+  if (!selectedTab) {
+    return false
+  }
+
+  selectedTab.focus({ preventScroll: true })
+
+  return document.activeElement === selectedTab
+}
+
+function focusApplicationFallback(tree: LayoutNode | null, preferredGroupId?: string): void {
+  const preferredPaneId = tree && preferredGroupId ? findGroup(tree, preferredGroupId)?.active : null
+
+  if (preferredPaneId && focusTabControl(preferredPaneId)) {
+    return
+  }
+
+  if (preferredGroupId && focusSelectedTabInGroup(preferredGroupId)) {
+    return
+  }
+
+  const selectedTab = selectedTabControl()
+
+  if (selectedTab) {
+    selectedTab.focus({ preventScroll: true })
+
+    return
+  }
+
+  const findVisibleFocusable = (selector: string) =>
+    Array.from(document.querySelectorAll<HTMLElement>(selector)).find(isVisible)
+
+  // Prefer an editor over nearby toolbar buttons: after a focused close, the
+  // composer is the useful application-level continuation point.
+  const focusable =
+    findVisibleFocusable(
+      '[data-tree-group] [contenteditable="true"], [data-tree-group] textarea:not([disabled]), [data-tree-group] input:not([disabled]):not([type="hidden"])'
+    ) ?? findVisibleFocusable('[data-tree-group] button:not([disabled]), [data-tree-group] [href]')
+
+  focusable?.focus({ preventScroll: true })
+}
+
 export function LayoutTreeRoot({ children }: { children?: ReactNode }) {
   const tree = useStore($layoutTree)
+  const collapsedTreeSides = useStore($collapsedTreeSides)
+  const hiddenTreePanes = useStore($hiddenTreePanes)
+  const focusRequest = useStore($treeFocusRequest)
 
   useLayoutEditHotkey(true)
-  // Track the interacted zone so ⌘W closes the right tab even when nothing is
-  // DOM-focused.
+
+  useEffect(
+    () => () => {
+      $treeFocusRequest.set(null)
+    },
+    []
+  )
+
   useEffect(trackActiveTreeGroup, [])
   // Publish --workspace-left/right so chrome (titlebar title) aligns to the
   // main pane's geometry in plain CSS.
   useEffect(publishWorkspaceGeometry, [])
+  useEffect(() => {
+    if (!focusRequest) {
+      return
+    }
+
+    if (focusRequest.kind === 'restore') {
+      const group = tree ? findGroup(tree, focusRequest.groupId) : null
+
+      if (group?.minimized) {
+        return
+      }
+
+      const frame = window.requestAnimationFrame(() => {
+        if (activeElementNeedsRecovery() && !focusTabControl(focusRequest.paneId)) {
+          focusApplicationFallback(tree)
+        }
+
+        clearTreeFocusRequest(focusRequest)
+      })
+
+      return () => window.cancelAnimationFrame(frame)
+    }
+
+    // A busy session can remove its tab before its confirmation dialog closes.
+    // Leave focus inside that modal until its closer explicitly settles.
+    if (focusRequest.status === 'pending') {
+      return
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      const sourceControlIsVisible = closeTabControlIsVisible(focusRequest.closedPaneId)
+
+      if (activeElementNeedsRecovery() && (!sourceControlIsVisible || !focusTabControl(focusRequest.closedPaneId))) {
+        focusApplicationFallback(tree, focusRequest.groupId)
+      }
+
+      clearTreeFocusRequest(focusRequest)
+    })
+
+    return () => window.cancelAnimationFrame(frame)
+  }, [collapsedTreeSides, focusRequest, hiddenTreePanes, tree])
 
   if (!tree) {
     return null

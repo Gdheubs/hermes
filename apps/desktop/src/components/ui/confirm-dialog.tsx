@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import type { ComponentProps, ReactNode } from 'react'
 import { useEffect, useState } from 'react'
 
 import { ActionStatus } from '@/components/ui/action-status'
@@ -17,6 +17,8 @@ import { AlertTriangle } from '@/lib/icons'
 interface ConfirmDialogProps {
   open: boolean
   onClose: () => void
+  /** Fires when the Dialog focus scope is actually unmounting after its exit animation. */
+  onCloseAutoFocus?: ComponentProps<typeof DialogContent>['onCloseAutoFocus']
   // Does the work. Throw to surface an inline error and keep the dialog open.
   onConfirm: () => Promise<void> | void
   title: ReactNode
@@ -36,6 +38,7 @@ interface ConfirmDialogProps {
 export function ConfirmDialog({
   open,
   onClose,
+  onCloseAutoFocus,
   onConfirm,
   title,
   description,
@@ -96,6 +99,7 @@ export function ConfirmDialog({
     <Dialog onOpenChange={value => !value && !busy && onClose()} open={open}>
       <DialogContent
         className="max-w-md"
+        onCloseAutoFocus={onCloseAutoFocus}
         onKeyDown={event => {
           // Enter/Space confirm regardless of which button holds focus
           // (preventDefault stops a focused Cancel from swallowing it).

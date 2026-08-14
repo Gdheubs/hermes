@@ -101,7 +101,9 @@ describe('focused chat zone drives the tab verbs', () => {
 
     const closed: string[] = []
 
-    tree.registerPaneCloser('preview-tile:url:x', () => closed.push('preview-tile:url:x'))
+    tree.registerPaneCloser('preview-tile:url:x', () => {
+      closed.push('preview-tile:url:x')
+    })
     tree.declareDefaultTree(
       model.split('row', [
         model.group(['workspace'], { active: 'workspace', id: 'grp-main' }),

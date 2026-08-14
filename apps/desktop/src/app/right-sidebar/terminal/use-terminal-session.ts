@@ -17,6 +17,7 @@ import { $terminalInjection } from '../store'
 import { observeActiveTerminalResize } from './active-resize'
 import { makeTerminalReader, registerTerminalReader } from './buffer'
 import { mirrorSelection, terminalClipboardIntent } from './clipboard'
+import { focusTerminalUnlessRailOwnsFocus } from './focus-handoff'
 import { terminalLinkHandler, terminalWebLinksAddon } from './links'
 import {
   isAddSelectionShortcut,
@@ -27,7 +28,7 @@ import {
   terminalTheme
 } from './selection'
 import { prepareTerminalFontFamily } from './terminal-font'
-import { closeTerminal, updateTerminalRestoreCwd, updateTerminalReviveBuffer } from './terminals'
+import { $activeTerminalId, closeTerminal, updateTerminalRestoreCwd, updateTerminalReviveBuffer } from './terminals'
 import { useTerminalFontController } from './use-terminal-font'
 
 // How many scrollback lines to serialize for relaunch restore. Mirrors VS Code's
@@ -896,7 +897,10 @@ export function useTerminalSession({
 
       term.open(host)
       mountedRef.current = true
-      term.focus()
+
+      if ($activeTerminalId.get() === id) {
+        focusTerminalUnlessRailOwnsFocus(term)
+      }
 
       // WebGL renderer matches the dashboard ChatPage path; xterm's default DOM
       // renderer paints SGR via CSS classes that visibly mute against our skins.
@@ -1018,7 +1022,10 @@ export function useTerminalSession({
 
         webglRef.current?.clearTextureAtlas()
         term?.refresh(0, term.rows - 1)
-        term?.focus()
+
+        if (term && $activeTerminalId.get() === id) {
+          focusTerminalUnlessRailOwnsFocus(term)
+        }
       }
     })
   }, [active, status])
@@ -1044,7 +1051,13 @@ export function useTerminalSession({
       hasSessionActivityRef.current = true
       void window.hermesDesktop?.terminal?.write(sessionId, `${command}\r`)
       $terminalInjection.set(null)
-      termRef.current?.focus()
+      // A queued command is an automatic focus path. Respect an in-flight rail
+      // close/roving handoff rather than letting it steal selected-tab focus.
+      const term = termRef.current
+
+      if (term) {
+        focusTerminalUnlessRailOwnsFocus(term)
+      }
     })
   }, [active, status])
 

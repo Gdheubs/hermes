@@ -17,6 +17,7 @@ import {
   setTreeGroupHeaderHidden,
   togglePaneVisible
 } from './store'
+import { $treeFocusRequest, requestTreeFocusAfterClose } from './tree-focus'
 
 // Ground truth for "toggle terminal broke — ⌘J/⌘B work fine, but once I move
 // the terminal around it just doesn't open/close anymore", and for "I have the
@@ -44,6 +45,7 @@ beforeEach(() => {
   window.localStorage.clear()
   $dismissedPanes.set(new Set())
   $hiddenTreePanes.set(new Set())
+  $treeFocusRequest.set(null)
 
   for (const [id, data] of [
     ['workspace', { placement: 'main', uncloseable: true }],
@@ -58,6 +60,7 @@ beforeEach(() => {
 
 afterEach(() => {
   disposers.splice(0).forEach(dispose => dispose())
+  $treeFocusRequest.set(null)
 })
 
 /** The bottom tool zone, as the tree currently holds it. */
@@ -142,6 +145,28 @@ describe('toggling the terminal while it is stacked with logs', () => {
 
     togglePaneVisible('terminal')
     expect(isPaneVisible('terminal')).toBe(true)
+  })
+
+  it('keeps focus recovery pending through the visible-pane close', () => {
+    stackTree({ active: 'terminal' })
+    bindPaneCollapse('terminal', atom(true))
+    bindPaneCollapse('logs', atom(true))
+
+    togglePaneVisible('terminal')
+
+    expect($treeFocusRequest.get()).toMatchObject({ closedPaneId: 'terminal', status: 'settled' })
+  })
+
+  it('does not close a visible pane while another close owns focus recovery', () => {
+    const pending = requestTreeFocusAfterClose('busy-session')
+    stackTree({ active: 'terminal' })
+    bindPaneCollapse('terminal', atom(true))
+    bindPaneCollapse('logs', atom(true))
+
+    togglePaneVisible('terminal')
+
+    expect(isPaneVisible('terminal')).toBe(true)
+    expect($treeFocusRequest.get()).toBe(pending)
   })
 
   it('brings the terminal forward when logs holds the active tab', () => {

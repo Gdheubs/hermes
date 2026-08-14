@@ -2,7 +2,7 @@ import { FitAddon } from '@xterm/addon-fit'
 import { Unicode11Addon } from '@xterm/addon-unicode11'
 import { WebglAddon } from '@xterm/addon-webgl'
 import { Terminal } from '@xterm/xterm'
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import { writeClipboardText } from '@/components/ui/copy-button'
 import { markRightPanePerf } from '@/debug/right-pane-events'
@@ -13,6 +13,7 @@ import { observeActiveTerminalResize } from './active-resize'
 import { registerAgentTerminalWriter } from './agent-terminal-stream'
 import { makeTerminalReader, registerTerminalReader } from './buffer'
 import { mirrorSelection, terminalClipboardIntent } from './clipboard'
+import { focusTerminalUnlessRailOwnsFocus } from './focus-handoff'
 import { terminalLinkHandler, terminalWebLinksAddon } from './links'
 import { isMacPlatform, resolveSurfaceColor, terminalTheme } from './selection'
 import { prepareTerminalFontFamily } from './terminal-font'
@@ -24,11 +25,15 @@ import { useTerminalFontController } from './use-terminal-font'
 export function useAgentTerminal({ active, id, procId }: { active: boolean; id: string; procId: string }) {
   const { renderedMode, theme, themeName } = useTheme()
   const hostRef = useRef<HTMLDivElement | null>(null)
+  const activeRef = useRef(active)
   const termRef = useRef<Terminal | null>(null)
   const webglRef = useRef<WebglAddon | null>(null)
   const fitRef = useRef<((visible: boolean) => void) | null>(null)
   const initialActiveFitRef = useRef(false)
+  const [mountedGeneration, setMountedGeneration] = useState(0)
   const { latestFontFamilyRef, mountedRef } = useTerminalFontController({ fitRef, termRef, webglRef })
+
+  activeRef.current = active
 
   const surfaceTheme = () => {
     const ansi = renderedMode === 'dark' ? (theme.darkTerminal ?? theme.terminal) : theme.terminal
@@ -135,8 +140,12 @@ export function useAgentTerminal({ active, id, procId }: { active: boolean; id: 
         // No WebGL — xterm falls back to the DOM renderer.
       }
 
-      fitRef.current?.(active)
-      initialActiveFitRef.current = active
+      // The font promise can settle after this tab becomes active. Trigger the
+      // active lifecycle again after mounting so its guarded focus transfer and
+      // resize observer see the real xterm instead of the earlier null ref.
+      fitRef.current?.(activeRef.current)
+      initialActiveFitRef.current = activeRef.current
+      setMountedGeneration(generation => generation + 1)
 
       // Stream live output straight into the terminal (replays backlog on attach).
       unregister = registerAgentTerminalWriter(procId, chunk => term.write(chunk))
@@ -215,10 +224,13 @@ export function useAgentTerminal({ active, id, procId }: { active: boolean; id: 
         // Take focus on activation (parity with the user terminal) so the active
         // agent tab holds focus and ⌘W's isFocusWithin('[data-terminal]') routes
         // the close to this tab rather than to a preview.
-        term?.focus()
+
+        if (term) {
+          focusTerminalUnlessRailOwnsFocus(term)
+        }
       }
     })
-  }, [active])
+  }, [active, mountedGeneration])
 
   return { hostRef }
 }

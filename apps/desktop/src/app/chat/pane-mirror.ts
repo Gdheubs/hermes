@@ -10,7 +10,12 @@ import type { ReadableAtom } from 'nanostores'
 import type { ReactElement, ReactNode, PointerEvent as ReactPointerEvent } from 'react'
 
 import type { DoubleTapContext } from '@/components/pane-shell/tree/renderer/drag-session'
-import { registerPaneCloser, removeTreePane, treePanesWithPrefix } from '@/components/pane-shell/tree/store'
+import {
+  type PaneCloseResult,
+  registerPaneCloser,
+  removeTreePane,
+  treePanesWithPrefix
+} from '@/components/pane-shell/tree/store'
 import type { PaneStripTool } from '@/components/ui/pane-tab'
 import { registry } from '@/contrib/registry'
 import type { TileDock } from '@/store/session-states'
@@ -56,8 +61,9 @@ export interface PaneMirror<T> {
     onTap: () => void,
     double?: DoubleTapContext
   ) => boolean
-  /** Wired as the pane's closer (tab Close). */
-  close: (key: string) => void
+  /** Wired as the pane's closer (tab Close). A confirmation must stay pending
+   * until it either commits or rejects, so keyboard focus can follow it. */
+  close: (key: string) => PaneCloseResult
 }
 
 /** Build a `watch*` fn: syncs once, then re-syncs on every source/also change.

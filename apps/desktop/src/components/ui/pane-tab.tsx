@@ -2,8 +2,9 @@ import * as React from 'react'
 
 import { type MenuKit, renderActionItem } from '@/components/ui/actions-menu'
 import { Button } from '@/components/ui/button'
+import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
-import { translateNow } from '@/i18n'
+import { translateNow, useI18n } from '@/i18n'
 import { isMetaClose, middleClickHandlers } from '@/lib/middle-click'
 import { cn } from '@/lib/utils'
 
@@ -43,9 +44,11 @@ const TAB_SELECTED =
 
 interface PaneTabProps extends React.ComponentProps<'div'> {
   active?: boolean
+  /** Stable pane identity belongs to the visual wrapper used by drag/scroll logic. */
+  'data-tree-tab'?: string
   dirty?: boolean
-  /** Close gesture, no hover X (too easy to hit on small tabs): middle-click,
-   *  or ⌘-click as the trackpad-friendly Mac equivalent. */
+  /** Close gesture: hover X on horizontal tabs, plus middle-click and ⌘-click
+   *  (the trackpad-friendly Mac equivalent). */
   onClose?: () => void
   /** Part of a multi-tab selection (⌥/Ctrl-click, Shift-click) — an accent
    *  wash marks every tab that a drag would carry, Chrome-style. */
@@ -68,15 +71,23 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
     active = false,
     dirty = false,
     onClose,
+    onClick,
+    onMouseEnter,
+    onMouseLeave,
     onMouseDown,
     onPointerDown,
     onPointerUp,
     onClickCapture,
+    role,
     selected = false,
+    tabIndex,
     vertical = false,
     side = 'left',
     children,
     className,
+    style,
+    'aria-selected': ariaSelected,
+    'data-tree-tab': treeTabId,
     ...props
   },
   ref
@@ -84,7 +95,13 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
   // Vertical rails only. Horizontal tabs draw no bottom border — the strip owns
   // that rule, and a per-tab border stacked a second translucent line over it.
   const edge = vertical ? (side === 'right' ? 'border-l' : 'border-r') : undefined
+  const canShowClose = Boolean(onClose && !vertical)
   const middle = middleClickHandlers(onClose)
+  const closeMiddle = middleClickHandlers(onClose)
+  const [closeHovered, setCloseHovered] = React.useState(false)
+  const [closeFocused, setCloseFocused] = React.useState(false)
+  const closeVisible = closeHovered || closeFocused
+  const { t } = useI18n()
 
   return (
     <div
@@ -100,53 +117,191 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
       )}
       data-active={active}
       data-selected={selected || undefined}
+      data-tree-tab={treeTabId}
       data-vertical={vertical || undefined}
-      onClickCapture={event => {
-        // Sites whose tab activates on the label's own onClick (the preview
-        // rail) fire it AFTER our pointerdown close — swallow that stray click
-        // in the capture phase so it can't re-select the just-closed tab.
-        if (onClose && isMetaClose(event)) {
-          event.preventDefault()
-          event.stopPropagation()
+      onMouseEnter={event => {
+        if (canShowClose) {
+          setCloseHovered(true)
         }
 
-        onClickCapture?.(event)
+        onMouseEnter?.(event)
       }}
-      onMouseDown={event => {
-        middle.onMouseDown(event)
-        onMouseDown?.(event)
-      }}
-      onPointerDown={event => {
-        middle.onPointerDown(event)
-
-        // ⌘-click closes. Preempt here — the tab strips activate/drag on
-        // pointerdown (drag-session onTap), so we must claim the press before
-        // the shell's own handler starts a drag, and skip it entirely.
-        if (onClose && isMetaClose(event)) {
-          event.preventDefault()
-          event.stopPropagation()
-          onClose()
-
-          return
+      onMouseLeave={event => {
+        if (canShowClose) {
+          setCloseHovered(false)
         }
 
-        onPointerDown?.(event)
-      }}
-      onPointerUp={event => {
-        middle.onPointerUp(event)
-        onPointerUp?.(event)
+        onMouseLeave?.(event)
       }}
       ref={ref}
-      {...props}
+      role={role ? 'presentation' : undefined}
+      style={style}
     >
-      {children}
-      {dirty && (
+      <div
+        aria-selected={ariaSelected}
+        className={cn(
+          'flex min-h-0 min-w-0 items-center self-stretch overflow-hidden outline-none',
+          vertical && 'w-full justify-center'
+        )}
+        // Context-menu triggers clone this element and replace `data-slot`.
+        // Keep a dedicated marker for tab focus recovery across that wrapper.
+        data-pane-tab-control="true"
+        data-slot="pane-tab-control"
+        onClick={onClick}
+        onClickCapture={event => {
+          // Sites whose tab activates on the label's own onClick (the preview
+          // rail) fire it AFTER our pointerdown close — swallow that stray click
+          // in the capture phase so it can't re-select the just-closed tab.
+          if (onClose && isMetaClose(event)) {
+            event.preventDefault()
+            event.stopPropagation()
+          }
+
+          onClickCapture?.(event)
+        }}
+        onMouseDown={event => {
+          middle.onMouseDown(event)
+          onMouseDown?.(event)
+        }}
+        onPointerDown={event => {
+          middle.onPointerDown(event)
+
+          // ⌘-click closes. Preempt here — the tab strips activate/drag on
+          // pointerdown (drag-session onTap), so we must claim the press before
+          // the shell's own handler starts a drag, and skip it entirely.
+          if (onClose && isMetaClose(event)) {
+            event.preventDefault()
+            event.stopPropagation()
+            onClose()
+
+            return
+          }
+
+          onPointerDown?.(event)
+        }}
+        onPointerUp={event => {
+          middle.onPointerUp(event)
+          onPointerUp?.(event)
+        }}
+        role={role}
+        tabIndex={tabIndex}
+        {...props}
+      >
+        {children}
+      </div>
+      {canShowClose && (
+        <Button
+          aria-label={t.zones.closeTab}
+          className="group/close relative mr-0.5 self-center text-(--ui-text-tertiary)"
+          data-pane-tab-close="true"
+          onAuxClick={event => {
+            if (event.button === 1) {
+              event.preventDefault()
+              event.stopPropagation()
+            }
+          }}
+          onBlur={() => setCloseFocused(false)}
+          onClick={event => {
+            // A meta-close is claimed on pointerdown so the shell cannot start
+            // a drag. Suppress the synthetic follow-up click to avoid closing
+            // a second tab after this one unmounts.
+            if (isMetaClose(event)) {
+              event.preventDefault()
+              event.stopPropagation()
+
+              return
+            }
+
+            if (event.button === 1) {
+              event.preventDefault()
+              event.stopPropagation()
+
+              return
+            }
+
+            if (event.button !== 0) {
+              return
+            }
+
+            event.preventDefault()
+            event.stopPropagation()
+            onClose?.()
+          }}
+          onFocus={() => setCloseFocused(true)}
+          onMouseDown={event => {
+            closeMiddle.onMouseDown(event)
+
+            if (event.button === 0 || event.button === 1) {
+              event.stopPropagation()
+            }
+          }}
+          onPointerDown={event => {
+            closeMiddle.onPointerDown(event)
+
+            if (isMetaClose(event)) {
+              event.preventDefault()
+              event.stopPropagation()
+              onClose?.()
+
+              return
+            }
+
+            // Primary and middle presses belong to this leaf action. A right
+            // press is deliberately left alone so the tab context menu still
+            // receives it from the visual wrapper / strip.
+            if (event.button === 0 || event.button === 1) {
+              event.preventDefault()
+              event.stopPropagation()
+
+              // Preventing the native primary press protects the parent tab
+              // from activating or starting a drag, but it also suppresses
+              // the browser's usual button focus. Restore that focus so the
+              // close lifecycle can move it to the surviving tab once this
+              // control unmounts.
+              if (event.button === 0) {
+                event.currentTarget.focus({ preventScroll: true })
+              }
+            }
+          }}
+          onPointerUp={event => {
+            if (event.button === 0 || event.button === 1) {
+              event.preventDefault()
+              event.stopPropagation()
+            }
+
+            closeMiddle.onPointerUp(event)
+          }}
+          size="icon-xs"
+          type="button"
+          variant="ghost"
+        >
+          {dirty && (
+            <span
+              aria-hidden
+              className="pointer-events-none absolute inset-0 grid place-items-center transition-opacity"
+              data-slot="pane-tab-dirty-indicator"
+              style={{ opacity: closeVisible ? 0 : 1 }}
+            >
+              <span className="size-2 rounded-full bg-amber-500 shadow-[0_0_0_2px_var(--tab-bg),0_1px_2px_rgba(0,0,0,0.45)] dark:bg-amber-400" />
+            </span>
+          )}
+          <Codicon
+            className="transition-opacity"
+            data-slot="pane-tab-close-icon"
+            name="close"
+            size="0.625rem"
+            style={{ opacity: closeVisible ? 1 : 0 }}
+          />
+        </Button>
+      )}
+      {dirty && !canShowClose && (
         <span
           aria-hidden
           className={cn(
             'pointer-events-none absolute grid size-4 place-items-center',
             vertical ? 'bottom-1.5 left-1/2 -translate-x-1/2' : 'right-1.5 top-1/2 -translate-y-1/2'
           )}
+          data-slot="pane-tab-dirty-indicator"
         >
           <span className="size-2 rounded-full bg-amber-500 shadow-[0_0_0_2px_var(--tab-bg),0_1px_2px_rgba(0,0,0,0.45)] dark:bg-amber-400" />
         </span>
