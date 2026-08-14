@@ -208,15 +208,30 @@ _OMLX_057_STREAM_ABORT = (
 # the structured ``code``/``omlx_code`` survive.  Captured alongside the
 # stream abort above (same reporter, same engine build), which is what makes
 # the pair useful: it isolates the streaming exit as the only thing that
-# strips the structure.  Trailing "..." is the reporter's own elision of the
-# remediation sentence and is kept, so this fixture deliberately carries NO
-# context-overflow token at all.
+# strips the structure.
+#
+# COMPLETE capture.  An earlier revision of this fixture ended at "metal_cap
+# ceiling 86.40 GB). ..." because the report it was transcribed from elided
+# the remediation sentence; ``limit_bytes`` and the outer ``"type": "error"``
+# sat behind a second elision.  All three are on the wire, and the first of
+# them carries "context length", so this shape DOES reach the overflow branch
+# — see the docstring on the 400 test below, which the elision had made
+# wrong.  ``error.message`` is 562 characters.
+#
+# This is the 13 Aug 14:11 firing (``kv_len=83168``): the one that goes with
+# the ``approx_tokens=63337`` the test below passes, and with the 174 -> 9
+# message collapse the report is built on.  A 12 Aug 16:37 firing
+# (``kv_len=51311``, ``estimated_bytes`` 84368206439, 560 characters) is
+# equally real and identically worded — only the accounting numbers differ —
+# so the self-consistent pairing is the one pinned here.
 _OMLX_057_PREFILL_400_MESSAGE = (
-    "oMLX prefill memory guard rejected this prompt: Prefill context too "
-    "large for available memory (preflight safety guard, kv_len=51311, "
-    "min_chunk=32): predicted peak would require ~78.57 GB (current 71.22 GB "
-    "+ KV 3.28 GB + min-chunk transient 4.08 GB) but prefill safety cap is "
-    "77.76 GB (90% of metal_cap ceiling 86.40 GB). ..."
+    "oMLX prefill memory guard rejected this prompt: Prefill context too large for "
+    "available memory (preflight safety guard, kv_len=83168, min_chunk=32): predicted "
+    "peak would require ~78.31 GB (current 72.33 GB + KV 5.22 GB + min-chunk transient "
+    "772.56 MB) but prefill safety cap is 77.76 GB (90% of metal_cap ceiling 86.40 GB). "
+    "Raise kernel iogpu.wired_limit_mb in Terminal (currently caps Metal at 86.40 GB), "
+    "or reduce context length. To continue, set Memory Guard to aggressive, raise the "
+    "custom memory guard ceiling, free system memory, or compact/reduce context."
 )
 
 _OMLX_057_PREFILL_400_BODY = {
@@ -226,9 +241,27 @@ _OMLX_057_PREFILL_400_BODY = {
         "param": None,
         "code": "prefill_memory_exceeded",
         "omlx_code": "prefill_memory_exceeded",
-        "estimated_bytes": 84368206439,
-    }
+        "estimated_bytes": 84082063701,
+        "limit_bytes": 83493598003,
+    },
+    "type": "error",
 }
+
+# CONSTRUCTED — NOT a capture.  This is the truncated form the fixture above
+# used to carry, kept deliberately because no real oMLX body omits the
+# remediation sentence: the reporter went looking for a token-less capture and
+# there is not one.  Its only job is to pin the LOWER BOUND — that the guard
+# rests on the memory wording and the structured code, not on the presence of
+# "context length" — so that a future engine copy-edit which drops the
+# remediation hint cannot silently reopen this bug.  Do not describe it as
+# captured output anywhere.
+_SYNTHETIC_PREFILL_400_NO_OVERFLOW_TOKEN = (
+    "oMLX prefill memory guard rejected this prompt: Prefill context too "
+    "large for available memory (preflight safety guard, kv_len=51311, "
+    "min_chunk=32): predicted peak would require ~78.57 GB (current 71.22 GB "
+    "+ KV 3.28 GB + min-chunk transient 4.08 GB) but prefill safety cap is "
+    "77.76 GB (90% of metal_cap ceiling 86.40 GB). ..."
+)
 
 
 # ── Test: Full classification pipeline ─────────────────────────────────
@@ -905,6 +938,46 @@ class TestClassifyApiError:
         assert result.retryable is True
         assert result.should_compress is False
         assert result.should_fallback is True
+
+    def test_400_prefill_memory_code_without_overflow_token_is_overloaded(self):
+        # LOWER BOUND, on a CONSTRUCTED body — see the fixture comment.  Every
+        # real oMLX rejection ends with a "reduce context length" hint, so the
+        # guard is never actually asked to work without one.  This pins that it
+        # could: strip the remediation sentence and classification still rests
+        # on the memory wording plus ``code: prefill_memory_exceeded``, so an
+        # engine copy-edit that drops the hint cannot silently reopen #52261.
+        #
+        # This is also the one shape whose unguarded failure mode is
+        # format_error rather than context_overflow: with no overflow token the
+        # 400 falls past every check to the non-retryable default.
+        body = {
+            "error": {
+                "message": _SYNTHETIC_PREFILL_400_NO_OVERFLOW_TOKEN,
+                "type": "invalid_request_error",
+                "param": None,
+                "code": "prefill_memory_exceeded",
+                "omlx_code": "prefill_memory_exceeded",
+                "estimated_bytes": 84368206439,
+                "limit_bytes": 83493598003,
+            },
+            "type": "error",
+        }
+        e = MockAPIError(
+            "Error code: 400 - " + repr(body), status_code=400, body=body,
+        )
+        result = classify_api_error(
+            e, provider="custom", model="qw36-27b-8bit-mtp:agent",
+            approx_tokens=63337, context_length=256000,
+        )
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+        assert result.should_compress is False
+        assert result.should_fallback is True
+        # The premise of this fixture: no overflow token is present at all.
+        assert not any(
+            p in _SYNTHETIC_PREFILL_400_NO_OVERFLOW_TOKEN.lower()
+            for p in _CONTEXT_OVERFLOW_PATTERNS
+        )
 
     @pytest.mark.parametrize("shape,message", [
         ("mid-stream", _OMLX_057_STREAM_ABORT),
