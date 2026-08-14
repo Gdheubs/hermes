@@ -2585,6 +2585,7 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     "_pending_one_turn_model_restores",
     "_session_reasoning_overrides",
     "_session_service_tier_overrides",
+    "_session_temperature_overrides",
     "_pending_model_notes",
     "_last_resolved_model",
     "_queued_events",
@@ -5106,7 +5107,9 @@ class TurnRunner:
                 log_message="interim_assistant_callback scheduling error",
             )
 
-        turn_route = self._runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+        turn_route = self._runner._resolve_turn_agent_config(
+            ctx.message, model, runtime_kwargs, session_key=ctx.session_key
+        )
 
         # Per-platform skip_context_files — messaging platforms can opt out
         # of filesystem-heavy context-file discovery (SOUL.md, AGENTS.md,
@@ -6317,6 +6320,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_service_tier_overrides = legacy_dict_property(
         "_session_service_tier_overrides"
     )
+    _session_temperature_overrides = legacy_dict_property("_session_temperature_overrides")
     _last_resolved_model = legacy_dict_property("_last_resolved_model")
     _queued_events = legacy_dict_property("_queued_events")
     _pending_turn_sidecar_notes = legacy_dict_property("_pending_turn_sidecar_notes")
@@ -7621,13 +7625,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict, session_key: Optional[str] = None) -> dict:
         """Build the effective model/runtime config for a single turn.
 
         Always uses the session's primary model/provider.  If `/fast` is
         enabled and the model supports Priority Processing / Anthropic fast
         mode, attach `request_overrides` so the API call is marked
-        accordingly.
+        accordingly.  A session-scoped `/temperature` override is merged
+        into `request_overrides` so the sampling temperature reaches the
+        provider on every turn of the session.
         """
         from hermes_cli.models import resolve_fast_mode_overrides
 
@@ -7657,15 +7663,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         }
 
         service_tier = getattr(self, "_service_tier", None)
-        if not service_tier:
-            route["request_overrides"] = {}
-            return route
+        overrides: Dict[str, Any] = {}
+        if service_tier:
+            try:
+                overrides = resolve_fast_mode_overrides(route["model"]) or {}
+            except Exception:
+                overrides = {}
 
-        try:
-            overrides = resolve_fast_mode_overrides(route["model"])
-        except Exception:
-            overrides = None
-        route["request_overrides"] = overrides or {}
+        # Session-scoped /temperature override (set via the /temperature
+        # slash command) flows into request_overrides so the sampling
+        # temperature reaches the provider on every turn of this session.
+        session_temperature = self._resolve_session_temperature(
+            session_key=session_key,
+        )
+        if session_temperature is not None:
+            overrides["temperature"] = session_temperature
+
+        route["request_overrides"] = overrides
         return route
 
     def _sync_session_model_from_agent(self, session_id: str, agent: Any) -> None:
@@ -8897,6 +8911,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._session_state(session_key).conversation.reasoning_override = (
             None if reasoning_config is None else dict(reasoning_config)
         )
+
+    def _set_session_temperature_override(
+        self,
+        session_key: str,
+        temperature: Optional[float],
+    ) -> None:
+        """Set or clear the session-scoped temperature override."""
+        if not session_key:
+            return
+        self._session_state(session_key).conversation.temperature_override = temperature
+
+    def _resolve_session_temperature(
+        self,
+        source=None,
+        session_key: Optional[str] = None,
+    ) -> Optional[float]:
+        """Resolve the effective sampling temperature for a session.
+
+        A session-scoped /temperature override wins over the config default.
+        Returns None when no override is set (the provider default applies).
+        """
+        resolved_session_key = session_key
+        if not resolved_session_key and source is not None:
+            try:
+                resolved_session_key = self._session_key_for_source(source)
+            except Exception:
+                resolved_session_key = None
+
+        if resolved_session_key:
+            _t_state = self._peek_session_state(resolved_session_key)
+            if _t_state is not None and _t_state.conversation.temperature_override is not None:
+                return _t_state.conversation.temperature_override
+        return None
 
     def _resolve_session_service_tier(
         self,
@@ -16342,6 +16389,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         if canonical == "reasoning":
             return await self._handle_reasoning_command(event)
+
+        if canonical == "temperature":
+            return await self._handle_temperature_command(event)
 
         if canonical == "memory":
             return await self._handle_memory_command(event)

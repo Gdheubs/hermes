@@ -234,6 +234,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("reasoning", "Manage reasoning effort and display", "Configuration",
                args_hint="[level|show|hide|full|clamp] [--global]",
                subcommands=("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "show", "hide", "on", "off", "full", "clamp", "--global")),
+    CommandDef("temperature", "View or set LLM sampling temperature (session-scoped; --global to persist)", "Configuration",
+               aliases=("temp",),
+               args_hint="[0.0-2.0] [--global] [reset]",
+               subcommands=("reset", "--global")),
     CommandDef("fast", "Toggle fast mode — OpenAI Priority Processing / Anthropic Fast Mode (Normal/Fast)", "Configuration",
                args_hint="[normal|fast|status] [--global]",
                subcommands=("normal", "fast", "status", "on", "off", "--global")),
@@ -1277,7 +1281,10 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     native slash.
 #   - pause: global emergency stop; reached via /hermes pause [off] on
 #     Slack. Added at the 50-cap — a native slot would clamp /platform.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause"})
+#   - temperature: view/set sampling temperature; reached via /hermes
+#     temperature on Slack. Added at the 50-cap — a native slot would
+#     clamp an existing native slash.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "temperature"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

@@ -310,6 +310,28 @@ def _request_service_tier(model_options: Any) -> Any:
     return _REQUEST_OPTION_MISSING
 
 
+def _request_generation_params(model_options: Any) -> Optional[Dict[str, Any]]:
+    """Translate model_options.generation into request_overrides.
+
+    Mirrors _request_reasoning_config / _request_service_tier. The stack's
+    chat-service sends a ``generation`` sub-object with sampling parameters
+    (temperature, top_p, max_tokens) and an optional ``extra_body`` dict for
+    provider-specific fields (e.g. num_ctx). Returns None when absent so
+    callers can distinguish "not provided" from "explicitly cleared".
+    """
+    if not isinstance(model_options, dict):
+        return None
+    generation = model_options.get("generation")
+    if not isinstance(generation, dict) or not generation:
+        return None
+
+    overrides: Dict[str, Any] = {}
+    for key in ("temperature", "top_p", "max_tokens", "extra_body"):
+        if key in generation:
+            overrides[key] = generation[key]
+    return overrides or None
+
+
 def _apply_runtime_agent_overrides(
     runtime_kwargs: Dict[str, Any], overrides: Optional[Dict[str, Any]]
 ) -> Dict[str, Any]:
@@ -2681,6 +2703,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         request_reasoning_config = _request_reasoning_config(model_options)
         request_service_tier = _request_service_tier(model_options)
+        request_generation_params = _request_generation_params(model_options)
 
         request_model = _clean_request_string(requested_model)
         request_provider = _clean_request_string(requested_provider)
@@ -2920,6 +2943,11 @@ class APIServerAdapter(BasePlatformAdapter):
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
+        if request_generation_params:
+            agent_kwargs["request_overrides"] = {
+                **dict(agent_kwargs.get("request_overrides") or {}),
+                **request_generation_params,
+            }
 
         agent = AIAgent(**agent_kwargs)
         agent._hermes_api_runtime = {
