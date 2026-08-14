@@ -1012,6 +1012,48 @@ class TestClassifyApiError:
         assert result.should_fallback is True
         assert result.should_rotate_credential is False
 
+    # ── Memory-ceiling rejections surfaced as 409 (issue #52261) ──
+    #
+    # NOT CAPTURED.  Read from the engine's source: oMLX's ``ModelLoadingError``
+    # carries "Model 'X' load aborted: process memory limit exceeded" and
+    # ``server.py`` maps it to 409.  No reporter has produced a 409 body, so
+    # this fixture is constructed from that message, and the test is pinned as
+    # a code reading rather than as evidence.
+
+    def test_409_memory_abort_is_overloaded_not_format_error(self):
+        # Before the 409 branch this reached the generic "other 4xx" bucket and
+        # was reported as format_error / retryable=False: a transient memory
+        # abort called a malformed request.  should_fallback was already set,
+        # so the turn was not stranded — but it was never retried against the
+        # primary either, even though the abort clears the moment the host
+        # reclaims memory.
+        e = MockAPIError(
+            "Model 'Qwen3.6-27B-MLX-8bit' load aborted: process memory limit "
+            "exceeded",
+            status_code=409,
+        )
+        result = classify_api_error(
+            e, provider="custom", model="qwen3.6-27b-mlx-8bit",
+            approx_tokens=63337, context_length=256000,
+        )
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+        assert result.should_compress is False
+        assert result.should_fallback is True
+
+    def test_409_without_memory_wording_is_still_format_error(self):
+        # CONTROL: 409 Conflict has ordinary uses (a model swap already in
+        # flight, a duplicate request id).  Those must keep the existing 4xx
+        # treatment, so the new branch cannot claim the whole status code.
+        e = MockAPIError("A model swap is already in progress.", status_code=409)
+        result = classify_api_error(
+            e, provider="custom", model="x",
+            approx_tokens=5000, context_length=64000,
+        )
+        assert result.reason == FailoverReason.format_error
+        assert result.retryable is False
+        assert result.should_fallback is True
+
     def test_507_without_memory_wording_is_generic_server_error(self):
         # CONTROL: 507 Insufficient Storage also has its literal meaning.  A
         # body with no memory wording must keep the generic 5xx treatment, so

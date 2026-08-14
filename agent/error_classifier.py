@@ -1441,6 +1441,25 @@ def _classify_by_status(
     if status_code == 408:
         return result_fn(FailoverReason.timeout, retryable=True)
 
+    # 409 Conflict carrying memory-ceiling wording.  oMLX raises
+    # ``ModelLoadingError`` with "Model 'X' load aborted: process memory limit
+    # exceeded" and ``server.py`` maps it to 409, which reaches the generic
+    # "other 4xx" bucket below and is reported as ``format_error``,
+    # retryable=False — a transient memory abort called a malformed request.
+    # ``should_fallback`` is already set there so the turn is not stranded, but
+    # it is never retried against the primary either, even though the abort
+    # clears as soon as the host reclaims memory.
+    #
+    # UNLIKE the 507 branch above, this one is read from the engine's source,
+    # not from a captured response: no reporter has produced a 409 body.  It is
+    # included because it is the same guard and the same wall as the shapes
+    # that ARE captured, and because the predicate gate makes it inert
+    # otherwise — a 409 without memory wording (a genuine state conflict, e.g.
+    # a model swap already in progress) keeps the existing 4xx treatment.
+    # See issue #52261.
+    if status_code == 409 and _is_memory_ceiling(error_msg, error_code):
+        return _memory_ceiling_result(result_fn)
+
     # Other 4xx — non-retryable
     if 400 <= status_code < 500:
         return result_fn(
