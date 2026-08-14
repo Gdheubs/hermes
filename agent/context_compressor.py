@@ -178,6 +178,19 @@ MAX_ITERATIONS_SUMMARY_REQUEST = (
     "without calling any more tools."
 )
 _BACKGROUND_PROCESS_NOTIFICATION_PREFIX = "[IMPORTANT: Background process "
+# Sibling notification prefixes the block above did not cover: watch_disabled
+# and watch_overflow_* share the "[IMPORTANT: ...]" wrapper but not the
+# "Background process " text (watch_overflow is a cross-session summary with
+# no single owning process), and async-delegation completions use their own
+# "[ASYNC DELEGATION ...]" wrapper entirely. See
+# tools/process_registry.py's format_process_notification /
+# _format_async_delegation and gateway/run.py's
+# _format_gateway_process_notification for the exact producer text.
+_WATCH_DISABLED_NOTIFICATION_PREFIX = "[IMPORTANT: Watch patterns disabled"
+_WATCH_OVERFLOW_TRIPPED_PREFIX = "[IMPORTANT: Watch-pattern overflow:"
+_WATCH_OVERFLOW_RELEASED_PREFIX = "[IMPORTANT: Watch-pattern notifications resumed"
+_ASYNC_DELEGATION_COMPLETE_PREFIX = "[ASYNC DELEGATION COMPLETE"
+_ASYNC_DELEGATION_BATCH_COMPLETE_PREFIX = "[ASYNC DELEGATION BATCH COMPLETE"
 
 
 def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
@@ -4590,6 +4603,14 @@ This compaction should PRIORITISE preserving all information related to the focu
             return False
         if cls._has_compressed_summary_metadata(message):
             return True
+        # display_kind survives SessionDB projection (it is a real column,
+        # not stripped underscore-prefixed metadata) and is the authoritative
+        # marker for background-process/async-delegation notifications
+        # persisted via gateway/run.py's internal-turn stamping. Checked
+        # narrowly for this one kind so model_switch/personality_switch
+        # markers (handled by their own dedicated recognizers) are unaffected.
+        if message.get("display_kind") == "internal_notification":
+            return True
         content = message.get("content")
         if cls._is_context_summary_content(content):
             return True
@@ -4621,6 +4642,16 @@ This compaction should PRIORITISE preserving all information related to the focu
             _LENGTH_CONTINUATION_OUTPUT_LIMIT,
         } or text.startswith(
             _BACKGROUND_PROCESS_NOTIFICATION_PREFIX
+        ) or text.startswith(
+            _WATCH_DISABLED_NOTIFICATION_PREFIX
+        ) or text.startswith(
+            _WATCH_OVERFLOW_TRIPPED_PREFIX
+        ) or text.startswith(
+            _WATCH_OVERFLOW_RELEASED_PREFIX
+        ) or text.startswith(
+            _ASYNC_DELEGATION_COMPLETE_PREFIX
+        ) or text.startswith(
+            _ASYNC_DELEGATION_BATCH_COMPLETE_PREFIX
         ) or text.startswith(
             TODO_INJECTION_HEADER + "\n"
         ) or text.startswith(

@@ -613,3 +613,65 @@ def test_gateway_drain_retains_and_formats_overflow_events():
     out_released = _format_gateway_process_notification(released)
     assert "notifications resumed" in out_released
     assert "exit code" not in out_released
+
+
+# ---------------------------------------------------------------------------
+# watch_match output/command get the same forced redaction floor as
+# completion notifications, even when security.redact_secrets is off.
+# ---------------------------------------------------------------------------
+
+def test_gateway_watch_match_force_redacts_output_when_redaction_disabled(monkeypatch):
+    """A user setting cannot disable the gateway's outbound secret floor for
+    watch_match — it must match completion notifications' force=True floor."""
+    import agent.redact as redact_module
+    from gateway.run import _format_gateway_process_notification
+
+    secret = "abc123randomopaquetokenvalue999"
+    monkeypatch.setattr(redact_module, "_REDACT_ENABLED", False)
+
+    evt = {
+        "type": "watch_match",
+        "session_id": "proc_secret",
+        "pattern": "TOKEN",
+        "command": f"echo MY_SERVICE_TOKEN={secret}",
+        "output": f"MY_SERVICE_TOKEN={secret}\nHOME=/home/user",
+        "suppressed": 0,
+    }
+
+    text = _format_gateway_process_notification(evt)
+
+    assert secret not in text
+    assert "HOME=/home/user" in text
+
+
+def test_process_registry_watch_match_force_redacts_output_when_redaction_disabled(
+    monkeypatch,
+):
+    """Same floor for the shared tools/process_registry.py formatter used by
+    the TUI gateway surface.
+
+    Uses a recognized credential prefix (not a bare KEY=value pair) because
+    the command here ("echo ...") is not an env-dump command, so
+    redact_terminal_output's code_file=True heuristic intentionally skips the
+    generic ENV-assignment pass regardless of the force floor (pre-existing,
+    unrelated to this fix) — prefix-matched secrets are unaffected by that.
+    """
+    import agent.redact as redact_module
+    from tools.process_registry import format_process_notification
+
+    secret = "sk-ant-api03-" + "x" * 40
+    monkeypatch.setattr(redact_module, "_REDACT_ENABLED", False)
+
+    evt = {
+        "type": "watch_match",
+        "session_id": "proc_secret",
+        "pattern": "TOKEN",
+        "command": "echo hello",
+        "output": f"Authorization token: {secret}\nHOME=/home/user",
+        "suppressed": 0,
+    }
+
+    text = format_process_notification(evt)
+
+    assert secret not in text
+    assert "HOME=/home/user" in text
