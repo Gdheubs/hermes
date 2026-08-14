@@ -242,6 +242,8 @@ class TestStartRun:
 
                 assert status["status"] == "completed"
                 assert create_calls["n"] == 1
+                assert session_id not in adapter._session_turn_locks
+                assert session_id not in adapter._session_turn_lock_refs
 
     @pytest.mark.asyncio
     async def test_start_rejects_conflicting_route_and_request_provider(self):

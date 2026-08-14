@@ -125,13 +125,19 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
     assert calls["n"] == 2
 
 
-def test_session_turn_lock_serializes_same_session():
-    """Same session_id must not overlap across _run_agent and /v1/runs (#84235)."""
+def _bare_session_lock_adapter():
     from gateway.platforms.api_server import APIServerAdapter
 
     adapter = APIServerAdapter.__new__(APIServerAdapter)
     adapter._session_turn_locks = {}
+    adapter._session_turn_lock_refs = {}
     adapter._session_turn_locks_guard = asyncio.Lock()
+    return adapter
+
+
+def test_session_turn_lock_serializes_same_session():
+    """Same session_id must not overlap across _run_agent and /v1/runs (#84235)."""
+    adapter = _bare_session_lock_adapter()
 
     active = {"n": 0}
     max_active = {"n": 0}
@@ -157,6 +163,8 @@ def test_session_turn_lock_serializes_same_session():
         "a:start",
         "a:end",
     ]
+    assert adapter._session_turn_locks == {}
+    assert adapter._session_turn_lock_refs == {}
 
 
 def test_session_turn_lock_wired_into_run_agent_and_handle_runs():
@@ -173,11 +181,7 @@ def test_session_turn_lock_wired_into_run_agent_and_handle_runs():
 
 
 def test_session_turn_lock_allows_different_sessions_in_parallel():
-    from gateway.platforms.api_server import APIServerAdapter
-
-    adapter = APIServerAdapter.__new__(APIServerAdapter)
-    adapter._session_turn_locks = {}
-    adapter._session_turn_locks_guard = asyncio.Lock()
+    adapter = _bare_session_lock_adapter()
 
     active = {"n": 0}
     max_active = {"n": 0}
@@ -202,4 +206,103 @@ def test_session_turn_lock_allows_different_sessions_in_parallel():
 
     asyncio.run(run())
     assert max_active["n"] == 2
+    assert adapter._session_turn_locks == {}
+    assert adapter._session_turn_lock_refs == {}
+
+
+def test_session_turn_lock_prunes_idle_and_ephemeral_entries():
+    """Idle session ids must not accumulate Lock objects (review on #84876)."""
+    adapter = _bare_session_lock_adapter()
+
+    async def run():
+        async with adapter._hold_session_turn_lock("sess-1"):
+            assert "sess-1" in adapter._session_turn_locks
+            assert adapter._session_turn_lock_refs["sess-1"] == 1
+        assert adapter._session_turn_locks == {}
+        assert adapter._session_turn_lock_refs == {}
+
+        for i in range(20):
+            async with adapter._hold_session_turn_lock(f"ephemeral-{i}"):
+                pass
+        assert adapter._session_turn_locks == {}
+        assert adapter._session_turn_lock_refs == {}
+
+        async with adapter._hold_session_turn_lock(""):
+            pass
+        async with adapter._hold_session_turn_lock("   "):
+            pass
+        assert adapter._session_turn_locks == {}
+
+    asyncio.run(run())
+
+
+def test_session_turn_lock_keeps_entry_while_waiter_queued():
+    """Do not pop on release while another turn already checked out the Lock."""
+    adapter = _bare_session_lock_adapter()
+
+    async def run():
+        holder_started = asyncio.Event()
+        release_holder = asyncio.Event()
+
+        async def hold_a():
+            async with adapter._hold_session_turn_lock("sess-1"):
+                holder_started.set()
+                await release_holder.wait()
+
+        async def hold_b():
+            async with adapter._hold_session_turn_lock("sess-1"):
+                pass
+
+        t_a = asyncio.create_task(hold_a())
+        await holder_started.wait()
+        t_b = asyncio.create_task(hold_b())
+        for _ in range(50):
+            if adapter._session_turn_lock_refs.get("sess-1", 0) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        assert adapter._session_turn_lock_refs["sess-1"] == 2
+        assert "sess-1" in adapter._session_turn_locks
+        release_holder.set()
+        await asyncio.gather(t_a, t_b)
+        assert adapter._session_turn_locks == {}
+        assert adapter._session_turn_lock_refs == {}
+
+    asyncio.run(run())
+
+
+def test_session_turn_lock_prunes_after_cancelled_waiter():
+    adapter = _bare_session_lock_adapter()
+
+    async def run():
+        holder_started = asyncio.Event()
+        release_holder = asyncio.Event()
+
+        async def hold_a():
+            async with adapter._hold_session_turn_lock("sess-1"):
+                holder_started.set()
+                await release_holder.wait()
+
+        async def hold_b():
+            async with adapter._hold_session_turn_lock("sess-1"):
+                pass
+
+        t_a = asyncio.create_task(hold_a())
+        await holder_started.wait()
+        t_b = asyncio.create_task(hold_b())
+        for _ in range(50):
+            if adapter._session_turn_lock_refs.get("sess-1", 0) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        assert adapter._session_turn_lock_refs["sess-1"] == 2
+        t_b.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t_b
+        assert adapter._session_turn_lock_refs["sess-1"] == 1
+        assert "sess-1" in adapter._session_turn_locks
+        release_holder.set()
+        await t_a
+        assert adapter._session_turn_locks == {}
+        assert adapter._session_turn_lock_refs == {}
+
+    asyncio.run(run())
 

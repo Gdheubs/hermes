@@ -1462,7 +1462,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # / stale snapshots / compression lock_contended). Ephemeral
         # fingerprint sessions still serialize when they share the derived id;
         # empty ids skip the lock. Related: #84235.
+        #
+        # Entries live only while a hold is in flight (holder + waiters).
+        # Popping after the last ref drops prevents unbounded growth from
+        # one-shot / fingerprint session ids. Do not pop on lock.release()
+        # alone: a waiter may already hold the Lock object, and a new map
+        # entry would let the next turn run in parallel with it.
         self._session_turn_locks: Dict[str, asyncio.Lock] = {}
+        self._session_turn_lock_refs: Dict[str, int] = {}
         self._session_turn_locks_guard = asyncio.Lock()
         # Every agent currently inside _run_agent(), i.e. exactly the turns
         # counted by _inflight_agent_runs above.  Shutdown needs the whole
@@ -6175,13 +6182,31 @@ class APIServerAdapter(BasePlatformAdapter):
         return None
 
     async def _get_session_turn_lock(self, session_id: str) -> asyncio.Lock:
-        """Return the asyncio.Lock that serializes turns for ``session_id``."""
+        """Checkout the asyncio.Lock that serializes turns for ``session_id``.
+
+        Increments the in-flight refcount (holder + waiters) so the map entry
+        cannot be pruned until this checkout is released.
+        """
         async with self._session_turn_locks_guard:
             lock = self._session_turn_locks.get(session_id)
             if lock is None:
                 lock = asyncio.Lock()
                 self._session_turn_locks[session_id] = lock
+            self._session_turn_lock_refs[session_id] = (
+                self._session_turn_lock_refs.get(session_id, 0) + 1
+            )
             return lock
+
+    async def _release_session_turn_lock(self, session_id: str, lock: asyncio.Lock) -> None:
+        """Drop one checkout ref; prune the map when no holder or waiter remains."""
+        async with self._session_turn_locks_guard:
+            remaining = self._session_turn_lock_refs.get(session_id, 1) - 1
+            if remaining > 0:
+                self._session_turn_lock_refs[session_id] = remaining
+                return
+            self._session_turn_lock_refs.pop(session_id, None)
+            if self._session_turn_locks.get(session_id) is lock:
+                self._session_turn_locks.pop(session_id, None)
 
     @asynccontextmanager
     async def _hold_session_turn_lock(self, session_id: Optional[str]):
@@ -6191,17 +6216,21 @@ class APIServerAdapter(BasePlatformAdapter):
         ``/v1/runs`` background tasks so a wake self-post cannot interleave
         with an in-flight run on the same SessionDB transcript (#84235).
         Waiting on this lock queues the second turn behind the first.
+        The map entry is removed when the last waiter/holder exits.
         """
         sid = (session_id or "").strip()
         if not sid:
             yield
             return
         lock = await self._get_session_turn_lock(sid)
-        await lock.acquire()
         try:
-            yield
+            await lock.acquire()
+            try:
+                yield
+            finally:
+                lock.release()
         finally:
-            lock.release()
+            await self._release_session_turn_lock(sid, lock)
 
     @staticmethod
     def _bind_api_server_session(
