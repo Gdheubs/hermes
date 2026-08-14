@@ -305,3 +305,174 @@ def test_skill_patch_off_silent_verbose_shows_diff():
     )
     assert len(verbose) == 1
     assert "demo" in verbose[0] and "→" in verbose[0]
+
+
+# ---------------------------------------------------------------------------
+# start notice (#28976)
+# ---------------------------------------------------------------------------
+
+
+class _NoOpThread:
+    """Thread stub that skips the worker — start-notice tests don't need the
+    real review to run, and skipping it removes any chance of the end notice
+    racing into our capture lists.
+    """
+
+    def __init__(self, *, target=None, daemon=None, name=None):
+        self.started = False
+
+    def start(self):
+        self.started = True
+
+
+def _capture_spawn_notices(
+    monkeypatch,
+    *,
+    review_memory: bool,
+    review_skills: bool = False,
+    notifications: str | None = None,
+):
+    """Run ``_spawn_background_review`` against a thread stub and capture
+    everything that landed on either notification surface before the worker
+    would have started.  ``notifications=None`` leaves the attribute unset so
+    the ``getattr(..., "on")`` default is exercised.
+    """
+    started: list = []
+
+    class _RecordingThread(_NoOpThread):
+        def start(self):
+            started.append(True)
+
+    monkeypatch.setattr(run_agent_module.threading, "Thread", _RecordingThread)
+
+    captured_prints: list = []
+    captured_bg_callback: list = []
+
+    agent = _bare_agent()
+    agent._safe_print = lambda *a, **kw: captured_prints.append(
+        " ".join(str(x) for x in a)
+    )
+    agent.background_review_callback = lambda msg: captured_bg_callback.append(msg)
+    if notifications is not None:
+        agent.memory_notifications = notifications
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hi"}],
+        review_memory=review_memory,
+        review_skills=review_skills,
+    )
+    return captured_prints, captured_bg_callback, started
+
+
+def test_background_review_emits_start_notice_for_memory_only(monkeypatch):
+    """Issue #28976: the user must see a start notice when the background
+    review is launched, not only an end notice that fires solely when
+    something actually changed.  The scope tag tells them which stores are
+    being reviewed so they can predict the kind of end update to expect.
+    """
+    prints, bg, _ = _capture_spawn_notices(monkeypatch, review_memory=True)
+    assert len(prints) == 1, prints
+    assert "Self-improvement review: starting (memory)" in prints[0], prints[0]
+    assert bg == ["💾 Self-improvement review: starting (memory)…"], bg
+
+
+def test_background_review_emits_start_notice_for_skills_only(monkeypatch):
+    prints, bg, _ = _capture_spawn_notices(
+        monkeypatch, review_memory=False, review_skills=True
+    )
+    assert len(prints) == 1, prints
+    assert "Self-improvement review: starting (skills)" in prints[0], prints[0]
+    assert bg == ["💾 Self-improvement review: starting (skills)…"], bg
+
+
+def test_background_review_emits_start_notice_for_both_scopes(monkeypatch):
+    prints, bg, _ = _capture_spawn_notices(
+        monkeypatch, review_memory=True, review_skills=True
+    )
+    assert len(prints) == 1, prints
+    assert "Self-improvement review: starting (memory + skills)" in prints[0], prints[0]
+    assert bg == ["💾 Self-improvement review: starting (memory + skills)…"], bg
+
+
+def test_background_review_start_notice_suppressed_when_notifications_off(monkeypatch):
+    """``display.memory_notifications: off`` documents "No chat notification"
+    and ``summarize_background_review_actions`` returns no actions for it, so
+    BOTH end-notice surfaces stay silent.  The start notice must honour the
+    same contract on both surfaces — otherwise an "off" user gets a start
+    event that is never followed by an end event.  The review itself must
+    still run: the setting governs display only.
+    """
+    prints, bg, started = _capture_spawn_notices(
+        monkeypatch, review_memory=True, review_skills=True, notifications="off"
+    )
+    assert prints == [], prints
+    assert bg == [], bg
+    assert started == [True], "off suppresses the notice, not the review"
+
+
+def test_background_review_start_notice_emitted_for_verbose(monkeypatch):
+    """"verbose" is a louder mode, not a quieter one — it must still get the
+    start notice.  Guards the ``!= "off"`` gate against being narrowed to an
+    ``== "on"`` allow-list that would silently drop verbose users.
+    """
+    prints, bg, _ = _capture_spawn_notices(
+        monkeypatch, review_memory=True, notifications="verbose"
+    )
+    assert len(prints) == 1, prints
+    assert bg == ["💾 Self-improvement review: starting (memory)…"], bg
+
+
+def test_background_review_start_notice_survives_callback_exception(monkeypatch):
+    """A misbehaving gateway callback must not prevent the worker from being
+    scheduled — the same contract the end-notice path already relies on.
+    Without this guard a failing TUI consumer would silently disable
+    background review entirely.
+    """
+    started: list = []
+
+    class _RecordingThread(_NoOpThread):
+        def start(self):
+            started.append(True)
+
+    monkeypatch.setattr(run_agent_module.threading, "Thread", _RecordingThread)
+
+    def _boom(_msg):
+        raise RuntimeError("gateway down")
+
+    agent = _bare_agent()
+    agent._safe_print = lambda *a, **kw: None
+    agent.background_review_callback = _boom
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hi"}],
+        review_memory=True,
+    )
+
+    assert started == [True], "thread must still start after callback raise"
+
+
+def test_background_review_start_notice_skipped_when_no_callback(monkeypatch):
+    """The CLI path has ``background_review_callback = None``; the start
+    notice must still print on ``_safe_print`` and must not crash trying to
+    invoke a None callback.
+    """
+    monkeypatch.setattr(run_agent_module.threading, "Thread", _NoOpThread)
+
+    captured_prints: list = []
+
+    agent = _bare_agent()
+    agent._safe_print = lambda *a, **kw: captured_prints.append(
+        " ".join(str(x) for x in a)
+    )
+    agent.background_review_callback = None
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hi"}],
+        review_memory=True,
+    )
+
+    assert len(captured_prints) == 1, captured_prints
+    assert "starting (memory)" in captured_prints[0]

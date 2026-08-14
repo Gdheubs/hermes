@@ -1828,6 +1828,42 @@ class AIAgent:
             review_skills=review_skills,
             focus=focus,
         )
+
+        # Issue #28976: announce the start so the user knows a background
+        # update kicked off.  Only the END was reported before, and only when
+        # the review actually changed something, so a no-op review — or the
+        # whole in-flight window — was invisible.
+        #
+        # Gated on the same ``memory_notifications`` mode the end summary
+        # uses: ``summarize_background_review_actions`` returns no actions for
+        # "off", which suppresses BOTH end-notice surfaces below.  An "off"
+        # user must therefore get neither notice, not a start with no matching
+        # end.  Compared against "off" rather than allow-listing "on"/
+        # "verbose" so a future mode defaults to visible, matching how the
+        # end notice treats unknown values.
+        #
+        # Same two surfaces and same ``💾 Self-improvement review:`` prefix as
+        # the end notice in ``agent.background_review`` so CLI and gateway
+        # consumers can correlate start/end pairs.
+        if str(getattr(self, "memory_notifications", "on") or "on").lower() != "off":
+            if review_memory and review_skills:
+                scope = "memory + skills"
+            elif review_memory:
+                scope = "memory"
+            else:
+                scope = "skills"
+            start_msg = f"💾 Self-improvement review: starting ({scope})…"
+            try:
+                self._safe_print(f"  {start_msg}")
+            except Exception:
+                pass
+            bg_cb = getattr(self, "background_review_callback", None)
+            if bg_cb:
+                try:
+                    bg_cb(start_msg)
+                except Exception:
+                    pass
+
         # Carry the active profile into the review thread so MEMORY.md / skill
         # review writes land in the right profile (#54937).
         t = threading.Thread(
