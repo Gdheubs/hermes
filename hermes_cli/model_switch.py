@@ -3217,7 +3217,12 @@ def list_authenticated_providers(
                         # on the next read.  A failed save is non-fatal.
                         # Only after a real probe: a cache hit is already the
                         # product of an earlier probe that saved it.
-                        if _probe_live:
+                        # ...but never for a keyless entry that declared no
+                        # models: the saved list reads back as an allowlist
+                        # and the keyless probe gate then suppresses every
+                        # re-probe - the entry self-pins on its first probe.
+                        # Keyed entries always re-probe; persisting is safe.
+                        if _probe_live and bool(api_key):
                             _save_discovered_models_to_config(
                                 api_url, live_models
                             )
