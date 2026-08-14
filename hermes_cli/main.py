@@ -478,6 +478,7 @@ from hermes_cli.subcommands.acp import build_acp_parser
 from hermes_cli.subcommands.tools import build_tools_parser
 from hermes_cli.subcommands.insights import build_insights_parser
 from hermes_cli.subcommands.monitoring import build_monitoring_parser
+from hermes_cli.subcommands.trace import build_trace_parser
 from hermes_cli.subcommands.skills import build_skills_parser
 from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
@@ -9489,6 +9490,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "pairing",
         "skills",
         "tools",
+        "trace",
         "mcp",
         "sessions",
         "insights",
@@ -10916,7 +10918,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "prompt-size",
         "resume",
         "send", "sessions", "setup",
-        "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
+        "skin", "skills", "slack", "status", "sync", "tools", "trace", "uninstall", "update",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
         "verify",
         # Help-ish invocations — plugin commands not being listed in
@@ -11528,6 +11530,83 @@ def cmd_monitoring(args):
 
     print(f"Unknown monitoring action: {action}", file=sys.stderr)
     sys.exit(2)
+
+
+def cmd_trace(args):
+    from hermes_state import SessionDB
+
+    db = None
+    try:
+        db = SessionDB()
+        sid = db.resolve_session_id(args.session)
+        if not sid:
+            print(f"Error: no session matching {args.session!r}")
+            return
+
+        from agent.trace_builder import build_trace
+
+        trace = build_trace(db, sid, include_subagents=not args.no_subagents)
+        if trace is None or not trace.spans:
+            print(f"No trace data for session {sid}")
+            return
+
+        action = getattr(args, "trace_action", None)
+        if action == "show":
+            _print_trace_tree(trace)
+            return
+
+        from agent.trace_export import dumps
+
+        payload = dumps(trace, getattr(args, "format", "otlp"))
+        output = getattr(args, "output", None)
+        if not output or output == "-":
+            print(payload)
+        else:
+            with open(output, "w", encoding="utf-8") as fh:
+                fh.write(payload)
+            print(
+                f"Wrote {len(trace.spans)} spans ({args.format}) to {output}"
+            )
+    except Exception as e:
+        print(f"Error building trace: {e}")
+    finally:
+        if db is not None:
+            db.close()
+
+
+def _print_trace_tree(trace) -> None:
+    """Render a span tree as an indented summary for the terminal."""
+    from agent.trace_builder import STATUS_ERROR
+
+    by_parent: dict = {}
+    for span in trace.spans:
+        by_parent.setdefault(span.parent_id, []).append(span)
+    for kids in by_parent.values():
+        kids.sort(key=lambda s: s.start)
+
+    glyph = {"AGENT": "◆", "LLM": "✦", "TOOL": "⚙", "CHAIN": "▸"}
+
+    print(
+        f"trace {trace.root_session_id[:12]} · {len(trace.spans)} spans · "
+        f"{trace.duration:.1f}s"
+    )
+
+    def walk(parent_id, depth):
+        for span in by_parent.get(parent_id, []):
+            mark = "✗" if span.status == STATUS_ERROR else glyph.get(span.kind, "·")
+            indent = "  " * depth
+            print(
+                f"{indent}{mark} [{span.kind:<5}] {span.name[:60]:<60} "
+                f"{span.duration:7.2f}s"
+            )
+            walk(span.span_id, depth + 1)
+
+    roots = [s for s in trace.spans if s.parent_id is None]
+    roots.sort(key=lambda s: s.start)
+    for root in roots:
+        mark = "✗" if root.status == STATUS_ERROR else glyph.get(root.kind, "·")
+        print(f"{mark} [{root.kind:<5}] {root.name[:60]:<60} {root.duration:7.2f}s")
+        walk(root.span_id, 1)
 
 
 def cmd_skills(args):
@@ -12824,6 +12903,11 @@ def main():
     # =========================================================================
     build_insights_parser(subparsers, cmd_insights=cmd_insights)
     build_monitoring_parser(subparsers, cmd_monitoring=cmd_monitoring)
+
+    # =========================================================================
+    # trace command  (parser built in hermes_cli/subcommands/trace.py)
+    # =========================================================================
+    build_trace_parser(subparsers, cmd_trace=cmd_trace)
 
     # =========================================================================
     # claw command  (parser built in hermes_cli/subcommands/claw.py)
