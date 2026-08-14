@@ -78,6 +78,38 @@ def test_bearer_prefix_is_preserved():
     assert "Bearer zzz" not in redacted
 
 
+# Unicode case-fold characters that Python's IGNORECASE maps onto ASCII
+# letters: U+0130 İ, U+0131 ı, U+017F ſ, U+212A K. With the blanket ``(?i)``
+# these folded into the ASCII word lookarounds, so a token glued beside one
+# was NOT redacted (the boundary assertion failed). The fix scopes
+# case-insensitivity to the Bearer literal via ``(?i:Bearer)`` (#81073).
+_CASE_FOLD_NEIGHBORS = ("İ", "ı", "ſ", "K")
+
+
+@pytest.mark.parametrize("neighbor", _CASE_FOLD_NEIGHBORS)
+def test_bearer_redacted_beside_unicode_case_fold_left(neighbor):
+    """A bare Bearer token glued after a case-fold character must redact."""
+    redacted = _pattern_pass("xx" + neighbor + "Bearer " + "g" * 20)
+    assert "[REDACTED]" in redacted, f"left {neighbor!r} leaked: {redacted!r}"
+    assert "Bearer g" not in redacted, f"left {neighbor!r} leaked: {redacted!r}"
+
+
+@pytest.mark.parametrize("neighbor", _CASE_FOLD_NEIGHBORS)
+def test_bearer_redacted_beside_unicode_case_fold_right(neighbor):
+    """A bare Bearer token followed by a case-fold character must redact."""
+    redacted = _pattern_pass("Bearer " + "g" * 20 + neighbor)
+    assert "[REDACTED]" in redacted, f"right {neighbor!r} leaked: {redacted!r}"
+    assert "Bearer g" not in redacted, f"right {neighbor!r} leaked: {redacted!r}"
+
+
+@pytest.mark.parametrize("prefix", ["Bearer", "BEARER", "bearer", "BeArEr"])
+def test_bearer_literal_case_variants_still_redact(prefix):
+    """Case-insensitivity of the Bearer literal is preserved (scoped flag)."""
+    redacted = _pattern_pass("Authorization: " + prefix + " " + "z" * 20)
+    assert "[REDACTED]" in redacted
+    assert prefix + " zzz" not in redacted
+
+
 def test_prose_without_tokens_unchanged():
     """Ordinary prose must pass through untouched."""
     text = "Hello, world. Nothing secret here."

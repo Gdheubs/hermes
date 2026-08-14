@@ -403,7 +403,11 @@ _GATEWAY_RATE_LIMIT_RE = re.compile(
 # Boundary anchors use ASCII word lookarounds instead of ``\b``: under Python 3's
 # default Unicode semantics ``\b`` treats CJK/fullwidth letters as word
 # characters, so a token glued to one (``xx中sk-...``) is NOT at a boundary and
-# the fallback pass silently leaks it (#81073).
+# the fallback pass silently leaks it (#81073). The Bearer pattern scopes its
+# case-insensitivity to the literal via ``(?i:Bearer)`` — a blanket ``(?i)``
+# would also case-fold the lookarounds, making Python treat the Unicode
+# case-fold characters İ ı ſ K as ASCII word neighbors and leaking a bare
+# ``KBearer <token>`` beside them (#81073).
 _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"(?<![A-Za-z0-9_])sk-[A-Za-z0-9][A-Za-z0-9_\-]{12,}(?![A-Za-z0-9_])"),
     re.compile(r"(?<![A-Za-z0-9_])gh[pousr]_[A-Za-z0-9_]{20,}(?![A-Za-z0-9_])"),
@@ -411,7 +415,7 @@ _GATEWAY_SECRET_PATTERNS = (
     re.compile(r"(?<![A-Za-z0-9_])xox[baprs]-[A-Za-z0-9\-]{20,}(?![A-Za-z0-9_])"),
     re.compile(r"(?<![A-Za-z0-9_])hf_[A-Za-z0-9]{20,}(?![A-Za-z0-9_])"),
     re.compile(r"(?<![A-Za-z0-9_])glpat-[A-Za-z0-9_\-]{20,}(?![A-Za-z0-9_])"),
-    re.compile(r"(?i)(?<![A-Za-z0-9_])(Bearer\s+)[A-Za-z0-9._\-]{20,}(?![A-Za-z0-9_])"),
+    re.compile(r"(?<![A-Za-z0-9_])((?i:Bearer)\s+)[A-Za-z0-9._\-]{20,}(?![A-Za-z0-9_])"),
 )
 
 
