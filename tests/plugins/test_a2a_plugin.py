@@ -547,6 +547,99 @@ class TestClientTools:
         assert "No peers configured" in out
 
 
+class TestPerPeerHeaders:
+    """Per-peer custom headers (e.g. Cloudflare Access service tokens) must
+    ride along on every outbound request — discovery, calls, and fan-out."""
+
+    _CFG = {
+        "a2a_agents": {
+            "mac": {
+                "url": "http://localhost:9999",
+                "auth": {"type": "bearer", "token": "tok-123"},
+                "headers": {
+                    "CF-Access-Client-Id": "cf-id",
+                    "CF-Access-Client-Secret": "cf-secret",
+                },
+            }
+        }
+    }
+
+    def test_resolve_peer_carries_headers(self, monkeypatch):
+        monkeypatch.setattr(tools, "_load_config", lambda: self._CFG)
+        peer = tools._resolve_peer("mac")
+        assert peer["headers"]["CF-Access-Client-Id"] == "cf-id"
+        assert peer["auth"]["token"] == "tok-123"
+
+    def test_resolve_peer_defaults_headers_to_empty(self, monkeypatch):
+        monkeypatch.setattr(
+            tools, "_load_config",
+            lambda: {"a2a_agents": {"bare": {"url": "http://localhost:9999"}}},
+        )
+        peer = tools._resolve_peer("bare")
+        assert peer["headers"] == {}
+
+    def test_call_sends_auth_and_custom_headers(self, monkeypatch):
+        monkeypatch.setattr(tools, "_load_config", lambda: self._CFG)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        captured = {}
+
+        def fake_post(url, body, headers, timeout):
+            captured.update(headers)
+            return protocol.jsonrpc_result(
+                body["id"],
+                protocol.build_task("t", "c1", protocol.STATE_COMPLETED, "ok"),
+            )
+
+        monkeypatch.setattr(tools, "_http_post_json", fake_post)
+        out = tools.a2a_call({"agent": "mac", "message": "ping"})
+        assert "ok" in out
+        assert captured["Authorization"] == "Bearer tok-123"
+        assert captured["CF-Access-Client-Id"] == "cf-id"
+        assert captured["CF-Access-Client-Secret"] == "cf-secret"
+
+    def test_custom_headers_take_precedence(self, monkeypatch):
+        """Peer config wins over defaults — a peer can override User-Agent
+        (some WAF policies require a specific value)."""
+        cfg = {"a2a_agents": {"mac": dict(self._CFG["a2a_agents"]["mac"],
+                                          headers={"User-Agent": "CustomUA/2"})}}
+        monkeypatch.setattr(tools, "_load_config", lambda: cfg)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        captured = {}
+
+        def fake_post(url, body, headers, timeout):
+            captured.update(headers)
+            return protocol.jsonrpc_result(
+                body["id"],
+                protocol.build_task("t", "c1", protocol.STATE_COMPLETED, "ok"),
+            )
+
+        monkeypatch.setattr(tools, "_http_post_json", fake_post)
+        tools.a2a_call({"agent": "mac", "message": "ping"})
+        assert captured["User-Agent"] == "CustomUA/2"
+
+    def test_orchestrate_fanout_sends_custom_headers(self, monkeypatch):
+        """The a2a_orchestrate path rebuilds the peer dict — it must carry
+        headers (and tenant) through, not just url/auth/timeout."""
+        cfg = {"a2a_agents": {"mac": dict(self._CFG["a2a_agents"]["mac"],
+                                          capabilities=["research"])}}
+        monkeypatch.setattr(tools, "_load_config", lambda: cfg)
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        captured = {}
+
+        def fake_post(url, body, headers, timeout):
+            captured.update(headers)
+            return protocol.jsonrpc_result(
+                body["id"],
+                protocol.build_task("t", "c1", protocol.STATE_COMPLETED, "ok"),
+            )
+
+        monkeypatch.setattr(tools, "_http_post_json", fake_post)
+        out = tools.a2a_orchestrate({"capability": "research", "message": "go"})
+        assert "ok" in out
+        assert captured.get("CF-Access-Client-Id") == "cf-id"
+        assert captured.get("Authorization") == "Bearer tok-123"
+
+
 class TestRegistryDispatchConvention:
     """Tools must accept the args-as-dict positional that registry.dispatch
     uses (`entry.handler(args, **kwargs)`), not keyword params."""
