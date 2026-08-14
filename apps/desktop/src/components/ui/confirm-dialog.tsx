@@ -34,9 +34,10 @@ interface ConfirmDialogProps {
   onOpenAutoFocus?: (event: Event) => void
 }
 
-// Shared confirmation dialog: Enter confirms (from anywhere in the dialog),
-// Esc/Cancel/backdrop dismiss. Owns the pending → done → close beat and inline
-// error, so callers pass only an async onConfirm that does the work.
+// Shared confirmation dialog. Native button semantics own Enter/Space so a
+// focused Cancel button cannot accidentally trigger the confirm action. Owns
+// the pending → done → close beat and inline error, so callers pass only an
+// async onConfirm that does the work.
 export function ConfirmDialog({
   open,
   onClose,
@@ -117,8 +118,12 @@ export function ConfirmDialog({
         </DialogHeader>
 
         {error && (
-          <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
-            <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+          <div
+            aria-atomic="true"
+            className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+            role="alert"
+          >
+            <AlertTriangle aria-hidden="true" className="mt-0.5 size-3.5 shrink-0" />
             <span>{error}</span>
           </div>
         )}
