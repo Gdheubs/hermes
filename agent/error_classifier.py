@@ -447,6 +447,17 @@ _REQUEST_VALIDATION_PATTERNS = [
 _MEMORY_CEILING_PATTERNS = [
     "memory guard",                      # "prefill memory guard rejected"
     "memory limit exceeded",             # "process memory limit exceeded"
+    # Neither of the next two is load-bearing, and the list must not be pruned
+    # down to them.  oMLX builds the remediation tail from
+    # ``describe_ceiling_binding()``, whose branches vary BOTH: the noun before
+    # "ceiling" is "ceiling" / "static ceiling" / "dynamic ceiling" /
+    # "metal_cap ceiling" depending on which cap binds (and ties slash-join, so
+    # "static/metal_cap ceiling" is reachable), and "memory_guard_tier" is named
+    # in only some branches — the dynamic+custom branch says "Raise
+    # custom_ceiling_bytes in admin Memory settings" and the metal_cap branch
+    # says "Raise kernel iogpu.wired_limit_mb in Terminal" instead.  Nothing is
+    # left unguarded, because "memory limit exceeded" sits in the message PREFIX
+    # and survives every branch; these two just widen the net.
     "memory_guard_tier",                 # "lower memory_guard_tier"
     "dynamic ceiling",                   # "dynamic ceiling is 13.50 GB"
     "memory ceiling",
@@ -477,16 +488,27 @@ _MEMORY_CEILING_PATTERNS = [
 # ``limit_bytes`` in *bytes* — definitively memory, not a token/window count.
 # Deliberately NARROW: only memory-prefill codes, never ``resource_exhausted``
 # (already mapped to rate_limit) or generic ``invalid_request_error``.
-# See issue #52261.
+#
 # ``prefill_memory_aborted`` is the SIBLING of ``prefill_memory_exceeded``:
 # oMLX's prefill-memory body builder picks between the two by exception type
 # (``PrefillMemoryAbortedError`` vs the rejection), so "exceeded" is the prompt
 # turned away at admission and "aborted" is the prompt admitted and then killed
-# mid-prefill.  Same guard, same wall, same recovery — but only one of them was
-# in this set.  Today's aborted body still says "memory guard" and "available
-# memory", so it classifies correctly through the message patterns; the code
-# layer is the one that would not hold, which is the layer that exists
-# precisely for a reworded or proxy-stripped body.
+# mid-prefill.  Same guard, same wall, same recovery.  Today's aborted body
+# still says "memory guard" and "available memory", so it classifies correctly
+# through the message patterns; the code layer is the one that would not hold,
+# which is the layer that exists precisely for a reworded or proxy-stripped
+# body.
+#
+# ``omlx_prefill_memory_exceeded`` has NO KNOWN PRODUCER.  ``omlx_code`` is a
+# mirror of ``code`` rather than a prefixed variant, so the engine emits the
+# unprefixed spelling in both fields (the captured bodies in the tests show
+# exactly that), and this entry has never matched anything observed.  It is
+# retained rather than dropped because it cannot false-positive — no other
+# vendor will emit a string this specific — and because a namespacing proxy or
+# a later engine release is the obvious way it would start appearing.  Do not
+# read it as evidence that such a body exists.
+#
+# See issue #52261.
 _MEMORY_CEILING_ERROR_CODES = frozenset({
     "prefill_memory_exceeded",
     "prefill_memory_aborted",

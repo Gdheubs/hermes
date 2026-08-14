@@ -280,11 +280,25 @@ _SYNTHETIC_PREFILL_400_NO_OVERFLOW_TOKEN = (
 # guard has to sit ahead of the overflow branch rather than beside it, and
 # ahead of the usage-limit branch too.
 #
-# The separator between the tier names is a "→" in the reporter's transcript.
-# Whether the engine emits U+2192 or ASCII "->" has not been established from
-# the raw log, so both forms are pinned below and asserted to classify
-# identically.  None of the matching keys ("memory limit exceeded",
-# "memory_guard_tier", "context length") involve the separator.
+# SEPARATOR: SETTLED — it is U+2192, and this fixture already carried the right
+# one.  An earlier revision of this comment said the spelling "has not been
+# established from the raw log"; it has been since.  ``grep`` over the raw logs
+# returns twelve occurrences in ``agent.log`` and twelve in ``errors.log``,
+# every one of them the bytes ``e2 86 92``, with zero occurrences of the ASCII
+# "safe -> balanced" in either; and the engine holds the ladder in a single
+# module-level constant, ``MEMORY_GUARD_TIER_LADDER = "safe → balanced →
+# aggressive"``, with no ASCII sibling in the bundle.  Strictly the grep proves
+# the decoded string rather than the wire encoding, and the constant settles the
+# rest.
+#
+# The ASCII form below is therefore CONSTRUCTED, not captured — the same status
+# as _SYNTHETIC_PREFILL_400_NO_OVERFLOW_TOKEN above, and it is labelled here so
+# nobody reads it as a second real spelling.  It is kept because its job is a
+# lower bound, not a claim: none of the matching keys ("memory limit exceeded",
+# "memory_guard_tier", "context length") involve the separator, and the test
+# below pins that, so a future transcoding hop — a proxy, a log shipper, a
+# terminal — cannot quietly become load-bearing.  Do not add an ASCII spelling
+# to any production pattern list.
 _OMLX_057_PROCESS_MEMORY_ABORT = (
     "Request aborted: process memory limit exceeded (usage 49.8 GB, abort "
     "threshold (hard watermark) 49.2 GB, ceiling 51.8 GB). Reduce context "
@@ -1214,10 +1228,11 @@ class TestClassifyApiError:
         assert result.should_fallback is True
 
     def test_omlx_057_process_memory_abort_does_not_rest_on_the_arrow(self):
-        # The tier separator is the one byte in this capture that could not be
-        # confirmed against the raw log, so nothing is allowed to depend on it:
-        # the two spellings must be indistinguishable to the classifier, and
-        # every matching token must live outside the separator.
+        # The tier separator is settled as U+2192 (see the fixture comment), so
+        # this is no longer a test about an open question — it is a lower bound.
+        # Nothing is allowed to depend on the separator surviving a transcoding
+        # hop: the two spellings must be indistinguishable to the classifier,
+        # and every matching token must live outside the separator.
         for message in (
             _OMLX_057_PROCESS_MEMORY_ABORT,
             _OMLX_057_PROCESS_MEMORY_ABORT_ASCII_ARROW,
