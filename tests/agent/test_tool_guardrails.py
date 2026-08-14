@@ -119,16 +119,49 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
 
 
 
-def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
+def test_successful_identical_signatures_block_even_when_result_hash_changes():
     controller = ToolCallGuardrailController(
-        ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=3,
+        )
     )
+    args = {"todos": [{"id": "loop-fix", "content": "same", "status": "in_progress"}]}
 
-    for _ in range(3):
-        assert controller.before_call("write_file", {"path": "/tmp/x", "content": "x"}).action == "allow"
-        assert controller.after_call("write_file", {"path": "/tmp/x", "content": "x"}, "ok", failed=False).action == "allow"
-        assert controller.before_call("custom_tool", {"x": 1}).action == "allow"
-        assert controller.after_call("custom_tool", {"x": 1}, "ok", failed=False).action == "allow"
+    assert controller.before_call("todo", args).action == "allow"
+    assert controller.after_call(
+        "todo",
+        args,
+        '{"todos":[{"id":"loop-fix","content":"same","status":"in_progress"}]}',
+        failed=False,
+    ).action == "allow"
+
+    assert controller.before_call("todo", args).action == "allow"
+    second = controller.after_call(
+        "todo",
+        args,
+        "[Duplicate tool output — same content as a more recent call]",
+        failed=False,
+    )
+    assert second.action == "warn"
+    assert second.code == "no_progress_warning"
+    assert second.count == 2
+
+    assert controller.before_call("todo", args).action == "allow"
+    third = controller.after_call(
+        "todo",
+        args,
+        '{"status":"unchanged","content_returned":false}',
+        failed=False,
+    )
+    assert third.action == "warn"
+    assert third.count == 3
+
+    blocked = controller.before_call("todo", args)
+    assert blocked.action == "block"
+    assert blocked.code == "no_progress_block"
+    assert blocked.count == 3
 
 
 
@@ -177,3 +210,93 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
 
 
 
+
+
+def test_no_progress_streak_survives_turn_boundary_until_real_work_lands():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=3,
+        )
+    )
+    args = {"todos": [{"id": "a", "content": "same", "status": "in_progress"}]}
+
+    for _ in range(3):
+        assert controller.before_call("todo", args).action == "allow"
+        controller.after_call("todo", args, "same-list", failed=False)
+        # Context compaction / a new user message starts a fresh turn.
+        controller.reset_for_turn()
+
+    blocked = controller.before_call("todo", args)
+    assert blocked.action == "block"
+    assert blocked.code == "no_progress_block"
+
+    # A real mutating write moves the world and clears the stale streak.
+    controller.after_call(
+        "write_file",
+        {"path": "/tmp/x", "content": "x"},
+        '{"path": "/tmp/x", "bytes_written": 1}',
+        failed=False,
+    )
+    assert controller.before_call("todo", args).action == "allow"
+
+
+# ── Arg jitter + duplicate-stub hashing ────────────────────────────────────
+#
+# Signature counting (bcb9e0374) closes the result-hash hole, but the signature
+# is still derived from canonical args -- so jittering an irrelevant field
+# mints a fresh signature and restarts the streak at 1. Observed live on
+# ``todo``: alternating ``merge`` while re-asserting a byte-identical list.
+
+
+_DUPLICATE_STUB = "[Duplicate tool output — same content as a more recent call]"
+
+
+def test_cosmetic_todo_jitter_does_not_mint_a_fresh_signature():
+    items = [
+        {"id": "1", "content": "convert skill", "status": "completed"},
+        {"id": "2", "content": "open PR", "status": "pending"},
+    ]
+    a = {"todos": items, "merge": True}
+    b = {"todos": list(reversed(items)), "merge": False}
+
+    assert canonical_tool_args(a) == canonical_tool_args(b)
+    assert ToolCallSignature.from_call("todo", a) == ToolCallSignature.from_call("todo", b)
+
+
+def test_jittered_todo_payloads_still_reach_the_no_progress_block():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=3,
+        )
+    )
+    items = [{"id": "1", "content": "convert skill", "status": "pending"}]
+
+    for i in range(3):
+        # Flip an irrelevant field every call; the asserted end state is identical.
+        args = {"todos": items, "merge": bool(i % 2)}
+        assert controller.before_call("todo", args).action == "allow"
+        controller.after_call("todo", args, "same-list", failed=False)
+
+    blocked = controller.before_call("todo", {"todos": items, "merge": True})
+    assert blocked.action == "block"
+    assert blocked.code == "no_progress_block"
+
+
+def test_non_declarative_args_are_untouched_by_normalization():
+    # Normalization must not collapse genuinely different calls.
+    a = {"path": "/tmp/a", "content": "x"}
+    b = {"path": "/tmp/b", "content": "x"}
+    assert canonical_tool_args(a) != canonical_tool_args(b)
+    # A todos payload that is not a list is passed through unchanged.
+    assert canonical_tool_args({"todos": "not-a-list"}) == canonical_tool_args({"todos": "not-a-list"})
+
+
+def test_duplicate_stub_hashes_to_a_stable_sentinel():
+    from agent.tool_guardrails import _result_hash
+
+    assert _result_hash(_DUPLICATE_STUB) == _result_hash(f"  {_DUPLICATE_STUB} trailing text")
+    assert _result_hash(_DUPLICATE_STUB) != _result_hash('{"todos":[]}')
