@@ -200,6 +200,17 @@ def build_models_payload(
         excluded_providers=ctx.excluded_providers or [],
     )
 
+    # Managed local runtime: staged GGUFs are selectable like any provider's
+    # models. list_authenticated_providers can't know about them (no
+    # credential, no custom_providers entry — the credential is
+    # reachability), so inject the row here where every picker surface
+    # inherits it. Present whenever models are staged; picking one routes
+    # through the llamacpp alias -> managed/detected server resolution.
+    local_row = _local_runtime_row(ctx)
+    if local_row is not None:
+        rows = [r for r in rows if str(r.get("slug", "")).lower() != "llamacpp"]
+        rows.append(local_row)
+
     moa_row = _moa_provider_row(ctx.current_provider)
     if moa_row is not None:
         rows = [moa_row] + [r for r in rows if str(r.get("slug", "")).lower() != "moa"]
@@ -823,6 +834,54 @@ def _apply_pricing(
                 # is never blocked from picking a model.
                 row["free_tier"] = False
                 row["unavailable_models"] = []
+
+
+def _local_runtime_row(ctx: "ConfigContext") -> dict | None:
+    """Build the ``llamacpp`` provider row from staged local models.
+
+    Present whenever GGUFs are staged in the managed models directory —
+    downloaded models must be selectable even before the server is running
+    (selection starts it via the runtime_provider seam / activate flow).
+    Returns ``None`` when nothing is staged.
+    """
+    try:
+        from hermes_cli.local_runtime.bootstrap import staged_model_ids
+
+        staged = staged_model_ids()
+        if not staged:
+            return None
+        current = (ctx.current_provider or "").strip().lower() in (
+            "llamacpp", "llama.cpp", "llama-cpp")
+        if not current:
+            # A LIVE session on the managed server reports provider "custom"
+            # (the resolution seam's label) with the managed base_url. Match
+            # on the endpoint so the picker still marks this row current —
+            # otherwise the session the user is chatting in shows no
+            # selection.
+            try:
+                from hermes_cli.local_runtime.endpoint import _state_endpoint
+
+                managed = _state_endpoint()
+                current = bool(
+                    managed
+                    and (ctx.current_base_url or "").strip().rstrip("/")
+                    == managed["base_url"].rstrip("/"))
+            except Exception:
+                current = False
+        return {
+            "slug": "llamacpp",
+            "name": "Local (llama.cpp)",
+            "is_current": current,
+            "is_user_defined": False,
+            "models": staged,
+            "total_models": len(staged),
+            "source": "local-runtime",
+            "authenticated": True,       # the credential is reachability
+            "auth_type": "local",
+            "warning": None,
+        }
+    except Exception:
+        return None
 
 
 def _moa_provider_row(current_provider: str = "") -> dict | None:

@@ -293,6 +293,7 @@ export interface Translations {
       providerAccounts: string
       providerApiKeys: string
       providerCustomEndpoints: string
+      providerLocalModels: string
       gateway: string
       apiKeys: string
       keybinds: string
@@ -736,6 +737,77 @@ export interface Translations {
       fallbackEmpty: string
       notInCatalog: string
       tasks: Record<string, AuxTaskCopy>
+    }
+    localModels: {
+      title: string
+      runtimeTitle: string
+      runtimeReady: (backend: string) => string
+      serverRunning: string
+      runtimeInstalled: string
+      runtimeInstalledDetail: (tag: string, backend: string) => string
+      installTitle: string
+      installDetail: string
+      installAction: string
+      installing: string
+      installFailed: string
+      hardwareTitle: string
+      hardwareLoading: string
+      vram: (label: string) => string
+      ram: (label: string) => string
+      unifiedMemory: string
+      modelsTitle: string
+      recommended: string
+      downloaded: string
+      downloadAction: (size: string) => string
+      downloadProgress: (done: string, total: string) => string
+      downloadDoneToast: (model: string) => string
+      installDoneToast: string
+      useAction: string
+      activePill: string
+      updateTitle: string
+      updateDetail: (next: string, current: string) => string
+      updateAction: string
+      updating: string
+      upToDateTitle: string
+      upToDateDetail: (tag: string, backend: string) => string
+      updateToast: (next: string) => string
+      activeDetail: string
+      activeNotLoaded: string
+      loadedPill: string
+      placementResident: string
+      placementSpilled: string
+      placementResidentTip: string
+      placementSpilledTip: string
+      loadingPill: string
+      ejectTip: string
+      ejected: string
+      ejectFailed: string
+      stopServer: string
+      startServer: string
+      runtimeRunningDetail: string
+      serverStopped: string
+      serverStarted: string
+      serverStopFailed: string
+      serverStartFailed: string
+      activating: string
+      activateFailed: (model: string) => string
+      activateDoneToast: (model: string) => string
+      verifying: string
+      downloadFailed: (model: string) => string
+      pillFitsGpu: string
+      pillUsesRam: string
+      pillTooBig: string
+      pillFullContext: (max: string) => string
+      pillFullContextTip: string
+      pillStarts: (start: string) => string
+      pillStartsTip: string
+      pillUpTo: (max: string) => string
+      pillGrowsTip: string
+      pillVision: string
+      deleteAction: string
+      deleteConfirm: (model: string) => string
+      deleted: (model: string) => string
+      deleteFailed: string
     }
     providers: {
       connectAccount: string
@@ -2004,6 +2076,8 @@ export interface Translations {
     connected: string
     featuredPitch: string
     fireworksPitch: string
+    localModelsTitle: string
+    localModelsPitch: string
     openRouterPitch: string
     apiKeyOptions: Record<string, { short: string; description: string }>
     backToSignIn: string
@@ -2177,6 +2251,15 @@ export interface Translations {
       openStarmap: string
       turnRunning: string
       contextUsage: string
+      systemResources: {
+        title: string
+        loading: string
+        gpuUtilization: string
+        gpuMemory: string
+        ram: string
+        unifiedNote: string
+        toggle: string
+      }
       contextUsagePanel: {
         categories: {
           conversation: string

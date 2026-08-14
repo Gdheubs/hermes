@@ -10,6 +10,7 @@ import {
   Archive,
   BarChart3,
   Bell,
+  Cpu,
   Download,
   Globe,
   Info,
@@ -191,6 +192,13 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
             id: 'pview:custom-endpoints',
             label: t.settings.nav.providerCustomEndpoints,
             onSelect: () => openProviderView('custom-endpoints')
+          },
+          {
+            active: activeView === 'providers' && providerView === 'local',
+            icon: Cpu,
+            id: 'pview:local',
+            label: t.settings.nav.providerLocalModels,
+            onSelect: () => openProviderView('local')
           }
         ],
         gapBefore: true,

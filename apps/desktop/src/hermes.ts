@@ -25,6 +25,10 @@ import type {
   EnvVarInfo,
   HermesConfig,
   HermesConfigRecord,
+  LocalCatalogModel,
+  LocalHardware,
+  LocalModelsStatus,
+  LocalRuntimeJob,
   LogsResponse,
   McpCatalogResponse,
   McpServerSummary,
@@ -785,6 +789,96 @@ export function getStatus(): Promise<StatusResponse> {
   return window.hermesDesktop.api<StatusResponse>({
     ...profileScoped(),
     path: '/api/status'
+  })
+}
+
+// ── Managed local runtime (llama.cpp) ──────────────────────────
+
+export function getLocalModelsStatus(): Promise<LocalModelsStatus> {
+  return window.hermesDesktop.api<LocalModelsStatus>({
+    ...profileScoped(),
+    path: '/api/local-models/status'
+  })
+}
+
+export function getLocalHardware(): Promise<LocalHardware> {
+  return window.hermesDesktop.api<LocalHardware>({
+    ...profileScoped(),
+    path: '/api/local-models/hardware'
+  })
+}
+
+export function getLocalCatalog(): Promise<{ models: LocalCatalogModel[] }> {
+  return window.hermesDesktop.api<{ models: LocalCatalogModel[] }>({
+    ...profileScoped(),
+    path: '/api/local-models/catalog'
+  })
+}
+
+export function installLocalRuntime(backend?: string): Promise<{ job_id: string; backend: string; tag: string }> {
+  return window.hermesDesktop.api<{ job_id: string; backend: string; tag: string }>({
+    ...profileScoped(),
+    path: '/api/local-models/runtime/install',
+    method: 'POST',
+    body: { backend: backend ?? null }
+  })
+}
+
+export function downloadLocalModel(modelId: string): Promise<{ job_id: string | null; already_downloaded?: boolean }> {
+  return window.hermesDesktop.api<{ job_id: string | null; already_downloaded?: boolean }>({
+    ...profileScoped(),
+    path: '/api/local-models/download',
+    method: 'POST',
+    body: { model_id: modelId }
+  })
+}
+
+export function deleteLocalModel(modelId: string): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    ...profileScoped(),
+    path: `/api/local-models/models/${encodeURIComponent(modelId)}`,
+    method: 'DELETE'
+  })
+}
+
+export function getLocalRuntimeJob(jobId: string): Promise<LocalRuntimeJob> {
+  return window.hermesDesktop.api<LocalRuntimeJob>({
+    ...profileScoped(),
+    path: `/api/local-models/jobs/${encodeURIComponent(jobId)}`
+  })
+}
+
+export function getLocalModelsJobs(): Promise<{ jobs: LocalRuntimeJob[] }> {
+  return window.hermesDesktop.api<{ jobs: LocalRuntimeJob[] }>({
+    ...profileScoped(),
+    path: '/api/local-models/jobs'
+  })
+}
+
+export function activateLocalModel(modelId: string): Promise<{ job_id: string }> {
+  return window.hermesDesktop.api<{ job_id: string }>({
+    ...profileScoped(),
+    path: '/api/local-models/activate',
+    method: 'POST',
+    body: { model_id: modelId }
+  })
+}
+
+export function ejectLocalModel(modelId: string): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    ...profileScoped(),
+    path: '/api/local-models/eject',
+    method: 'POST',
+    body: { model_id: modelId }
+  })
+}
+
+export function setLocalServer(action: 'start' | 'stop'): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    ...profileScoped(),
+    path: '/api/local-models/server',
+    method: 'POST',
+    body: { action }
   })
 }
 
