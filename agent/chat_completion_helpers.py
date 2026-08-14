@@ -2728,6 +2728,21 @@ def cleanup_task_resources(agent, task_id: str) -> None:
             logger.warning("Failed to cleanup browser for task %s: %s", task_id, e)
 
 
+def _chunk_server_timings(chunk):
+    """Return the server ``timings`` block off a stream chunk, or None.
+
+    llama-server attaches ``timings`` to the final SSE chunk (alongside
+    usage); the OpenAI SDK parses unknown top-level fields into
+    ``model_extra``. Never raises on foreign chunk shapes.
+    """
+    extra = getattr(chunk, "model_extra", None)
+    if isinstance(extra, dict):
+        timings = extra.get("timings")
+        if isinstance(timings, dict):
+            return timings
+    return None
+
+
 def _build_partial_stream_stub(
     role, full_content, full_reasoning, model_name, usage_obj, *,
     dropped_tool_names=None,
@@ -3365,6 +3380,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         role = "assistant"
         reasoning_parts: list = []
         usage_obj = None
+        timings_obj = None
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
         _writer_token = {"value": None}
@@ -3539,6 +3555,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # Usage comes in the final chunk with empty choices
                 if hasattr(chunk, "usage") and chunk.usage:
                     usage_obj = chunk.usage
+                timings_obj = _chunk_server_timings(chunk) or timings_obj
                 continue
 
             delta = chunk.choices[0].delta
@@ -3668,6 +3685,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             # Usage in the final chunk
             if hasattr(chunk, "usage") and chunk.usage:
                 usage_obj = chunk.usage
+            timings_obj = _chunk_server_timings(chunk) or timings_obj
 
         _close_managed_stream()
 
@@ -3855,6 +3873,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             model=model_name,
             choices=[mock_choice],
             usage=usage_obj,
+            # Server ``timings`` from the final chunk, mirrored under the
+            # same attribute the OpenAI SDK uses for unknown fields so the
+            # streaming and non-streaming paths read identically.
+            model_extra={"timings": timings_obj} if timings_obj else None,
         )
 
     def _call_anthropic(request_client):

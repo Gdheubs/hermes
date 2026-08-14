@@ -2858,7 +2858,13 @@ def run_conversation(
                     break
                 
                 api_duration = time.time() - api_start_time
-                
+
+                # Server-reported generation speed (REQ-14): re-assigned on
+                # every completed call, and only ever set when the resolved
+                # provider profile opts in via surfaces_server_timings. The
+                # status bar reads agent.last_server_tps.
+                agent._capture_server_timings(response)
+
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
                 if thinking_spinner:

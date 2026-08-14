@@ -7469,6 +7469,46 @@ class AIAgent:
             return False
         return bool(getattr(profile, "echo_reasoning_content", False))
 
+    def _profile_surfaces_server_timings(self) -> bool:
+        """True when the resolved profile opts into ``surfaces_server_timings``.
+
+        Non-opted providers resolve False, so no speed figure is recorded
+        and their display is unchanged.
+        """
+        try:
+            from providers import resolve_provider_profile
+
+            profile = resolve_provider_profile(
+                self.provider, getattr(self, "requested_provider", None)
+            )
+        except Exception:
+            return False
+        return bool(getattr(profile, "surfaces_server_timings", False))
+
+    def _capture_server_timings(self, response: Any) -> None:
+        """Record the server's own generation speed off a completed response.
+
+        Reads ``timings.predicted_per_second`` from ``model_extra``.
+        Re-assigned on every completed call, so a response without timings
+        clears it instead of leaving a stale number.
+        """
+        tps = None
+        try:
+            if self._profile_surfaces_server_timings():
+                extra = getattr(response, "model_extra", None)
+                timings = extra.get("timings") if isinstance(extra, dict) else None
+                if isinstance(timings, dict):
+                    value = timings.get("predicted_per_second")
+                    if (
+                        isinstance(value, (int, float))
+                        and not isinstance(value, bool)
+                        and value > 0
+                    ):
+                        tps = float(value)
+        except Exception:
+            tps = None
+        self.last_server_tps = tps
+
     def _needs_kimi_tool_reasoning(self) -> bool:
         """Return True when the current provider is Kimi / Moonshot thinking mode.
 

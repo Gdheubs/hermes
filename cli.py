@@ -5408,6 +5408,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "session_total_tokens": 0,
             "session_api_calls": 0,
             "compressions": 0,
+            # Server-reported generation speed for the last completed
+            # response. Only providers whose profile opts into
+            # surfaces_server_timings ever set it; None hides the segment.
+            "server_tps": getattr(agent, "last_server_tps", None),
             "active_background_tasks": 0,
             "active_background_processes": 0,
             "active_background_subagents": 0,
@@ -6178,6 +6182,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
             if battery_label:
                 parts.insert(0, battery_label)
+            server_tps = snapshot.get("server_tps")
+            if server_tps:
+                parts.append(f"⚡ {server_tps:.1f} tok/s")
             if compressions:
                 parts.append(f"🗜️ {compressions}")
             bg_count = snapshot.get("active_background_tasks", 0)
