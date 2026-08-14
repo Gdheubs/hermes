@@ -257,18 +257,25 @@ def validate_embeds(embeds: Sequence[Embed]) -> None:
     """Enforce Discord's per-message embed limits.
 
     A single message may carry at most EMBED_LIMITS["per_message"] (10) embeds,
-    and the combined character budget across all embeds is capped at
-    EMBED_LIMITS["total"] (6000) per embed — the aggregate limit applies per
-    individual embed, not across the whole message. This function validates
-    the count constraint and delegates per-embed validation (already enforced
-    at construction) so callers get one entry point for the full message.
+    and the combined character budget across *all* embeds in that message is
+    capped at EMBED_LIMITS["total"] (6000). Individual embeds are already
+    validated at construction; this function adds the message-level count and
+    aggregate-budget constraints so callers have one entry point for the full
+    message.
 
-    Raises EmbedValidationError when the collection violates the count limit.
+    Raises EmbedValidationError when the collection violates either limit.
     """
+    embeds = list(embeds)
     if len(embeds) > EMBED_LIMITS["per_message"]:
         raise EmbedValidationError(
             f"message has {len(embeds)} embeds, exceeds Discord limit "
             f"{EMBED_LIMITS['per_message']}"
+        )
+    aggregate = sum(e._total_chars() for e in embeds)
+    if aggregate > EMBED_LIMITS["total"]:
+        raise EmbedValidationError(
+            f"message embed content is {aggregate} chars, exceeds Discord "
+            f"per-message limit {EMBED_LIMITS['total']}"
         )
 
 

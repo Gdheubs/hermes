@@ -155,6 +155,23 @@ def test_validate_embeds_count_limit():
         validate_embeds(embeds)
 
 
+def test_validate_embeds_aggregate_budget_exceeded():
+    # Each embed is individually valid (within its own 6000-char budget), but
+    # the combined total across all embeds in the message exceeds 6000 chars.
+    # This exercises the message-level aggregate-budget path, not per-embed
+    # rejection.
+    embeds = [Embed(description="x" * 3000) for _ in range(3)]
+    # 3 embeds × 3000 chars = 9000 > 6000, but each embed is 3000 ≤ 6000
+    with pytest.raises(EmbedValidationError):
+        validate_embeds(embeds)
+
+
+def test_validate_embeds_aggregate_budget_ok():
+    # 10 embeds at 500 chars each (via description, 4096 limit) = 5000 ≤ 6000 → OK
+    embeds = [Embed(description="x" * 500) for _ in range(10)]
+    validate_embeds(embeds)
+
+
 # ── mention policy ───────────────────────────────────────────────────────────
 def test_mention_detection():
     assert contains_mention("ping @everyone")
