@@ -956,4 +956,25 @@ def resolve_provider_full(
     except Exception:
         pass
 
+    # 4. auth_type="none" providers registered in PROVIDER_REGISTRY (e.g.
+    #    plugins/model-providers/<name>/ with auth_type="none"). These need
+    #    no credential, so unlike api_key providers they must resolve even
+    #    when no env var or config entry exists. Mirror of the picker's
+    #    always-list treatment (see model_switch.list_authenticated_providers).
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY as _AUTH_REGISTRY_FINAL
+        _pcfg = _AUTH_REGISTRY_FINAL.get(raw)
+        if _pcfg is not None and getattr(_pcfg, "auth_type", "") == "none":
+            return ProviderDef(
+                id=_pcfg.id,
+                name=_pcfg.name,
+                transport="openai_chat",
+                api_key_env_vars=tuple(_pcfg.api_key_env_vars or ()),
+                base_url=_pcfg.inference_base_url or "",
+                auth_type="none",
+                source="hermes-auth-registry",
+            )
+    except Exception:
+        pass
+
     return None

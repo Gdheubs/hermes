@@ -90,6 +90,68 @@ def test_resolve_provider_full_finds_named_custom_provider():
     assert resolved.source == "user-config"
 
 
+def test_resolve_provider_full_resolves_none_auth_registry_provider(monkeypatch):
+    """auth_type='none' registry providers resolve without any credential.
+
+    resolve_provider_full used to return None for plugin-registered
+    auth_type='none' providers (no models.dev entry, no overlay, no
+    credential, no config entry), which made `hermes model` and the
+    /model switch fail with "Unknown provider" even though the runtime
+    resolver and picker both handle them. A no-auth provider needs no
+    secret, so it must resolve unconditionally.
+    """
+    import types
+
+    from hermes_cli.auth import PROVIDER_REGISTRY
+
+    cfg = types.SimpleNamespace(
+        id="noauth-preview",
+        name="NoAuth Preview",
+        auth_type="none",
+        api_key_env_vars=(),
+        inference_base_url="https://preview.example.com/v1",
+    )
+    PROVIDER_REGISTRY["noauth-preview"] = cfg
+    try:
+        resolved = resolve_provider_full("noauth-preview", {}, [])
+    finally:
+        PROVIDER_REGISTRY.pop("noauth-preview", None)
+
+    assert resolved is not None
+    assert resolved.id == "noauth-preview"
+    assert resolved.auth_type == "none"
+    assert resolved.base_url == "https://preview.example.com/v1"
+    assert resolved.source == "hermes-auth-registry"
+
+
+def test_resolve_provider_full_still_requires_creds_for_api_key_registry_provider(monkeypatch):
+    """api_key registry providers without a model/credential stay unresolved.
+
+    Negative-control guard: the none-auth fallback must not leak into
+    api_key providers — those must keep returning None when no models.dev
+    entry, overlay, or credential exists (callers rely on that to prompt
+    for a key rather than silently resolving).
+    """
+    import types
+
+    from hermes_cli.auth import PROVIDER_REGISTRY
+
+    cfg = types.SimpleNamespace(
+        id="keyed-preview",
+        name="Keyed Preview",
+        auth_type="api_key",
+        api_key_env_vars=("KEYED_PREVIEW_KEY",),
+        inference_base_url="https://keyed.example.com/v1",
+    )
+    PROVIDER_REGISTRY["keyed-preview"] = cfg
+    try:
+        resolved = resolve_provider_full("keyed-preview", {}, [])
+    finally:
+        PROVIDER_REGISTRY.pop("keyed-preview", None)
+
+    assert resolved is None
+
+
 @pytest.mark.parametrize(
     "requested",
     [

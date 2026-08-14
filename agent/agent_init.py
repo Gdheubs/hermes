@@ -1441,7 +1441,19 @@ def init_agent(
                 elif isinstance(key_used, str) and key_used and key_used != "dummy-key" and len(key_used) > 12:
                     print(f"🔑 Using API key: {key_used[:8]}...{key_used[-4:]}")
                 else:
-                    print("⚠️  Warning: API key appears invalid or missing")
+                    # auth_type="none" providers (free tiers that reject
+                    # Authorization headers) legitimately carry an empty key —
+                    # don't warn. Generic check via the provider profile so any
+                    # no-auth plugin profile lands here, not just built-ins.
+                    from providers import get_provider_profile
+                    _noauth = False
+                    try:
+                        _pp = get_provider_profile(agent.provider or "")
+                        _noauth = bool(_pp and _pp.auth_type == "none")
+                    except Exception:
+                        _noauth = False
+                    if not _noauth:
+                        print("⚠️  Warning: API key appears invalid or missing")
         except Exception as e:
             raise RuntimeError(f"Failed to initialize OpenAI client: {e}")
 

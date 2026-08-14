@@ -98,7 +98,7 @@ Full definition in `providers/base.py`. The most useful ones:
 | `env_vars` | `tuple[str, ...]` | API-key env vars in priority order; a final `*_BASE_URL` entry is used as the user base-URL override |
 | `base_url` | str | Default inference endpoint |
 | `models_url` | str | Explicit catalog URL (falls back to `{base_url}/models`) |
-| `auth_type` | str | `api_key` \| `oauth_device_code` \| `oauth_external` \| `copilot` \| `aws_sdk` \| `external_process` |
+| `auth_type` | str | `api_key` \| `oauth_device_code` \| `oauth_external` \| `copilot` \| `aws_sdk` \| `external_process` \| `none` |
 | `fallback_models` | `tuple[str, ...]` | Curated list shown when live catalog fetch fails |
 | `default_headers` | `dict[str, str]` | Sent on every request (e.g. Copilot's `Editor-Version`) |
 | `fixed_temperature` | Any | `None` = use caller's value; `OMIT_TEMPERATURE` sentinel = don't send temperature at all (Kimi) |
@@ -199,8 +199,9 @@ Set `profile.api_mode` to match the default your provider ships — it acts as a
 | `copilot` | GitHub Copilot token refresh cycle | `copilot` plugin only |
 | `aws_sdk` | AWS SDK credential chain (IAM role, profile, env) | `bedrock` plugin only |
 | `external_process` | Auth handled by a subprocess the agent spawns | `copilot-acp` plugin only |
+| `none` | Provider requires no authentication. No API key is requested or synthesized, and the transport must not emit an `Authorization` header | Free tiers that reject `Authorization` outright |
 
-`auth_type` gates which codepaths treat your provider as a "simple api-key provider" — if it's not `api_key`, the PluginManager still records the manifest but Hermes' CLI-level automation (doctor checks, `--provider` flag, setup wizard delegation) may skip over it.
+`auth_type` gates which codepaths treat your provider as a "simple api-key provider" — if it's not `api_key`, the PluginManager still records the manifest but Hermes' CLI-level automation (doctor checks, `--provider` flag, setup wizard delegation) may skip over it. `none` is treated as a first-class credential-free provider: it participates in the same resolution, picker, and setup paths as `api_key`, but always resolves with an empty key and never emits an `Authorization` header.
 
 ## Discovery timing
 
@@ -210,7 +211,7 @@ Provider discovery is **lazy** — triggered by the first `get_provider_profile(
 hermes doctor
 ```
 
-— a successful `auth_type="api_key"` profile appears under the Provider Connectivity section with a `/models` probe.
+— a successful `auth_type="api_key"` profile appears under the Provider Connectivity section with a `/models` probe. A successful `auth_type="none"` profile appears there too, reported as `(no-auth)` without a probe or credential check.
 
 For programmatic inspection:
 

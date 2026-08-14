@@ -2725,17 +2725,29 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
     key_env = pconfig.api_key_env_vars[0] if pconfig.api_key_env_vars else ""
     base_url_env = pconfig.base_url_env_var or ""
 
+    # No-auth providers (auth_type="none"): skip the API-key prompt — the
+    # endpoint rejects Authorization entirely, so there is no key to enter.
+    # Credential resolution already forces api_key="".
+    is_noauth = pconfig.auth_type == "none"
+
     # Check / prompt for API key
     existing_key, existing_source = _existing_api_key_for_model_flow(provider_id, pconfig)
 
-    existing_key, abort = _prompt_api_key(
-        pconfig,
-        existing_key,
-        provider_id=provider_id,
-        existing_source=existing_source,
-    )
-    if abort:
-        return
+    if is_noauth:
+        # auth_type="none": never send a credential even if a similarly-named
+        # env var exists — the endpoint rejects any Authorization header.
+        existing_key = ""
+        existing_source = ""
+
+    if not is_noauth:
+        existing_key, abort = _prompt_api_key(
+            pconfig,
+            existing_key,
+            provider_id=provider_id,
+            existing_source=existing_source,
+        )
+        if abort:
+            return
 
     # Gemini free-tier gate: free-tier daily quotas (<= 250 RPD for Flash)
     # are exhausted in a handful of agent turns, so refuse to wire up the
@@ -2907,16 +2919,44 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
     else:
         curated = _PROVIDER_MODELS.get(provider_id, [])
 
+        # Plugin-profile providers (auth_type="none" free tiers, or any
+        # profile that ships its own fetch_models/fallback_models): route
+        # through provider_model_ids() — the same resolver the /model
+        # picker uses — so the profile's live catalog filter applies
+        # instead of a raw /models probe returning the full paid catalog.
+        _profiled = False
+        if not curated and provider_id not in _PROVIDER_MODELS:
+            try:
+                from providers import get_provider_profile
+
+                _pp = get_provider_profile(provider_id)
+                _profiled = bool(
+                    _pp
+                    and _pp.fallback_models
+                    and (getattr(_pp, "fetch_models", None) is not None)
+                )
+            except Exception:
+                _profiled = False
+        if _profiled:
+            from hermes_cli.models import provider_model_ids
+
+            model_list = provider_model_ids(provider_id, force_refresh=True)
+            if model_list:
+                print(f"  Found {len(model_list)} model(s) via provider profile")
+
         # Try models.dev first — returns tool-capable models, filtered for noise
         mdev_models: list = []
-        try:
-            from agent.models_dev import list_agentic_models
+        if not _profiled:
+            try:
+                from agent.models_dev import list_agentic_models
 
-            mdev_models = list_agentic_models(provider_id)
-        except Exception:
-            pass
+                mdev_models = list_agentic_models(provider_id)
+            except Exception:
+                pass
 
-        if mdev_models:
+        if _profiled:
+            pass  # model_list already resolved above
+        elif mdev_models:
             # Merge models.dev with curated list so newly added models
             # (not yet in models.dev) still appear in the picker.
             if curated:

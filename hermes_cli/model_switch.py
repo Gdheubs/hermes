@@ -2593,7 +2593,10 @@ def list_authenticated_providers(
         # Check credentials via PROVIDER_REGISTRY (auth.py)
         _cp_config = _auth_registry.get(_cp.slug)
         _cp_has_creds = False
-        if _cp_config and _cp_config.api_key_env_vars:
+        if _cp_config and getattr(_cp_config, "auth_type", "") == "none":
+            # auth_type="none" requires no credential; always list.
+            _cp_has_creds = True
+        elif _cp_config and _cp_config.api_key_env_vars:
             _cp_has_creds = any(os.environ.get(ev) for ev in _cp_config.api_key_env_vars)
         # Also check auth store and credential pool
         if not _cp_has_creds:

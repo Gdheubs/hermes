@@ -192,3 +192,55 @@ def test_distinct_kimi_china_credential_still_listed(monkeypatch):
     assert slugs.count("kimi-coding") == 1
     assert "kimi" not in slugs          # alias collapsed into the canonical row
     assert "kimi-coding-cn" in slugs    # distinct China endpoint preserved
+
+
+# ---------------------------------------------------------------------------
+# list_authenticated_providers: auth_type="none" providers need no credential
+# ---------------------------------------------------------------------------
+#
+# A no-auth provider (free tier that rejects Authorization entirely) must
+# appear in the picker even though it has no API-key env var, no auth-store
+# entry, and no credential-pool entry — a secret is required by definition
+# to be absent. The 2b canonical cross-check used to require detectable
+# credentials for every row, silently dropping none-auth providers.
+
+
+def _none_auth_config(*, slug):
+    """Build a minimal ProviderConfig-shaped object with auth_type='none'."""
+    import types
+
+    cfg = types.SimpleNamespace(
+        auth_type="none",
+        api_key_env_vars=(),
+        base_url_env_var="",
+    )
+    cfg.slug = slug
+    return cfg
+
+
+def test_noauth_canonical_provider_listed_without_credentials(monkeypatch):
+    """A canonical provider with auth_type='none' is listed with no key set."""
+    import agent.models_dev as md
+    import hermes_cli.models as hm
+    from hermes_cli.auth import PROVIDER_REGISTRY
+
+    monkeypatch.setattr(md, "PROVIDER_TO_MODELS_DEV", {})
+    monkeypatch.setattr(md, "fetch_models_dev", lambda *a, **k: {})
+    monkeypatch.setattr("hermes_cli.providers.HERMES_OVERLAYS", {})
+    monkeypatch.setattr(hm, "CANONICAL_PROVIDERS", [
+        hm.ProviderEntry("noauth-preview", "NoAuth Preview", "desc"),
+    ])
+    monkeypatch.setattr(hm, "cached_provider_model_ids",
+                        lambda *a, **k: ["preview-1", "preview-2"])
+    monkeypatch.setattr(hm, "clear_provider_models_cache", lambda *a, **k: None)
+
+    PROVIDER_REGISTRY["noauth-preview"] = _none_auth_config(slug="noauth-preview")
+    try:
+        rows = model_switch.list_authenticated_providers(max_models=10)
+    finally:
+        PROVIDER_REGISTRY.pop("noauth-preview", None)
+
+    slugs = [r["slug"] for r in rows]
+    assert "noauth-preview" in slugs, f"none-auth provider dropped: {slugs}"
+    row = next(r for r in rows if r["slug"] == "noauth-preview")
+    assert row["models"] == ["preview-1", "preview-2"]
