@@ -101,6 +101,89 @@ class TestFetchOpenRouterModels:
         # Image-only model advertised supported_parameters WITHOUT tools → must be dropped.
         assert "google/gemini-3-pro-image-preview" not in ids
 
+    def test_show_all_models_opt_in_surfaces_non_curated_models(self, monkeypatch):
+        """openrouter.show_all_models=true returns every live tool-capable model,
+        including ids absent from the curated list."""
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                # two curated ids + one uncurated id; both tool-capable except the image one
+                return (
+                    b'{"data":['
+                    b'{"id":"anthropic/claude-opus-4.6","pricing":{"prompt":"0.000015","completion":"0.000075"},'
+                    b'"supported_parameters":["temperature","tools"]},'
+                    b'{"id":"qwen/qwen3.7-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"},'
+                    b'"supported_parameters":["tools","temperature"]},'
+                    b'{"id":"uncurated/gemini-9-flash","pricing":{"prompt":"0.00001","completion":"0.00003"},'
+                    b'"supported_parameters":["temperature","tools"]},'
+                    b'{"id":"uncurated/image-only","pricing":{"prompt":"0.00001","completion":"0.00003"},'
+                    b'"supported_parameters":["temperature","response_format"]}'
+                    b']}'
+                )
+
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        monkeypatch.setattr(
+            _models_mod,
+            "OPENROUTER_MODELS",
+            [("anthropic/claude-opus-4.6", ""), ("qwen/qwen3.7-max", "")],
+        )
+        mock_config = {"openrouter": {"show_all_models": True}}
+        with (
+            patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=[]),
+            patch("hermes_cli.config.load_config", return_value=mock_config),
+            patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()),
+        ):
+            models = fetch_openrouter_models(force_refresh=True)
+
+        ids = [mid for mid, _ in models]
+        assert "anthropic/claude-opus-4.6" in ids
+        assert "qwen/qwen3.7-max" in ids
+        # uncurated but tool-capable → surfaced in show-all mode
+        assert "uncurated/gemini-9-flash" in ids
+        # still filtered by tool support
+        assert "uncurated/image-only" not in ids
+
+    def test_show_all_models_off_by_default(self, monkeypatch):
+        """Without openrouter.show_all_models, non-curated models stay hidden."""
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return (
+                    b'{"data":['
+                    b'{"id":"anthropic/claude-opus-4.6","pricing":{"prompt":"0.000015","completion":"0.000075"},'
+                    b'"supported_parameters":["temperature","tools"]},'
+                    b'{"id":"uncurated/gemini-9-flash","pricing":{"prompt":"0.00001","completion":"0.00003"},'
+                    b'"supported_parameters":["temperature","tools"]}'
+                    b']}'
+                )
+
+        monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
+        monkeypatch.setattr(
+            _models_mod,
+            "OPENROUTER_MODELS",
+            [("anthropic/claude-opus-4.6", "")],
+        )
+        with (
+            patch("hermes_cli.model_catalog.get_curated_openrouter_models", return_value=[]),
+            patch("hermes_cli.config.load_config", return_value={}),
+            patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()),
+        ):
+            models = fetch_openrouter_models(force_refresh=True)
+
+        ids = [mid for mid, _ in models]
+        assert "anthropic/claude-opus-4.6" in ids
+        assert "uncurated/gemini-9-flash" not in ids
+
 
 
 class TestOpenRouterToolSupportHelper:

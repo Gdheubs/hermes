@@ -1719,7 +1719,11 @@ def fetch_openrouter_models(
     *,
     force_refresh: bool = False,
 ) -> list[tuple[str, str]]:
-    """Return the curated OpenRouter picker list, refreshed from the live catalog when possible."""
+    """Return the OpenRouter picker list, refreshed from the live catalog when possible.
+
+    By default this is the curated list; with ``openrouter.show_all_models: true``
+    in config.yaml it returns every live model that supports tool-calling.
+    """
     global _openrouter_catalog_cache
 
     if _openrouter_catalog_cache is not None and not force_refresh:
@@ -1759,6 +1763,23 @@ def fetch_openrouter_models(
         if not mid:
             continue
         live_by_id[mid] = item
+
+    # Opt-in "show everything" mode: when openrouter.show_all_models is set in
+    # config.yaml, surface every live OpenRouter model that supports tool
+    # calling instead of the curated subset. Off by default so the picker
+    # keeps its curated UX unless the user explicitly opts into the full list.
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        openrouter_cfg = cfg.get("openrouter") or {}
+        show_all_models = bool(openrouter_cfg.get("show_all_models", False))
+    except Exception:
+        show_all_models = False
+    if show_all_models:
+        preferred_ids = [
+            mid for mid in live_by_id
+            if _openrouter_model_supports_tools(live_by_id[mid])
+        ]
 
     # Free warm-up for the reasoning-capability cache: this is the same
     # payload _fetch_openrouter_reasoning_caps would fetch, so parse it once
