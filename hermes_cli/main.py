@@ -5133,6 +5133,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _npm_manifests_digest,
     _orphaned_desktop_backend_pids,
     _pause_windows_gateways_for_update,
+    _write_update_planned_stop_marker,
     _print_curator_first_run_notice,
     _print_curator_recent_run_notice,
     _print_fts_optimize_available_notice,
