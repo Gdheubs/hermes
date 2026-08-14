@@ -48,9 +48,9 @@ def _make_tool_call_delta(index=0, tc_id=None, name=None, arguments=None, extra_
     return delta
 
 
-def _make_empty_chunk(model=None, usage=None):
+def _make_empty_chunk(model=None, usage=None, cost=None):
     """Build a chunk with no choices (usage-only final chunk)."""
-    return SimpleNamespace(choices=[], model=model, usage=usage)
+    return SimpleNamespace(choices=[], model=model, usage=usage, cost=cost)
 
 
 # ── Test: Streaming Accumulator ──────────────────────────────────────────
@@ -95,6 +95,43 @@ class TestStreamingAccumulator:
         assert response.choices[0].finish_reason == "stop"
         assert response.usage is not None
         assert response.usage.completion_tokens == 3
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_opencode_go_cost_terminal_chunk_completes_text_without_finish_reason(
+        self, mock_close, mock_create,
+    ):
+        """OpenCode Go ends text streams with a cost-only chunk, not stop."""
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(content="STREAM_OK", model="gpt-5.6-luna"),
+            _make_empty_chunk(
+                usage=SimpleNamespace(prompt_tokens=10, completion_tokens=1),
+            ),
+            _make_empty_chunk(cost=0),
+        ]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://opencode.ai/zen/go/v1",
+            provider="opencode-go",
+            model="gpt-5.6-luna",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        response = agent._interruptible_streaming_api_call({})
+
+        assert response.choices[0].message.content == "STREAM_OK"
+        assert response.choices[0].finish_reason == "stop"
+        assert mock_client.chat.completions.create.call_count == 1
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
