@@ -1756,6 +1756,26 @@ def init_agent(
             mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
+            # When an external memory provider is configured, the built-in
+            # MEMORY.md/USER.md store is always created and injected alongside
+            # the provider block — the documented contract is "additive, never
+            # replacing" (issue #85622).  Without this, a config left at
+            # memory_enabled: false by the blank-slate setup wizard suppresses
+            # built-in memory when the user later enables a provider, silently
+            # dropping durable notes from every new-chat system prompt.
+            _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
+            _provider_configured = bool(_mem_provider_name and _mem_provider_name.strip())
+            if _provider_configured:
+                if not agent._memory_enabled:
+                    agent._memory_enabled = True
+                    _ra().logger.info(
+                        "External memory provider '%s' configured; enabling "
+                        "built-in MEMORY.md injection (additive contract, "
+                        "issue #85622).",
+                        _mem_provider_name,
+                    )
+                if not agent._user_profile_enabled:
+                    agent._user_profile_enabled = True
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
                 from tools.memory_tool import MemoryStore
