@@ -351,9 +351,9 @@ class TestStringTypedConfigValues:
     @pytest.mark.parametrize("value", ["off", "on", "yes", "no", "true", "false", "01"])
     def test_string_typed_values_are_not_coerced(self, _isolated_hermes_home, value):
         """Values stay strings when DEFAULT_CONFIG declares the leaf as a string."""
-        # approvals.mode is security-sensitive; force=True is the explicit
-        # operator override (the canonical path is `hermes approvals`).
-        set_config_value("approvals.mode", value, force=True)
+        # approvals.mode is security-sensitive; approval_override is the
+        # dedicated /approvals channel (#81108).
+        set_config_value("approvals.mode", value, approval_override=True)
 
         import yaml
         saved = yaml.safe_load(_read_config(_isolated_hermes_home))
@@ -367,8 +367,8 @@ class TestStringTypedConfigValues:
     def test_non_string_defaults_keep_existing_coercion(
         self, _isolated_hermes_home, key, value, expected
     ):
-        force = key == "approvals.timeout"  # security-sensitive key
-        set_config_value(key, value, force=force)
+        approval_override = key == "approvals.timeout"  # security-sensitive key
+        set_config_value(key, value, approval_override=approval_override)
 
         import yaml
         saved = yaml.safe_load(_read_config(_isolated_hermes_home))
@@ -777,15 +777,9 @@ class TestSensitiveConfigKeyGuard:
         ("security.redact_secrets", False),  # bool default → "off" coerces to False
         ("command_allowlist", "git push --force"),  # list default → literal string
     ])
-    def test_sensitive_key_allowed_with_force(self, _isolated_hermes_home, key, expected):
-        """Writer-level force=True stays honored for the /approvals contract.
-
-        This is the in-process user-mediated canonical path
-        (approval_mode.py → set_config_value(..., force=True)); the CLI never
-        forwards --force for sensitive keys (see
-        test_cli_set_refuses_sensitive_key_even_with_force below).
-        """
-        set_config_value(key, "off" if key != "command_allowlist" else "git push --force", force=True)
+    def test_sensitive_key_allowed_with_approval_override(self, _isolated_hermes_home, key, expected):
+        """approval_override (the dedicated /approvals channel) may write."""
+        set_config_value(key, "off" if key != "command_allowlist" else "git push --force", approval_override=True)
 
         import yaml
         saved = yaml.safe_load(_read_config(_isolated_hermes_home))
@@ -829,6 +823,28 @@ class TestSensitiveConfigKeyGuard:
         assert "security" not in raw
         assert "command_allowlist" not in raw
 
+    @pytest.mark.parametrize("key", [
+        "approvals.mode",
+        "approvals.cron_mode",
+        "security.redact_secrets",
+        "command_allowlist",
+    ])
+    def test_sensitive_key_refused_with_generic_force(self, _isolated_hermes_home, capsys, key):
+        """Generic ``force=True`` must NOT authorize a security-policy write
+        at the writer layer either: an alternate CLI entrypoint reaching
+        set_config_value with force would otherwise bypass the approval gate
+        (#81108). Only the dedicated approval_override counts."""
+        with pytest.raises(SystemExit):
+            set_config_value(key, "off", force=True)
+
+        captured = capsys.readouterr()
+        assert "security policy" in captured.err
+
+        raw = _read_config(_isolated_hermes_home)
+        assert "approvals" not in raw
+        assert "security" not in raw
+        assert "command_allowlist" not in raw
+
     def test_cli_set_force_still_works_for_non_sensitive_key(self, _isolated_hermes_home):
         """--force keeps its documented meaning for non-sensitive keys."""
         from types import SimpleNamespace
@@ -845,7 +861,7 @@ class TestSensitiveConfigKeyGuard:
             set_config_value("approvals.mode", "off")
 
         captured = capsys.readouterr()
-        assert "hermes approvals" in captured.err
+        assert "/approvals" in captured.err
 
     def test_non_sensitive_keys_still_work(self, _isolated_hermes_home):
         """Ordinary config keys are unaffected by the guard."""

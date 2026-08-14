@@ -54,15 +54,16 @@ def run_approval_mode_command(requested_mode: Optional[str]) -> ApprovalModeResu
     # set_config_value is the canonical managed-scope/write-safety chokepoint.
     # It reports managed policy through stderr + SystemExit, so capture that for
     # slash-command output instead of terminating the interactive worker.
-    # force=True is the explicit operator override for the security-policy guard
-    # (#81101): /approvals is the sanctioned way to change approvals.mode, so it
-    # must not be blocked by the same guard that stops a raw `config set`.
+    # approval_override=True is the dedicated authorization for the sanctioned
+    # /approvals command — deliberately NOT the generic ``force`` escape hatch,
+    # so an alternate CLI entrypoint reaching the writer cannot weaken the
+    # security policy by passing force (#81108).
     from hermes_cli.config import set_config_value
 
     output = StringIO()
     try:
         with redirect_stdout(output), redirect_stderr(output):
-            set_config_value("approvals.mode", requested, force=True)
+            set_config_value("approvals.mode", requested, approval_override=True)
     except SystemExit:
         detail = output.getvalue().strip() or "Approval mode is managed and cannot be changed."
         return ApprovalModeResult(False, current, False, detail)

@@ -800,6 +800,11 @@ DANGEROUS_PATTERNS = [
     # it (``--force "approvals.mode" off``), so quoting cannot slip past the gate.
     (r'\bhermes\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*config\s+set\s+(?:--force\s+)?["\']?(?:approvals|security|command_allowlist)\b',
      "hermes config set on a security-policy key (approvals/security/command_allowlist)"),
+    # Alternate supported entrypoint: ``python -m hermes_cli.main`` reaches the
+    # same config CLI as ``hermes`` (main.py exposes ``if __name__ ==
+    # "__main__"``), so an agent typing the module form must hit the same gate.
+    (r'\bpython(?:3|3\.\d+)?\s+-m\s+hermes_cli\.main\s+(?:-{1,2}\S+(?:\s+\S+)?\s+)*config\s+set\s+(?:--force\s+)?["\']?(?:approvals|security|command_allowlist)\b',
+     "python -m hermes_cli.main config set on a security-policy key (approvals/security/command_allowlist)"),
     # Docker container lifecycle — any user with docker.sock mounted (a common
     # Docker Compose pattern) gives the agent the ability to restart/stop/kill
     # containers without approval.  These are agent-initiated lifecycle operations

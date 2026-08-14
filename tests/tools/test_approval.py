@@ -855,10 +855,11 @@ class TestConfigSetSecurityPolicy:
 
     config.yaml IS the security policy (approvals.mode, command_allowlist,
     security.*) and the config cache is mtime-keyed, so a write takes effect
-    mid-session. The CLI refuses these keys without --force (config.py #81101);
-    this terminal-side pattern gates even the explicit --force variant so the
-    operator is always surfaced for approval — the same treatment sed/tee on
-    config.yaml already get.
+    mid-session. The CLI refuses these keys through the config API (config.py
+    #81101); this terminal-side pattern gates the terminal path the same way
+    sed/tee on config.yaml are gated, so the operator is always surfaced for
+    approval — including alternate entrypoints like ``python -m
+    hermes_cli.main`` (#81108).
     """
 
     def test_security_policy_keys_detected(self):
@@ -885,6 +886,27 @@ class TestConfigSetSecurityPolicy:
             dangerous, _, desc = detect_dangerous_command(cmd)
             assert dangerous is True, cmd
             assert "security-policy" in desc, cmd
+
+    def test_python_dash_m_entrypoint_detected(self):
+        """``python -m hermes_cli.main`` is an alternate supported CLI
+        entrypoint reaching the same config writer (main.py exposes
+        ``if __name__ == "__main__"``); it must hit the same gate (#81108)."""
+        for cmd in (
+            "python -m hermes_cli.main config set --force approvals.mode off",
+            "python3 -m hermes_cli.main config set approvals.mode off",
+            "python3.12 -m hermes_cli.main -p ade config set --force security.redact_secrets false",
+        ):
+            dangerous, _, desc = detect_dangerous_command(cmd)
+            assert dangerous is True, cmd
+            assert "security-policy" in desc, cmd
+
+    def test_benign_python_dash_m_not_flagged(self):
+        for cmd in (
+            "python -m hermes_cli.main config set terminal.backend docker",
+            "python -m hermes_cli.main config show",
+        ):
+            dangerous, _, _ = detect_dangerous_command(cmd)
+            assert dangerous is False, cmd
 
     def test_benign_config_set_not_flagged(self):
         for cmd in (
