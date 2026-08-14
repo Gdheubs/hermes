@@ -1125,6 +1125,21 @@ def _(rid, params: dict) -> dict:
     _cmd_base = (_cmd_parts[0] if _cmd_parts else "").lower()
     _cmd_arg = _cmd_parts[1] if len(_cmd_parts) > 1 else ""
 
+    # Quick aliases must be projected back to the TUI instead of executing in
+    # the isolated slash worker.  The frontend can then route aliases targeting
+    # native commands such as ``/image``, preserving both the attached-image
+    # token and any trailing prompt text.
+    quick_command = _load_cfg().get("quick_commands", {}).get(_cmd_base)
+    if isinstance(quick_command, dict) and quick_command.get("type") == "alias":
+        return _methods["command.dispatch"](
+            rid,
+            {
+                "name": _cmd_base,
+                "arg": _cmd_arg,
+                "session_id": params.get("session_id", ""),
+            },
+        )
+
     live_output = _live_slash_command_output(
         params.get("session_id", ""), session, _cmd_base, _cmd_arg
     )

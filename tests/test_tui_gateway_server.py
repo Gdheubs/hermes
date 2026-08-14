@@ -8775,6 +8775,46 @@ def test_file_attach_quotes_ref_with_spaces(monkeypatch, tmp_path):
         server._sessions.pop("sid", None)
 
 
+def test_slash_exec_routes_quick_alias_to_command_dispatch(monkeypatch):
+    class _ExplodingWorker:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("quick aliases must not run in the slash worker")
+
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "quick_commands": {
+                "capture": {
+                    "type": "alias",
+                    "target": "image latest.png",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(server, "_SlashWorker", _ExplodingWorker)
+    server._sessions["sid"] = _session()
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "slash.exec",
+                "params": {
+                    "session_id": "sid",
+                    "command": "capture describe this image",
+                },
+            }
+        )
+
+        assert resp["result"] == {
+            "type": "alias",
+            "target": "image latest.png",
+        }
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_commands_catalog_surfaces_quick_commands(monkeypatch):
     monkeypatch.setattr(
         server,
