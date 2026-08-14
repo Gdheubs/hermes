@@ -1522,8 +1522,10 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     # Profiles handle per-provider quirks via hooks. When a profile is
     # found, delegate fully; otherwise fall through to the legacy flag path.
     try:
-        from providers import get_provider_profile
-        _profile = get_provider_profile(agent.provider)
+        from providers import resolve_provider_profile
+        _profile = resolve_provider_profile(
+            agent.provider, getattr(agent, "requested_provider", None)
+        )
     except Exception:
         _profile = None
 
