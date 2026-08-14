@@ -428,6 +428,26 @@ tool_loop_guardrails:
     idempotent_no_progress: 5
 
 # =============================================================================
+# Repeat Tool Reminder (advisory loop hygiene)
+# =============================================================================
+# Detects CONSECUTIVE identical tool calls (same tool name + canonically
+# identical arguments — property order does not matter) and appends a soft
+# reminder to the tail of the current tool result when the run length hits a
+# threshold. Purely advisory: never blocks execution, never vetoes, never
+# touches tool schemas, and the cached conversation prefix stays unchanged.
+# The counter is per session and resets whenever a real user message arrives.
+repeat_tool_reminder:
+  enabled: true                 # master switch (advisory: safe by default)
+  thresholds: [3, 5, 8]         # run lengths that trigger a reminder; first
+                                # threshold = gentle tier, later = detailed
+                                # tier (tool, count, args preview)
+  include: []                   # tool-name wildcard patterns to track;
+                                # empty = track every tool ("*" = any run)
+  exclude: []                   # wildcard patterns transparent to the chain
+                                # (neither count nor reset); wins over include
+  arguments_preview_chars: 500  # cap for args quoted in the detailed reminder
+
+# =============================================================================
 # Context Compression (Auto-shrinks long conversations)
 # =============================================================================
 # When conversation approaches model's context limit, middle turns are

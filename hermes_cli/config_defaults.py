@@ -3356,6 +3356,37 @@ DEFAULT_CONFIG = {
         "region": "global",
     },
 
+    # Advisory loop-hygiene guard (agent/repeat_tool_reminder.py): detects
+    # consecutive identical tool calls (same tool name + canonically identical
+    # arguments, deep key-sorted JSON) and appends a soft reminder to the tail
+    # of the CURRENT tool result when the run length hits a threshold.
+    # Advisory only — never blocks execution, never vetoes, never touches tool
+    # schemas, and the cached conversation prefix stays byte-identical.
+    # The chain is per agent instance (per session in the gateway) and resets
+    # when a real user message arrives (new turn or mid-turn steer).
+    "repeat_tool_reminder": {
+        # Master switch. On by default: the reminder is low-risk (tail-only,
+        # advisory text that only appears after N identical consecutive calls)
+        # and is the cheapest loop-hygiene signal available. Set false to
+        # disable entirely.
+        "enabled": True,
+        # Run lengths that trigger a reminder. The first threshold gets the
+        # gentle tier; later thresholds get the detailed tier (tool name, run
+        # length, capped canonical-arguments preview). An explicitly empty
+        # list disables reminders. Every value must be an integer >= 2.
+        "thresholds": [3, 5, 8],
+        # Tool-name wildcard patterns to track; empty = every tool is tracked.
+        # "*" matches any run of characters, everything else matches literally.
+        "include": [],
+        # Tool-name wildcard patterns that are transparent to the chain
+        # (neither count nor reset). "exclude" wins over "include".
+        "exclude": [],
+        # Maximum characters of canonical arguments quoted in the DETAILED
+        # reminder. Bounds only the model-visible preview — detection always
+        # compares the full canonical arguments.
+        "arguments_preview_chars": 500,
+    },
+
     # Config schema version - bump this when adding new required fields
     "_config_version": 34,
 }

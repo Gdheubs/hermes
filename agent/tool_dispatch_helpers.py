@@ -536,6 +536,7 @@ def make_tool_result_message(
     tool_call_id: str,
     *,
     effect_disposition: str | None = None,
+    append_tail: str | None = None,
 ) -> dict:
     """Build a tool-result message dict with both the OpenAI-format ``name``
     field (required by the wire format and provider adapters) and the internal
@@ -555,8 +556,16 @@ def make_tool_result_message(
     neutralized and framed). Non-text parts (e.g. image_url) are preserved.
     The outer list itself is rebuilt rather than returned by identity, so
     callers should compare by value, not by ``is``.
+
+    ``append_tail`` (optional): advisory text appended at the very END of the
+    result content, AFTER untrusted-content wrapping — so a reminder is never
+    wrapped as untrusted data and never interrupts the wrapped payload. String
+    content gets ``"\\n\\n" + tail``; multimodal content lists get a trailing
+    text part. Any other content shape is returned unchanged.
     """
     wrapped = _maybe_wrap_untrusted(name, content)
+    if append_tail:
+        wrapped = _append_tail_to_content(wrapped, append_tail)
     message = {
         "role": "tool",
         "name": name,
@@ -574,6 +583,21 @@ def make_tool_result_message(
     if effect_disposition is not None:
         message["effect_disposition"] = effect_disposition
     return message
+
+
+def _append_tail_to_content(content: Any, tail: str) -> Any:
+    """Append advisory text to the END of tool-result content.
+
+    Handles plain string content (separated by a blank line) and OpenAI-style
+    multimodal content lists (adds a trailing text part so image blocks stay
+    intact). Any other content shape is returned unchanged — the tail must
+    never break a valid tool-result message.
+    """
+    if isinstance(content, str):
+        return f"{content}\n\n{tail}" if content else tail
+    if isinstance(content, list):
+        return [*content, {"type": "text", "text": tail}]
+    return content
 
 
 # Tools whose results carry attacker-controllable content.  Wrapping their

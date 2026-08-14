@@ -298,6 +298,15 @@ def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text
     agent._current_streamed_assistant_text = ""
     agent._stream_needs_break = True
 
+    # A real user correction (steer/interrupt) resets the consecutive-repeat
+    # tool-call chain: repetition across user input is not a loop. Advisory.
+    try:
+        from agent.repeat_tool_reminder import reset as _reset_repeat_reminder
+
+        _reset_repeat_reminder(agent)
+    except Exception:
+        pass
+
 
 def _is_copilot_provider(agent: Any) -> bool:
     """Delegate to ``AIAgent._is_copilot_provider`` (single owner of the check).
@@ -1528,6 +1537,18 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+
+    # A real user turn starts here (CLI/gateway invoke run_conversation once
+    # per user message; synthetic continuations like auto_continue and the
+    # background-review fork run on separate agent instances or inside the
+    # loop below). Reset the consecutive-repeat tool-call chain so repetition
+    # across turns is never counted as a loop. Advisory; never raises.
+    try:
+        from agent.repeat_tool_reminder import reset as _reset_repeat_reminder
+
+        _reset_repeat_reminder(agent)
+    except Exception:
+        pass
 
     # If a background memory/skill review spawned at the end of a PRIOR turn
     # (agent/background_review.py) is still running its own run_conversation()

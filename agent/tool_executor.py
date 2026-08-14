@@ -40,6 +40,7 @@ from agent.tool_dispatch_helpers import (
     _plan_tool_batch_segments,
     make_tool_result_message,
 )
+from agent.repeat_tool_reminder import maybe_remind as _maybe_repeat_remind
 from tools.terminal_tool import (
     get_active_env,
 )
@@ -1494,11 +1495,18 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # image tool result never poisons canonical session history.
         # String results pass through unchanged.
         _tool_content = agent._tool_result_content_for_active_model(name, function_result)
+        # Advisory loop-hygiene: append a repeat-call reminder to the tail of
+        # this result when the same tool has been called with canonically
+        # identical arguments N consecutive times (never blocks, never vetoes).
+        # ``name``/``args`` (not the worker-unpacked locals) are used so the
+        # identity is correct on every outcome path (success, timeout, cancel).
+        _reminder_tail = _maybe_repeat_remind(agent, name, args)
         tool_message = make_tool_result_message(
             name,
             _tool_content,
             tc.id,
             effect_disposition=effect_disposition,
+            append_tail=_reminder_tail,
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
@@ -2289,7 +2297,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
-        tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
+        # Advisory loop-hygiene: append a repeat-call reminder to the tail of
+        # this result when the same tool has been called with canonically
+        # identical arguments N consecutive times (never blocks, never vetoes).
+        _reminder_tail = _maybe_repeat_remind(agent, function_name, function_args)
+        tool_message = make_tool_result_message(
+            function_name, _tool_content, tool_call.id, append_tail=_reminder_tail,
+        )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(
