@@ -819,6 +819,48 @@ class TestClassifyApiError:
         # _memory_ceiling_result contract against per-route drift.
         assert result.should_fallback is True
 
+    @pytest.mark.parametrize("status_code", [400, None])
+    def test_prefill_memory_aborted_code_is_overloaded(self, status_code):
+        # The SIBLING code.  oMLX's prefill-memory body builder picks between
+        # ``prefill_memory_exceeded`` and ``prefill_memory_aborted`` by
+        # exception type (``PrefillMemoryAbortedError``): "exceeded" is the
+        # prompt turned away at admission, "aborted" is the prompt admitted and
+        # then killed mid-prefill.  Same guard, same wall, same recovery — but
+        # only "exceeded" was in _MEMORY_CEILING_ERROR_CODES, so with the
+        # message stripped of memory wording (the scenario the code layer
+        # exists for) the two diverged: exceeded -> overloaded/retryable,
+        # aborted -> format_error/not-retryable on the 400 path and the
+        # retryable ``unknown`` bucket on the status-less one.
+        #
+        # NOT a capture: the reporter's logs carry only
+        # ``prefill_memory_exceeded``.  The code pairing is read from the
+        # engine's body builder, and the reworded-message premise is the one
+        # already established by the 0.5.6 -> 0.5.7 rewording documented below.
+        body = {"error": {
+            "message": "Prompt aborted by the prefill guard. Try a smaller request.",
+            "type": "invalid_request_error",
+            "code": "prefill_memory_aborted",
+            "omlx_code": "prefill_memory_aborted",
+            "limit_bytes": 14495514624,
+        }, "type": "error"}
+        e = MockAPIError(
+            "Prompt aborted by the prefill guard. Try a smaller request.",
+            status_code=status_code, body=body,
+        )
+        result = classify_api_error(
+            e, provider="custom", model="omlx-chat",
+            approx_tokens=5700, context_length=64000,
+        )
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+        assert result.should_compress is False
+        assert result.should_fallback is True
+        # The premise of this test: nothing in the message could have carried
+        # the classification.
+        assert not any(
+            p in body["error"]["message"].lower() for p in _MEMORY_CEILING_PATTERNS
+        )
+
     def test_400_litellm_proxy_flattened_memory_guard_is_overloaded(self):
         # Proxy-flattened transport shape (real oMLX-behind-LiteLLM capture from
         # issue #52261): LiteLLM collapses the structured body into a single

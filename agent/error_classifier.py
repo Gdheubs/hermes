@@ -478,8 +478,18 @@ _MEMORY_CEILING_PATTERNS = [
 # Deliberately NARROW: only memory-prefill codes, never ``resource_exhausted``
 # (already mapped to rate_limit) or generic ``invalid_request_error``.
 # See issue #52261.
+# ``prefill_memory_aborted`` is the SIBLING of ``prefill_memory_exceeded``:
+# oMLX's prefill-memory body builder picks between the two by exception type
+# (``PrefillMemoryAbortedError`` vs the rejection), so "exceeded" is the prompt
+# turned away at admission and "aborted" is the prompt admitted and then killed
+# mid-prefill.  Same guard, same wall, same recovery — but only one of them was
+# in this set.  Today's aborted body still says "memory guard" and "available
+# memory", so it classifies correctly through the message patterns; the code
+# layer is the one that would not hold, which is the layer that exists
+# precisely for a reworded or proxy-stripped body.
 _MEMORY_CEILING_ERROR_CODES = frozenset({
     "prefill_memory_exceeded",
+    "prefill_memory_aborted",
     "omlx_prefill_memory_exceeded",
     "memory_limit_exceeded",
 })
