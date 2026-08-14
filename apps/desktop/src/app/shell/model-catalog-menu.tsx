@@ -38,6 +38,7 @@ import { $collapsedProviders, toggleCollapsedProvider } from '@/store/provider-c
 import { $defaultReasoningEffort } from '@/store/session'
 import type { ModelOptionProvider, ModelOptionsResponse } from '@/types/hermes'
 
+import { ModelPrice } from '@/components/model-picker'
 import { type FastControl, ModelEditSubmenu, resolveFastControl } from './model-edit-submenu'
 
 // Lets the host dropdown (model-pill, a kanban field trigger, …) hand the panel
@@ -441,6 +442,7 @@ export function ModelCatalogMenu({
                             <HighlightMatches query={search} text={name} />
                             {meta ? <span className="text-(--ui-text-tertiary)"> {meta}</span> : null}
                           </span>
+                          <ModelPrice isCurrent={isCurrent} price={group.provider.pricing?.[family.id]} />
                           {isCurrent ? (
                             <Codicon className="ml-auto text-foreground" name="check" size="0.75rem" />
                           ) : null}
