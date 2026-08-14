@@ -1401,6 +1401,25 @@ def _classify_by_status(
             )
         return result_fn(FailoverReason.overloaded, retryable=True)
 
+    # 507 Insufficient Storage — the local-inference model-LOAD path, which is
+    # a different guard from the prefill path above and does not arrive as a
+    # 400 or as a 500/503.  oMLX maps both ``ModelTooLargeError`` and
+    # ``InsufficientMemoryError`` to 507, and ``/v1/chat/completions``,
+    # ``/v1/completions`` and ``/v1/messages`` all reach them through
+    # ``get_engine_for_model`` → ``get_engine``, so an ordinary chat call can
+    # come back as "Model 'X' (33.95GB) does not fit under the dynamic memory
+    # ceiling (25.22GB) … raise memory_guard_tier".  Without this check the
+    # body falls to the generic "other 5xx" bucket below, which does retry but
+    # leaves ``should_fallback`` unset — and a model that does not fit under
+    # the host's memory ceiling does not start fitting within the retry
+    # budget, so the turn is stranded on the wedged host instead of failing
+    # over to a roomier provider.  That gap is exactly what
+    # _memory_ceiling_result exists to close.  Gated on the shared predicate,
+    # so a 507 with no memory wording (a real disk/storage exhaustion) keeps
+    # the generic 5xx treatment.  See issue #52261.
+    if status_code == 507 and _is_memory_ceiling(error_msg, error_code):
+        return _memory_ceiling_result(result_fn)
+
     # 408 Request Timeout — a transient timing failure the server itself flags
     # as safe to retry (RFC 9110 §15.5.9), not a malformed request. Commonly
     # emitted by reverse proxies sitting in front of self-hosted backends

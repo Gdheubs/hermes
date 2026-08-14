@@ -296,6 +296,44 @@ _OMLX_057_PROCESS_MEMORY_ABORT_ASCII_ARROW = (
     _OMLX_057_PROCESS_MEMORY_ABORT.replace("→", "->")
 )
 
+# oMLX 0.5.7, FOURTH shape — the model LOAD guard, reached before any prefill
+# happens at all, and the only one of the four that arrives as HTTP 507.
+# ``omlx/server.py`` maps both ``ModelTooLargeError`` and
+# ``InsufficientMemoryError`` to 507, and ``/v1/chat/completions``,
+# ``/v1/completions`` and ``/v1/messages`` all reach them through
+# ``get_engine_for_model`` -> ``get_engine``, so an ordinary chat call against a
+# model the host cannot seat comes back on a status the classifier had no
+# branch for.
+#
+# CAPTURED: verbatim from a reporter's log, 11 Aug 04:03:30, a plain
+# ``/v1/chat/completions`` call surfaced by the OpenAI SDK as
+# ``openai.InternalServerError: Error code: 507``.  ``code`` is null in the
+# body — the wrapper that carries the structured ``prefill_memory_*`` codes is
+# on the prefill path, not this one — so classification rests entirely on the
+# message, which carries "memory ceiling" and "memory_guard_tier".
+#
+# Unguarded, this lands in the generic "other 5xx" bucket: retryable=True but
+# should_fallback=False.  ``should_fallback`` is the bit that matters here,
+# because a model that does not fit under the ceiling does not begin to fit
+# within the retry budget.  The ``InsufficientMemoryError`` sibling is not
+# pinned: it is documented as sharing the 507 mapping, but no body for it has
+# been captured, so there is nothing to assert against.
+_OMLX_057_MODEL_LOAD_507 = (
+    "Model 'Qwen3.6-27B-MLX-8bit' (33.95GB) does not fit under the dynamic "
+    "memory ceiling (25.22GB). Close other apps to free RAM (static cap is "
+    "90.00GB but only 7.15GB is reclaimable right now), raise memory_guard_tier "
+    "(safe → balanced → aggressive), or use a smaller model."
+)
+
+_OMLX_057_MODEL_LOAD_507_BODY = {
+    "error": {
+        "message": _OMLX_057_MODEL_LOAD_507,
+        "type": "server_error",
+        "param": None,
+        "code": None,
+    },
+}
+
 
 # ── Test: Full classification pipeline ─────────────────────────────────
 
@@ -901,6 +939,49 @@ class TestClassifyApiError:
         )
         assert result.reason == FailoverReason.server_error
         assert result.retryable is True
+
+    # ── Memory-ceiling rejections surfaced as 507 (issue #52261) ──
+    #
+    # The model-LOAD guard, which is not the prefill guard and does not come
+    # back as a 400.  See the _OMLX_057_MODEL_LOAD_507 fixture.
+
+    def test_507_omlx_model_load_ceiling_is_overloaded_with_fallback(self):
+        # Verbatim 507 capture.  Before the 507 branch this fell through to the
+        # generic "other 5xx" rule: server_error, retryable=True, but
+        # should_fallback=False — so once the retries were spent the turn died
+        # on a host whose memory wall had not moved, with no failover to a
+        # roomier provider.  Every other memory-ceiling route already sets
+        # should_fallback; this one has to match them.
+        e = MockAPIError(
+            "Error code: 507 - " + repr(_OMLX_057_MODEL_LOAD_507_BODY),
+            status_code=507,
+            body=_OMLX_057_MODEL_LOAD_507_BODY,
+        )
+        result = classify_api_error(
+            e, provider="custom", model="qwen3.6-27b-mlx-8bit",
+            approx_tokens=63337, context_length=256000,
+        )
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+        # Nothing to compress: the model does not fit before a single token of
+        # the conversation is read.
+        assert result.should_compress is False
+        # The regression this test exists for.
+        assert result.should_fallback is True
+        assert result.should_rotate_credential is False
+
+    def test_507_without_memory_wording_is_generic_server_error(self):
+        # CONTROL: 507 Insufficient Storage also has its literal meaning.  A
+        # body with no memory wording must keep the generic 5xx treatment, so
+        # the new branch cannot claim the whole status code.
+        e = MockAPIError("Insufficient storage on device.", status_code=507)
+        result = classify_api_error(
+            e, provider="custom", model="x",
+            approx_tokens=5000, context_length=64000,
+        )
+        assert result.reason == FailoverReason.server_error
+        assert result.retryable is True
+        assert result.should_compress is False
 
     def test_genuine_billing_credit_limit_still_billing(self):
         # NEGATIVE/invariant guard: a real billing exhaustion message must STILL
