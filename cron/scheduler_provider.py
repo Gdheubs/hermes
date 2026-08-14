@@ -98,7 +98,8 @@ class CronScheduler(ABC):
 
         return recover_interrupted_executions()
 
-    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
+    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None,
+                 profile_adapters: Any = None) -> bool:
         """Run a single job NOW via the shared orchestrator. Called by the
         inbound fire webhook when an external scheduler signals a job is due.
 
@@ -120,7 +121,8 @@ class CronScheduler(ABC):
         if job is None:
             return False  # job removed (e.g. repeat-N exhausted) between arm and fire
         job["execution_id"] = create_execution(job_id, source=self.name)["id"]
-        return run_one_job(job, adapters=adapters, loop=loop)
+        return run_one_job(job, adapters=adapters, loop=loop,
+                           profile_adapters=profile_adapters)
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (the desired state):
@@ -192,6 +194,7 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        profile_adapters=None,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
@@ -219,6 +222,7 @@ class InProcessCronScheduler(CronScheduler):
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
+                profile_adapters=profile_adapters,
             )
             return
 
@@ -244,6 +248,7 @@ class InProcessCronScheduler(CronScheduler):
                         loop=loop,
                         sync=False,
                         can_dispatch=can_dispatch,
+                        profile_adapters=profile_adapters,
                     )
                 ok = True
             except BaseException as e:
@@ -279,6 +284,7 @@ class InProcessCronScheduler(CronScheduler):
         loop=None,
         interval=60,
         can_dispatch=None,
+        profile_adapters=None,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -339,6 +345,7 @@ class InProcessCronScheduler(CronScheduler):
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,
+                                    profile_adapters=profile_adapters,
                                 )
                         finally:
                             reset_hermes_home_override(home_token)
