@@ -639,6 +639,63 @@ class TestPerPeerHeaders:
         assert captured.get("CF-Access-Client-Id") == "cf-id"
         assert captured.get("Authorization") == "Bearer tok-123"
 
+    def test_post_retries_on_524(self, monkeypatch):
+        """Cloudflare cuts proxy connections at ~100s with HTTP 524; long
+        peer tasks must be retried, not lost. Other errors don't retry."""
+        import urllib.error as urlerr
+
+        sleeps = []
+        monkeypatch.setattr(tools.time, "sleep", lambda s: sleeps.append(s))
+
+        attempts = {"n": 0}
+        seen_reqs = []
+        body_bytes = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}).encode()
+
+        class _Resp:
+            def read(self):
+                return body_bytes
+
+        def fake_urlopen(req, timeout=None):
+            attempts["n"] += 1
+            seen_reqs.append(req)
+            if attempts["n"] == 1:
+                raise urlerr.HTTPError(req.full_url, 524, "Origin Time-out", {}, None)
+
+            class _Ctx:
+                def __enter__(self_inner):
+                    return _Resp()
+
+                def __exit__(self_inner, *a):
+                    return False
+
+            return _Ctx()
+
+        monkeypatch.setattr(tools.urllib.request, "urlopen", fake_urlopen)
+        out = tools._http_post_json("http://peer/", {"x": 1}, {"CF-Access-Client-Id": "cf-id"}, 30)
+        assert out == {"jsonrpc": "2.0", "id": 1, "result": {}}
+        assert attempts["n"] == 2
+        assert sleeps == [1]
+        # Both attempts carry the User-Agent and caller-provided headers.
+        for req in seen_reqs:
+            assert req.get_header("User-agent") == "Hermes-A2A/1.0"
+            assert req.get_header("Cf-access-client-id") == "cf-id"
+
+    def test_post_does_not_retry_other_errors(self, monkeypatch):
+        import urllib.error as urlerr
+
+        monkeypatch.setattr(tools.time, "sleep", lambda s: None)
+        attempts = {"n": 0}
+
+        def fake_urlopen(req, timeout=None):
+            attempts["n"] += 1
+            raise urlerr.HTTPError(req.full_url, 403, "Forbidden", {}, None)
+
+        monkeypatch.setattr(tools.urllib.request, "urlopen", fake_urlopen)
+        with pytest.raises(urlerr.HTTPError) as ei:
+            tools._http_post_json("http://peer/", {"x": 1}, {}, 30)
+        assert ei.value.code == 403
+        assert attempts["n"] == 1
+
 
 class TestRegistryDispatchConvention:
     """Tools must accept the args-as-dict positional that registry.dispatch

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -35,6 +36,7 @@ from . import protocol, security
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT = 120
+_POST_MAX_RETRIES = 3  # retries for HTTP 524 (proxy-side timeout), see below
 _ORCHESTRATE_MAX_WORKERS = 6  # max parallel peers for fan-out
 
 
@@ -89,8 +91,30 @@ def _http_post_json(url: str, body: dict, headers: dict, timeout: int) -> dict:
     data = json.dumps(body).encode("utf-8")
     hdrs = {"Content-Type": "application/json", "A2A-Version": protocol.PROTOCOL_VERSION, "User-Agent": "Hermes-A2A/1.0", **headers}
     req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
-        return json.loads(resp.read().decode("utf-8"))
+
+    # Peers fronted by Cloudflare (common for remote Hermes instances) get
+    # cut off with HTTP 524 when the origin agent takes longer than the
+    # proxy's fixed response window (~100s). Retry with backoff: each
+    # attempt gives the peer another full ``timeout`` window. Trade-off:
+    # the peer may run the task again — acceptable vs. silently losing a
+    # long task's result. All other errors propagate immediately.
+    for attempt in range(_POST_MAX_RETRIES):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 (configured peers)
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code == 524 and attempt < _POST_MAX_RETRIES - 1:
+                wait = 2 ** attempt  # 1s, 2s
+                logger.warning(
+                    "a2a: POST to %s got HTTP 524 (proxy timeout); "
+                    "retrying in %ds (attempt %d/%d)",
+                    url, wait, attempt + 2, _POST_MAX_RETRIES,
+                )
+                time.sleep(wait)
+                continue
+            raise
+    # Unreachable: each iteration returns on success or re-raises.
+    raise RuntimeError("a2a: POST retry loop exited unexpectedly")
 
 
 def _card_url(base_url: str) -> str:
