@@ -1031,6 +1031,8 @@ export interface HermesSelectPathsOptions {
   defaultPath?: string
   directories?: boolean
   multiple?: boolean
+  /** Backend profile that produced defaultPath; Electron uses it for WSL gating. */
+  profile?: string
   filters?: Array<{ name: string; extensions: string[] }>
 }
 
