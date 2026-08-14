@@ -890,12 +890,17 @@ class TestClassifyApiError:
         # as a window overflow, compresses, and reports the session
         # uncompressible at 37,629 tokens two minutes later.
         #
-        # The window figures are the reporter's corrected ones: the model's own
-        # window is 262,144, but Hermes could not read it (the value is nested
-        # under ``text_config`` in config.json) and fell back to 256,000, which
-        # is the number the compression decision was actually taken against.
-        # Either way 37,629 tokens is nowhere near the ceiling — the request was
-        # rejected on a GPU memory peak, not on context.
+        # ``context_length`` here only has to be a plausible window well above
+        # 37,629; it is not a claim about what the compressor resolved.  (An
+        # earlier revision of this comment asserted that Hermes could not read
+        # the model's window because it was nested under ``text_config``, and
+        # that 256,000 was therefore the number compression ran against.  Both
+        # were wrong: oMLX reports ``{"max_model_len": 262144}`` on /v1/models,
+        # which model_metadata already parses, and 256,000 is a dashboard
+        # display value from a different code path.)  What the assertions below
+        # rest on is only this: 37,629 tokens is nowhere near any plausible
+        # ceiling, so the request was rejected on a GPU memory peak, not on
+        # context.
         e = Exception(_OMLX_057_STREAM_ABORT)
         result = classify_api_error(
             e, provider="custom", model="qw36-27b-8bit-mtp:agent",
@@ -919,11 +924,17 @@ class TestClassifyApiError:
         # without that exclusion this 400 would be a non-retryable format_error
         # before any memory or overflow check ran.
         #
-        # This body carries NO context-overflow token (the reporter elided the
-        # remediation sentence), so on an unguarded classifier it does not even
-        # reach the overflow branch — it falls all the way through 400 handling
-        # to the non-retryable format_error default.  Wrong in a different
-        # direction from the streaming shape, and from the same rejection.
+        # On an unguarded classifier this body is read as context_overflow with
+        # should_compress=True — the SAME failure direction as the mid-stream
+        # shape above, from the same rejection: its remediation sentence ends
+        # "or reduce context length", which is the single overflow token.
+        #
+        # (An earlier revision of this comment said the opposite — that the body
+        # carried no overflow token and fell through to a non-retryable
+        # format_error.  That described the elided transcription this fixture
+        # used to carry, not oMLX; see the fixture comment.  The same claim is
+        # in the message of commit 4db5a59, which is pushed and cannot be
+        # amended, so it is corrected here instead.)
         e = MockAPIError(
             "Error code: 400 - " + repr(_OMLX_057_PREFILL_400_BODY),
             status_code=400,
