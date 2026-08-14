@@ -210,6 +210,10 @@ VALID_HOOKS: Set[str] = {
     # docs/plugins/hook-taxonomy.md.
     "transform_api_error_classification",
     "on_session_start",
+    # A frontend attached to an already-live or newly resumed session. Unlike
+    # on_session_start, this describes UI focus/attachment rather than a new
+    # agent lifecycle.
+    "on_session_activate",
     "on_session_end",
     "on_session_finalize",
     "on_session_reset",

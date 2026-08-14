@@ -19,6 +19,10 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
     from hermes_cli import plugins
 
+    # Session boundaries can precede agent construction, which is otherwise the
+    # first plugin-discovery consumer. Complete the profile-keyed, idempotent
+    # discovery sweep before dispatch so the first lifecycle event is not lost.
+    plugins.discover_plugins()
     return plugins.invoke_hook(hook_name, **kwargs)
 
 
