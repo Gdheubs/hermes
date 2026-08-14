@@ -3064,6 +3064,7 @@ async function applyUpdates(opts = {}) {
     let child
 
     if (scriptHandoff) {
+      const updateStartedAt = Math.floor(Date.now() / 1000)
       // A bare detached+hidden powershell spawn silently dies before -File
       // processing (console-subsystem init failure — see
       // wrapHandoffForDetachedConsole). Route through `cmd start` so the
@@ -3087,6 +3088,7 @@ async function applyUpdates(opts = {}) {
         env: {
           ...process.env,
           HERMES_HOME,
+          HERMES_UPDATE_STARTED_AT: String(updateStartedAt),
           PATH: pathWithHermesManagedNode(venvBin)
         },
         detached: true,
@@ -3101,7 +3103,7 @@ async function applyUpdates(opts = {}) {
       // The `hermes update` child adopts the SCRIPT's claim via
       // update_lock.py's process-ancestry rule; no mtime heuristics needed.
       if (Number.isInteger(child.pid)) {
-        writeUpdateMarker(HERMES_HOME, child.pid)
+        writeUpdateMarker(HERMES_HOME, child.pid, { startedAt: updateStartedAt })
       }
 
       rememberLog(
@@ -3402,6 +3404,7 @@ async function applyUpdatesPosixHandoff(opts: any) {
   }
 
   const args = [...handoff.args, '--install-root', updateRoot, '--branch', branch, '--desktop-pid', String(process.pid)]
+  const updateStartedAt = Math.floor(Date.now() / 1000)
 
   // Relaunch target: the running .app bundle on mac (script swaps the
   // rebuilt bundle over it), the running binary elsewhere. The script's gate
@@ -3434,6 +3437,7 @@ async function applyUpdatesPosixHandoff(opts: any) {
     env: {
       ...process.env,
       HERMES_HOME,
+      HERMES_UPDATE_STARTED_AT: String(updateStartedAt),
       PATH: pathWithHermesManagedNode(path.join(updateRoot, 'venv', 'bin'))
     },
     detached: true,
@@ -3444,7 +3448,7 @@ async function applyUpdatesPosixHandoff(opts: any) {
   // until the script claims the marker with its own pid as step 0. If the
   // script never starts, the dead pid reads as stale and self-deletes.
   if (Number.isInteger(child.pid)) {
-    writeUpdateMarker(HERMES_HOME, child.pid)
+    writeUpdateMarker(HERMES_HOME, child.pid, { startedAt: updateStartedAt })
   }
 
   rememberLog(`[updates] launched posix hand-off: ${handoff.scriptPath} (branch ${branch}); quitting to hand off`)
