@@ -9299,14 +9299,8 @@ class TelegramAdapter(BasePlatformAdapter):
         coalesce on (and dispatch to) the recovered lane rather than the
         raw inbound ``message_thread_id`` Telegram may have attached.
         """
-        from gateway.session import build_session_key
         self._apply_topic_recovery(event)
-        return build_session_key(
-            event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=event.source.profile,
-        )
+        return self._batch_session_key(event)
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.
@@ -9395,18 +9389,36 @@ class TelegramAdapter(BasePlatformAdapter):
     # Photo batching
     # ------------------------------------------------------------------
 
-    def _photo_batch_key(self, event: MessageEvent, msg: Message) -> str:
-        """Return a batching key for Telegram photos/albums."""
+    def _batch_session_key(self, event: MessageEvent) -> str:
+        """Return the profile-aware session namespace for delayed Telegram delivery.
+
+        A shared adapter can receive a profile resolved from gateway.profile_routes
+        on the event, while a secondary adapter knows its owned profile before its
+        message handler runs. Preserve the former and use the latter only as a
+        fallback.
+        """
         from gateway.session import build_session_key
-        session_key = build_session_key(
+
+        profile = getattr(event.source, "profile", None) or getattr(
+            self, "profile_name", None
+        )
+        return build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=profile,
         )
+
+    def _media_group_batch_key(self, event: MessageEvent, media_group_id: str) -> str:
+        """Return the profile-scoped key for one Telegram media group."""
+        return f"{self._batch_session_key(event)}:album:{media_group_id}"
+
+    def _photo_batch_key(self, event: MessageEvent, msg: Message) -> str:
+        """Return a profile-scoped batching key for Telegram photos/albums."""
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
-            return f"{session_key}:album:{media_group_id}"
-        return f"{session_key}:photo-burst"
+            return self._media_group_batch_key(event, str(media_group_id))
+        return f"{self._batch_session_key(event)}:photo-burst"
 
     async def _flush_photo_batch(self, batch_key: str) -> None:
         """Send a buffered photo burst/album as a single MessageEvent."""
@@ -9514,7 +9526,9 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.info("[Telegram] Cached user photo at %s", cached_path)
                 media_group_id = getattr(msg, "media_group_id", None)
                 if media_group_id:
-                    await self._queue_media_group_event(str(media_group_id), event)
+                    await self._queue_media_group_event(
+                        self._photo_batch_key(event, msg), event
+                    )
                 else:
                     batch_key = self._photo_batch_key(event, msg)
                     self._enqueue_photo_event(batch_key, event)
@@ -9643,7 +9657,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
                     media_group_id = getattr(msg, "media_group_id", None)
                     if media_group_id:
-                        await self._queue_media_group_event(str(media_group_id), event)
+                        await self._queue_media_group_event(
+                            self._photo_batch_key(event, msg), event
+                        )
                     else:
                         batch_key = self._photo_batch_key(event, msg)
                         self._enqueue_photo_event(batch_key, event)
@@ -9741,7 +9757,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
-            await self._queue_media_group_event(str(media_group_id), event)
+            await self._queue_media_group_event(
+                self._media_group_batch_key(event, str(media_group_id)), event
+            )
             return
 
         await self.handle_message(event)

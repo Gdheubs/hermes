@@ -58,6 +58,42 @@ def _make_event(text: str, chat_id: str = "12345") -> MessageEvent:
     )
 
 
+def _make_text_update(text: str = "received text"):
+    message = SimpleNamespace(
+        message_id=42,
+        text=text,
+        caption=None,
+        entities=[],
+        caption_entities=[],
+        message_thread_id=None,
+        is_topic_message=False,
+        chat=SimpleNamespace(
+            id=100,
+            type="private",
+            title=None,
+            full_name="Test User",
+            is_forum=False,
+        ),
+        from_user=SimpleNamespace(
+            id=1,
+            full_name="Test User",
+            first_name="Test",
+            is_bot=False,
+        ),
+        reply_to_message=None,
+        date=None,
+        location=None,
+        photo=None,
+        video=None,
+        audio=None,
+        voice=None,
+        document=None,
+        sticker=None,
+        media_group_id=None,
+    )
+    return SimpleNamespace(update_id=1, message=message, effective_message=None)
+
+
 class TestTextBatching:
     @pytest.mark.asyncio
     async def test_single_message_dispatched_after_delay(self):
@@ -115,6 +151,71 @@ class TestTextBatching:
         assert "chunk 2" in text
         assert "chunk 3" in text
 
+    def test_text_batch_key_falls_back_to_secondary_adapter_profile(self):
+        """A secondary adapter owns its profile before its handler can stamp it."""
+        adapter = _make_adapter()
+        adapter.profile_name = "pilot"
+        event = _make_event("secondary profile text")
+
+        assert event.source.profile is None
+        assert adapter._text_batch_key(event) == build_session_key(
+            event.source,
+            group_sessions_per_user=adapter.config.extra.get(
+                "group_sessions_per_user", True
+            ),
+            thread_sessions_per_user=adapter.config.extra.get(
+                "thread_sessions_per_user", False
+            ),
+            profile="pilot",
+        )
+
+    @pytest.mark.parametrize(
+        ("routed_profile", "adapter_profile", "expected_profile"),
+        [
+            ("pilot", "secondary", "pilot"),
+            (None, "pilot", "pilot"),
+            (None, None, None),
+        ],
+        ids=["shared_route_wins", "secondary_adapter_fallback", "legacy_main"],
+    )
+    @pytest.mark.asyncio
+    async def test_receive_path_uses_profile_aware_text_batch_key(
+        self, routed_profile, adapter_profile, expected_profile
+    ):
+        """Text ingress must preserve a routed profile before debounce enqueue."""
+        adapter = _make_adapter()
+        adapter.profile_name = adapter_profile
+        adapter.gateway_runner = SimpleNamespace(
+            _profile_name_for_source=lambda source: routed_profile
+        )
+        adapter._is_user_authorized_from_message = lambda message: True
+        adapter._should_process_message = lambda message, **kwargs: True
+        adapter._ensure_forum_commands = AsyncMock()
+        adapter._cache_replied_media = AsyncMock()
+        adapter._apply_telegram_group_observe_attribution = lambda event: event
+        adapter._clean_bot_trigger_text = lambda text: text
+
+        try:
+            await adapter._handle_text_message(
+                _make_text_update(), SimpleNamespace()
+            )
+
+            assert len(adapter._pending_text_batches) == 1
+            batch_key, event = next(iter(adapter._pending_text_batches.items()))
+            expected_session_key = build_session_key(
+                event.source,
+                group_sessions_per_user=adapter.config.extra.get(
+                    "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=adapter.config.extra.get(
+                    "thread_sessions_per_user", False
+                ),
+                profile=expected_profile,
+            )
+            assert event.source.profile == routed_profile
+            assert batch_key == expected_session_key
+        finally:
+            await adapter.disconnect()
 
     @pytest.mark.asyncio
     async def test_disconnected_adapter_drops_pending_media_group_flush_before_dispatch(self):

@@ -96,6 +96,67 @@ class TestProfileMessageHandler:
         assert seen["profile"] == "coder"
 
 
+class TestProfileAdapterConfiguration:
+    def test_secondary_adapter_records_its_owned_profile_before_ingress(self):
+        """Pre-handler batching/guard logic needs the adapter's profile synchronously."""
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.session_store = object()
+        runner._busy_text_mode = "queue"
+        runner._busy_text_modes_by_profile = {}
+        runner._make_profile_message_handler = lambda profile: ("message", profile)
+        runner._make_profile_fatal_error_handler = lambda profile, platform: (
+            "fatal",
+            profile,
+            platform,
+        )
+        runner._make_profile_busy_session_handler = lambda profile: ("busy", profile)
+        runner._make_profile_platform_event_handler = lambda profile: (
+            "platform-event",
+            profile,
+        )
+        runner._handle_reaction_event = object()
+        runner._recover_telegram_topic_thread_id = object()
+        runner._make_adapter_auth_check = lambda platform, profile_name=None: (
+            "auth",
+            platform,
+            profile_name,
+        )
+
+        class _Adapter:
+            def __init__(self):
+                self.profile_name = None
+
+            def set_message_handler(self, handler):
+                self.message_handler = handler
+
+            def set_fatal_error_handler(self, handler):
+                self.fatal_error_handler = handler
+
+            def set_session_store(self, store):
+                self.session_store = store
+
+            def set_busy_session_handler(self, handler):
+                self.busy_session_handler = handler
+
+            def set_reaction_handler(self, handler):
+                self.reaction_handler = handler
+
+            def set_topic_recovery_fn(self, handler):
+                self.topic_recovery_fn = handler
+
+            def set_authorization_check(self, handler):
+                self.authorization_check = handler
+
+            def set_platform_event_handler(self, handler):
+                self.platform_event_handler = handler
+
+        adapter = _Adapter()
+        runner._configure_profile_adapter(adapter, "pilot", Platform.TELEGRAM)
+
+        assert adapter.profile_name == "pilot"
+        assert adapter.platform_event_handler == ("platform-event", "pilot")
+
+
 class _SecondaryRecoveryAdapter:
     platform = Platform.DISCORD
 

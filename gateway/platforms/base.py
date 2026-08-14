@@ -3005,6 +3005,9 @@ class BasePlatformAdapter(ABC):
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
         self.platform = platform
+        # Set by GatewayRunner for a secondary multiplexed adapter. It is used
+        # only when ingress has not already resolved source.profile.
+        self.profile_name: Optional[str] = None
         self._message_handler: Optional[MessageHandler] = None
         # Optional gateway-supplied fan-out for platform-native emoji
         # reaction events (see ``set_reaction_handler``).
@@ -5964,6 +5967,13 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
+        source = getattr(event, "source", None)
+        profile = getattr(source, "profile", None) or getattr(
+            self, "profile_name", None
+        )
+        if source is not None and not source.profile:
+            source.profile = profile
+
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
 
@@ -5982,6 +5992,7 @@ class BasePlatformAdapter(ABC):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=profile,
         )
         expected_session_key = str(
             (event.metadata or {}).get("gateway_session_key") or ""

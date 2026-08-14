@@ -249,7 +249,12 @@ async def test_secondary_adapter_busy_guard_stamps_profile_before_resolving_mode
         "steer",
     )
     event = _event(profile=None)
-    adapter_session_key = build_session_key(event.source)
+    # The adapter owns ``research`` before ingress. Its active-session lock
+    # must therefore use that profile's namespace even though the event has
+    # not yet been stamped by the profile-scoped message handler.
+    legacy_session_key = build_session_key(event.source)
+    adapter_session_key = build_session_key(event.source, profile="research")
+    assert adapter_session_key != legacy_session_key
     adapter._active_sessions[adapter_session_key] = asyncio.Event()
 
     routed_source = _event(profile="research").source

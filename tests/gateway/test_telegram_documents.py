@@ -16,13 +16,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
     SUPPORTED_VIDEO_TYPES,
 )
+from gateway.session import build_session_key
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +302,74 @@ class TestDocumentDownloadBlock:
         assert "could not be downloaded" in (event.text or "")
 
 
+    @pytest.mark.asyncio
+    async def test_routed_image_document_album_uses_profile_scoped_batch_key(self, adapter):
+        """Image documents use a separate album enqueue branch but share its isolation rule."""
+        adapter.gateway_runner = SimpleNamespace(
+            _profile_name_for_source=lambda source: "pilot"
+        )
+        document = _make_document(
+            file_name="screenshot.png",
+            mime_type="image/png",
+            file_obj=_make_file_obj(b"routed-image-document"),
+        )
+        message = _make_message(document=document, media_group_id="shared-album")
+
+        with patch(
+            "plugins.platforms.telegram.adapter.cache_image_from_bytes",
+            return_value="/tmp/routed-image-document.png",
+        ):
+            await adapter._handle_media_message(_make_update(message), MagicMock())
+
+        try:
+            batch_key, event = next(iter(adapter._media_group_events.items()))
+            expected_session_key = build_session_key(
+                event.source,
+                group_sessions_per_user=adapter.config.extra.get(
+                    "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=adapter.config.extra.get(
+                    "thread_sessions_per_user", False
+                ),
+                profile="pilot",
+            )
+            assert event.source.profile == "pilot"
+            assert batch_key == f"{expected_session_key}:album:shared-album"
+        finally:
+            await adapter.disconnect()
+    @pytest.mark.asyncio
+    async def test_routed_document_album_uses_profile_scoped_batch_key(self, adapter):
+        """The generic document album branch must not retain a raw group key."""
+        adapter.gateway_runner = SimpleNamespace(
+            _profile_name_for_source=lambda source: "pilot"
+        )
+        document = _make_document(
+            file_name="notes.pdf",
+            mime_type="application/pdf",
+            file_obj=_make_file_obj(b"routed-document"),
+        )
+        message = _make_message(document=document, media_group_id="shared-album")
+
+        await adapter._handle_media_message(_make_update(message), MagicMock())
+
+        try:
+            batch_key, event = next(iter(adapter._media_group_events.items()))
+            expected_session_key = build_session_key(
+                event.source,
+                group_sessions_per_user=adapter.config.extra.get(
+                    "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=adapter.config.extra.get(
+                    "thread_sessions_per_user", False
+                ),
+                profile="pilot",
+            )
+            assert event.source.profile == "pilot"
+            assert batch_key == f"{expected_session_key}:album:shared-album"
+        finally:
+            await adapter.disconnect()
+
+
 class TestVideoDownloadBlock:
     @pytest.mark.asyncio
     async def test_native_video_is_cached(self, adapter):
@@ -342,6 +411,166 @@ class TestMediaGroups:
         assert event.text == "two images"
         assert event.media_urls == ["/tmp/burst-one.jpg", "/tmp/burst-two.jpg"]
         assert len(event.media_types) == 2
+
+    @pytest.mark.asyncio
+    async def test_same_album_id_from_distinct_profiles_does_not_merge(self, adapter):
+        """A raw Telegram album ID cannot bridge two profile-scoped sessions."""
+        adapter.gateway_runner = SimpleNamespace(
+            _profile_name_for_source=lambda source: {
+                "100": "pilot",
+                "200": "reviewer",
+            }[source.chat_id]
+        )
+        first = _make_message(
+            media_group_id="same-album",
+            photo=[_make_photo(_make_file_obj(b"first-profile"))],
+        )
+        second = _make_message(
+            media_group_id="same-album",
+            photo=[_make_photo(_make_file_obj(b"second-profile"))],
+        )
+        second.chat.id = 200
+
+        with patch(
+            "plugins.platforms.telegram.adapter.cache_image_from_bytes",
+            side_effect=["/tmp/pilot.jpg", "/tmp/reviewer.jpg"],
+        ):
+            await adapter._handle_media_message(_make_update(first), MagicMock())
+            await adapter._handle_media_message(_make_update(second), MagicMock())
+
+        try:
+            assert len(adapter._media_group_events) == 2
+            assert set(adapter._media_group_events) == {
+                "agent:pilot:telegram:dm:100:album:same-album",
+                "agent:reviewer:telegram:dm:200:album:same-album",
+            }
+        finally:
+            await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_routed_photo_burst_uses_profile_scoped_batch_key(self, adapter):
+        """Ingress routing must survive the non-album photo enqueue path."""
+        adapter.gateway_runner = SimpleNamespace(
+            _profile_name_for_source=lambda source: "pilot"
+        )
+        photo = _make_photo(_make_file_obj(b"routed-photo"))
+        message = _make_message(photo=[photo])
+
+        with (
+            patch(
+                "plugins.platforms.telegram.adapter.cache_image_from_bytes",
+                return_value="/tmp/routed-photo.jpg",
+            ),
+            patch.object(adapter, "_enqueue_photo_event") as enqueue_photo,
+        ):
+            await adapter._handle_media_message(_make_update(message), MagicMock())
+
+        enqueue_photo.assert_called_once()
+        batch_key, event = enqueue_photo.call_args.args
+        expected_session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=adapter.config.extra.get(
+                "group_sessions_per_user", True
+            ),
+            thread_sessions_per_user=adapter.config.extra.get(
+                "thread_sessions_per_user", False
+            ),
+            profile="pilot",
+        )
+        assert event.source.profile == "pilot"
+        assert batch_key == f"{expected_session_key}:photo-burst"
+
+    @pytest.mark.asyncio
+    async def test_secondary_adapter_photo_burst_falls_back_to_owned_profile(self, adapter):
+        """A secondary adapter has its profile before a message handler can stamp it."""
+        adapter.profile_name = "pilot"
+        photo = _make_photo(_make_file_obj(b"secondary-photo"))
+        message = _make_message(photo=[photo])
+
+        with (
+            patch(
+                "plugins.platforms.telegram.adapter.cache_image_from_bytes",
+                return_value="/tmp/secondary-photo.jpg",
+            ),
+            patch.object(adapter, "_enqueue_photo_event") as enqueue_photo,
+        ):
+            await adapter._handle_media_message(_make_update(message), MagicMock())
+
+        batch_key, event = enqueue_photo.call_args.args
+        expected_session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=adapter.config.extra.get(
+                "group_sessions_per_user", True
+            ),
+            thread_sessions_per_user=adapter.config.extra.get(
+                "thread_sessions_per_user", False
+            ),
+            profile="pilot",
+        )
+        assert event.source.profile is None
+        assert batch_key == f"{expected_session_key}:photo-burst"
+
+    @pytest.mark.asyncio
+    async def test_routed_photo_album_uses_profile_scoped_batch_key(self, adapter):
+        """An album buffer must not use raw media_group_id across profiles."""
+        adapter.gateway_runner = SimpleNamespace(
+            _profile_name_for_source=lambda source: "pilot"
+        )
+        photo = _make_photo(_make_file_obj(b"routed-album"))
+        message = _make_message(media_group_id="shared-album", photo=[photo])
+
+        with patch(
+            "plugins.platforms.telegram.adapter.cache_image_from_bytes",
+            return_value="/tmp/routed-album.jpg",
+        ):
+            await adapter._handle_media_message(_make_update(message), MagicMock())
+
+        try:
+            assert len(adapter._media_group_events) == 1
+            batch_key, event = next(iter(adapter._media_group_events.items()))
+            expected_session_key = build_session_key(
+                event.source,
+                group_sessions_per_user=adapter.config.extra.get(
+                    "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=adapter.config.extra.get(
+                    "thread_sessions_per_user", False
+                ),
+                profile="pilot",
+            )
+            assert event.source.profile == "pilot"
+            assert batch_key == f"{expected_session_key}:album:shared-album"
+        finally:
+            await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_unrouted_photo_album_keeps_legacy_main_namespace(self, adapter):
+        """No source or adapter profile preserves the historical main namespace."""
+        photo = _make_photo(_make_file_obj(b"legacy-album"))
+        message = _make_message(media_group_id="legacy-album", photo=[photo])
+
+        with patch(
+            "plugins.platforms.telegram.adapter.cache_image_from_bytes",
+            return_value="/tmp/legacy-album.jpg",
+        ):
+            await adapter._handle_media_message(_make_update(message), MagicMock())
+
+        try:
+            batch_key, event = next(iter(adapter._media_group_events.items()))
+            expected_session_key = build_session_key(
+                event.source,
+                group_sessions_per_user=adapter.config.extra.get(
+                    "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=adapter.config.extra.get(
+                    "thread_sessions_per_user", False
+                ),
+                profile=None,
+            )
+            assert event.source.profile is None
+            assert batch_key == f"{expected_session_key}:album:legacy-album"
+        finally:
+            await adapter.disconnect()
 
 
 # ---------------------------------------------------------------------------
