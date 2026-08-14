@@ -733,13 +733,16 @@ class TestMalformedYAMLConfigPreservation:
 # ---------------------------------------------------------------------------
 
 class TestSensitiveConfigKeyGuard:
-    """`hermes config set` must refuse security-policy keys without --force.
+    """`hermes config set` must refuse security-policy keys at every CLI form.
 
     config.yaml IS the security policy (approvals.mode, command_allowlist,
     security.*); the config cache is mtime-keyed so a write takes effect
     mid-session. The file tools already hard-deny agent writes to config.yaml
     (tools/file_tools.py), so the sanctioned CLI must not be the one-command
-    bypass for an agent to disable the approval gate.
+    bypass for an agent to disable the approval gate — with or without
+    --force. The writer honors force=True only for the in-process
+    user-mediated canonical path (`hermes approvals` / /approvals); the CLI
+    never forwards it for sensitive keys. See review on #81108.
     """
 
     @pytest.mark.parametrize("key", [
@@ -775,7 +778,13 @@ class TestSensitiveConfigKeyGuard:
         ("command_allowlist", "git push --force"),  # list default → literal string
     ])
     def test_sensitive_key_allowed_with_force(self, _isolated_hermes_home, key, expected):
-        """--force is the explicit operator override for security keys."""
+        """Writer-level force=True stays honored for the /approvals contract.
+
+        This is the in-process user-mediated canonical path
+        (approval_mode.py → set_config_value(..., force=True)); the CLI never
+        forwards --force for sensitive keys (see
+        test_cli_set_refuses_sensitive_key_even_with_force below).
+        """
         set_config_value(key, "off" if key != "command_allowlist" else "git push --force", force=True)
 
         import yaml
@@ -784,6 +793,52 @@ class TestSensitiveConfigKeyGuard:
         for part in key.split("."):
             node = node[part]
         assert node == expected
+
+    @pytest.mark.parametrize("key", [
+        "approvals.mode",
+        "approvals.cron_mode",
+        "approvals",
+        "security.redact_secrets",
+        "security",
+        "command_allowlist",
+    ])
+    def test_cli_set_refuses_sensitive_key_even_with_force(
+        self, _isolated_hermes_home, capsys, key
+    ):
+        """`hermes config set --force <sensitive-key>` is still refused.
+
+        --force is a non-sensitive-key escape hatch (unknown-key notice /
+        scalar-over-mapping). If it also bypassed the security guard, an
+        agent typing the command into the terminal could persist
+        ``approvals.mode: off`` and disable approval checks — the alternate
+        entrypoint reported in the #81108 review. The refusal must fire at
+        the CLI layer regardless of the flag.
+        """
+        from types import SimpleNamespace
+
+        args = SimpleNamespace(config_command="set", key=key, value="off", force=True)
+        with pytest.raises(SystemExit):
+            config_command(args)
+
+        captured = capsys.readouterr()
+        assert "security policy" in captured.err
+
+        # Nothing was written to config.yaml.
+        raw = _read_config(_isolated_hermes_home)
+        assert "approvals" not in raw
+        assert "security" not in raw
+        assert "command_allowlist" not in raw
+
+    def test_cli_set_force_still_works_for_non_sensitive_key(self, _isolated_hermes_home):
+        """--force keeps its documented meaning for non-sensitive keys."""
+        from types import SimpleNamespace
+
+        args = SimpleNamespace(config_command="set", key="model", value="gpt-5.6-sol", force=True)
+        config_command(args)
+
+        import yaml
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert saved["model"] == "gpt-5.6-sol"
 
     def test_approvals_mode_refusal_mentions_canonical_command(self, _isolated_hermes_home, capsys):
         with pytest.raises(SystemExit):
