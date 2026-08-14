@@ -7509,6 +7509,28 @@ class AIAgent:
             tps = None
         self.last_server_tps = tps
 
+    def _capture_server_residency(self) -> None:
+        """Record which models the endpoint's swap proxy has resident.
+
+        Only profiles exposing ``resident_models`` report anything; all
+        others record None and the indicator stays hidden.
+        """
+        residency = None
+        try:
+            from providers import resolve_provider_profile
+
+            profile = resolve_provider_profile(
+                self.provider, getattr(self, "requested_provider", None)
+            )
+            getter = getattr(profile, "resident_models", None)
+            if callable(getter):
+                resident = getter(base_url=self.base_url)
+                if resident is not None:
+                    residency = tuple(str(m) for m in resident)
+        except Exception:
+            residency = None
+        self.last_server_residency = residency
+
     def _needs_kimi_tool_reasoning(self) -> bool:
         """Return True when the current provider is Kimi / Moonshot thinking mode.
 

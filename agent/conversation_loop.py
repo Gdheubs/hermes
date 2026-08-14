@@ -2859,11 +2859,14 @@ def run_conversation(
                 
                 api_duration = time.time() - api_start_time
 
-                # Server-reported generation speed (REQ-14): re-assigned on
-                # every completed call, and only ever set when the resolved
-                # provider profile opts in via surfaces_server_timings. The
-                # status bar reads agent.last_server_tps.
+                # Server-side observability, re-assigned on every completed
+                # call and only ever set when the resolved provider profile
+                # opts in: generation speed from the response timings block
+                # (surfaces_server_timings) and swap-proxy residency
+                # from /running (resident_models). The status bar
+                # reads agent.last_server_tps / agent.last_server_residency.
                 agent._capture_server_timings(response)
+                agent._capture_server_residency()
 
                 # Stop thinking spinner silently -- the response box or tool
                 # execution messages that follow are more informative.
