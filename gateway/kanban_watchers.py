@@ -1,9 +1,9 @@
-"""Kanban board watcher methods for GatewayRunner.
+﻿"""Kanban board watcher methods for GatewayRunner.
 
 Extracted verbatim from ``gateway/run.py`` (god-file decomposition Phase 3).
 These are the background-loop methods that subscribe to kanban boards, deliver
 notifications/artifacts, and drive the multi-agent dispatcher. They use only
-``self`` state, so they live on a mixin that ``GatewayRunner`` inherits — the
+``self`` state, so they live on a mixin that ``GatewayRunner`` inherits ΓÇö the
 ``self._kanban_*`` call sites resolve identically via the MRO, making this a
 behavior-neutral move that lifts ~1,000 LOC out of run.py.
 """
@@ -33,11 +33,11 @@ def _resolve_auto_decompose_settings(
     Read fresh from config on every dispatcher tick (#49638) so that flipping
     ``kanban.auto_decompose: false`` to STOP runaway fan-out takes effect on the
     next tick instead of requiring a gateway restart. Auto-decompose is a
-    safety toggle — a user who sees it create and launch tasks they didn't
+    safety toggle ΓÇö a user who sees it create and launch tasks they didn't
     intend reaches for this flag to halt it, and a stale boot-captured value
     silently ignoring that change is the bug reported in #49638.
 
-    Fails **safe**: if the config read raises, return ``(False, 3)`` — a
+    Fails **safe**: if the config read raises, return ``(False, 3)`` ΓÇö a
     transient read error must never re-enable a feature the user turned off,
     nor fall back to the burst-prone default-on behaviour. ``per_tick`` is
     clamped to ``>= 1``.
@@ -62,7 +62,7 @@ def _kanban_dispatch_allowed() -> bool:
 
     Checked every dispatcher tick BEFORE spawning new workers so a pause takes
     effect on the next tick without a gateway restart. In-flight workers are
-    never touched — this only stops NEW spawns. Fails open: if the estop
+    never touched ΓÇö this only stops NEW spawns. Fails open: if the estop
     module is unimportable, dispatch proceeds (the sentinel gate must not
     become a new crash surface for the dispatcher).
     """
@@ -78,8 +78,8 @@ def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
 
     Only one gateway process machine-wide may run the embedded kanban
     dispatcher: concurrent dispatchers double the reclaim frequency (each
-    runs its own ``release_stale_claims`` → promote → dispatch loop), double
-    claim-attempt events in the event log, and — with ``wal_autocheckpoint=0`` —
+    runs its own ``release_stale_claims`` ΓåÆ promote ΓåÆ dispatch loop), double
+    claim-attempt events in the event log, and ΓÇö with ``wal_autocheckpoint=0`` ΓÇö
     concurrent manual WAL checkpoints can corrupt index pages. The
     ``dispatch_in_gateway`` config flag is the primary control; this lock is the
     backstop that survives config drift and same-profile restart races.
@@ -87,12 +87,12 @@ def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     Delegates to :func:`gateway.status._try_acquire_file_lock` (``fcntl`` on
     POSIX, ``msvcrt`` on Windows) so the guard is cross-platform.
 
-    Returns ``(handle, "held")`` on success — the caller keeps the file handle
+    Returns ``(handle, "held")`` on success ΓÇö the caller keeps the file handle
     for the process lifetime and **must** release it via
     :func:`_release_singleton_lock` when done. ``(None, "contended")`` when
     another process holds the lock (caller must NOT dispatch). ``(None,
     "unavailable")`` when locking cannot be performed (non-POSIX filesystem
-    without flock, or the status.py helpers are unimportable) — caller falls
+    without flock, or the status.py helpers are unimportable) ΓÇö caller falls
     back to config-only control.
     """
     try:
@@ -134,7 +134,7 @@ def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
     session.
 
     The subscription's persisted ``delivery_metadata`` wins over the adapter's
-    live chat → scope mapping, because it records the scope the subscription was
+    live chat ΓåÆ scope mapping, because it records the scope the subscription was
     created from; the mapping only covers rows that stored no metadata. ``None``
     means the chat has no scope, which is what an unscoped platform's key
     contains.
@@ -212,7 +212,7 @@ class GatewayKanbanWatchersMixin:
             return
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
-        # writes — surface those transitions to subscribers too.
+        # writes ΓÇö surface those transitions to subscribers too.
         # ``review_requested`` wakes the origin subscriber like a block does,
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
@@ -233,14 +233,14 @@ class GatewayKanbanWatchersMixin:
         # claim_unseen_events_for_sub) handle dedup, and any retry-loop
         # event reaches the user.
         # Per-subscription send-failure counter. Adapter.send raising
-        # means the chat is dead (deleted, bot kicked, etc.) — after N
+        # means the chat is dead (deleted, bot kicked, etc.) ΓÇö after N
         # consecutive send failures the sub is dropped so we don't spin
         # against a dead chat every 5 seconds forever.
         # Raised from 3 to 12 (~60s at the 5s tick cadence): now that a
         # reported SendResult(success=False) also lands here (see the
         # delivery loop below), a transient Telegram/API outage of a few
         # ticks must NOT permanently unsubscribe a live review-gate channel.
-        # A genuinely dead chat still drops, just ~60s later — a fine trade
+        # A genuinely dead chat still drops, just ~60s later ΓÇö a fine trade
         # for an unattended gate where a false drop means silent work pileup.
         MAX_SEND_FAILURES = 12
         sub_fail_counts: dict[tuple, int] = getattr(
@@ -259,12 +259,12 @@ class GatewayKanbanWatchersMixin:
         # reversible), so boards that never archive would otherwise
         # accumulate rows scanned on every 5s tick forever. The sweep is a
         # single DELETE per board, gated to once per watcher startup and at
-        # most once per hour thereafter — cheap relative to the tick's own
+        # most once per hour thereafter ΓÇö cheap relative to the tick's own
         # per-sub claims. Retention is kanban.done_sub_retention_days in
         # config.yaml (default 30; 0 disables), re-read at each sweep so a
         # config change applies without a restart.
         _GC_INTERVAL_SECONDS = 3600.0
-        _gc_next_at = 0.0  # 0 → sweep on the first tick after startup
+        _gc_next_at = 0.0  # 0 ΓåÆ sweep on the first tick after startup
 
         while self._running:
             try:
@@ -300,14 +300,14 @@ class GatewayKanbanWatchersMixin:
                     # Widen to every platform any secondary profile has live,
                     # not just the default profile's. This is only a coarse
                     # pre-filter to skip claiming events for subs nobody can
-                    # possibly deliver — the precise per-profile check (via
+                    # possibly deliver ΓÇö the precise per-profile check (via
                     # gateway/authz_mixin.py::_authorization_adapter, which
                     # forbids default-profile fallback) still runs at delivery
                     # time below, rewinding the claim if it resolves to None.
                     # Without this, a subscription owned by a secondary
                     # profile on a platform the DEFAULT profile never
                     # connected (e.g. beta owns discord, default doesn't) was
-                    # dropped here before ever being claimed — no rewind
+                    # dropped here before ever being claimed ΓÇö no rewind
                     # applies to an unclaimed event, so it silently never
                     # retries.
                     for _profile_adapter_map in getattr(self, "_profile_adapters", {}).values():
@@ -377,7 +377,7 @@ class GatewayKanbanWatchersMixin:
                                 # Hourly (plus once at startup) stale-sub GC:
                                 # drop subscriptions for tasks that have been
                                 # ``done`` untouched past the retention
-                                # window. Best-effort — a failed sweep never
+                                # window. Best-effort ΓÇö a failed sweep never
                                 # blocks delivery; the next hourly gate
                                 # retries it.
                                 try:
@@ -403,7 +403,7 @@ class GatewayKanbanWatchersMixin:
                             # connection, which races the first and used to
                             # log a benign but noisy `duplicate column name`
                             # traceback (and intermittent "database is locked"
-                            # — issue #21378) on every gateway start against
+                            # ΓÇö issue #21378) on every gateway start against
                             # a legacy DB. `_add_column_if_missing` now
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
@@ -444,7 +444,7 @@ class GatewayKanbanWatchersMixin:
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
                                     logger.debug(
-                                        "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
+                                        "kanban notifier: claimed %d event(s) for %s on board %s cursor %sΓåÆ%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
                                     )
                                     deliveries.append({
@@ -487,7 +487,7 @@ class GatewayKanbanWatchersMixin:
                     # (gateway/authz_mixin.py::_authorization_adapter): a stamped
                     # profile with its own adapter-registry entry must be served
                     # by THAT profile's same-platform adapter and must NOT silently
-                    # fall back to the default profile's adapter — otherwise a
+                    # fall back to the default profile's adapter ΓÇö otherwise a
                     # secondary profile's task notification is delivered by the
                     # wrong bot (the cross-profile mis-delivery this whole change
                     # exists to fix). The helper returns None only when the profile
@@ -552,25 +552,25 @@ class GatewayKanbanWatchersMixin:
                                 handoff = f"\n{r}"
                                 wake_handoff = r
                             msg = (
-                                f"✔ {board_tag}{tag}Kanban {sub['task_id']} done"
-                                f" — {title}{handoff}"
+                                f"Γ£ö {board_tag}{tag}Kanban {sub['task_id']} done"
+                                f" ΓÇö {title}{handoff}"
                             )
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                            msg = f"ΓÅ╕ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
                             msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
+                                f"Γ£û {board_tag}{tag}Kanban {sub['task_id']} gave up "
                                 f"after repeated spawn failures{err}"
                             )
                         elif kind == "crashed":
                             msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
+                                f"Γ£û {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
                                 f"(pid gone); dispatcher will retry"
                             )
                         elif kind == "timed_out":
@@ -578,14 +578,14 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("limit_seconds"):
                                 limit = int(ev.payload["limit_seconds"])
                             msg = (
-                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
+                                f"ΓÅ▒ {board_tag}{tag}Kanban {sub['task_id']} timed out "
                                 f"(max_runtime={limit}s); will retry"
                             )
                         elif kind == "status":
                             new_status = ""
                             if ev.payload and ev.payload.get("status"):
                                 new_status = str(ev.payload["status"])
-                            msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
+                            msg = f"≡ƒöä {board_tag}{tag}Kanban {sub['task_id']} ΓåÆ {new_status}"
                         elif kind == "review_requested":
                             # Implementation complete; task moved to the
                             # first-class review lane. Wake the origin thread.
@@ -593,15 +593,15 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("summary"):
                                 handoff = f"\n{str(ev.payload['summary'])[:200]}"
                             msg = (
-                                f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
-                                f" — {title}{handoff}"
+                                f"≡ƒæÇ {board_tag}{tag}Kanban {sub['task_id']} ready for review"
+                                f" ΓÇö {title}{handoff}"
                             )
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the
                             # recurrence limit and was routed to `triage` for a
                             # human decision. This is the ONE transition that
                             # exists to force human attention, yet it emits no
-                            # `blocked`/`status` event — so before adding it to
+                            # `blocked`/`status` event ΓÇö so before adding it to
                             # TERMINAL_KINDS it produced zero notification and
                             # the task stalled in triage silently. Ping loudly.
                             reason = ""
@@ -612,8 +612,8 @@ class GatewayKanbanWatchersMixin:
                                 recurrences = ev.payload.get("recurrences")
                             rc = f" (blocked {recurrences}x for the same cause)" if recurrences else ""
                             msg = (
-                                f"🛑 {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
-                                f" — needs a human decision{rc}{reason}"
+                                f"≡ƒ¢æ {board_tag}{tag}Kanban {sub['task_id']} routed to TRIAGE"
+                                f" ΓÇö needs a human decision{rc}{reason}"
                             )
                         else:
                             # archived / unblocked are claimed by TERMINAL_KINDS
@@ -633,14 +633,14 @@ class GatewayKanbanWatchersMixin:
 
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
-                        # Adapters with no push channel (the API server —
+                        # Adapters with no push channel (the API server ΓÇö
                         # ``supports_async_delivery = False``) can NEVER
                         # satisfy a text-send: ``send()`` always reports
                         # SendResult(success=False) by design (see
                         # ApiServerAdapter.send()). Treating that as a
                         # delivery failure would rewind/drop the subscription
-                        # forever and — because the wake dispatch below lives
-                        # in this loop's ``else`` clause — would also make the
+                        # forever and ΓÇö because the wake dispatch below lives
+                        # in this loop's ``else`` clause ΓÇö would also make the
                         # wake-on-completion path (the actual fix for the
                         # api_server wrong-session bug) unreachable. So for
                         # non-push adapters, skip the doomed send attempt
@@ -663,7 +663,7 @@ class GatewayKanbanWatchersMixin:
                         if not send_passive:
                             # Wake-only subscriptions intentionally skip the
                             # visible platform message. The retained wake path
-                            # below is the sole delivery — the failure counter
+                            # below is the sole delivery ΓÇö the failure counter
                             # is resolved (reset or bumped) by the wake
                             # outcome there, not by skipping the send here.
                             continue
@@ -674,7 +674,7 @@ class GatewayKanbanWatchersMixin:
                             # A SendResult(success=False) without an exception
                             # (returned by push-capable adapters on a genuine
                             # transient failure) must count as a FAILED
-                            # delivery — otherwise the cursor advances and the
+                            # delivery ΓÇö otherwise the cursor advances and the
                             # event is permanently lost. Adapters returning
                             # None (or anything non-SendResult shaped) keep
                             # the legacy "no exception == delivered" contract.
@@ -755,7 +755,7 @@ class GatewayKanbanWatchersMixin:
                         #   retry-exhausted self-post (swallowed by the
                         #   best-effort except) permanently lose the event.
                         #   So the self-post runs FIRST and the cursor only
-                        #   advances after it succeeds — a failure rewinds the
+                        #   advances after it succeeds ΓÇö a failure rewinds the
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
@@ -775,7 +775,7 @@ class GatewayKanbanWatchersMixin:
                                 _session_key = getattr(task, "session_id", None) or ""
                             else:
                                 # Non-push (api_server) wakes go to the
-                                # subscription's delivery destination —
+                                # subscription's delivery destination ΓÇö
                                 # sub["chat_id"] IS the raw session id the
                                 # subscriber registered with. task.session_id
                                 # is worker/creator provenance and may point
@@ -820,7 +820,7 @@ class GatewayKanbanWatchersMixin:
                             )
 
                         if not _is_push_adapter and _wake_kinds and _session_key:
-                            # Wake self-post IS the delivery on this path —
+                            # Wake self-post IS the delivery on this path ΓÇö
                             # it must succeed BEFORE the cursor advances.
                             from gateway.wake import deliver_wake
 
@@ -854,7 +854,7 @@ class GatewayKanbanWatchersMixin:
                                     sub_fail_counts.pop(sub_key, None)
                                 else:
                                     # Rewind the pre-send claim so the next
-                                    # tick retries the self-post — the event
+                                    # tick retries the self-post ΓÇö the event
                                     # is NOT lost.
                                     await asyncio.to_thread(
                                         self._kanban_rewind,
@@ -883,7 +883,7 @@ class GatewayKanbanWatchersMixin:
                             # "group" mis-routed DM/thread creators into a
                             # fresh session. Legacy rows written before the
                             # column existed may still carry chat_type in
-                            # delivery_metadata (#60600 rows) — fall back
+                            # delivery_metadata (#60600 rows) ΓÇö fall back
                             # to that, then to "group" (the historical
                             # default that suits the dashboard/group flows).
                             # handle_message() get_or_create_session's the
@@ -927,7 +927,7 @@ class GatewayKanbanWatchersMixin:
                             # Wake-only (delivery_mode='wake') push sub: the
                             # text ping was intentionally skipped above, so
                             # the wake IS the sole delivery. It must succeed
-                            # BEFORE the cursor advances — advancing first
+                            # BEFORE the cursor advances ΓÇö advancing first
                             # would let a failed wake (previously swallowed
                             # by the best-effort except below) permanently
                             # lose the event. Mirrors the non-push
@@ -954,7 +954,7 @@ class GatewayKanbanWatchersMixin:
                                     sub_fail_counts.pop(sub_key, None)
                                 else:
                                     # Rewind the pre-send claim so the next
-                                    # tick retries the wake — the event is
+                                    # tick retries the wake ΓÇö the event is
                                     # NOT lost.
                                     await asyncio.to_thread(
                                         self._kanban_rewind,
@@ -968,7 +968,7 @@ class GatewayKanbanWatchersMixin:
                         # Delivery complete (text ping for push adapters, wake
                         # self-post for non-push, wake injection for wake-only
                         # push subs): advance cursor. The cursor is the dedup
-                        # mechanism — it prevents re-delivery of the same
+                        # mechanism ΓÇö it prevents re-delivery of the same
                         # event on subsequent ticks.
                         await asyncio.to_thread(
                             self._kanban_advance, sub, d["cursor"], board_slug,
@@ -991,7 +991,7 @@ class GatewayKanbanWatchersMixin:
                             except Exception as _wk_err:
                                 # Best-effort: the notification itself already
                                 # delivered and the cursor has advanced, so a
-                                # broken wake path must not wedge the tick — but
+                                # broken wake path must not wedge the tick ΓÇö but
                                 # log at WARNING with a traceback rather than
                                 # DEBUG so a persistently-failing wake is visible
                                 # in normal logs instead of silently no-op'ing.
@@ -1087,7 +1087,7 @@ class GatewayKanbanWatchersMixin:
         chat.
 
         Sources scanned, in priority order:
-          1. ``event_payload['artifacts']`` (explicit list — preferred)
+          1. ``event_payload['artifacts']`` (explicit list ΓÇö preferred)
           2. ``event_payload['summary']`` (truncated first line)
           3. ``task.result`` (legacy fallback)
 
@@ -1180,7 +1180,7 @@ class GatewayKanbanWatchersMixin:
                 )
 
     async def _kanban_dispatcher_watcher(self) -> None:
-        """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
+        """Embedded kanban dispatcher ΓÇö one tick every `dispatch_interval_seconds`.
 
         Gated by `kanban.dispatch_in_gateway` in config.yaml (default True).
         When true, the gateway hosts the single dispatcher for this profile:
@@ -1189,7 +1189,7 @@ class GatewayKanbanWatchersMixin:
 
         Each tick calls :func:`kanban_db.dispatch_once` inside
         ``asyncio.to_thread`` so the SQLite WAL lock never blocks the
-        event loop. Failures in one tick don't stop subsequent ticks —
+        event loop. Failures in one tick don't stop subsequent ticks ΓÇö
         same pattern as `_kanban_notifier_watcher`.
 
         Shutdown: the loop checks ``self._running`` between ticks; gateway
@@ -1232,8 +1232,8 @@ class GatewayKanbanWatchersMixin:
         # Single-dispatcher backstop. dispatch_in_gateway defaults to true, so a
         # new profile gateway (or a same-profile restart race) can silently
         # start a second dispatcher; concurrent dispatchers double reclaim
-        # frequency, double claim-attempt events, and — with
-        # wal_autocheckpoint=0 — concurrent manual WAL checkpoints can corrupt
+        # frequency, double claim-attempt events, and ΓÇö with
+        # wal_autocheckpoint=0 ΓÇö concurrent manual WAL checkpoints can corrupt
         # index pages. The lock lives at the machine-global kanban root
         # (shared across profiles by design), so it serialises ALL gateways.
         self._kanban_dispatcher_lock_handle = None
@@ -1262,7 +1262,7 @@ class GatewayKanbanWatchersMixin:
                 kanban_cfg.get("dispatch_interval_seconds"),
             )
             interval = 60.0
-        interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
+        interval = max(interval, 1.0)  # sanity floor ΓÇö tighter than this is a footgun
 
         # Read max_spawn config to limit concurrent kanban tasks
         max_spawn = kanban_cfg.get("max_spawn", None)
@@ -1312,7 +1312,7 @@ class GatewayKanbanWatchersMixin:
             )
             failure_limit = _kb.DEFAULT_FAILURE_LIMIT
 
-        # Read stale_timeout_seconds — 0 disables stale detection.
+        # Read stale_timeout_seconds ΓÇö 0 disables stale detection.
         raw_stale = kanban_cfg.get("dispatch_stale_timeout_seconds", 0)
         try:
             stale_timeout_seconds = int(raw_stale or 0)
@@ -1326,15 +1326,15 @@ class GatewayKanbanWatchersMixin:
 
         # kanban.reconcile_orphans (config.yaml, default true): each tick,
         # requeue 'running' cards whose claim bookkeeping is broken (no
-        # valid claim, dead/gone worker) — the zombie-card reconciliation
+        # valid claim, dead/gone worker) ΓÇö the zombie-card reconciliation
         # pass. Set false to keep orphans frozen for manual forensics.
         reconcile_orphans = bool(kanban_cfg.get("reconcile_orphans", True))
 
-        # Read kanban.default_assignee — fallback profile for tasks
+        # Read kanban.default_assignee ΓÇö fallback profile for tasks
         # created without an explicit assignee (e.g. via the dashboard).
         # When set, the dispatcher applies it to unassigned ready tasks
         # instead of skipping them indefinitely (#27145). Empty string
-        # (the schema default) means "no fallback, keep skipping" —
+        # (the schema default) means "no fallback, keep skipping" ΓÇö
         # backward-compatible with existing installs.
         default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None
         if default_assignee:
@@ -1344,7 +1344,7 @@ class GatewayKanbanWatchersMixin:
                 default_assignee,
             )
 
-        # Read kanban.max_in_progress_per_profile — per-profile concurrency
+        # Read kanban.max_in_progress_per_profile ΓÇö per-profile concurrency
         # cap (#21582). When set, no single profile gets more than N
         # workers running at once, even if the global max_in_progress
         # would allow it. Prevents one profile's local model / API quota
@@ -1379,7 +1379,7 @@ class GatewayKanbanWatchersMixin:
         await asyncio.sleep(5)
 
         # Health telemetry mirrored from `_cmd_daemon`: warn when ready
-        # queue is non-empty but spawns are 0 for N consecutive ticks —
+        # queue is non-empty but spawns are 0 for N consecutive ticks ΓÇö
         # usually means broken PATH, missing venv, or credential loss.
         HEALTH_WINDOW = 6
         bad_ticks = 0
@@ -1535,7 +1535,7 @@ class GatewayKanbanWatchersMixin:
             PATH, missing venv, credential loss for a real Hermes profile).
             """
             # Only probe the review column when autonomous review dispatch is
-            # actually on. With ``review_dispatch`` off (the default — no
+            # actually on. With ``review_dispatch`` off (the default ΓÇö no
             # sdlc-review agent), a task parked in 'review' is "correctly idle"
             # waiting for a human, not a stuck dispatcher; probing it here would
             # fire a false "dispatcher stuck" warning that never clears. Shares
@@ -1574,7 +1574,7 @@ class GatewayKanbanWatchersMixin:
         # The flag is re-read from config EVERY tick (#49638) rather than
         # captured once at boot. Auto-decompose is a safety toggle: a user who
         # sees it fan out and run tasks they didn't intend reaches for
-        # ``kanban.auto_decompose: false`` to STOP it — and that must take
+        # ``kanban.auto_decompose: false`` to STOP it ΓÇö and that must take
         # effect on the next tick, not require a gateway restart. (Reported:
         # auto-decompose created and launched destructive tasks while the user
         # was still typing the task description, and the flag "couldn't be
@@ -1605,7 +1605,7 @@ class GatewayKanbanWatchersMixin:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 if attempted >= auto_decompose_per_tick:
                     break
-                # Pin this board for the duration of the call — same
+                # Pin this board for the duration of the call ΓÇö same
                 # pattern as the dashboard specify endpoint. The
                 # decomposer module connects with no board kwarg and
                 # relies on the env var.
@@ -1638,12 +1638,12 @@ class GatewayKanbanWatchersMixin:
                             successes += 1
                             if outcome.fanout and outcome.child_ids:
                                 logger.info(
-                                    "kanban auto-decompose [%s]: %s → %d children",
+                                    "kanban auto-decompose [%s]: %s ΓåÆ %d children",
                                     slug, tid, len(outcome.child_ids),
                                 )
                             else:
                                 logger.info(
-                                    "kanban auto-decompose [%s]: %s → single task (no fanout)",
+                                    "kanban auto-decompose [%s]: %s ΓåÆ single task (no fanout)",
                                     slug, tid,
                                 )
                         else:
@@ -1679,7 +1679,7 @@ class GatewayKanbanWatchersMixin:
 
             try:
                 # Global emergency stop (`hermes pause`): skip auto-decompose
-                # and dispatch entirely — no new workers while paused. Running
+                # and dispatch entirely ΓÇö no new workers while paused. Running
                 # workers finish naturally; zombie reaping above still runs.
                 if not _kanban_dispatch_allowed():
                     ready_pending = False
@@ -1696,7 +1696,7 @@ class GatewayKanbanWatchersMixin:
                     for slug, res in (results or []):
                         if res is not None and getattr(res, "spawned", None):
                             any_spawned = True
-                            # Quiet by default — only log when something actually
+                            # Quiet by default ΓÇö only log when something actually
                             # happened, so an idle gateway stays silent.
                             logger.info(
                                 "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
@@ -1733,7 +1733,7 @@ class GatewayKanbanWatchersMixin:
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
 
-            # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
+            # Sleep in 1s slices so shutdown is snappy ΓÇö otherwise a stop()
             # waits up to `interval` seconds for the current sleep to finish.
             slept = 0.0
             while slept < interval and self._running:
