@@ -106,3 +106,48 @@ describe('the catalog owns model curation', () => {
     expect($modelVisibilityOpen.get()).toBe(true)
   })
 })
+
+// A row shows its model's effort ("Gemini 3.1 Pro  Max"), which reads as a
+// fixed model+effort combo unless the row also advertises that the effort is
+// editable behind it. The caret is that advertisement, and ArrowRight is the
+// way in for anyone not driving the menu with a mouse.
+describe('the per-row options submenu is discoverable', () => {
+  it('marks each model row as opening a submenu', async () => {
+    renderMenu()
+
+    const row = await screen.findByText(/Gemini 3\.1 Pro/i)
+    const trigger = row.closest('[data-slot="dropdown-menu-sub-trigger"]')
+
+    expect(trigger).not.toBeNull()
+    expect(trigger?.querySelector('.codicon-chevron-right')).not.toBeNull()
+  })
+
+  it('opens the highlighted row with ArrowRight, so effort is reachable without a mouse', async () => {
+    renderMenu()
+    await screen.findByText(/Gemini 3\.1 Pro/i)
+
+    const input = screen.getByRole('textbox', { name: 'Search models' })
+
+    // Nothing is selected yet, so highlight the first row before opening it.
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    fireEvent.keyDown(input, { key: 'ArrowRight' })
+
+    expect(await screen.findByText('Effort')).not.toBeNull()
+    expect(screen.getByRole('menuitemradio', { name: 'Extra High' })).not.toBeNull()
+  })
+
+  it('leaves ArrowRight to the search field while the caret is inside the query', async () => {
+    renderMenu()
+    await screen.findByText(/Gemini 3\.1 Pro/i)
+
+    const input = screen.getByRole('textbox', { name: 'Search models' }) as HTMLInputElement
+
+    fireEvent.change(input, { target: { value: 'gemini' } })
+    input.setSelectionRange(0, 0)
+
+    fireEvent.keyDown(input, { key: 'ArrowDown' })
+    fireEvent.keyDown(input, { key: 'ArrowRight' })
+
+    expect(screen.queryByText('Effort')).toBeNull()
+  })
+})
