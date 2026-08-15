@@ -966,13 +966,15 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
         uv_bin = _ensure_uv_for_termux(pip_cmd)
 
     shared_hermes_root = get_default_hermes_root()
-    install_group = "all"
+    uv_env = None
+    if uv_bin:
+        uv_env = {**os.environ, "VIRTUAL_ENV": str(_m().PROJECT_ROOT / "venv")}
+        if _m()._is_termux_env(uv_env):
+            uv_env.pop("PYTHONPATH", None)
+            uv_env.pop("PYTHONHOME", None)
+    install_group = _python_install_group(uv_env)
     if _python_dependencies_changed(shared_hermes_root, install_group):
         if uv_bin:
-            uv_env = {**os.environ, "VIRTUAL_ENV": str(_m().PROJECT_ROOT / "venv")}
-            if _m()._is_termux_env(uv_env):
-                uv_env.pop("PYTHONPATH", None)
-                uv_env.pop("PYTHONHOME", None)
             _m()._install_python_dependencies_with_optional_fallback([uv_bin, "pip"], env=uv_env, group=install_group)
         else:
             # Use sys.executable to explicitly call the venv's pip module,
@@ -2265,6 +2267,19 @@ def _repair_node_deps_on_current_checkout(print_completion) -> None:
     print_completion("✓ Already up to date!")
 
 
+def _python_install_group(env: dict | None = None) -> str:
+    """Return the extra group both ZIP and git update paths must hash and install."""
+    if env is not None:
+        return "termux-all" if _m()._is_termux_env(env) else "all"
+    return "termux-all" if _m()._is_termux_env() else "all"
+
+
+def _python_runtime_token() -> bytes:
+    """Interpreter/platform identity so a moved or upgraded venv cannot skip."""
+    version = "%s.%s.%s" % sys.version_info[:3]
+    return f"{sys.implementation.name}-{version}-{sys.platform}".encode()
+
+
 def _python_dependency_inputs(install_group: str) -> list[tuple[str, bytes | None]]:
     """Return the labelled file contents that determine whether a Python
     dependency reinstall is necessary.
@@ -2277,7 +2292,10 @@ def _python_dependency_inputs(install_group: str) -> list[tuple[str, bytes | Non
         ("uv.lock", _m().PROJECT_ROOT / "uv.lock"),
         ("constraints-termux.txt", _m().PROJECT_ROOT / "constraints-termux.txt"),
     ]
-    inputs: list[tuple[str, bytes | None]] = [("group", install_group.encode())]
+    inputs: list[tuple[str, bytes | None]] = [
+        ("group", install_group.encode()),
+        ("runtime", _python_runtime_token()),
+    ]
     for label, path in paths:
         if not path.exists():
             inputs.append((label, None))
@@ -2290,10 +2308,8 @@ def _python_dependency_inputs(install_group: str) -> list[tuple[str, bytes | Non
 
 
 def _python_dependencies_digest(install_group: str) -> str | None:
-    """SHA-256 digest over the Python dependency input files."""
+    """SHA-256 digest over the Python dependency input files and runtime."""
     inputs = _python_dependency_inputs(install_group)
-    if not inputs:
-        return None
     # pyproject.toml must exist for a sane install; if it's missing we can't
     # safely declare the inputs unchanged.
     for label, data in inputs:
@@ -2346,7 +2362,9 @@ def _record_python_dependencies_hash(hermes_root: Path, install_group: str) -> N
     try:
         cache_key = hashlib.sha256(str(_m().PROJECT_ROOT).encode()).hexdigest()[:12]
         cache_file = hermes_root / f".python_dep_hash_{install_group}_{cache_key}"
-        cache_file.write_text(digest, encoding="utf-8")
+        from utils import atomic_write_text
+
+        atomic_write_text(cache_file, digest)
     except OSError:
         logger.debug("Could not write python dependency hash cache")
 
@@ -5078,15 +5096,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
         pip_cmd = [sys.executable, "-m", "pip"]
         if not uv_bin:
             uv_bin = _ensure_uv_for_termux(pip_cmd)
-        install_group = "all"
 
+        uv_env = None
         if uv_bin:
             uv_env = {**os.environ, "VIRTUAL_ENV": str(_m().PROJECT_ROOT / "venv")}
             if _m()._is_termux_env(uv_env):
                 uv_env.pop("PYTHONPATH", None)
                 uv_env.pop("PYTHONHOME", None)
-                install_group = "termux-all"
-                print("  → Termux detected: using uv + curated termux-all optional profile...")
             if _m()._is_termux_env(uv_env) and _is_android_python():
                 print("  → Termux/Android detected: prebuilding psutil with Linux source path compatibility...")
                 _install_psutil_android_compat([uv_bin, "pip"], env=uv_env)
@@ -5109,14 +5125,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     cwd=_m().PROJECT_ROOT,
                     check=True,
                 )
-            if _m()._is_termux_env():
-                install_group = "termux-all"
-                print("  → Termux detected: using curated termux-all optional profile...")
             if _m()._is_termux_env() and _is_android_python():
                 print("  → Termux/Android detected: prebuilding psutil with Linux source path compatibility...")
                 _install_psutil_android_compat(pip_cmd)
 
         shared_hermes_root = get_default_hermes_root()
+        install_group = _python_install_group(uv_env)
+        if install_group == "termux-all":
+            print("  → Termux detected: using curated termux-all optional profile...")
         if _python_dependencies_changed(shared_hermes_root, install_group):
             if uv_bin:
                 _m()._install_python_dependencies_with_optional_fallback(
