@@ -1260,6 +1260,15 @@ class RelayAdapter(BasePlatformAdapter):
                 success=False,
                 error=f"relay does not front platform {platform_value}",
             )
+        # Finding #7 (live canary): the delivery resolver calls THIS method
+        # directly (gateway/delivery.py), bypassing send() — an open native
+        # stream must absorb the turn-final here too, or the stream is left
+        # unsealed (frozen live indicator) and the final posts as a separate
+        # duplicate message.
+        if str(chat_id) in self._open_draft_by_chat:
+            return await self._seal_open_draft(
+                chat_id, content, dict(metadata or {})
+            )
         if self._transport is None:
             return SendResult(success=False, error="no transport")
         result = await self._transport.send_outbound(
@@ -1288,6 +1297,17 @@ class RelayAdapter(BasePlatformAdapter):
     ) -> SendResult:
         send_metadata = dict(metadata or {})
         explicit_platform = send_metadata.pop("_relay_logical_platform", None)
+        # NS-658 seal-interception — checked BEFORE the explicit-platform
+        # branch (finding #7, live canary): the delivery-resolver lane
+        # (follow-up queue, media-accompanied finals, scheduled sends) routes
+        # through send_for_platform, which posted a plain send while the
+        # native stream stayed open — the user got the stream frozen
+        # mid-word (live indicator, never sealed) PLUS the final as a
+        # separate message. An open stream absorbs the turn-final send no
+        # matter which egress door it arrives through; the stream IS the
+        # message.
+        if str(chat_id) in self._open_draft_by_chat:
+            return await self._seal_open_draft(chat_id, content, send_metadata)
         if explicit_platform:
             return await self.send_for_platform(
                 explicit_platform,
@@ -1298,11 +1318,6 @@ class RelayAdapter(BasePlatformAdapter):
             )
         if self._transport is None:
             return SendResult(success=False, error="no transport")
-        # NS-658: an open native draft stream absorbs the turn-final send —
-        # the stream IS the message; sealing it posts the final content and
-        # returns the stream ts as the message identity.
-        if str(chat_id) in self._open_draft_by_chat:
-            return await self._seal_open_draft(chat_id, content, send_metadata)
         # Native _resolve_thread_ts parity: a Slack DM reply must post flat at
         # the DM root, not threaded under the triggering message. One shared
         # helper resolves the anchor for EVERY egress lane (see
