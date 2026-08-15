@@ -87,3 +87,47 @@ def test_trace_multisegment_draft_flow():
         f"each segment-break send() gets converted to draft(final=true) by the "
         f"adapter's seal-interception, sealing a stream PER SEGMENT"
     )
+
+
+def test_trace_parallel_turns_do_not_collide():
+    """Finding #10 (live): three concurrent turns in ONE flat DM must keep
+    fully independent stream + card identities. Per-chat keying merged
+    turn B's card into turn A's and clobbered seal state (3x duplicates)."""
+    adapter, t = _mk_adapter()
+    loop = asyncio.new_event_loop()
+    # Each turn's metadata carries its own thread anchor (inbound stamps
+    # thread_ts = event.thread_ts or ts on every top-level message).
+    md_a = {"thread_ts": "100.1"}
+    md_b = {"thread_ts": "200.2"}
+
+    async def interleaved():
+        # A and B stream interleaved on the SAME chat with different anchors
+        await adapter.send_draft("C1", 11, "A partial", metadata=md_a)
+        await adapter.send_draft("C1", 12, "B partial", metadata=md_b)
+        # A's card and B's card must be distinct card_ids
+        await adapter.send_native_task_card_progress(
+            "C1", [{"id": "t1", "title": "x", "status": "in_progress"}],
+            reply_to=None, metadata=md_a)
+        await adapter.send_native_task_card_progress(
+            "C1", [{"id": "t2", "title": "y", "status": "in_progress"}],
+            reply_to=None, metadata=md_b)
+        # A seals; B keeps streaming — B's state must survive A's seal
+        ra = await adapter.send("C1", "A final.", metadata=md_a)
+        await adapter.send_draft("C1", 12, "B partial more", metadata=md_b)
+        rb = await adapter.send("C1", "B final.", metadata=md_b)
+        return ra, rb
+
+    ra, rb = loop.run_until_complete(interleaved())
+    drafts = [o for o in t.ops if o["op"] == "draft"]
+    seals = [o for o in drafts if o.get("final")]
+    cards = [o for o in t.ops if o["op"] == "task_card"]
+    plain = [o for o in t.ops if o["op"] == "send"]
+    # Distinct card identities per turn:
+    assert len({c["card_id"] for c in cards}) == 2, cards
+    # Each turn sealed its OWN stream (2 seals, matching draft_ids 11/12):
+    assert sorted(s["draft_id"] for s in seals) == [11, 12], seals
+    # No leaked plain send: both finals absorbed by their own seals:
+    assert not plain, plain
+    # B's post-A-seal frame was NOT dropped by A's tombstone:
+    b_frames = [d for d in drafts if d["draft_id"] == 12 and not d.get("final")]
+    assert len(b_frames) == 2, b_frames

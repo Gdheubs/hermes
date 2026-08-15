@@ -99,6 +99,10 @@ class RelayAdapter(BasePlatformAdapter):
         # (NS-658 live cards). Armed by send_draft on a successful frame;
         # consumed by send() to convert the turn-final delivery into the
         # sealing draft(final=true) frame instead of a duplicate post.
+        # Keyed by _draft_key (chat + turn thread anchor), NOT bare chat:
+        # parallel turns in one DM are distinct streams (live finding #10 —
+        # per-chat keying collided three concurrent turns: merged task
+        # cards, clobbered seal state, 3x duplicate finals).
         self._open_draft_by_chat: Dict[str, int] = {}
         # chat_id -> draft_id of the most recently SEALED stream (gateway
         # mirror of the connector's sealed-key tombstone): post-seal
@@ -309,6 +313,19 @@ class RelayAdapter(BasePlatformAdapter):
         advertises task_card."""
         return self.supports_native_task_cards()
 
+    @staticmethod
+    def _draft_key(chat_id: str, metadata: Optional[Dict[str, Any]]) -> str:
+        """Coordination key for one turn's stream: (chat, thread anchor).
+
+        Finding #10: every inbound stamps thread_ts = event.thread_ts or ts,
+        so each turn carries its own anchor even in a flat DM — parallel
+        turns in one chat must never share draft/seal state. Falls back to
+        the bare chat when no anchor exists (single-turn semantics).
+        """
+        md = metadata or {}
+        anchor = md.get("thread_ts") or md.get("thread_id") or ""
+        return f"{chat_id}:{anchor}"
+
     async def send_draft(
         self,
         chat_id: str,
@@ -332,7 +349,7 @@ class RelayAdapter(BasePlatformAdapter):
         # converted to draft(final=true) on the tombstoned key — clearing
         # the tombstone, re-opening a stream, and freezing it (the observed
         # escalating-frozen-prefixes regression).
-        chat_key = str(chat_id)
+        chat_key = self._draft_key(str(chat_id), metadata)
         if self._sealed_draft_by_chat.get(chat_key) == draft_id:
             # Post-seal straggler: its content is already in the sealed
             # message; report success, send nothing, arm nothing.
@@ -367,11 +384,12 @@ class RelayAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]],
     ) -> SendResult:
         """Convert the turn-final send into the sealing draft frame."""
-        draft_id = self._open_draft_by_chat.pop(str(chat_id))
+        draft_key = self._draft_key(str(chat_id), metadata)
+        draft_id = self._open_draft_by_chat.pop(draft_key)
         # Tombstone BEFORE the transport call (regression fix): whatever the
         # ack says, this draft_id's stream must never be re-armed by a
         # straggler frame — the connector-side tombstone handles its half.
-        self._sealed_draft_by_chat[str(chat_id)] = draft_id
+        self._sealed_draft_by_chat[draft_key] = draft_id
         if self._transport is None:
             return SendResult(success=False, error="no transport")
         result = await self._transport.send_outbound(
@@ -427,7 +445,13 @@ class RelayAdapter(BasePlatformAdapter):
             )
         if self._transport is None:
             return SendResult(success=False, error="no transport")
-        card_id = f"turn:{reply_to or 'root'}"
+        # Finding #10: bare reply_to is None in flat DMs — every parallel
+        # turn collided on card key 'turn:root'. Anchor on the same turn
+        # thread identity the draft lane uses.
+        _anchor = reply_to or (metadata or {}).get("thread_ts") or (
+            metadata or {}
+        ).get("thread_id") or "root"
+        card_id = f"turn:{_anchor}"
         merged_meta = dict(metadata or {})
         if reply_to and "thread_ts" not in merged_meta:
             # Slack card streams are thread replies (same rule as draft):
@@ -467,7 +491,10 @@ class RelayAdapter(BasePlatformAdapter):
             )
         if self._transport is None:
             return SendResult(success=False, error="no transport")
-        card_id = f"turn:{reply_to or 'root'}"
+        _anchor = reply_to or (metadata or {}).get("thread_ts") or (
+            metadata or {}
+        ).get("thread_id") or "root"
+        card_id = f"turn:{_anchor}"
         result = await self._transport.send_outbound(
             {
                 "op": "task_card_stop",
@@ -1291,7 +1318,7 @@ class RelayAdapter(BasePlatformAdapter):
         # stream must absorb the turn-final here too, or the stream is left
         # unsealed (frozen live indicator) and the final posts as a separate
         # duplicate message.
-        if str(chat_id) in self._open_draft_by_chat:
+        if self._draft_key(str(chat_id), dict(metadata or {})) in self._open_draft_by_chat:
             seal = await self._seal_open_draft(
                 chat_id, content, dict(metadata or {})
             )
@@ -1340,7 +1367,7 @@ class RelayAdapter(BasePlatformAdapter):
         # separate message. An open stream absorbs the turn-final send no
         # matter which egress door it arrives through; the stream IS the
         # message.
-        if str(chat_id) in self._open_draft_by_chat:
+        if self._draft_key(str(chat_id), send_metadata) in self._open_draft_by_chat:
             seal = await self._seal_open_draft(chat_id, content, send_metadata)
             if seal.success:
                 return seal
