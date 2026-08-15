@@ -100,6 +100,12 @@ class RelayAdapter(BasePlatformAdapter):
         # consumed by send() to convert the turn-final delivery into the
         # sealing draft(final=true) frame instead of a duplicate post.
         self._open_draft_by_chat: Dict[str, int] = {}
+        # chat_id -> draft_id of the most recently SEALED stream (gateway
+        # mirror of the connector's sealed-key tombstone): post-seal
+        # straggler frames must neither re-arm interception nor re-open a
+        # stream. One entry per chat; a NEW turn's fresh draft_id differs,
+        # so it arms normally and overwrites the tombstone at its own seal.
+        self._sealed_draft_by_chat: Dict[str, int] = {}
         # Stream-is-the-message marker (finding #4): the stream consumer
         # checks this to keep ONE draft stream per turn instead of bumping
         # draft_id at tool boundaries (which opens a new Slack message per
@@ -316,17 +322,22 @@ class RelayAdapter(BasePlatformAdapter):
             )
         if self._transport is None:
             return SendResult(success=False, error="no transport")
-        # Audit fix (G-D1, deep audit 2026-08-15): arm seal-interception
-        # OPTIMISTICALLY, before the transport call, and KEEP it armed on
-        # failure. The outbound leg is at-most-once on the wire but its ack
-        # is lossy — a timeout/WS-drop "failure" often means the frame WAS
-        # delivered and the connector's stream is open. Disarming on such a
-        # false failure sent the turn-final as a plain send beside a live
-        # stream (orphan mid-word + duplicate final, intermittent). Arming
-        # is strictly safe: the connector seals a NON-existent stream as a
-        # single complete message (start+stop in one op), and a truly
-        # failed seal falls back to plain send at the interception sites.
-        self._open_draft_by_chat[str(chat_id)] = draft_id
+        # Audit fix G-D1 + regression fix (2026-08-15): arm optimistically
+        # BEFORE the transport call (lossy ack: a timeout/WS-drop 'failure'
+        # often means delivered), but NEVER for a draft_id that has already
+        # been sealed this chat — the gateway-side mirror of the connector's
+        # sealed-key tombstone. Without this, a straggler frame arriving
+        # after the seal re-armed interception with no live stream, and the
+        # next unrelated send (media follow-up, next-turn text) was wrongly
+        # converted to draft(final=true) on the tombstoned key — clearing
+        # the tombstone, re-opening a stream, and freezing it (the observed
+        # escalating-frozen-prefixes regression).
+        chat_key = str(chat_id)
+        if self._sealed_draft_by_chat.get(chat_key) == draft_id:
+            # Post-seal straggler: its content is already in the sealed
+            # message; report success, send nothing, arm nothing.
+            return SendResult(success=True)
+        self._open_draft_by_chat[chat_key] = draft_id
         try:
             result = await self._transport.send_outbound(
                 {
@@ -357,6 +368,10 @@ class RelayAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Convert the turn-final send into the sealing draft frame."""
         draft_id = self._open_draft_by_chat.pop(str(chat_id))
+        # Tombstone BEFORE the transport call (regression fix): whatever the
+        # ack says, this draft_id's stream must never be re-armed by a
+        # straggler frame — the connector-side tombstone handles its half.
+        self._sealed_draft_by_chat[str(chat_id)] = draft_id
         if self._transport is None:
             return SendResult(success=False, error="no transport")
         result = await self._transport.send_outbound(
