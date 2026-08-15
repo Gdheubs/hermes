@@ -1,0 +1,38 @@
+name: replay-economy-bench
+on:
+  pull_request:
+    paths:
+      - 'agent/deepseek_replay.py'
+      - 'agent/conversation_loop.py'
+      - 'agent/model_metadata.py'
+      - 'agent/message_sanitization.py'
+      - 'scripts/bench_replay_economy.py'
+      - 'tests/agent/test_replay_economy_benchmark.py'
+permissions:
+  contents: read
+
+concurrency:
+  group: replay-bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Pinned + cached like tests.yml: unpinned setup-uv fetches a 'latest'
+      # manifest per job (flake); enable-cache persists ~/.cache/uv across
+      # runs, keyed on the manifests, so uv sync re-resolves from a warm cache.
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+      - run: uv sync --locked --python 3.11 --extra dev
+      - run: uv cache prune --ci
+      - name: Compare PR economy vs base
+        run: .venv/bin/python scripts/bench_replay_economy.py --against "${{ github.event.pull_request.base.sha }}"
