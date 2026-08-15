@@ -4571,6 +4571,7 @@ DELEGATE_TASK_SCHEMA = {
             },
             "tasks": {
                 "type": "array",
+                "default": [],
                 "items": {
                     "type": "object",
                     "properties": {
