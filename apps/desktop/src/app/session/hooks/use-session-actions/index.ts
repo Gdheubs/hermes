@@ -1591,6 +1591,10 @@ export function useSessionActions({
       // slices so the DELETE is routed with the owning profile (#78836).
       const listed = findListedSession(storedSessionId)
       const removed = listed?.session
+      // Resolve ownership before the optimistic drop. A profile-less / uncached
+      // row falls through to getSession + upsertResolvedSession; doing that
+      // after dropListedSession can put the doomed row back into $sessions.
+      const profile = await resolveSessionMutationProfile(storedSessionId, removed)
       const wasSelected = selectedStoredSessionId === storedSessionId
       const closingRuntimeId = wasSelected ? activeSessionId : null
       const previousMessages = $messages.get()
@@ -1620,9 +1624,6 @@ export function useSessionActions({
           await requestGateway('session.close', { session_id: closingRuntimeId }).catch(() => undefined)
         }
 
-        // Resolve ownership before DELETE: a cache miss / profile-less row must
-        // not fall through to the primary backend (fake already_absent success).
-        const profile = await resolveSessionMutationProfile(storedSessionId, removed)
         await deleteSession(storedSessionId, profile)
         // Only after the RPC lands — the optimistic eviction above can roll
         // back, and a rolled-back row must keep its watermark/marker.
@@ -1700,6 +1701,7 @@ export function useSessionActions({
       // Same cross-slice ownership rule as delete (#78836 family).
       const listed = findListedSession(storedSessionId)
       const archived = listed?.session
+      const profile = await resolveSessionMutationProfile(storedSessionId, archived)
       const wasSelected = selectedStoredSessionId === storedSessionId
       const previousPinned = $pinnedSessionIds.get()
       // Pins are keyed on the durable lineage-root id; the stored id may be the
@@ -1718,7 +1720,6 @@ export function useSessionActions({
       }
 
       try {
-        const profile = await resolveSessionMutationProfile(storedSessionId, archived)
         await setSessionArchived(storedSessionId, true, profile)
         // Archived rows never reach the sidebar, so their persisted unread can
         // only rot. Dropped after the RPC so a failed archive keeps it.

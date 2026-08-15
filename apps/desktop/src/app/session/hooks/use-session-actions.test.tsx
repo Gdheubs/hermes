@@ -9,7 +9,7 @@ import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tre
 import { deleteSession, getAllSessionMessages, getLatestSessionMessages, getSession, type SessionInfo } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
-import { $activeGatewayProfile, $newChatProfile, ensureGatewayProfile } from '@/store/profile'
+import { $activeGatewayProfile, $newChatProfile, $profiles, ensureGatewayProfile } from '@/store/profile'
 import { $projectScope, $projectTree, ALL_PROJECTS } from '@/store/projects'
 import {
   $activeSessionId,
@@ -24,6 +24,7 @@ import {
   $newChatWorkspaceTarget,
   $resumeFailedSessionId,
   $selectedStoredSessionId,
+  $sessions,
   $turnStartedAt,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
@@ -68,6 +69,7 @@ vi.mock('@/store/profile', async importOriginal => ({
 }))
 
 const mockDeleteSession = vi.mocked(deleteSession)
+const mockGetSession = vi.mocked(getSession)
 
 vi.mock('@/components/pane-shell/tree/store', async importOriginal => ({
   ...(await importOriginal<Record<string, unknown>>()),
@@ -2528,5 +2530,29 @@ describe('removeSession profile routing (#78836)', () => {
     })
 
     expect(mockDeleteSession).toHaveBeenCalledWith('desk-1', 'default')
+  })
+
+  it('does not re-upsert a profile-less messaging row into recents after DELETE', async () => {
+    mockDeleteSession.mockResolvedValue({ ok: true })
+    $profiles.set([{ name: 'default' }, { name: 'winefox' }] as never)
+    $activeGatewayProfile.set('default')
+    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+    mockGetSession.mockResolvedValueOnce(
+      storedSession({ id: 'tg-1', profile: 'winefox', source: 'telegram' })
+    )
+    setMessagingSessions([storedSession({ id: 'tg-1', source: 'telegram', title: 'TG chat' })])
+    setSessions([])
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={vi.fn(async () => ({}) as never)} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.removeSession('tg-1')
+    })
+
+    expect(mockDeleteSession).toHaveBeenCalledWith('tg-1', 'winefox')
+    expect($messagingSessions.get()).toEqual([])
+    expect($sessions.get()).toEqual([])
   })
 })
