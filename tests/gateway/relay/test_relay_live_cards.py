@@ -248,3 +248,71 @@ class TestTaskCardOps:
     def test_task_card_legacy_empty_ops_not_fail_open(self):
         legacy, _ = _connected_adapter(supported_ops=())
         assert legacy.supports_native_task_cards() is False
+
+
+class TestInboundReplayDedupe:
+    """Finding #3 (live canary): connector replay of the original inbound
+    after a WS re-handshake must not re-run the turn."""
+
+    def _event(self, message_id="1700.100", chat_id="C1", text="hi"):
+        from types import SimpleNamespace
+        return SimpleNamespace(
+            message_id=message_id, chat_id=chat_id, text=text, media=None
+        )
+
+    def test_replayed_inbound_dropped(self, loop):
+        adapter, _ = _connected_adapter()
+        handled = []
+        adapter.handle_message = lambda e: _record(handled, e)
+        adapter._consume_prompt_response = lambda e: _false_coro()
+        adapter._localize_inbound_media = lambda e: _none_coro()
+        e = self._event()
+        loop.run_until_complete(adapter._on_inbound(e))
+        loop.run_until_complete(adapter._on_inbound(e))  # replay
+        assert len(handled) == 1
+
+    def test_distinct_messages_both_handled(self, loop):
+        adapter, _ = _connected_adapter()
+        handled = []
+        adapter.handle_message = lambda e: _record(handled, e)
+        adapter._consume_prompt_response = lambda e: _false_coro()
+        adapter._localize_inbound_media = lambda e: _none_coro()
+        loop.run_until_complete(adapter._on_inbound(self._event("1700.100")))
+        loop.run_until_complete(adapter._on_inbound(self._event("1700.200")))
+        assert len(handled) == 2
+
+    def test_missing_message_id_fails_open(self, loop):
+        adapter, _ = _connected_adapter()
+        handled = []
+        adapter.handle_message = lambda e: _record(handled, e)
+        adapter._consume_prompt_response = lambda e: _false_coro()
+        adapter._localize_inbound_media = lambda e: _none_coro()
+        e = self._event(message_id=None)
+        loop.run_until_complete(adapter._on_inbound(e))
+        loop.run_until_complete(adapter._on_inbound(e))
+        assert len(handled) == 2  # never dedupe without identity
+
+    def test_seen_set_bounded(self, loop):
+        adapter, _ = _connected_adapter()
+        adapter.handle_message = lambda e: _none_coro()
+        adapter._consume_prompt_response = lambda e: _false_coro()
+        adapter._localize_inbound_media = lambda e: _none_coro()
+        for i in range(600):
+            loop.run_until_complete(adapter._on_inbound(self._event(f"ts.{i}")))
+        assert len(adapter._seen_inbound) <= adapter._SEEN_INBOUND_MAX
+
+
+async def _false_coro():
+    return False
+
+
+async def _none_coro():
+    return None
+
+
+async def _record_coro(bucket, e):
+    bucket.append(e)
+
+
+def _record(bucket, e):
+    return _record_coro(bucket, e)
