@@ -479,10 +479,28 @@ def load_hermes_dotenv(
     - project `.env` acts as a dev fallback and only fills missing values when
       the user env exists.
     - if no user env exists, the project `.env` also overrides stale shell vars.
+    - routed multiplex profile loads hydrate external sources into the
+      profile's private secret snapshot without mutating the shared process
+      environment; unscoped startup loads retain the normal behavior above.
     """
-    loaded: list[Path] = []
-
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
+
+    # A multiplex gateway hosts every profile in one process.  While a routed
+    # profile-home override is active, copying that profile's .env into
+    # os.environ would expose its credentials to sibling turns and every
+    # subsequently spawned child.  An unscoped startup load remains process
+    # configuration and must retain the normal loading path.
+    # External secret sources still need their normal refresh path, so resolve
+    # them against the existing profile-local mapping instead of simply
+    # returning before all hydration work.
+    from agent.secret_scope import is_multiplex_active
+    from hermes_constants import get_hermes_home_override
+
+    if is_multiplex_active() and get_hermes_home_override() is not None:
+        hydrate_profile_secret_sources(home_path)
+        return []
+
+    loaded: list[Path] = []
     user_env = home_path / ".env"
     project_env_path = Path(project_env) if project_env else None
 
