@@ -370,6 +370,13 @@ class ProcessSession:
     command: str                                 # Original command string
     task_id: str = ""                           # Task/sandbox isolation key
     session_key: str = ""                       # Gateway session key (for reset protection)
+    # The exact UI session (WebUI/desktop tab) that commissioned this process.
+    # session_key is the durable conversation key and several live tabs can
+    # share one, so it cannot identify the originating window on its own.
+    # Delegated children replace session_key with their temporary child
+    # session but inherit HERMES_UI_SESSION_ID from the parent chat, so this
+    # stays pinned to the tab a user actually started the command from.
+    origin_ui_session_id: str = ""
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
     env_ref: Any = None                         # Reference to the environment object
@@ -629,6 +636,7 @@ class ProcessRegistry:
         notification = {
             "session_id": session.id,
             "session_key": session.session_key,
+            "origin_ui_session_id": session.origin_ui_session_id,
             "command": session.command,
             "type": "watch_match",
             "pattern": matched_pattern,
@@ -978,6 +986,7 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        origin_ui_session_id: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -1003,6 +1012,7 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            origin_ui_session_id=origin_ui_session_id,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
@@ -1216,6 +1226,7 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        origin_ui_session_id: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -1233,6 +1244,7 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            origin_ui_session_id=origin_ui_session_id,
             cwd=cwd,
             started_at=time.time(),
             env_ref=env,
@@ -1574,6 +1586,7 @@ class ProcessRegistry:
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
+                "origin_ui_session_id": session.origin_ui_session_id,
                 "command": session.command,
                 "exit_code": session.exit_code,
                 "completion_reason": session.completion_reason,
@@ -2519,6 +2532,7 @@ class ProcessRegistry:
                             "started_at": s.started_at,
                             "task_id": s.task_id,
                             "session_key": s.session_key,
+                            "origin_ui_session_id": s.origin_ui_session_id,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
                             "watcher_user_id": s.watcher_user_id,
@@ -2609,6 +2623,7 @@ class ProcessRegistry:
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
                 session_key=entry.get("session_key", ""),
+                origin_ui_session_id=entry.get("origin_ui_session_id", ""),
                 pid=pid,
                 host_start_time=recorded_start,
                 pid_scope=pid_scope,

@@ -10004,14 +10004,32 @@ def _wire_agent_terminal_output() -> None:
         return
 
     def _owner_sid_for_process(session) -> str:
+        # The tab that started the command is the exact owner. Several live
+        # tabs can share one durable session_key, so a bare key match hands
+        # background output to whichever of them happens to be first in
+        # iteration order. Prefer the recorded origin whenever it is still
+        # live, and fall back to key matching only for processes spawned
+        # before an origin was tracked (older checkpoints, CLI sessions).
+        origin_ui_session_id = str(getattr(session, "origin_ui_session_id", "") or "")
         session_key = str(getattr(session, "session_key", "") or "")
-        if not session_key:
-            return ""
         with _sessions_lock:
+            if origin_ui_session_id:
+                owner = _sessions.get(origin_ui_session_id)
+                if owner is not None and not owner.get("_finalized"):
+                    return origin_ui_session_id
+            if not session_key:
+                return ""
+            fallback = ""
             for sid, tui_session in _sessions.items():
-                if str(tui_session.get("session_key") or "") == session_key:
+                if str(tui_session.get("session_key") or "") != session_key:
+                    continue
+                if not tui_session.get("_finalized"):
                     return sid
-        return ""
+                # Remember a closed tab only as a last resort: routing to it
+                # drops the output, so any live tab on the same conversation
+                # is a better destination.
+                fallback = fallback or sid
+            return fallback
 
     def _emit_agent_terminal_output(session, chunk):
         _emit(
