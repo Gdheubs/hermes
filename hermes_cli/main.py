@@ -4245,7 +4245,7 @@ def _save_custom_provider(
 
     # Check if this URL is already saved — update model/context_length if so
     for entry in providers:
-        if isinstance(entry, dict) and entry.get("base_url", "").rstrip(
+        if isinstance(entry, dict) and (entry.get("base_url") or "").rstrip(
             "/"
         ) == base_url.rstrip("/"):
             changed = False
@@ -4315,7 +4315,7 @@ def _remove_custom_provider(config):
     for entry in providers:
         if isinstance(entry, dict):
             name = entry.get("name", "unnamed")
-            url = entry.get("base_url", "")
+            url = entry.get("base_url") or ""
             short_url = url.replace("https://", "").replace("http://", "").rstrip("/")
             choices.append(f"{name} ({short_url})")
         else:
