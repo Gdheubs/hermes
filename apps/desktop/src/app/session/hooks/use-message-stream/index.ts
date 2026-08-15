@@ -623,10 +623,23 @@ export function useMessageStream({
             return { ...settled, error: completionError, parts: settled.parts.filter(part => part.type !== 'text') }
           }
 
+          if (completionError) {
+            return {
+              ...settled,
+              error: completionError,
+              parts: completeOpenTimelineParts(replaceTextPart(settled.parts), occurredAt)
+            }
+          }
+
+          // Successful completion must drop any error retained from an earlier
+          // failed provider attempt on this same stream id (billing failover
+          // that recovered mid-turn — #87248). Spreading `settled` alone would
+          // keep `message.error` forever.
+          const { error: _clearedError, ...withoutError } = settled
+
           return {
-            ...settled,
-            parts: completeOpenTimelineParts(replaceTextPart(settled.parts), occurredAt),
-            ...(completionError ? { error: completionError } : {})
+            ...withoutError,
+            parts: completeOpenTimelineParts(replaceTextPart(settled.parts), occurredAt)
           }
         }
 
@@ -702,6 +715,14 @@ export function useMessageStream({
               //   `message.interim` and `message.complete` must not force an
               //   append of a duplicate bubble (#74560). This also closes the
               //   non-previewed tool-call gap from #63679.
+              nextMessages = prev.map((message, messageIndex) =>
+                messageIndex === index ? completeMessage(message) : message
+              )
+            } else if (existing.error && finalText && !completionError) {
+              // Recovered provider attempt: a successful terminal frame after
+              // a retained error on the same tail assistant (billing failover
+              // that completed cleanly — #87248). Settle in place so the
+              // sticky error bubble is replaced by the real reply.
               nextMessages = prev.map((message, messageIndex) =>
                 messageIndex === index ? completeMessage(message) : message
               )

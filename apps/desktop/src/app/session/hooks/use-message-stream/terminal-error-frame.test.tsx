@@ -116,4 +116,32 @@ describe('terminal error message.complete frames', () => {
     const bubble = lastAssistant()
     expect(bubble?.error).toBe('Error: something broke')
   })
+
+  it('clears a retained error when the same stream later completes successfully (#87248)', async () => {
+    await mountStream()
+    await start()
+    await delta('partial')
+
+    await completeWithError({
+      text: 'HTTP 402: You have depleted your monthly included credits',
+      error: 'HTTP 402: You have depleted your monthly included credits',
+      recoverable: true
+    })
+
+    expect(lastAssistant()?.error).toMatch(/HTTP 402/)
+
+    // In-place failover recovery lands a successful complete on the same stream.
+    await act(() =>
+      handleEvent!({
+        payload: { status: 'complete', text: 'Recovered answer from fallback' },
+        session_id: SID,
+        type: 'message.complete'
+      })
+    )
+
+    const bubble = lastAssistant()
+    expect(bubble?.error).toBeUndefined()
+    expect(chatMessageText(bubble!)).toBe('Recovered answer from fallback')
+    expect(getState().messages.filter(m => m.role === 'assistant')).toHaveLength(1)
+  })
 })
