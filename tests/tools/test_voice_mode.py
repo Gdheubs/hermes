@@ -209,7 +209,9 @@ class TestDetectAudioEnvironment:
                             lambda: (MagicMock(), MagicMock()))
 
         proc_version = tmp_path / "proc_version"
-        proc_version.write_text("Linux 5.15.0-microsoft-standard-WSL2")
+        proc_version.write_text(
+            "Linux 5.15.0-microsoft-standard-WSL2", encoding="utf-8"
+        )
 
         _real_open = open
         def _fake_open(f, *a, **kw):
@@ -1414,6 +1416,7 @@ class TestWSL2PowerShellFallback:
             return m
 
         with patch("tools.voice_mode._is_wsl2_env", return_value=True), \
+             patch("tools.voice_mode.platform.system", return_value="Linux"), \
              patch("tools.voice_mode._import_audio", side_effect=ImportError), \
              patch("tools.voice_mode.shutil.which",
                    side_effect=lambda x: f"/bin/{x}" if x in ("powershell.exe", "ffmpeg", "ffplay", "sh") else (x if x.startswith("/") else None)), \
@@ -1466,6 +1469,7 @@ class TestWSL2PowerShellFallback:
             return open(path, *args, **kwargs)
 
         with patch("builtins.open", side_effect=_fake_open), \
+             patch("tools.voice_mode.platform.system", return_value="Linux"), \
              patch("shutil.which", side_effect=lambda x: f"/bin/{x}" if x in ("powershell.exe", "ffmpeg", "ffplay") else None), \
              patch("subprocess.check_output", side_effect=_capture_check_output), \
              patch("subprocess.Popen", return_value=MagicMock(returncode=0, wait=lambda **k: 0)), \

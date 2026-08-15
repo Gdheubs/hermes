@@ -192,6 +192,7 @@ def fake_subprocess_run(monkeypatch: pytest.MonkeyPatch):
 # tests/docker/test_s6_profile_gateway_integration.py.
 
 
+@pytest.mark.linux_only
 def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     """Verifies the dirs + FIFO + modes the helper lays down."""
     import stat
@@ -340,7 +341,9 @@ def test_s6_log_run_creates_leaf_as_hermes_without_chown(
     mgr = S6ServiceManager(scandir=s6_scandir)
     mgr.register_profile_gateway("coder")
 
-    log_text = (s6_scandir / "gateway-coder" / "log" / "run").read_text()
+    log_text = (s6_scandir / "gateway-coder" / "log" / "run").read_text(
+        encoding="utf-8"
+    )
 
     assert not any(line.lstrip().startswith("chown ") for line in log_text.splitlines()), (
         "restartable log/run must not invoke chown on hermes-writable paths; "
@@ -487,5 +490,3 @@ def test_s6_log_run_never_invokes_chown_with_symlinked_log_dir(tmp_path) -> None
     assert after.st_gid == before.st_gid
     assert (victim / "marker").read_text(encoding="utf-8") == "keep"
     assert (victim / "lock").read_text(encoding="utf-8") == "keep-lock"
-
-
