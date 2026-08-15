@@ -40,7 +40,12 @@ import contextvars as _ctxvars
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from hermes_constants import get_hermes_home, display_hermes_home
+from hermes_constants import (
+    get_hermes_home,
+    display_hermes_home,
+    set_hermes_home_override,
+    reset_hermes_home_override,
+)
 from utils import atomic_write_text, is_truthy_value
 from hermes_cli.config import cfg_get
 from agent.skill_utils import (
@@ -155,6 +160,178 @@ import yaml
 HERMES_HOME = get_hermes_home()
 SKILLS_DIR = HERMES_HOME / "skills"
 _SKILLS_DIR_AT_IMPORT = SKILLS_DIR
+
+
+def _fleet_default_home() -> Path:
+    """Return the default fleet HERMES_HOME from any profile-scoped home."""
+    current = get_hermes_home()
+    try:
+        resolved = current.resolve()
+    except OSError:
+        resolved = current
+    if resolved.parent.name == "profiles":
+        return resolved.parent.parent
+    return resolved
+
+
+def _skill_owner_routing_policy() -> Dict[str, Any]:
+    """Read the fleet-level skill owner-routing policy from Default config.
+
+    The policy lives on Default because it governs cross-profile admission. A
+    specialist profile should not be able to silently weaken the fleet rule by
+    carrying a different local config. Generic Hermes installs remain unchanged
+    because the feature is disabled by default.
+    """
+    defaults = {
+        "enabled": False,
+        "require_owner_metadata": True,
+        "route_from_default": True,
+    }
+    try:
+        from hermes_cli.config import load_config
+
+        token = set_hermes_home_override(_fleet_default_home())
+        try:
+            cfg = load_config() or {}
+        finally:
+            reset_hermes_home_override(token)
+        raw = cfg_get(cfg, "skills", "owner_routing", default={})
+        if isinstance(raw, bool):
+            return {**defaults, "enabled": raw}
+        if not isinstance(raw, dict):
+            return defaults
+        return {
+            "enabled": is_truthy_value(raw.get("enabled"), default=False),
+            "require_owner_metadata": is_truthy_value(
+                raw.get("require_owner_metadata"), default=True
+            ),
+            "route_from_default": is_truthy_value(
+                raw.get("route_from_default"), default=True
+            ),
+        }
+    except Exception:
+        logger.debug("Could not resolve skill owner-routing policy", exc_info=True)
+        return defaults
+
+
+def _declared_skill_owner(content: str) -> Optional[str]:
+    """Return metadata.hermes.owner_profile from SKILL.md frontmatter."""
+    try:
+        frontmatter, _body = _parse_frontmatter(content)
+    except Exception:
+        return None
+    metadata = frontmatter.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    hermes_meta = metadata.get("hermes")
+    if not isinstance(hermes_meta, dict):
+        return None
+    raw = hermes_meta.get("owner_profile")
+    if raw is None:
+        return None
+    owner = str(raw).strip().lower()
+    return owner or None
+
+
+def _create_skill_with_owner_routing(
+    name: str, content: str, category: str = None
+) -> Dict[str, Any]:
+    """Create a skill in the profile that owns the encoded capability.
+
+    When fleet owner-routing is enabled, every new skill declares
+    ``metadata.hermes.owner_profile``. Default may route a create into the
+    declared registered profile. Named specialists may create only for
+    themselves; sideways writes are refused and must be handed off.
+    """
+    policy = _skill_owner_routing_policy()
+    if not policy.get("enabled"):
+        return _create_skill(name, content, category)
+
+    owner = _declared_skill_owner(content)
+    if not owner:
+        if policy.get("require_owner_metadata", True):
+            return {
+                "success": False,
+                "error": (
+                    "Skill owner routing is enabled. New skills must declare "
+                    "metadata.hermes.owner_profile in SKILL.md frontmatter. "
+                    "Choose the profile that owns the capability's primary "
+                    "output, not the profile that happened to discover it."
+                ),
+            }
+        return _create_skill(name, content, category)
+
+    try:
+        from hermes_cli.profiles import (
+            get_active_profile_name,
+            get_profile_dir,
+            normalize_profile_name,
+            profile_exists,
+            validate_profile_name,
+        )
+
+        owner = normalize_profile_name(owner)
+        validate_profile_name(owner)
+        active = normalize_profile_name(get_active_profile_name() or "default")
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": f"Could not resolve skill owner profile {owner!r}: {exc}",
+        }
+
+    if not profile_exists(owner):
+        return {
+            "success": False,
+            "error": f"Declared skill owner profile {owner!r} is not registered.",
+        }
+
+    if active == owner:
+        result = _create_skill(name, content, category)
+        if result.get("success"):
+            result["owner_profile"] = owner
+        return result
+
+    if active != "default":
+        return {
+            "success": False,
+            "error": (
+                f"Skill {name!r} declares owner_profile={owner!r}, but the active "
+                f"profile is {active!r}. Named specialists may not write skills "
+                "sideways into another specialist. Hand the skill creation to "
+                f"the {owner!r} profile."
+            ),
+            "owner_profile": owner,
+            "active_profile": active,
+        }
+
+    if not policy.get("route_from_default", True):
+        return {
+            "success": False,
+            "error": (
+                f"Skill {name!r} belongs to {owner!r}. Default owner-routing is "
+                "configured to refuse cross-profile creation; delegate the create."
+            ),
+            "owner_profile": owner,
+        }
+
+    target_home = get_profile_dir(owner)
+    token = set_hermes_home_override(target_home)
+    try:
+        result = _create_skill(name, content, category)
+    finally:
+        reset_hermes_home_override(token)
+    if result.get("success"):
+        result["owner_profile"] = owner
+        result["routed_from_profile"] = "default"
+        result["message"] = (
+            f"Skill {name!r} created in owner profile {owner!r} "
+            "(routed from default)."
+        )
+        result["hint"] = (
+            f"Further edits, patches, or supporting-file writes for {name!r} "
+            f"belong to profile {owner!r}; hand those mutations to that profile."
+        )
+    return result
 
 
 def _skills_dir() -> Path:
@@ -1578,7 +1755,7 @@ def skill_manage(
     if action == "create":
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
-        result = _create_skill(name, content, category)
+        result = _create_skill_with_owner_routing(name, content, category)
 
     elif action == "edit":
         if not content:
@@ -1611,54 +1788,78 @@ def skill_manage(
         result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
 
     if result.get("success"):
-        try:
-            from agent.prompt_builder import clear_skills_system_prompt_cache
-            clear_skills_system_prompt_cache(clear_snapshot=True)
-        except Exception:
-            pass
-        # Curator telemetry: bump patch_count on edit/patch/write_file (the actions
-        # that mutate an existing skill's guidance), drop the record on delete.
-        # Only mark a skill as agent-created when the background self-improvement
-        # review fork creates it — foreground `skill_manage(create)` calls are
-        # user-directed, and those skills belong to the user (the curator must
-        # not touch them). Best-effort; telemetry failures never break the tool.
-        try:
-            from tools.skill_usage import bump_patch, forget, record_created
-            from tools.skill_provenance import is_background_review
-            if action == "create":
-                record_created(
-                    name,
-                    agent_created=is_background_review(),
-                    task_id=task_id,
-                    session_id=session_id,
-                )
-            elif action in {"patch", "edit", "write_file", "remove_file"}:
-                bump_patch(
-                    name,
-                    action=action,
-                    task_id=task_id,
-                    session_id=session_id,
-                )
-            elif action == "delete":
-                # A recoverable curator archive (routed through archive_skill)
-                # keeps its usage record as STATE_ARCHIVED so `hermes curator
-                # status`/`restore` still see it. Only a hard delete forgets.
-                if not result.get("_archived"):
-                    forget(name)
-        except Exception:
-            pass
+        # A create routed from Default must keep its post-write bookkeeping in
+        # the same owner profile as the SKILL.md. Otherwise usage/provenance
+        # records are written to Default after _create_skill_with_owner_routing()
+        # restores the caller's HERMES_HOME, leaving the skill and its telemetry
+        # in different profiles.
+        post_write_token = None
+        if action == "create" and result.get("routed_from_profile") == "default":
+            try:
+                from hermes_cli.profiles import get_profile_dir
 
-        # Sync push hook (debounced, best-effort). Fires only AFTER the
-        # write gate passed (staged/unapproved writes never reach here -- the
-        # gate returns early above), so we never push un-reviewed content.
-        # Inert unless the access gate is open (the user is a Nous admin on the
-        # token), a sync base URL is configured, and the skill is opted into
-        # sync. Debounced so a burst of edits collapses to one push. Never
-        # raises -- an agent write must never block on sync (M1-C invariant).
+                owner = str(result.get("owner_profile") or "")
+                if owner:
+                    post_write_token = set_hermes_home_override(get_profile_dir(owner))
+            except Exception:
+                logger.warning(
+                    "Could not scope post-write hooks to routed skill owner %r",
+                    result.get("owner_profile"),
+                    exc_info=True,
+                )
+
         try:
-            _maybe_debounced_sync_push(name)
-        except Exception:
-            pass
+            try:
+                from agent.prompt_builder import clear_skills_system_prompt_cache
+                clear_skills_system_prompt_cache(clear_snapshot=True)
+            except Exception:
+                pass
+            # Curator telemetry: bump patch_count on edit/patch/write_file (the actions
+            # that mutate an existing skill's guidance), drop the record on delete.
+            # Only mark a skill as agent-created when the background self-improvement
+            # review fork creates it — foreground `skill_manage(create)` calls are
+            # user-directed, and those skills belong to the user (the curator must
+            # not touch them). Best-effort; telemetry failures never break the tool.
+            try:
+                from tools.skill_usage import bump_patch, forget, record_created
+                from tools.skill_provenance import is_background_review
+                if action == "create":
+                    record_created(
+                        name,
+                        agent_created=is_background_review(),
+                        task_id=task_id,
+                        session_id=session_id,
+                    )
+                elif action in {"patch", "edit", "write_file", "remove_file"}:
+                    bump_patch(
+                        name,
+                        action=action,
+                        task_id=task_id,
+                        session_id=session_id,
+                    )
+                elif action == "delete":
+                    # A recoverable curator archive (routed through archive_skill)
+                    # keeps its usage record as STATE_ARCHIVED so `hermes curator
+                    # status`/`restore` still see it. Only a hard delete forgets.
+                    if not result.get("_archived"):
+                        forget(name)
+            except Exception:
+                pass
+
+            # Sync push hook (debounced, best-effort). Fires only AFTER the
+            # write gate passed (staged/unapproved writes never reach here -- the
+            # gate returns early above), so we never push un-reviewed content.
+            # Inert unless the access gate is open (the user is a Nous admin on the
+            # token), a sync base URL is configured, and the skill is opted into
+            # sync. Debounced so a burst of edits collapses to one push. Never
+            # raises -- an agent write must never block on sync (M1-C invariant).
+            try:
+                _maybe_debounced_sync_push(name)
+            except Exception:
+                pass
+        finally:
+            if post_write_token is not None:
+                reset_hermes_home_override(post_write_token)
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -1687,6 +1888,11 @@ SKILL_MANAGE_SCHEMA = {
         "Create when: complex task succeeded (5+ calls), errors overcome, "
         "user-corrected approach worked, non-trivial workflow discovered, "
         "or user asks you to remember a procedure.\n"
+        "When fleet skill owner-routing is enabled, every new SKILL.md must "
+        "declare metadata.hermes.owner_profile. Choose the profile that owns "
+        "the capability's primary output, not whichever profile discovered the "
+        "need. Default may route the write into that owner automatically; named "
+        "specialists may not write sideways into another specialist.\n"
         "Update when: instructions stale/wrong, OS-specific failures, "
         "missing steps or pitfalls found during use. "
         "If you used a skill and hit issues not covered by it, patch it immediately.\n\n"

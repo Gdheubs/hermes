@@ -1959,6 +1959,15 @@ DEFAULT_CONFIG = {
         #                     never crammed into a chat bubble), apply with
         #                     /skills approve <id> or drop with /skills reject <id>.
         "write_approval": False,
+        # Fleet skill ownership routing. Off by default for generic Hermes
+        # installs. When enabled, new agent-created skills must declare
+        # metadata.hermes.owner_profile. Default may route creation into that
+        # registered profile; named specialists may create only for themselves.
+        "owner_routing": {
+            "enabled": False,
+            "require_owner_metadata": True,
+            "route_from_default": True,
+        },
     },
 
     # Curator — background skill maintenance.
