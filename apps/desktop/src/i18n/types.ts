@@ -1976,6 +1976,7 @@ export interface Translations {
     updateNow: string
     maybeLater: string
     moreChanges: (count: number) => string
+    copyFullLog: string
     manualTitle: string
     manualBody: string
     manualPickedUp: string
