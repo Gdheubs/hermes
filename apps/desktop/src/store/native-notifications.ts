@@ -2,9 +2,9 @@ import { atom } from 'nanostores'
 
 import { persistString, storedString } from '@/lib/storage'
 
-import { $gateway } from './gateway'
+import { gatewayForScope } from './gateway'
 import { withinNativeNotifyBaseline } from './notify-baseline'
-import { clearApprovalRequest } from './prompts'
+import { clearApprovalRequest, sessionApprovalRequest } from './prompts'
 import { $activeSessionId } from './session'
 
 // Native OS notifications (Electron `Notification`), separate from the in-app
@@ -226,15 +226,20 @@ export async function respondToApprovalAction(sessionId: null | string, actionId
     return
   }
 
-  const gateway = $gateway.get()
+  const approval = sessionApprovalRequest(sessionId).get()
+  const gateway = gatewayForScope(approval?.scope)
 
-  if (!gateway) {
+  if (!approval || !gateway) {
     return
   }
 
   try {
-    await gateway.request('approval.respond', { choice, session_id: sessionId ?? undefined })
-    clearApprovalRequest(sessionId)
+    await gateway.request('approval.respond', {
+      choice,
+      request_id: approval.requestId,
+      session_id: sessionId ?? undefined
+    })
+    clearApprovalRequest(sessionId, approval.requestId)
   } catch {
     // Leave the prompt parked so the user can still resolve it in-app.
   }

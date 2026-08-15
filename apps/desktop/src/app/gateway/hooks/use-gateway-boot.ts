@@ -18,6 +18,7 @@ import {
   closeSecondaryGateways,
   configureGatewayRegistry,
   ensureGatewayForProfile,
+  primaryGatewayScope,
   pruneSecondaryGateways,
   reconnectSecondaryGateways,
   reportPrimaryGatewayState,
@@ -269,7 +270,7 @@ export function useGatewayBoot({
         const profileKey = override ?? (await desktop.profile?.get?.())?.profile ?? ''
         const key = normalizeProfileKey(profileKey)
         $activeGatewayProfile.set(key)
-        setPrimaryGateway(gateway, key)
+        setPrimaryGateway(gateway, key, $connection.get()?.connectionId ?? null)
         void ensureGatewayForProfile(key)
       } catch {
         $activeGatewayProfile.set(normalizeProfileKey(override))
@@ -392,7 +393,11 @@ export function useGatewayBoot({
     const gateway = adoptedFromHmr ? survivor!.gateway : new HermesGateway()
 
     callbacksRef.current.onGatewayReady(gateway)
-    setPrimaryGateway(gateway, survivor?.profile ?? normalizeProfileKey($activeGatewayProfile.get()))
+    setPrimaryGateway(
+      gateway,
+      survivor?.profile ?? normalizeProfileKey($activeGatewayProfile.get()),
+      survivor?.connection?.connectionId ?? null
+    )
     // Secondary (background-profile) sockets funnel into the same handler.
     configureGatewayRegistry({ onEvent: event => callbacksRef.current.handleGatewayEvent(event) })
 
@@ -423,11 +428,16 @@ export function useGatewayBoot({
       }
     })
 
-    const sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
+    const offEvent = gateway.onEvent(event => {
+      const source = primaryGatewayScope()
 
-    const offEvent = gateway.onEvent(event =>
-      callbacksRef.current.handleGatewayEvent({ ...event, profile: sourceProfile })
-    )
+      callbacksRef.current.handleGatewayEvent({
+        ...event,
+        ...(source
+          ? { profile: source.profile, ...(source.connectionId ? { connectionId: source.connectionId } : {}) }
+          : {})
+      })
+    })
 
     // Wake signals: power resume (macOS/Windows), network coming back, and the
     // window regaining focus/visibility. Each nudges an immediate reconnect.
@@ -603,6 +613,7 @@ export function useGatewayBoot({
 
       const profile = survivor?.profile ?? $activeGatewayProfile.get()
       $activeGatewayProfile.set(profile)
+      setPrimaryGateway(gateway, profile, survivor?.connection?.connectionId ?? $connection.get()?.connectionId ?? null)
       void ensureGatewayForProfile(profile)
 
       // Mirror the current (already-open) socket state into the composer so the

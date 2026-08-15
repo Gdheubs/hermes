@@ -1,3 +1,4 @@
+import type { GatewaySourceScope } from '@hermes/shared'
 import { atom, computed, type ReadableAtom } from 'nanostores'
 
 import { $clarifyRequest, $clarifyRequests } from './clarify'
@@ -19,6 +20,8 @@ const keyFor = (sessionId: string | null | undefined): string => sessionId ?? ''
 
 interface KeyedPrompt {
   sessionId: string | null
+  /** Exact backend that raised this blocking request. */
+  scope?: GatewaySourceScope | null
 }
 
 interface PromptStore<T extends KeyedPrompt> {
@@ -126,7 +129,11 @@ export async function receiveApprovalRequest(gateway: ApprovalGateway | null, re
   }
 }
 
-export async function replayPendingApproval(gateway: ApprovalGateway | null, sessionId: string | null): Promise<void> {
+export async function replayPendingApproval(
+  gateway: ApprovalGateway | null,
+  sessionId: string | null,
+  scope?: GatewaySourceScope | null
+): Promise<void> {
   if (!gateway || !sessionId) {
     return
   }
@@ -151,6 +158,7 @@ export async function replayPendingApproval(gateway: ApprovalGateway | null, ses
     description: typeof pending.description === 'string' ? pending.description : 'dangerous command',
     requestId: pending.request_id,
     sessionId,
+    scope,
     smartDenied: pending.smart_denied === true
   })
 }

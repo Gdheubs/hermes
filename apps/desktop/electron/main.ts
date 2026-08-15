@@ -12506,28 +12506,50 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
 }
 
 ipcMain.handle('hermes:api', async (_event, request) => {
+  const rawConnectionId = request?.connectionId
+  const explicitConnectionId = typeof rawConnectionId === 'string' ? rawConnectionId.trim() : null
+
+  if (rawConnectionId !== undefined && rawConnectionId !== null && !explicitConnectionId) {
+    throw new Error('A source-bound API request requires a non-empty connection id.')
+  }
+
+  const hasExplicitConnection = explicitConnectionId !== null
   // Remote-profile session requests would otherwise hit the local primary off
   // each profile's on-disk state.db — fine for local profiles, but a remote
   // profile's sessions live on its remote host, so the UI's IDs 404 (or mutations
   // no-op) the moment they run there. Route reads + mutations to the remote.
-  const rerouted = await interceptSessionRequestForRemote(request)
+  const rerouted = hasExplicitConnection ? undefined : await interceptSessionRequestForRemote(request)
 
   if (rerouted !== undefined) {
     return rerouted
   }
 
-  const tornDownProfile = await prepareProfileDeleteRequest(request)
+  const tornDownProfile = hasExplicitConnection ? null : await prepareProfileDeleteRequest(request)
 
   const profile = request?.profile
   // After tearing down a backend for profile deletion, route to the primary
   // backend instead of spawning a fresh pool backend.  A freshly spawned
   // backend calls ensure_hermes_home() which recreates the profile directory,
   // defeating the deletion and leaving a zombie process.
-  const routeProfile = resolveRouteProfile(tornDownProfile, profile)
-  const connection = await ensureBackend(routeProfile)
+  const routeProfile = hasExplicitConnection ? profile : resolveRouteProfile(tornDownProfile, profile)
+
+  const connection = hasExplicitConnection
+    ? await ensureRegistryBackend(explicitConnectionId, routeProfile)
+    : await ensureBackend(routeProfile)
+
   const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
-  const requestPath = pathWithGlobalRemoteProfile(request.path, profile, profileRouteOptions(profile))
+  const requestPath = pathWithGlobalRemoteProfile(
+    request.path,
+    profile,
+    hasExplicitConnection
+      ? {
+          globalRemote: connection.sharedRemote === true,
+          primaryProfile: primaryProfileKey(),
+          profileRemoteOverride: false
+        }
+      : profileRouteOptions(profile)
+  )
 
   const url = `${connection.baseUrl}${requestPath}`
 
