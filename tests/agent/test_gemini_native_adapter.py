@@ -163,6 +163,36 @@ def test_translate_native_response_surfaces_reasoning_and_tool_calls():
     assert json.loads(choice.message.tool_calls[0].function.arguments) == {"q": "hermes"}
 
 
+@pytest.mark.parametrize(
+    "raw_reason",
+    ("MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"),
+)
+def test_translate_malformed_function_call_is_not_stop(raw_reason):
+    """Gemini tool-call-shape rejections must not fall through to stop.
+
+    An empty MALFORMED_FUNCTION_CALL candidate used to map to finish_reason
+    ``stop``, which the conversation loop treated as a successful empty
+    reply (#83869). These reasons are also not safety refusals.
+    """
+    from agent.gemini_native_adapter import translate_gemini_response
+
+    payload = {
+        "candidates": [
+            {
+                "content": {"parts": []},
+                "finishReason": raw_reason,
+            }
+        ],
+    }
+
+    response = translate_gemini_response(payload, model="gemini-2.5-flash")
+    choice = response.choices[0]
+    assert choice.finish_reason == "malformed_function_call"
+    assert choice.finish_reason != "stop"
+    assert choice.finish_reason != "content_filter"
+    assert not choice.message.tool_calls
+
+
 def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monkeypatch):
     from agent.gemini_native_adapter import GeminiNativeClient
 
@@ -288,6 +318,31 @@ def test_stream_event_translation_emits_tool_call_delta_with_stable_index():
     assert first[0].choices[0].delta.tool_calls[0].function.arguments == '{"q": "abc"}'
     assert second[0].choices[0].delta.tool_calls[0].function.arguments == ""
     assert first[-1].choices[0].finish_reason == "tool_calls"
+
+
+@pytest.mark.parametrize(
+    "raw_reason",
+    ("MALFORMED_FUNCTION_CALL", "UNEXPECTED_TOOL_CALL"),
+)
+def test_stream_malformed_function_call_is_not_stop(raw_reason):
+    from agent.gemini_native_adapter import translate_stream_event
+
+    event = {
+        "candidates": [
+            {
+                "content": {"parts": []},
+                "finishReason": raw_reason,
+            }
+        ],
+    }
+
+    chunks = translate_stream_event(
+        event, model="gemini-2.5-flash", tool_call_indices={}
+    )
+    assert chunks
+    assert chunks[-1].choices[0].finish_reason == "malformed_function_call"
+    assert chunks[-1].choices[0].finish_reason != "stop"
+    assert chunks[-1].choices[0].finish_reason != "content_filter"
 
 
 
