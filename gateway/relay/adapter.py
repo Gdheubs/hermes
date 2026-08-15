@@ -316,24 +316,35 @@ class RelayAdapter(BasePlatformAdapter):
             )
         if self._transport is None:
             return SendResult(success=False, error="no transport")
-        result = await self._transport.send_outbound(
-            {
-                "op": "draft",
-                "chat_id": chat_id,
-                "draft_id": draft_id,
-                "content": content,
-                "final": False,
-                "metadata": self._with_scope(chat_id, dict(metadata or {})),
-            },
-            platform=self._platform_by_chat.get(str(chat_id)),
-        )
+        # Audit fix (G-D1, deep audit 2026-08-15): arm seal-interception
+        # OPTIMISTICALLY, before the transport call, and KEEP it armed on
+        # failure. The outbound leg is at-most-once on the wire but its ack
+        # is lossy — a timeout/WS-drop "failure" often means the frame WAS
+        # delivered and the connector's stream is open. Disarming on such a
+        # false failure sent the turn-final as a plain send beside a live
+        # stream (orphan mid-word + duplicate final, intermittent). Arming
+        # is strictly safe: the connector seals a NON-existent stream as a
+        # single complete message (start+stop in one op), and a truly
+        # failed seal falls back to plain send at the interception sites.
+        self._open_draft_by_chat[str(chat_id)] = draft_id
+        try:
+            result = await self._transport.send_outbound(
+                {
+                    "op": "draft",
+                    "chat_id": chat_id,
+                    "draft_id": draft_id,
+                    "content": content,
+                    "final": False,
+                    "metadata": self._with_scope(chat_id, dict(metadata or {})),
+                },
+                platform=self._platform_by_chat.get(str(chat_id)),
+            )
+        except Exception as e:
+            # Ambiguous by definition (stale socket, mid-write drop): the
+            # frame may have been delivered. Keep interception armed.
+            return SendResult(success=False, error=f"draft transport error: {e}")
         if result.get("success"):
-            self._open_draft_by_chat[str(chat_id)] = draft_id
             return SendResult(success=True)
-        # A failed frame must NOT leave seal-interception armed: the stream
-        # consumer disables the draft transport for the run and the final
-        # answer must go out as a REAL send.
-        self._open_draft_by_chat.pop(str(chat_id), None)
         return SendResult(
             success=False, error=str(result.get("error") or "draft failed")
         )
