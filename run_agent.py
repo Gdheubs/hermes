@@ -1819,21 +1819,36 @@ class AIAgent:
         appended to the review prompt — e.g. "save the deploy workflow as a
         skill". The automatic post-turn triggers never set it.
         """
-        from agent.background_review import spawn_background_review_thread
+        from agent.background_review import (
+            finish_background_review_run,
+            prepare_background_review_run,
+            spawn_background_review_thread,
+        )
         from tools.thread_context import propagate_context_to_thread
-        target, _prompt = spawn_background_review_thread(
-            self,
-            messages_snapshot,
-            review_memory=review_memory,
-            review_skills=review_skills,
-            focus=focus,
-        )
-        # Carry the active profile into the review thread so MEMORY.md / skill
-        # review writes land in the right profile (#54937).
-        t = threading.Thread(
-            target=propagate_context_to_thread(target), daemon=True, name="bg-review"
-        )
-        t.start()
+
+        review_run = prepare_background_review_run(self)
+        if review_run is None:
+            return
+        try:
+            target, _prompt = spawn_background_review_thread(
+                self,
+                messages_snapshot,
+                review_memory=review_memory,
+                review_skills=review_skills,
+                focus=focus,
+                review_run=review_run,
+            )
+            # Carry the active profile into the review thread so MEMORY.md /
+            # skill review writes land in the right profile (#54937).
+            t = threading.Thread(
+                target=propagate_context_to_thread(target),
+                daemon=True,
+                name="bg-review",
+            )
+            t.start()
+        except Exception:
+            finish_background_review_run(self, review_run)
+            raise
 
     def _build_memory_write_metadata(
         self,
@@ -8050,6 +8065,32 @@ class AIAgent:
         moa_config: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        # A review deliberately shares this agent's session_id for prompt-cache
+        # parity. Fence review startup or interrupt an admitted request, then
+        # await that request's exit before opening any live-turn Relay or task
+        # instrumentation for the same session.
+        from agent.background_review import cancel_background_review_for_live_turn
+
+        if not cancel_background_review_for_live_turn(self):
+            failure = (
+                "Live turn not started: the prior background review did not "
+                "acknowledge cancellation before the bounded safety deadline. "
+                "Retry after the review has stopped."
+            )
+            existing_messages = conversation_history
+            if existing_messages is None:
+                existing_messages = getattr(self, "_session_messages", None)
+            return {
+                "final_response": failure,
+                "messages": list(existing_messages or []),
+                "completed": False,
+                "api_calls": 0,
+                "error": failure,
+                "failed": True,
+                "retryable": True,
+                "background_review_cancellation_timeout": True,
+            }
+
         from agent.aux_accounting import (
             reset_accounting_context,
             set_accounting_context,
