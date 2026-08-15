@@ -2718,6 +2718,7 @@ export const ja = defineLocale({
       statusError: 'エラー',
       statusRecovered: '回復しました',
       statusDone: '完了',
+      statusDispatched: 'ディスパッチ済み',
       statusUnverified: '未検証',
       statusPartial: '部分的',
       memoryWriteNoted: 'メモリへの書き込みを記録',

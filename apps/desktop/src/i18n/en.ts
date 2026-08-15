@@ -3049,6 +3049,7 @@ export const en: Translations = {
       statusError: 'Error',
       statusRecovered: 'Recovered',
       statusDone: 'Done',
+      statusDispatched: 'Dispatched',
       statusUnverified: 'Unverified',
       statusPartial: 'Partial',
       memoryWriteNoted: 'Memory write noted',

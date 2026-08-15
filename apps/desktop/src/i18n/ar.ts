@@ -2426,6 +2426,7 @@ export const ar = defineLocale({
       statusError: 'خطأ',
       statusRecovered: 'تم الاسترداد',
       statusDone: 'تم',
+      statusDispatched: 'تم الإرسال',
       statusUnverified: 'غير مُتحقَّق منه',
       statusPartial: 'جزئي',
       memoryWriteNoted: 'تم تسجيل كتابة الذاكرة',
