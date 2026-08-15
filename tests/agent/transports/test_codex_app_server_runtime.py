@@ -64,8 +64,6 @@ class TestMaybeApplyCodexAppServerRuntime:
         )
         assert got == "codex_app_server"
 
-
-
     @pytest.mark.parametrize(
         "provider",
         [
@@ -93,9 +91,6 @@ class TestMaybeApplyCodexAppServerRuntime:
 
 class TestCodexAppServerModule:
     """Module-surface tests for the JSON-RPC speaker. Don't require codex CLI."""
-
-
-
 
     def test_check_binary_handles_missing_executable(self) -> None:
         from agent.transports.codex_app_server import check_codex_binary
@@ -281,7 +276,9 @@ class TestSpawnEnvIsolation:
         assert captured["env"]["TMP"] == expected_tmp
         assert captured["env"]["TEMP"] == expected_tmp
 
-    def test_kanban_network_access_requires_explicit_opt_in(self, monkeypatch, tmp_path):
+    def test_kanban_network_access_requires_explicit_opt_in(
+        self, monkeypatch, tmp_path
+    ):
         import subprocess
         from agent.transports import codex_app_server as cas
 
@@ -302,14 +299,14 @@ class TestSpawnEnvIsolation:
         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_network")
         monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
 
-        client = cas.CodexAppServerClient(
-            codex_bin="codex", kanban_network_access=True
-        )
+        client = cas.CodexAppServerClient(codex_bin="codex", kanban_network_access=True)
         client._closed = True
 
         assert "sandbox_workspace_write.network_access=true" in captured["cmd"]
 
-    def test_git_common_dir_is_never_granted_to_non_worktree(self, monkeypatch, tmp_path):
+    def test_git_common_dir_is_never_granted_to_non_worktree(
+        self, monkeypatch, tmp_path
+    ):
         from agent.transports import codex_app_server as cas
 
         workspace = tmp_path / "workspace"
@@ -370,6 +367,137 @@ class TestSpawnEnvIsolation:
         nested = worktree / "nested"
         nested.mkdir()
         env["HERMES_KANBAN_WORKSPACE"] = str(nested)
+        assert cas._kanban_git_common_dir(env) is None
+
+    def test_git_common_dir_allows_real_separate_git_dir(self, tmp_path):
+        import os
+        import subprocess
+
+        from agent.transports import codex_app_server as cas
+
+        repo = tmp_path / "repo"
+        common_dir = tmp_path / "repo-metadata.git"
+        worktree = tmp_path / "explicit-target"
+        subprocess.run(
+            [
+                "git",
+                "init",
+                "-b",
+                "main",
+                "--separate-git-dir",
+                str(common_dir),
+                str(repo),
+            ],
+            check=True,
+        )
+        (repo / "README.md").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "base",
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "worktree",
+                "add",
+                "-b",
+                "wt/explicit",
+                str(worktree),
+            ],
+            check=True,
+        )
+        env = {
+            "HERMES_KANBAN_WORKSPACE": str(worktree),
+            "HERMES_KANBAN_WORKSPACE_KIND": "worktree",
+        }
+
+        assert cas._kanban_git_common_dir(env) == os.path.realpath(common_dir)
+
+    @pytest.mark.parametrize(
+        "case",
+        (
+            "symlink_marker",
+            "symlink_commondir",
+            "symlink_backlink",
+            "foreign_backlink",
+            "noncanonical_common",
+        ),
+    )
+    def test_git_common_dir_rejects_untrusted_worktree_metadata(
+        self, monkeypatch, tmp_path, case
+    ):
+        """Workspace-controlled metadata cannot widen Codex writable roots."""
+        import subprocess
+
+        from agent.transports import codex_app_server as cas
+
+        workspace = tmp_path / "explicit-target"
+        common_dir = tmp_path / "repo" / ".git"
+        git_dir = common_dir / "worktrees" / "slot"
+        marker = workspace / ".git"
+        workspace.mkdir()
+        git_dir.mkdir(parents=True)
+        marker.write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+        (git_dir / "commondir").write_text("../..\n", encoding="utf-8")
+        (git_dir / "gitdir").write_text(f"{marker}\n", encoding="utf-8")
+
+        if case == "symlink_marker":
+            marker_target = tmp_path / "marker-target"
+            marker_target.write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+            marker.unlink()
+            marker.symlink_to(marker_target)
+        elif case == "symlink_commondir":
+            common_target = tmp_path / "commondir-target"
+            common_target.write_text("../..\n", encoding="utf-8")
+            (git_dir / "commondir").unlink()
+            (git_dir / "commondir").symlink_to(common_target)
+        elif case == "symlink_backlink":
+            backlink_target = tmp_path / "backlink-target"
+            backlink_target.write_text(f"{marker}\n", encoding="utf-8")
+            (git_dir / "gitdir").unlink()
+            (git_dir / "gitdir").symlink_to(backlink_target)
+        elif case == "foreign_backlink":
+            foreign_marker = tmp_path / "foreign" / ".git"
+            foreign_marker.parent.mkdir()
+            foreign_marker.write_text("gitdir: ignored\n", encoding="utf-8")
+            (git_dir / "gitdir").write_text(f"{foreign_marker}\n", encoding="utf-8")
+        elif case == "noncanonical_common":
+            common_dir = tmp_path / "home"
+            git_dir = common_dir / "worktrees" / "slot"
+            git_dir.mkdir(parents=True)
+            marker.write_text(f"gitdir: {git_dir}\n", encoding="utf-8")
+            (git_dir / "commondir").write_text("../..\n", encoding="utf-8")
+            (git_dir / "gitdir").write_text(f"{marker}\n", encoding="utf-8")
+
+        monkeypatch.setattr(
+            cas.subprocess,
+            "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(
+                args=args[0],
+                returncode=0,
+                stdout=f"{workspace}\n{common_dir}\n",
+                stderr="",
+            ),
+        )
+        env = {
+            "HERMES_KANBAN_WORKSPACE": str(workspace),
+            "HERMES_KANBAN_WORKSPACE_KIND": "worktree",
+        }
+
         assert cas._kanban_git_common_dir(env) is None
 
 
@@ -435,9 +563,14 @@ class TestSpawnEnvSecretStripping:
 
         env = self._capture_spawn_env(monkeypatch)
         for var in (
-            "GH_TOKEN", "TELEGRAM_BOT_TOKEN", "MODAL_TOKEN_SECRET",
-            "HERMES_DASHBOARD_SESSION_TOKEN", "AUXILIARY_VISION_API_KEY",
-            "GATEWAY_RELAY_SECRET", "GATEWAY_RELAY_ID", "GATEWAY_RELAY_DELIVERY_KEY",
+            "GH_TOKEN",
+            "TELEGRAM_BOT_TOKEN",
+            "MODAL_TOKEN_SECRET",
+            "HERMES_DASHBOARD_SESSION_TOKEN",
+            "AUXILIARY_VISION_API_KEY",
+            "GATEWAY_RELAY_SECRET",
+            "GATEWAY_RELAY_ID",
+            "GATEWAY_RELAY_DELIVERY_KEY",
         ):
             assert var not in env, f"{var} leaked into codex app-server spawn env"
 
@@ -447,4 +580,3 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("OPENAI_API_KEY", "sk-codex-needs-this")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("OPENAI_API_KEY") == "sk-codex-needs-this"
-
