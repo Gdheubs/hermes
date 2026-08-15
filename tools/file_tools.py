@@ -2,6 +2,7 @@
 """File Tools Module - LLM agent file manipulation tools."""
 
 import base64
+import contextvars
 import errno
 import json
 import logging
@@ -1621,6 +1622,11 @@ def _special_file_kind(path) -> str | None:
     return "a special (non-regular) file"
 
 
+_read_abandon_event: contextvars.ContextVar[threading.Event | None] = (
+    contextvars.ContextVar("read_file_abandon_event", default=None)
+)
+
+
 def _read_file_tool_impl(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
     try:
@@ -1849,6 +1855,13 @@ def _read_file_tool_impl(path: str, offset: int = 1, limit: int = 2000, task_id:
         result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
 
+        abandon_event = _read_abandon_event.get()
+        if abandon_event is not None and abandon_event.is_set():
+            # The caller already returned a timeout. Do not publish a late read
+            # into dedup/staleness registries that refer to content the model
+            # never received.
+            return tool_error("read_file result abandoned after timeout")
+
         # ── Populate negative-result cache on not-found ───────────────
         # _suggest_similar_files returns ReadResult(error="File not found: ..").
         # Cache the JSON we'd return so a retry skips the parent-dir walk.
@@ -1923,6 +1936,17 @@ def _read_file_tool_impl(path: str, offset: int = 1, limit: int = 2000, task_id:
 
         # ── Track for consecutive-loop detection ──────────────────────
         read_key = ("read", path, offset, limit)
+
+        # Never perform filesystem I/O while holding the global tracker lock:
+        # a cloud-provider metadata stall would otherwise poison bookkeeping
+        # for every later read/write in this process.
+        try:
+            _mtime_now = os.path.getmtime(resolved_str)
+        except OSError:
+            _mtime_now = None
+        if abandon_event is not None and abandon_event.is_set():
+            return tool_error("read_file result abandoned after timeout")
+
         with _read_tracker_lock:
             # Ensure "dedup" / "dedup_hits" keys exist (backward compat with
             # old tracker state from pre-dedup-guard sessions).
@@ -1942,16 +1966,10 @@ def _read_file_tool_impl(path: str, offset: int = 1, limit: int = 2000, task_id:
                 task_data["consecutive"] = 1
             count = task_data["consecutive"]
 
-            # Store mtime at read time for two purposes:
-            # 1. Dedup: skip identical re-reads of unchanged files.
-            # 2. Staleness: warn on write/patch if the file changed since
-            #    the agent last read it (external edit, concurrent agent, etc.).
-            try:
-                _mtime_now = os.path.getmtime(resolved_str)
+            # Store mtime at read time for dedup and write-staleness checks.
+            if _mtime_now is not None:
                 task_data["dedup"][dedup_key] = _mtime_now
                 task_data.setdefault("read_timestamps", {})[resolved_str] = _mtime_now
-            except OSError:
-                pass  # Can't stat — skip tracking for this entry
 
             # Bound the per-task containers so a long CLI session doesn't
             # accumulate megabytes of dict/set state.  See _cap_read_tracker_data.
@@ -1964,6 +1982,8 @@ def _read_file_tool_impl(path: str, offset: int = 1, limit: int = 2000, task_id:
         # truncated (large file with more content than limit covered).
         # Outside the _read_tracker_lock so the registry's own locking
         # isn't nested under ours.
+        if abandon_event is not None and abandon_event.is_set():
+            return tool_error("read_file result abandoned after timeout")
         try:
             _partial = (offset > 1) or bool(result_dict.get("truncated"))
             file_state.record_read(task_id, resolved_str, partial=_partial)
@@ -2019,25 +2039,30 @@ def read_file_tool(
         return _read_file_tool_impl(path, offset, limit, task_id)
 
     import concurrent.futures
-    import contextvars
-
     from tools.daemon_pool import DaemonThreadPoolExecutor
 
     executor = DaemonThreadPoolExecutor(max_workers=1)
     context = contextvars.copy_context()
+
+    abandon_event = threading.Event()
+
+    def _run() -> str:
+        token = _read_abandon_event.set(abandon_event)
+        try:
+            return _read_file_tool_impl(path, offset, limit, task_id)
+        finally:
+            _read_abandon_event.reset(token)
+
     future = executor.submit(
         context.run,
-        _read_file_tool_impl,
-        path,
-        offset,
-        limit,
-        task_id,
+        _run,
     )
     timed_out = False
     try:
         return future.result(timeout=timeout_s)
     except concurrent.futures.TimeoutError:
         timed_out = True
+        abandon_event.set()
         future.cancel()
         logger.warning("read_file timed out after %.1fs for %s", timeout_s, path)
         return tool_error(
