@@ -300,6 +300,51 @@ export function ModelCatalogMenu({
     }
   }
 
+  // ── Keyboard path into a row's edit submenu ───────────────────────────────
+  // Rows are HIGHLIGHTED, not DOM-focused (focus stays in the search input so
+  // typing keeps working), which is why Radix's own ArrowRight-on-the-trigger
+  // never fires. ArrowRight therefore hands focus to the highlighted trigger
+  // and replays the key there: from that point Radix owns everything — opening
+  // the sub, focusing its first item, and returning focus to the trigger on
+  // Escape/ArrowLeft. `onOpenChange` below finishes the round trip by putting
+  // focus back in the search field.
+  const searchRef = useRef<HTMLInputElement>(null)
+  const keyboardSubRef = useRef(false)
+
+  const refocusSearch = () => requestAnimationFrame(() => searchRef.current?.focus())
+
+  const openActiveSubmenu = (): boolean => {
+    const trigger = listRef.current?.querySelector<HTMLElement>('[data-kb-active]')
+
+    if (!trigger) {
+      return false
+    }
+
+    keyboardSubRef.current = true
+    trigger.focus()
+    trigger.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'ArrowRight' }))
+
+    // If the sub did not open (a row without options, an interrupted open),
+    // don't strand focus on a trigger where typing no longer reaches search.
+    requestAnimationFrame(() => {
+      if (trigger.getAttribute('data-state') !== 'open') {
+        keyboardSubRef.current = false
+        searchRef.current?.focus()
+      }
+    })
+
+    return true
+  }
+
+  // Only a keyboard-opened sub owes focus back to the search field; during
+  // mouse use focus never left it, and hover open/close fires constantly.
+  const handleSubOpenChange = (open: boolean) => {
+    if (!open && keyboardSubRef.current) {
+      keyboardSubRef.current = false
+      refocusSearch()
+    }
+  }
+
   // Rows are hover-selectable, so they go inert with the pointer.
   const quietRows = pointerQuiet && 'pointer-events-none'
 
@@ -318,6 +363,13 @@ export function ModelCatalogMenu({
             event.preventDefault()
             event.stopPropagation()
             commitKbRow()
+          } else if (event.key === 'ArrowRight' && caretAtEnd(event.currentTarget)) {
+            // Claimed only with the caret parked at the end of the query, where
+            // ArrowRight has nothing left to do as a text cursor.
+            if (openActiveSubmenu()) {
+              event.preventDefault()
+              event.stopPropagation()
+            }
           }
         }}
         onValueChange={value => {
@@ -325,6 +377,7 @@ export function ModelCatalogMenu({
           setKbOverride(null)
         }}
         placeholder={copy.search}
+        ref={searchRef}
         value={search}
       />
 
@@ -416,7 +469,10 @@ export function ModelCatalogMenu({
 
                     // Clicking the row commits the model and closes; the edit
                     // submenu (reasoning/fast) is reached by HOVER, so you can
-                    // tweak those without the click dismissing everything.
+                    // tweak those without the click dismissing everything. The
+                    // trailing caret is what advertises that submenu — without
+                    // it the row's effort badge reads as a fixed model+effort
+                    // combo rather than an editable setting.
                     const activate = () => {
                       if (!isCurrent) {
                         void selectFamily(family, group.provider)
@@ -426,9 +482,11 @@ export function ModelCatalogMenu({
                     }
 
                     return (
-                      <DropdownMenuSub key={`${group.provider.slug}:${family.id}`}>
+                      <DropdownMenuSub
+                        key={`${group.provider.slug}:${family.id}`}
+                        onOpenChange={handleSubOpenChange}
+                      >
                         <DropdownMenuSubTrigger
-                          hideChevron
                           onClick={activate}
                           onKeyDown={event => {
                             if (event.key === 'Enter' || event.key === ' ') {
@@ -518,6 +576,14 @@ export function ModelCatalogMenu({
 
 /** Re-exported so callers building a footer row match the catalog's rows. */
 export { dropdownMenuRow }
+
+/** True when the text cursor sits at the very end with nothing selected — the
+ *  only state where ArrowRight is free for the menu to claim. */
+function caretAtEnd(input: HTMLInputElement): boolean {
+  const { selectionEnd, selectionStart, value } = input
+
+  return selectionStart === value.length && selectionEnd === value.length
+}
 
 // Collapsed we show the user's chosen models (or the curated default); typing
 // spans every available model so anything is reachable past the cut. A search
