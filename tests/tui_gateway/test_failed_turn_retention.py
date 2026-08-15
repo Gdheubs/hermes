@@ -241,6 +241,51 @@ def test_merge_interrupted_api_history_fingerprint_cases():
     unrelated = [{"role": "user", "content": "brand new"}]
     assert server._merge_interrupted_api_history(live, unrelated) == live
 
+    # A new compression summary in the returned transcript is a rewrite
+    # even though run_conversation never sets result["compressed"].
+    compacted_with_marker = [
+        {
+            "role": "user",
+            "content": "summary of prior turns",
+            "_compressed_summary": True,
+        }
+    ]
+    assert server._interrupted_result_allows_rewrite(
+        live, compacted_with_marker, {"turn_exit_reason": "interrupted_during_api_call"}
+    )
+    assert (
+        server._merge_interrupted_api_history(
+            live,
+            compacted_with_marker,
+            allow_rewrite=server._interrupted_result_allows_rewrite(
+                live, compacted_with_marker, {}
+            ),
+        )
+        == compacted_with_marker
+    )
+
+    # An older summary already on the live transcript is not a new rewrite
+    # — that is the stale-snapshot case from #78010.
+    live_already_compacted = [
+        {
+            "role": "user",
+            "content": "old summary",
+            "_compressed_summary": True,
+        },
+        {"role": "user", "content": "later question"},
+        {"role": "assistant", "content": "later answer"},
+    ]
+    stale_with_old_summary = [
+        {
+            "role": "user",
+            "content": "old summary",
+            "_compressed_summary": True,
+        }
+    ]
+    assert not server._interrupted_result_allows_rewrite(
+        live_already_compacted, stale_with_old_summary, {}
+    )
+
 
 # ── Returned-error path (run_conversation returns an error result) ────
 

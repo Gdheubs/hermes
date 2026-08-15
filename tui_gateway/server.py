@@ -7668,6 +7668,35 @@ def _merge_interrupted_api_history(
     return list(returned_history)
 
 
+def _interrupted_result_allows_rewrite(
+    live_history: list[dict],
+    returned_history: list[dict],
+    result: dict,
+) -> bool:
+    """True when an interrupted result is a legitimate compaction rewrite.
+
+    ``run_conversation`` does not currently set ``compressed`` /
+    ``context_compressed`` / ``history_rewrite`` on its result dict.  Detect a
+    *new* ``_compressed_summary`` row in the returned transcript instead.
+    An older summary that already exists in the live history must not flip
+    this on — that is the stale-snapshot case from #78010.
+    """
+    if result.get("compressed") or result.get("context_compressed") or result.get("history_rewrite"):
+        return True
+
+    live_summaries = {
+        _message_fingerprint(msg)
+        for msg in live_history
+        if isinstance(msg, dict) and msg.get("_compressed_summary")
+    }
+    return any(
+        isinstance(msg, dict)
+        and msg.get("_compressed_summary")
+        and _message_fingerprint(msg) not in live_summaries
+        for msg in returned_history
+    )
+
+
 def _fail_inflight_turn(session: dict, error: Any) -> None:
     """Mark the in-flight turn terminal-error but keep it replayable.
 
@@ -10799,14 +10828,15 @@ def _run_prompt_submit(
                                 # appends that forgot to bump history_version
                                 # still cannot be clobbered by a stale result.
                                 # Fingerprint equality, not object identity.
-                                allow_rewrite = bool(
-                                    result.get("compressed")
-                                    or result.get("context_compressed")
-                                    or result.get("history_rewrite")
+                                returned_messages = result["messages"]
+                                allow_rewrite = _interrupted_result_allows_rewrite(
+                                    session.get("history") or [],
+                                    returned_messages,
+                                    result,
                                 )
                                 session["history"] = _merge_interrupted_api_history(
                                     session.get("history") or [],
-                                    result["messages"],
+                                    returned_messages,
                                     allow_rewrite=allow_rewrite,
                                 )
                             else:
