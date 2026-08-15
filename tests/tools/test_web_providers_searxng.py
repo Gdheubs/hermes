@@ -58,9 +58,10 @@ class TestSearXNGSearchProviderSearch:
     def test_happy_path_returns_normalized_results(self, monkeypatch):
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
         from plugins.web.searxng.provider import SearXNGWebSearchProvider
-        mock_resp = self._make_mock_response(self._SAMPLE_RESPONSE)
-
-        with patch("httpx.get", return_value=mock_resp):
+        with patch(
+            "plugins.web.searxng.provider._httpx_json_request",
+            return_value=self._SAMPLE_RESPONSE,
+        ):
             result = SearXNGWebSearchProvider().search("test query", limit=5)
 
         assert result["success"] is True
@@ -82,9 +83,10 @@ class TestSearXNGSearchProviderSearch:
                 {"title": "Mid",  "url": "https://mid.example.com",  "content": "", "score": 0.5},
             ]
         }
-        mock_resp = self._make_mock_response(unordered)
-
-        with patch("httpx.get", return_value=mock_resp):
+        with patch(
+            "plugins.web.searxng.provider._httpx_json_request",
+            return_value=unordered,
+        ):
             result = SearXNGWebSearchProvider().search("query", limit=5)
 
         assert result["success"] is True
@@ -97,17 +99,32 @@ class TestSearXNGSearchProviderSearch:
         """Base URL trailing slash should not produce double-slash in endpoint."""
         monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080/")
         from plugins.web.searxng.provider import SearXNGWebSearchProvider
-        mock_resp = self._make_mock_response({"results": []})
-
         calls = []
-        def capture_get(url, **kwargs):
+        def capture_request(method, url, **kwargs):
+            assert method == "GET"
             calls.append(url)
-            return mock_resp
+            return {"results": []}
 
-        with patch("httpx.get", side_effect=capture_get):
+        with patch(
+            "plugins.web.searxng.provider._httpx_json_request",
+            side_effect=capture_request,
+        ):
             SearXNGWebSearchProvider().search("query", limit=5)
 
         assert calls[0] == "http://localhost:8080/search", f"Got: {calls[0]}"
+
+    def test_oversized_response_returns_failure(self, monkeypatch):
+        monkeypatch.setenv("SEARXNG_URL", "http://localhost:8080")
+        from plugins.web._bounded_json import WebProviderResponseTooLarge
+        from plugins.web.searxng.provider import SearXNGWebSearchProvider
+
+        with patch(
+            "plugins.web.searxng.provider._httpx_json_request",
+            side_effect=WebProviderResponseTooLarge("response exceeded cap"),
+        ):
+            result = SearXNGWebSearchProvider().search("query", limit=5)
+
+        assert result == {"success": False, "error": "response exceeded cap"}
 
 
 # ---------------------------------------------------------------------------

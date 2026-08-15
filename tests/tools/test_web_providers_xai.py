@@ -15,6 +15,9 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock, patch
 
+import httpx
+import pytest
+
 
 def _creds(api_key: str = "xai-test-key", base_url: str = "https://api.x.ai/v1") -> dict:
     return {"provider": "xai", "api_key": api_key, "base_url": base_url}
@@ -26,6 +29,18 @@ def _mock_resp(json_data, status_code: int = 200):
     m.json.return_value = json_data
     m.raise_for_status = MagicMock()
     return m
+
+
+@pytest.fixture(autouse=True)
+def _route_streams_through_existing_httpx_mocks(monkeypatch):
+    from plugins.web.xai import provider as xai_provider
+
+    def legacy_mock_adapter(method, url, **kwargs):
+        response = httpx.post(url, **kwargs)
+        response.raise_for_status()
+        return response.json()
+
+    monkeypatch.setattr(xai_provider, "_httpx_json_request", legacy_mock_adapter)
 
 
 def _responses_payload(text: str, annotations=None, citations=None) -> dict:
@@ -294,6 +309,34 @@ class TestXAIProviderSearchErrors:
         assert result["success"] is False
         assert "cannot both be set" in result["error"]
         posted.assert_not_called()
+
+    def test_oversized_success_returns_failure(self):
+        from plugins.web import _bounded_json
+        from plugins.web.xai import provider as xai_provider
+
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        response.iter_raw.return_value = [b"x" * (2 * 1024 * 1024 + 1)]
+        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds()), \
+             patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
+             patch.object(xai_provider, "_httpx_json_request", _bounded_json.httpx_json_request), \
+             patch("httpx.stream", return_value=response):
+            result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
+
+        assert result["success"] is False
+        assert "exceeded" in result["error"]
+
+    def test_malformed_success_returns_parse_failure(self):
+        from plugins.web.xai import provider as xai_provider
+
+        with patch.object(xai_provider, "resolve_xai_http_credentials", return_value=_creds()), \
+             patch.object(xai_provider, "_load_xai_web_config", return_value={}), \
+             patch.object(xai_provider, "_httpx_json_request", side_effect=json.JSONDecodeError("bad", "x", 0)):
+            result = xai_provider.XAIWebSearchProvider().search("q", limit=5)
+
+        assert result["success"] is False
+        assert "parse" in result["error"]
 
 
     def test_401_on_oauth_path_triggers_force_refresh_and_retry(self):

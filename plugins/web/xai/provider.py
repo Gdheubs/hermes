@@ -38,6 +38,10 @@ import re
 from typing import Any, Dict, List, Optional
 
 from agent.web_search_provider import WebSearchProvider
+from plugins.web._bounded_json import (
+    WebProviderResponseTooLarge,
+    httpx_json_request as _httpx_json_request,
+)
 from tools.xai_http import (
     has_xai_credentials,
     hermes_xai_user_agent,
@@ -251,16 +255,16 @@ class XAIWebSearchProvider(WebSearchProvider):
         # Env-var (`XAI_API_KEY`) credentials skip the retry entirely — we
         # can't refresh those and an immediate retry would just burn quota.
         is_oauth_path = (creds.get("provider") == "xai-oauth")
-        resp = None
+        data = None
         for attempt in range(2):
             try:
-                resp = httpx.post(
+                data = _httpx_json_request(
+                    "POST",
                     f"{base_url}/responses",
                     headers=headers,
                     json=payload,
                     timeout=timeout,
                 )
-                resp.raise_for_status()
                 break
             except httpx.HTTPStatusError as exc:
                 status = exc.response.status_code if exc.response is not None else 0
@@ -299,19 +303,19 @@ class XAIWebSearchProvider(WebSearchProvider):
             except httpx.RequestError as exc:
                 logger.warning("xAI web search request error: %s", exc)
                 return {"success": False, "error": f"Could not reach xAI: {exc}"}
+            except WebProviderResponseTooLarge as exc:
+                logger.warning("xAI web search response too large: %s", exc)
+                return {"success": False, "error": str(exc)}
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                logger.warning("xAI web search bad JSON: %s", exc)
+                return {
+                    "success": False,
+                    "error": "Could not parse xAI Responses API reply as JSON",
+                }
 
-        if resp is None:
+        if data is None:
             # Defensive — both attempts somehow exited the loop without resp.
             return {"success": False, "error": "xAI web search produced no response"}
-
-        try:
-            data = resp.json()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("xAI web search bad JSON: %s", exc)
-            return {
-                "success": False,
-                "error": "Could not parse xAI Responses API reply as JSON",
-            }
 
         # xAI's Responses surface sometimes returns HTTP 200 with an error
         # envelope (model overloaded, content-policy refusal, etc.). Without

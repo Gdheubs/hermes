@@ -61,7 +61,10 @@ class TestBraveFreeProviderSearch:
         monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "BSAkey123")
         from plugins.web.brave_free.provider import BraveFreeWebSearchProvider
 
-        with patch("httpx.get", return_value=self._mock_resp(self._SAMPLE_RESPONSE)):
+        with patch(
+            "plugins.web.brave_free.provider._httpx_json_request",
+            return_value=self._SAMPLE_RESPONSE,
+        ):
             result = BraveFreeWebSearchProvider().search("test query", limit=5)
 
         assert result["success"] is True
@@ -77,15 +80,20 @@ class TestBraveFreeProviderSearch:
 
         captured = {}
 
-        def fake_get(url, **kwargs):
+        def fake_request(method, url, **kwargs):
+            captured["method"] = method
             captured["url"] = url
             captured["headers"] = kwargs.get("headers", {})
             captured["params"] = kwargs.get("params", {})
-            return self._mock_resp({"web": {"results": []}})
+            return {"web": {"results": []}}
 
-        with patch("httpx.get", side_effect=fake_get):
+        with patch(
+            "plugins.web.brave_free.provider._httpx_json_request",
+            side_effect=fake_request,
+        ):
             BraveFreeWebSearchProvider().search("q", limit=5)
 
+        assert captured["method"] == "GET"
         assert captured["url"] == "https://api.search.brave.com/res/v1/web/search"
         assert captured["headers"].get("X-Subscription-Token") == "BSAkey123"
         assert captured["params"].get("q") == "q"
@@ -97,11 +105,28 @@ class TestBraveFreeProviderSearch:
         monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "BSAkey123")
         from plugins.web.brave_free.provider import BraveFreeWebSearchProvider
 
-        with patch("httpx.get", return_value=self._mock_resp({})):
+        with patch(
+            "plugins.web.brave_free.provider._httpx_json_request",
+            return_value={},
+        ):
             result = BraveFreeWebSearchProvider().search("q", limit=5)
 
         assert result["success"] is True
         assert result["data"]["web"] == []
+
+
+    def test_oversized_response_returns_failure(self, monkeypatch):
+        monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "BSAkey123")
+        from plugins.web._bounded_json import WebProviderResponseTooLarge
+        from plugins.web.brave_free.provider import BraveFreeWebSearchProvider
+
+        with patch(
+            "plugins.web.brave_free.provider._httpx_json_request",
+            side_effect=WebProviderResponseTooLarge("response exceeded cap"),
+        ):
+            result = BraveFreeWebSearchProvider().search("q", limit=5)
+
+        assert result == {"success": False, "error": "response exceeded cap"}
 
 
     def test_missing_key_returns_failure(self, monkeypatch):
