@@ -605,8 +605,18 @@ class GatewayStreamConsumer:
         # own visible message via the finalize, then a new draft animates
         # for the next one.
         if self._use_draft_streaming:
-            type(self)._draft_id_counter += 1
-            self._draft_id = type(self)._draft_id_counter
+            # Finding #4 (live canary, Alice): for stream-is-the-message
+            # adapters (relay Slack native streaming), a draft_id bump opens
+            # a brand-new platform stream per tool boundary — the user saw
+            # one frozen message per segment (each stuck with the streaming
+            # cursor, never sealed) plus the real final. Those adapters keep
+            # ONE stream per turn: tool progress lives in the native task
+            # card, and the connector's suffix-delta logic appends each new
+            # segment cleanly (prefix mismatch → whole-segment append).
+            # Telegram-shaped drafts (clear + separate final) keep the bump.
+            if not getattr(self.adapter, "draft_stream_is_message", False):
+                type(self)._draft_id_counter += 1
+                self._draft_id = type(self)._draft_id_counter
 
     def on_delta(self, text: str) -> None:
         """Thread-safe callback — called from the agent's worker thread.

@@ -100,6 +100,12 @@ class RelayAdapter(BasePlatformAdapter):
         # consumed by send() to convert the turn-final delivery into the
         # sealing draft(final=true) frame instead of a duplicate post.
         self._open_draft_by_chat: Dict[str, int] = {}
+        # Stream-is-the-message marker (finding #4): the stream consumer
+        # checks this to keep ONE draft stream per turn instead of bumping
+        # draft_id at tool boundaries (which opens a new Slack message per
+        # segment on native streaming — Telegram-shaped adapters want the
+        # bump, we don't).
+        self.draft_stream_is_message = True
         # Bounded FIFO seen-set for inbound replay dedupe (finding #3);
         # dict preserves insertion order, giving cheap oldest-first eviction.
         self._seen_inbound: Dict[str, None] = {}
