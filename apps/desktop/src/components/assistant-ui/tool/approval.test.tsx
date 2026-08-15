@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import type { HermesGateway } from '@/hermes'
-import { $gateway } from '@/store/gateway'
+import { $gateway, setPrimaryGateway } from '@/store/gateway'
 import { $approvalRequest, clearAllPrompts, setApprovalRequest } from '@/store/prompts'
 import { $activeSessionId } from '@/store/session'
 
@@ -36,12 +36,21 @@ function setRequest(
   extra: { choices?: string[]; smartDenied?: boolean } = {}
 ) {
   $activeSessionId.set('sess-1')
-  setApprovalRequest({ allowPermanent, command, description: 'dangerous command', sessionId: 'sess-1', ...extra })
+  setApprovalRequest({
+    allowPermanent,
+    command,
+    description: 'dangerous command',
+    sessionId: 'sess-1',
+    scope: { connectionId: null, profile: 'default' },
+    ...extra
+  })
 }
 
 function mockGateway() {
   const request = vi.fn().mockResolvedValue({ resolved: true })
-  $gateway.set({ request } as unknown as HermesGateway)
+  const gateway = { request } as unknown as HermesGateway
+  setPrimaryGateway(gateway, 'default')
+  $gateway.set(gateway)
 
   return request
 }
@@ -50,6 +59,7 @@ afterEach(() => {
   cleanup()
   clearAllPrompts()
   $activeSessionId.set(null)
+  setPrimaryGateway(null)
   $gateway.set(null)
 })
 
@@ -111,6 +121,33 @@ describe('PendingToolApproval', () => {
     await waitFor(() => {
       expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'sess-1' })
     })
+  })
+
+  it('sends a reply through the request source rather than the active gateway', async () => {
+    const sourceRequest = vi.fn().mockResolvedValue({ resolved: true })
+    const activeRequest = vi.fn().mockResolvedValue({ resolved: true })
+    $activeSessionId.set('sess-1')
+    setPrimaryGateway({ request: sourceRequest } as unknown as HermesGateway, 'worker', 'source-b')
+    $gateway.set({ request: activeRequest } as unknown as HermesGateway)
+    setApprovalRequest({
+      command: 'rm -rf /tmp/x',
+      description: 'dangerous command',
+      requestId: 'approval-source-b',
+      sessionId: 'sess-1',
+      scope: { connectionId: 'source-b', profile: 'worker' }
+    })
+    render(<PendingToolApproval part={part('terminal')} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Run/ }))
+
+    await waitFor(() => {
+      expect(sourceRequest).toHaveBeenCalledWith('approval.respond', {
+        choice: 'once',
+        request_id: 'approval-source-b',
+        session_id: 'sess-1'
+      })
+    })
+    expect(activeRequest).not.toHaveBeenCalled()
   })
 
   it('offers "Always allow" in the options menu by default', async () => {

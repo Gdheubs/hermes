@@ -10,7 +10,7 @@ import {
   setClarifyRequest,
   skipClarifyRequest
 } from './clarify'
-import { $gateway } from './gateway'
+import { $gateway, setPrimaryGateway } from './gateway'
 import { $activeSessionId } from './session'
 
 function clarify(sessionId: string | null, requestId: string): ClarifyRequest {
@@ -19,7 +19,8 @@ function clarify(sessionId: string | null, requestId: string): ClarifyRequest {
     question: `question-${requestId}`,
     choices: null,
     multiSelect: false,
-    sessionId
+    sessionId,
+    scope: { connectionId: null, profile: 'default' }
   }
 }
 
@@ -91,11 +92,14 @@ describe('skipClarifyRequest', () => {
   beforeEach(() => {
     $clarifyRequests.set({})
     request.mockClear()
-    $gateway.set({ request } as unknown as ReturnType<typeof $gateway.get>)
+    const gateway = { request } as unknown as ReturnType<typeof $gateway.get>
+    setPrimaryGateway(gateway as never, 'default')
+    $gateway.set(gateway)
   })
 
   afterEach(() => {
     $clarifyRequests.set({})
+    setPrimaryGateway(null)
     $gateway.set(null)
   })
 
@@ -122,6 +126,17 @@ describe('skipClarifyRequest', () => {
     request.mockRejectedValueOnce(new Error('socket closed'))
 
     await expect(skipClarifyRequest('session-a')).resolves.toBe(true)
+    expect(hasClarifyRequest('session-a')).toBe(false)
+  })
+
+  it('does not send a skip to the active gateway when the source is unavailable', async () => {
+    const activeRequest = vi.fn().mockResolvedValue({ ok: true })
+    $gateway.set({ request: activeRequest } as unknown as ReturnType<typeof $gateway.get>)
+    setClarifyRequest({ ...clarify('session-a', 'req-a'), scope: { connectionId: 'missing', profile: 'worker' } })
+
+    await expect(skipClarifyRequest('session-a')).resolves.toBe(true)
+
+    expect(activeRequest).not.toHaveBeenCalled()
     expect(hasClarifyRequest('session-a')).toBe(false)
   })
 })

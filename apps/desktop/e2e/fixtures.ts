@@ -287,15 +287,22 @@ export function findElectron(): string {
   // In dev mode, we use the `electron` binary directly (not the packaged app).
   // The dev:electron script in package.json does exactly this: `electron .`
   // after building. We replicate that here.
-  const localElectron = path.join(REPO_ROOT, 'node_modules', 'electron', 'dist', 'electron')
+  const executable = process.platform === 'win32' ? 'electron.exe' : 'electron'
+  const worktreeParent = path.dirname(REPO_ROOT)
+  const checkoutRoot = path.basename(worktreeParent) === '.worktrees' ? path.dirname(worktreeParent) : null
+  const candidateRoots = [DESKTOP_ROOT, REPO_ROOT, ...(checkoutRoot ? [checkoutRoot] : [])]
 
-  if (fs.existsSync(localElectron)) {
-    return localElectron
+  for (const root of candidateRoots) {
+    const localElectron = path.join(root, 'node_modules', 'electron', 'dist', executable)
+
+    if (fs.existsSync(localElectron)) {
+      return localElectron
+    }
   }
 
   // Fall back to PATH
-  const result = spawnSync('which', ['electron'], {
-    encoding: 'utf8',
+  const result = spawnSync(process.platform === 'win32' ? 'where' : 'which', [executable], {
+    encoding: 'utf8'
   })
 
   if (result.status === 0 && result.stdout.trim()) {
