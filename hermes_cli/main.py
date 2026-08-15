@@ -5235,6 +5235,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _refresh_windows_gateway_launchers,
     _reload_updated_runtime_modules,
     _resolve_pre_update_backup_mode,
+    _resolve_pre_update_snapshot_max_file_size,
     _resolve_stash_selector,
     _restart_phase_failure_is_incomplete,
     _restore_stashed_changes,
