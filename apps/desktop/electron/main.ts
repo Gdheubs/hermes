@@ -10457,7 +10457,12 @@ function spawnQuickEntryWindow() {
     // of the taskbar/alt-tab list; on macOS use an NSPanel so the frameless
     // capture window never becomes the app's cmd-tab anchor.
     skipTaskbar: !IS_MAC,
-    hasShadow: true,
+    // Quick Entry is a transparent floating card with its own CSS shadow
+    // (see quick-entry-app.tsx boxShadow). Native hasShadow on a transparent
+    // window draws a rectangular shadow around the whole window bounds
+    // instead of following the card's rounded corners, producing a visible
+    // "border-like" ring behind the card. Keep it off, like the pet overlay.
+    hasShadow: false,
     alwaysOnTop: true,
     type: IS_MAC ? 'panel' : undefined,
     hiddenInMissionControl: IS_MAC,
