@@ -1,7 +1,7 @@
 """Tests for hermes_cli.copilot_auth — Copilot token validation and resolution."""
 
 import pytest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 class TestTokenValidation:
@@ -70,6 +70,53 @@ class TestResolveToken:
         assert token == ""
         assert source == ""
         mock_cli.assert_not_called()
+
+
+class TestDeviceCodeLogin:
+    """Copilot OAuth device-code login."""
+
+    @patch("urllib.request.urlopen")
+    def test_device_code_response_size_limit(self, mock_urlopen, monkeypatch, capsys):
+        from hermes_cli.copilot_auth import copilot_device_code_login
+
+        monkeypatch.setattr(
+            "hermes_cli.copilot_auth._COPILOT_AUTH_JSON_BODY_MAX_BYTES",
+            8,
+        )
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = b"x" * 9
+        mock_resp.__enter__ = MagicMock(return_value=mock_resp)
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        assert copilot_device_code_login(timeout_seconds=0) is None
+
+        mock_resp.read.assert_called_once_with(9)
+        assert "response exceeded 8 bytes" in capsys.readouterr().out
+
+    @patch("time.sleep")
+    @patch("time.monotonic", side_effect=[0, 0, 2])
+    @patch("urllib.request.urlopen")
+    def test_poll_response_size_limit(
+        self, mock_urlopen, _mock_monotonic, _mock_sleep, monkeypatch, capsys
+    ):
+        from hermes_cli.copilot_auth import copilot_device_code_login
+
+        monkeypatch.setattr(
+            "hermes_cli.copilot_auth._COPILOT_AUTH_JSON_BODY_MAX_BYTES", 64
+        )
+        responses = [MagicMock(), MagicMock()]
+        responses[0].read.return_value = (
+            b'{"device_code":"d","user_code":"u","interval":1}'
+        )
+        responses[1].read.return_value = b"x" * 65
+        for response in responses:
+            response.__enter__.return_value = response
+        mock_urlopen.side_effect = responses
+
+        assert copilot_device_code_login(timeout_seconds=1) is None
+        assert "poll response exceeded 64 bytes" in capsys.readouterr().out
+        assert mock_urlopen.call_count == 2
 
 
 class TestRequestHeaders:
