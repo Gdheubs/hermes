@@ -286,6 +286,18 @@ def test_merge_interrupted_api_history_fingerprint_cases():
         live_already_compacted, stale_with_old_summary, {}
     )
 
+    # SessionDB replay can drop the in-process marker while keeping the
+    # summary text. A stale result that still has the marker must not
+    # count as a new rewrite.
+    live_unmarked_summary = [
+        {"role": "user", "content": "old summary"},
+        {"role": "user", "content": "later question"},
+        {"role": "assistant", "content": "later answer"},
+    ]
+    assert not server._interrupted_result_allows_rewrite(
+        live_unmarked_summary, stale_with_old_summary, {}
+    )
+
 
 # ── Returned-error path (run_conversation returns an error result) ────
 

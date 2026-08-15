@@ -7678,21 +7678,23 @@ def _interrupted_result_allows_rewrite(
     ``run_conversation`` does not currently set ``compressed`` /
     ``context_compressed`` / ``history_rewrite`` on its result dict.  Detect a
     *new* ``_compressed_summary`` row in the returned transcript instead.
-    An older summary that already exists in the live history must not flip
-    this on — that is the stale-snapshot case from #78010.
+    Compare against live fingerprints, not live markers: SessionDB replay
+    often drops ``_compressed_summary`` while keeping the summary text.
+    An older summary already present in live history must not flip this
+    on — that is the stale-snapshot case from #78010.
     """
     if result.get("compressed") or result.get("context_compressed") or result.get("history_rewrite"):
         return True
 
-    live_summaries = {
-        _message_fingerprint(msg)
-        for msg in live_history
-        if isinstance(msg, dict) and msg.get("_compressed_summary")
-    }
+    # Fingerprints ignore ``_compressed_summary``. SessionDB-backed live rows
+    # often keep the summary text but drop that in-process flag, so matching
+    # against live content (not live markers) is what prevents a stale
+    # marked snapshot from looking like a brand-new rewrite.
+    live_fingerprints = {_message_fingerprint(msg) for msg in live_history}
     return any(
         isinstance(msg, dict)
         and msg.get("_compressed_summary")
-        and _message_fingerprint(msg) not in live_summaries
+        and _message_fingerprint(msg) not in live_fingerprints
         for msg in returned_history
     )
 
