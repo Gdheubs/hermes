@@ -89,3 +89,173 @@ def test_late_read_does_not_publish_bookkeeping(tmp_path, monkeypatch):
         release.set()
         with file_tools._read_tracker_lock:
             file_tools._read_tracker.pop(task_id, None)
+
+
+def test_timeout_wins_before_bookkeeping_commit(tmp_path, monkeypatch):
+    path = tmp_path / "cloud.md"
+    path.write_text("local placeholder")
+    commit_attempted = threading.Event()
+    release_commit = threading.Event()
+    worker_finished = threading.Event()
+    call_finished = threading.Event()
+    payload_holder = {}
+    record_read = MagicMock()
+    real_impl = file_tools._read_file_tool_impl
+    real_try_begin_commit = file_tools._ReadAbandonState.try_begin_commit
+
+    def _observed_impl(*args, **kwargs):
+        try:
+            return real_impl(*args, **kwargs)
+        finally:
+            worker_finished.set()
+
+    def _blocked_try_begin_commit(self):
+        commit_attempted.set()
+        assert release_commit.wait(timeout=1)
+        return real_try_begin_commit(self)
+
+    class _FastOps:
+        def read_file(self, *_args, **_kwargs):
+            return ReadResult(content="late content", total_lines=1, file_size=12)
+
+    def _call_read_file():
+        payload_holder["payload"] = json.loads(
+            file_tools.read_file_tool(str(path), task_id=task_id)
+        )
+        call_finished.set()
+
+    task_id = "bookkeeping-race-task"
+    with file_tools._read_tracker_lock:
+        file_tools._read_tracker.pop(task_id, None)
+
+    monkeypatch.setattr(file_tools, "_get_file_ops", lambda _task_id: _FastOps())
+    monkeypatch.setattr(file_tools, "_file_ops_uses_host_paths", lambda _ops: True)
+    monkeypatch.setattr(file_tools, "_resolve_read_file_timeout", lambda: 0.05)
+    monkeypatch.setattr(file_tools, "_read_file_tool_impl", _observed_impl)
+    monkeypatch.setattr(
+        file_tools._ReadAbandonState,
+        "try_begin_commit",
+        _blocked_try_begin_commit,
+    )
+    monkeypatch.setattr(file_tools.file_state, "record_read", record_read)
+
+    caller = threading.Thread(target=_call_read_file)
+    caller.start()
+    try:
+        assert commit_attempted.wait(timeout=1)
+        assert call_finished.wait(timeout=1)
+        assert payload_holder["payload"]["error_type"] == "tool_timeout"
+        release_commit.set()
+        caller.join(timeout=1)
+        assert worker_finished.wait(timeout=1)
+
+        with file_tools._read_tracker_lock:
+            task_data = file_tools._read_tracker[task_id]
+            assert task_data["last_key"] is None
+            assert task_data["consecutive"] == 0
+            assert task_data["dedup"] == {}
+            assert task_data["read_timestamps"] == {}
+        record_read.assert_not_called()
+    finally:
+        release_commit.set()
+        caller.join(timeout=1)
+        with file_tools._read_tracker_lock:
+            file_tools._read_tracker.pop(task_id, None)
+
+
+def test_commit_winner_returns_real_result_instead_of_timeout(tmp_path, monkeypatch):
+    path = tmp_path / "cloud.md"
+    path.write_text("local placeholder")
+    commit_claimed = threading.Event()
+    release_commit = threading.Event()
+    call_finished = threading.Event()
+    payload_holder = {}
+    record_read = MagicMock()
+    real_try_begin_commit = file_tools._ReadAbandonState.try_begin_commit
+
+    def _claimed_then_blocked(self):
+        claimed = real_try_begin_commit(self)
+        assert claimed
+        commit_claimed.set()
+        assert release_commit.wait(timeout=1)
+        return claimed
+
+    class _FastOps:
+        def read_file(self, *_args, **_kwargs):
+            return ReadResult(content="on-time content", total_lines=1, file_size=15)
+
+    task_id = "bookkeeping-commit-winner-task"
+    with file_tools._read_tracker_lock:
+        file_tools._read_tracker.pop(task_id, None)
+
+    monkeypatch.setattr(file_tools, "_get_file_ops", lambda _task_id: _FastOps())
+    monkeypatch.setattr(file_tools, "_file_ops_uses_host_paths", lambda _ops: True)
+    monkeypatch.setattr(file_tools, "_resolve_read_file_timeout", lambda: 0.05)
+    monkeypatch.setattr(
+        file_tools._ReadAbandonState,
+        "try_begin_commit",
+        _claimed_then_blocked,
+    )
+    monkeypatch.setattr(file_tools.file_state, "record_read", record_read)
+
+    def _call_read_file():
+        payload_holder["payload"] = json.loads(
+            file_tools.read_file_tool(str(path), task_id=task_id)
+        )
+        call_finished.set()
+
+    caller = threading.Thread(target=_call_read_file)
+    caller.start()
+    try:
+        assert commit_claimed.wait(timeout=1)
+        time.sleep(0.1)
+        assert not call_finished.is_set()
+        release_commit.set()
+        assert call_finished.wait(timeout=1)
+        caller.join(timeout=1)
+
+        payload = payload_holder["payload"]
+        assert payload["content"] == "on-time content"
+        assert "error_type" not in payload
+        with file_tools._read_tracker_lock:
+            task_data = file_tools._read_tracker[task_id]
+            assert task_data["last_key"] == ("read", str(path), 1, 2000)
+            assert task_data["consecutive"] == 1
+        record_read.assert_called_once()
+        assert record_read.call_args.kwargs["mtime"] == path.stat().st_mtime
+    finally:
+        release_commit.set()
+        caller.join(timeout=1)
+        with file_tools._read_tracker_lock:
+            file_tools._read_tracker.pop(task_id, None)
+
+
+def test_unavailable_mtime_does_not_restat_after_commit(tmp_path, monkeypatch):
+    path = tmp_path / "cloud.md"
+    path.write_text("local placeholder")
+    getmtime = MagicMock(side_effect=OSError("metadata unavailable"))
+    record_read = MagicMock()
+
+    class _FastOps:
+        def read_file(self, *_args, **_kwargs):
+            return ReadResult(content="content", total_lines=1, file_size=7)
+
+    task_id = "bookkeeping-no-mtime-task"
+    with file_tools._read_tracker_lock:
+        file_tools._read_tracker.pop(task_id, None)
+
+    monkeypatch.setattr(file_tools, "_get_file_ops", lambda _task_id: _FastOps())
+    monkeypatch.setattr(file_tools, "_file_ops_uses_host_paths", lambda _ops: True)
+    monkeypatch.setattr(file_tools, "_resolve_read_file_timeout", lambda: 0.05)
+    monkeypatch.setattr(file_tools.os.path, "getmtime", getmtime)
+    monkeypatch.setattr(file_tools.file_state, "record_read", record_read)
+
+    try:
+        payload = json.loads(file_tools.read_file_tool(str(path), task_id=task_id))
+        assert payload["content"] == "content"
+        assert "error_type" not in payload
+        getmtime.assert_called_once_with(str(path))
+        record_read.assert_not_called()
+    finally:
+        with file_tools._read_tracker_lock:
+            file_tools._read_tracker.pop(task_id, None)

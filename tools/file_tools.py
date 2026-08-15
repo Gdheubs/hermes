@@ -1622,8 +1622,32 @@ def _special_file_kind(path) -> str | None:
     return "a special (non-regular) file"
 
 
-_read_abandon_event: contextvars.ContextVar[threading.Event | None] = (
-    contextvars.ContextVar("read_file_abandon_event", default=None)
+class _ReadAbandonState:
+    """Choose exactly one winner: timeout abandonment or result commit."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.status = "pending"
+
+    def try_begin_commit(self) -> bool:
+        """Claim publication for a worker that finished all blocking I/O."""
+        with self.lock:
+            if self.status != "pending":
+                return False
+            self.status = "committing"
+            return True
+
+    def abandon_if_pending(self) -> bool:
+        """Claim timeout publication, or report that the worker already won."""
+        with self.lock:
+            if self.status != "pending":
+                return False
+            self.status = "abandoned"
+            return True
+
+
+_read_abandon_state: contextvars.ContextVar[_ReadAbandonState | None] = (
+    contextvars.ContextVar("read_file_abandon_state", default=None)
 )
 
 
@@ -1855,13 +1879,6 @@ def _read_file_tool_impl(path: str, offset: int = 1, limit: int = 2000, task_id:
         result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
 
-        abandon_event = _read_abandon_event.get()
-        if abandon_event is not None and abandon_event.is_set():
-            # The caller already returned a timeout. Do not publish a late read
-            # into dedup/staleness registries that refer to content the model
-            # never received.
-            return tool_error("read_file result abandoned after timeout")
-
         # ── Populate negative-result cache on not-found ───────────────
         # _suggest_similar_files returns ReadResult(error="File not found: ..").
         # Cache the JSON we'd return so a retry skips the parent-dir walk.
@@ -1872,9 +1889,9 @@ def _read_file_tool_impl(path: str, offset: int = 1, limit: int = 2000, task_id:
         # test interaction). Serving from the cache (above) is the
         # optimization; recording must stay side-effect-identical.
         _err = result_dict.get("error") or ""
+        _not_found_json = None
         if isinstance(_err, str) and _err.startswith("File not found:"):
             _not_found_json = json.dumps(result_dict, ensure_ascii=False)
-            _record_not_found("read", resolved_str_for_neg, task_id, _not_found_json)
 
         # ── Character-count guard ─────────────────────────────────────
         # We're model-agnostic so we can't count tokens; characters are
@@ -1944,8 +1961,18 @@ def _read_file_tool_impl(path: str, offset: int = 1, limit: int = 2000, task_id:
             _mtime_now = os.path.getmtime(resolved_str)
         except OSError:
             _mtime_now = None
-        if abandon_event is not None and abandon_event.is_set():
+
+        # All potentially blocking filesystem work is complete. Atomically
+        # choose whether this result may publish shared bookkeeping. If the
+        # timeout path won first, the daemon worker exits without publication.
+        # If this worker wins, the timeout path returns the real result instead
+        # of publishing a timeout for content whose state was committed.
+        abandon_state = _read_abandon_state.get()
+        if abandon_state is not None and not abandon_state.try_begin_commit():
             return tool_error("read_file result abandoned after timeout")
+
+        if _not_found_json is not None:
+            _record_not_found("read", resolved_str_for_neg, task_id, _not_found_json)
 
         with _read_tracker_lock:
             # Ensure "dedup" / "dedup_hits" keys exist (backward compat with
@@ -1972,7 +1999,7 @@ def _read_file_tool_impl(path: str, offset: int = 1, limit: int = 2000, task_id:
                 task_data.setdefault("read_timestamps", {})[resolved_str] = _mtime_now
 
             # Bound the per-task containers so a long CLI session doesn't
-            # accumulate megabytes of dict/set state.  See _cap_read_tracker_data.
+            # accumulate megabytes of dict/set state.
             _cap_read_tracker_data(task_data)
 
         # Cross-agent file-state registry (separate from per-task read
@@ -1982,11 +2009,19 @@ def _read_file_tool_impl(path: str, offset: int = 1, limit: int = 2000, task_id:
         # truncated (large file with more content than limit covered).
         # Outside the _read_tracker_lock so the registry's own locking
         # isn't nested under ours.
-        if abandon_event is not None and abandon_event.is_set():
-            return tool_error("read_file result abandoned after timeout")
         try:
             _partial = (offset > 1) or bool(result_dict.get("truncated"))
-            file_state.record_read(task_id, resolved_str, partial=_partial)
+            # Never fall back to another filesystem stat after publication was
+            # claimed: that metadata call can wedge on the same cloud path and
+            # make the timeout path wait indefinitely. An unavailable mtime
+            # means there is no reliable staleness stamp to publish.
+            if _mtime_now is not None:
+                file_state.record_read(
+                    task_id,
+                    resolved_str,
+                    partial=_partial,
+                    mtime=_mtime_now,
+                )
         except Exception:
             logger.debug("file_state.record_read failed", exc_info=True)
 
@@ -2044,14 +2079,14 @@ def read_file_tool(
     executor = DaemonThreadPoolExecutor(max_workers=1)
     context = contextvars.copy_context()
 
-    abandon_event = threading.Event()
+    abandon_state = _ReadAbandonState()
 
     def _run() -> str:
-        token = _read_abandon_event.set(abandon_event)
+        token = _read_abandon_state.set(abandon_state)
         try:
             return _read_file_tool_impl(path, offset, limit, task_id)
         finally:
-            _read_abandon_event.reset(token)
+            _read_abandon_state.reset(token)
 
     future = executor.submit(
         context.run,
@@ -2061,8 +2096,14 @@ def read_file_tool(
     try:
         return future.result(timeout=timeout_s)
     except concurrent.futures.TimeoutError:
+        if not abandon_state.abandon_if_pending():
+            # The worker completed all potentially blocking I/O and claimed
+            # its short in-memory publication phase before the deadline race
+            # was resolved. Return that real result so bookkeeping and model
+            # context cannot diverge.
+            return future.result()
+
         timed_out = True
-        abandon_event.set()
         future.cancel()
         logger.warning("read_file timed out after %.1fs for %s", timeout_s, path)
         return tool_error(
