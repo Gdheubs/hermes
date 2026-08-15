@@ -136,7 +136,7 @@ class TestSessionPeerObservationConfig:
         release_first = threading.Event()
         calls = 0
 
-        def get_client():
+        def get_client(_config=None):
             nonlocal calls
             calls += 1
             if calls == 1:
