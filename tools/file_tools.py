@@ -1621,7 +1621,7 @@ def _special_file_kind(path) -> str | None:
     return "a special (non-regular) file"
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default") -> str:
+def _read_file_tool_impl(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
     try:
         offset, limit = normalize_read_pagination(offset, limit)
@@ -1991,6 +1991,69 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         return tool_error(str(e))
 
 
+_DEFAULT_READ_FILE_TIMEOUT_S = 45.0
+
+
+def _resolve_read_file_timeout() -> float | None:
+    """Return the bounded read deadline from ``timeouts.tools.read_file``."""
+    from agent.deadline import resolve_timeout
+
+    return resolve_timeout("tools.read_file", default=_DEFAULT_READ_FILE_TIMEOUT_S)
+
+
+def read_file_tool(
+    path: str,
+    offset: int = 1,
+    limit: int = 2000,
+    task_id: str = "default",
+) -> str:
+    """Read a file, returning promptly when a filesystem read wedges.
+
+    Cloud placeholders and permission brokers can block an otherwise ordinary
+    regular-file read for minutes. Run the implementation on a daemon worker so
+    the model receives an actionable timeout result and can try a direct/local
+    source or answer the user instead of holding the whole turn open.
+    """
+    timeout_s = _resolve_read_file_timeout()
+    if timeout_s is None:
+        return _read_file_tool_impl(path, offset, limit, task_id)
+
+    import concurrent.futures
+    import contextvars
+
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+
+    executor = DaemonThreadPoolExecutor(max_workers=1)
+    context = contextvars.copy_context()
+    future = executor.submit(
+        context.run,
+        _read_file_tool_impl,
+        path,
+        offset,
+        limit,
+        task_id,
+    )
+    timed_out = False
+    try:
+        return future.result(timeout=timeout_s)
+    except concurrent.futures.TimeoutError:
+        timed_out = True
+        future.cancel()
+        logger.warning("read_file timed out after %.1fs for %s", timeout_s, path)
+        return tool_error(
+            f"Timed out reading '{path}' after {timeout_s:.0f}s. The path may "
+            "be a cloud-backed placeholder, blocked by filesystem permissions, "
+            "or unavailable on this host. Try exact-path metadata, a local "
+            "clone/direct source, or report the access problem instead of "
+            "retrying the same read.",
+            error_type="tool_timeout",
+            timeout_seconds=timeout_s,
+            path=path,
+        )
+    finally:
+        # A filesystem syscall may remain blocked below Python. Never join that
+        # worker or register it with the stdlib atexit hook.
+        executor.shutdown(wait=not timed_out, cancel_futures=timed_out)
 
 
 def reset_file_dedup(task_id: str = None):
