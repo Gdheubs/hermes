@@ -362,6 +362,10 @@ export interface Translations {
       toolViewDesc: string
       uiScaleTitle: string
       uiScaleDesc: (percent: number) => string
+      effectsTitle: string
+      effectsDesc: string
+      effectsFull: string
+      effectsReduced: string
       terminalFontTitle: string
       terminalFontDesc: string
       terminalFontPlaceholder: string
