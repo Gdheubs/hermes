@@ -162,6 +162,66 @@ class TestSessionPeerObservationConfig:
         assert not second.is_alive()
         assert mgr._honcho is new_client
 
+    def test_parallel_session_flushes_do_not_serialize_network_calls(self):
+        client = MagicMock(name="client")
+        user_peer = MagicMock(name="user_peer")
+        assistant_peer = MagicMock(name="assistant_peer")
+        user_peer.message.side_effect = lambda content: ("user", content)
+        assistant_peer.message.side_effect = lambda content: ("assistant", content)
+        remote_a = MagicMock(name="remote_a")
+        remote_b = MagicMock(name="remote_b")
+        both_entered = threading.Event()
+        release = threading.Event()
+        entered_lock = threading.Lock()
+        entered = 0
+
+        def block_until_parallel(_messages):
+            nonlocal entered
+            with entered_lock:
+                entered += 1
+                if entered == 2:
+                    both_entered.set()
+            assert both_entered.wait(timeout=1)
+            assert release.wait(timeout=2)
+
+        remote_a.add_messages.side_effect = block_until_parallel
+        remote_b.add_messages.side_effect = block_until_parallel
+        mgr = HonchoSessionManager(honcho=client)
+        mgr._peers_cache.update({"user": user_peer, "assistant": assistant_peer})
+        mgr._sessions_cache.update({"session-a": remote_a, "session-b": remote_b})
+        session_a = HonchoSession(
+            key="a",
+            user_peer_id="user",
+            assistant_peer_id="assistant",
+            honcho_session_id="session-a",
+            messages=[{"role": "user", "content": "one", "_synced": False}],
+        )
+        session_b = HonchoSession(
+            key="b",
+            user_peer_id="user",
+            assistant_peer_id="assistant",
+            honcho_session_id="session-b",
+            messages=[{"role": "user", "content": "two", "_synced": False}],
+        )
+        results = []
+
+        with patch(
+            "plugins.memory.honcho.session.get_honcho_client",
+            return_value=client,
+        ):
+            first = threading.Thread(target=lambda: results.append(mgr._flush_session(session_a)))
+            second = threading.Thread(target=lambda: results.append(mgr._flush_session(session_b)))
+            first.start()
+            second.start()
+            assert both_entered.wait(timeout=1)
+            release.set()
+            first.join(timeout=2)
+            second.join(timeout=2)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert results == [True, True]
+
     def test_config_driven_client_rebuild_clears_cached_sdk_objects(self):
         old_client = MagicMock(name="old_client")
         new_client = MagicMock(name="new_client")

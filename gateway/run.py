@@ -25385,6 +25385,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if hcfg.api_key:
                 import hashlib
 
+                # Cache-signature material only. This deterministic fingerprint
+                # must never be logged, serialized, or exposed outside the
+                # in-process agent-cache comparison.
                 api_key_fingerprint = hashlib.sha256(
                     hcfg.api_key.encode("utf-8")
                 ).hexdigest()

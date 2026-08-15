@@ -714,6 +714,10 @@ class HonchoSessionManager:
 
         # Resolved inside the operation so a retry after a client rebuild gets fresh objects.
         def _sync_messages() -> int:
+            # Resolve every SDK object on one client generation, then release the
+            # config lock before the network write. In-flight calls may finish on
+            # their captured generation while a later config change redirects new
+            # calls; independent sessions must not serialize on Honcho latency.
             with self._client_config_lock:
                 user_peer = self._get_or_create_peer(session.user_peer_id)
                 assistant_peer = self._get_or_create_peer(session.assistant_peer_id)
@@ -728,8 +732,8 @@ class HonchoSessionManager:
                     )
                     for m in new_messages
                 ]
-                honcho_session.add_messages(honcho_messages)
-                return len(honcho_messages)
+            honcho_session.add_messages(honcho_messages)
+            return len(honcho_messages)
 
         try:
             synced = self._authed_call("message sync", _sync_messages)
