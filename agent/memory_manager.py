@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import inspect
 import threading
@@ -45,6 +46,9 @@ logger = logging.getLogger(__name__)
 # running past this window dies with the interpreter.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+# This is an interactive turn-bound, not a background-work deadline. It also
+# avoids platform-specific `thread.join()` timestamp overflow for huge values.
+MAX_EXTERNAL_PREFETCH_TIMEOUT_S = 60.0
 
 
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
@@ -372,13 +376,26 @@ class MemoryManager:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
-        self._external_prefetch_timeout = (
-            _EXTERNAL_PREFETCH_TIMEOUT_S
-            if external_prefetch_timeout is None
-            else float(external_prefetch_timeout)
-        )
-        if self._external_prefetch_timeout <= 0:
-            raise ValueError("external_prefetch_timeout must be positive")
+        try:
+            self._external_prefetch_timeout = (
+                _EXTERNAL_PREFETCH_TIMEOUT_S
+                if external_prefetch_timeout is None
+                else float(external_prefetch_timeout)
+            )
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                "external_prefetch_timeout must be finite, positive, and at most "
+                f"{MAX_EXTERNAL_PREFETCH_TIMEOUT_S:g} seconds"
+            ) from exc
+        if (
+            not math.isfinite(self._external_prefetch_timeout)
+            or self._external_prefetch_timeout <= 0
+            or self._external_prefetch_timeout > MAX_EXTERNAL_PREFETCH_TIMEOUT_S
+        ):
+            raise ValueError(
+                "external_prefetch_timeout must be finite, positive, and at most "
+                f"{MAX_EXTERNAL_PREFETCH_TIMEOUT_S:g} seconds"
+            )
         self._external_prefetch_threads: Dict[str, threading.Thread] = {}
         self._external_prefetch_lock = threading.Lock()
         # Background executor for end-of-turn sync/prefetch. Lazily created on

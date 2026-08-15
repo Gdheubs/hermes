@@ -1774,6 +1774,9 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # Interactive wait bound for external-memory recall. The work itself
+        # remains daemonized; this only limits how long the active turn joins.
+        "external_prefetch_timeout": 8.0,
     },
 
     # Subagent delegation — override the provider:model used by delegate_task
