@@ -1668,6 +1668,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    allow_silent: bool = True,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1725,6 +1726,12 @@ def create_job(
         monitor_url: Optional http(s) URL used as the monitor source instead
                 of a script — fetched with a bounded GET each tick. Same
                 hash-suppression semantics as ``monitor_script``.
+        allow_silent: When True (default), the scheduler prepends ``[SILENT]``
+                suppression guidance to the agent prompt, letting the agent
+                suppress delivery when there is nothing new to report. When
+                False, the suppression guidance is omitted and ``[SILENT]``
+                responses are still delivered — intended for recurring
+                briefing/report jobs that should always send an all-clear.
 
     Returns:
         The created job dict
@@ -1859,6 +1866,10 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
+        # When False, the scheduler omits [SILENT] suppression guidance and
+        # always delivers the agent's response. For recurring briefing/report
+        # jobs that should send an all-clear even when nothing changed (#53230).
+        "allow_silent": bool(allow_silent),
     }
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
