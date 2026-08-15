@@ -1538,6 +1538,45 @@ _MALFORMED_SCHEMA_MARKERS = (
 _repair_attempted_paths: set[str] = set()
 _repair_attempt_lock = threading.Lock()
 
+# A corruption report must outlive the particular SessionDB instance that saw
+# it.  Long-running backends create short-lived SessionDBs for sidebar polls,
+# while the gateway keeps another instance for writes; a process-wide latch
+# makes both report the same safe, explicit state.  It intentionally resets on
+# process restart so a completed offline repair can be adopted without a hidden
+# persistent marker in a database that may itself be unreadable.
+_storage_status_by_path: Dict[str, str] = {}
+_storage_status_lock = threading.Lock()
+
+
+class StorageDegradedError(sqlite3.DatabaseError):
+    """Raised when a profile's state.db was previously found corrupt."""
+
+
+def _storage_status_key(db_path: Path) -> str:
+    """Return a stable process-local key without requiring the path to exist."""
+    return str(Path(db_path).resolve(strict=False))
+
+
+def get_storage_status(db_path: Path) -> str:
+    """Return ``ok`` or the latched ``degraded`` state for *db_path*."""
+    with _storage_status_lock:
+        return _storage_status_by_path.get(_storage_status_key(db_path), "ok")
+
+
+def mark_storage_degraded(db_path: Path, exc: BaseException) -> None:
+    """Latch corruption for a profile and retain the diagnostic in logs only."""
+    key = _storage_status_key(db_path)
+    with _storage_status_lock:
+        already_degraded = _storage_status_by_path.get(key) == "degraded"
+        _storage_status_by_path[key] = "degraded"
+    if not already_degraded:
+        logger.error(
+            "state.db at %s entered storage_degraded; persistence is paused until "
+            "the profile is repaired: %s",
+            db_path,
+            exc,
+        )
+
 
 def is_malformed_db_error(exc: BaseException) -> bool:
     """True if *exc* is a SQLite 'malformed schema / disk image' error.
@@ -3919,6 +3958,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         Returns whatever *fn* returns.
         """
+        if get_storage_status(self.db_path) == "degraded":
+            raise StorageDegradedError(
+                "session database is degraded after a corruption error; "
+                "persistence is paused until the profile is repaired"
+            )
+
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
@@ -4021,6 +4066,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # derived indexes and retry against the canonical tables.
                 if self._try_runtime_fts_rebuild(exc):
                     continue
+                if is_malformed_db_error(exc):
+                    # A successful FTS rebuild is a derived-index repair and
+                    # does not degrade the profile.  If it cannot recover the
+                    # write, however, preserve the original data and refuse
+                    # all later persistence instead of turning corruption into
+                    # an unbounded error storm or apparent successful writes.
+                    mark_storage_degraded(self.db_path, exc)
+                    raise StorageDegradedError(
+                        "session database corruption detected; persistence is "
+                        "paused until the profile is repaired"
+                    ) from exc
                 if self._enter_fts_fail_open(exc):
                     continue
                 raise
