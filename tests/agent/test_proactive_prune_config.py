@@ -15,6 +15,7 @@ import io
 from pathlib import Path
 
 from hermes_state import SessionDB
+from agent.context_compressor import ContextCompressor
 from run_agent import AIAgent
 
 
@@ -35,7 +36,15 @@ def _config(**prune_keys) -> dict:
     }
 
 
-def _make_agent(monkeypatch, tmp_path: Path, **prune_keys):
+def _make_agent(
+    monkeypatch,
+    tmp_path,
+    *,
+    model: str = "gpt-5.5",
+    provider: str = "openai-codex",
+    base_url: str = "https://chatgpt.com/backend-api/codex",
+    **prune_keys,
+):
     from hermes_cli import config as config_mod
 
     monkeypatch.setattr(config_mod, "load_config", lambda: _config(**prune_keys))
@@ -44,10 +53,10 @@ def _make_agent(monkeypatch, tmp_path: Path, **prune_keys):
     db = SessionDB(db_path=tmp_path / "state.db")
     with contextlib.redirect_stdout(io.StringIO()):
         agent = AIAgent(
-            base_url="https://chatgpt.com/backend-api/codex",
+            base_url=base_url,
             api_key="test-key",
-            provider="openai-codex",
-            model="gpt-5.5",
+            provider=provider,
+            model=model,
             enabled_toolsets=[],
             disabled_toolsets=[],
             quiet_mode=True,
@@ -88,3 +97,63 @@ class TestProactivePruneConfig:
 
 
 
+
+
+class TestProactivePruneAutoDefault:
+    """config sentinel -1 (unset) resolves a model-gated auto default:
+    ON for large-window DeepSeek thinking sessions, OFF everywhere else.
+    Explicit config (including 0 = off) stays authoritative."""
+
+    def test_deepseek_unset_resolves_auto_on(self, monkeypatch, tmp_path):
+        agent = _make_agent(
+            monkeypatch, tmp_path,
+            model="deepseek-v4-flash", provider="deepseek",
+            base_url="https://api.deepseek.com/v1",
+        )
+        # 1M window // 8 = 125K.
+        assert agent.context_compressor.proactive_prune_tokens == 125_000
+
+    def test_deepseek_explicit_zero_stays_off(self, monkeypatch, tmp_path):
+        agent = _make_agent(
+            monkeypatch, tmp_path,
+            model="deepseek-v4-flash", provider="deepseek",
+            base_url="https://api.deepseek.com/v1",
+            proactive_prune_tokens=0,
+        )
+        assert agent.context_compressor.proactive_prune_tokens == 0
+
+    def test_non_deepseek_unset_stays_off(self, monkeypatch, tmp_path):
+        agent = _make_agent(monkeypatch, tmp_path)
+        assert agent.context_compressor.proactive_prune_tokens == 0
+
+    def test_compressor_derives_auto_from_window(self, monkeypatch):
+        from unittest.mock import patch
+
+        from agent.context_compressor import ContextCompressor
+
+        # Sentinel -1 is resolved inside the compressor against the resolved
+        # context window (no extra resolver call at init).
+        with patch("agent.context_compressor.get_model_context_length", return_value=2_000_000):
+            cc = ContextCompressor("gemini-2.5-pro", proactive_prune_tokens=-1)
+            assert cc.proactive_prune_tokens == 250_000
+        with patch("agent.context_compressor.get_model_context_length", return_value=256_000):
+            cc = ContextCompressor("gpt-4o", proactive_prune_tokens=-1)
+            assert cc.proactive_prune_tokens == 0
+
+
+def test_auto_prune_follows_model_switch(monkeypatch, tmp_path):
+    agent = _make_agent(
+        monkeypatch, tmp_path,
+        model="deepseek-v4-flash", provider="deepseek",
+        base_url="https://api.deepseek.com/v1",
+    )
+    cc = agent.context_compressor
+    assert cc.proactive_prune_tokens == 125_000  # 1M window // 8
+    cc.update_model("gpt-4o-mini", context_length=256_000)
+    assert cc.proactive_prune_tokens == 0  # small window: auto prune off
+    cc.update_model("gemini-2.5-pro", context_length=2_000_000)
+    assert cc.proactive_prune_tokens == 250_000  # 2M window // 8
+    # Explicit values are never re-derived.
+    cc2 = ContextCompressor("gpt-4o", proactive_prune_tokens=4096)
+    cc2.update_model("deepseek-v4-flash", context_length=1_000_000)
+    assert cc2.proactive_prune_tokens == 4096
