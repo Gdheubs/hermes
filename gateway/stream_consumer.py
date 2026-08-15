@@ -2154,10 +2154,19 @@ class GatewayStreamConsumer:
         #     a tool-boundary segment break where the prior text was finalized
         #     as a real sendMessage and the next text segment continues editing
         #     that one — staying on edit-based for that segment is correct).
+        # Stream-is-the-message exception (finding #5, live canary): for
+        # adapters like relay Slack native streaming, a segment-break
+        # finalize must NOT become a real send — the adapter's seal
+        # interception would convert it to draft(final=true), sealing the
+        # stream at EVERY tool boundary (one frozen cumulative message per
+        # segment; only the turn-final seal belongs). Those adapters keep
+        # ONE stream per turn: mid-turn boundaries just emit another
+        # cumulative frame; only got_done (is_turn_final) seals.
+        _stream_is_msg = getattr(self.adapter, "draft_stream_is_message", False)
         if (
             self._use_draft_streaming
-            and not finalize
             and self._message_id is None
+            and (not finalize or (_stream_is_msg and not is_turn_final))
         ):
             # No-op skip: identical to the last frame we sent.
             if text == self._last_sent_text:
