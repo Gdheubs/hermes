@@ -2335,6 +2335,9 @@ def _(rid, params: dict) -> dict:
                        status, portable}], "user_count": N, "bundled_count": M}
       - ``toggle`` → flip ``key`` (or ``name``) based on ``enable`` (bool).
                        Returns the refreshed row plus {"ok", "unchanged"}.
+      - ``install`` → git-clone into ``~/.hermes/plugins/`` (non-interactive).
+                       Params: ``identifier`` or ``repo``, optional ``force``,
+                       ``enable`` (default True). Returns dashboard install dict.
     """
     action = params.get("action", "list")
     try:
@@ -2419,6 +2422,25 @@ def _(rid, params: dict) -> dict:
                     "plugin": row,
                 },
             )
+
+        if action == "install":
+            from hermes_cli.plugins_cmd import dashboard_install_plugin
+
+            ident = (
+                params.get("identifier") or params.get("repo") or ""
+            ).strip()
+            if not ident:
+                return _err(
+                    rid, 4019, "plugins.install requires 'identifier' or 'repo'"
+                )
+            result = dashboard_install_plugin(
+                ident,
+                force=bool(params.get("force")),
+                enable=params.get("enable", True),
+            )
+            if not result.get("ok"):
+                return _err(rid, 5026, result.get("error") or "install failed")
+            return _ok(rid, result)
 
         return _err(rid, 4017, f"unknown plugins action: {action}")
     except Exception as e:

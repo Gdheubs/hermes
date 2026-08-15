@@ -111,6 +111,7 @@ import { useSessionActions } from '../session/hooks/use-session-actions'
 import { useSessionListActions } from '../session/hooks/use-session-list-actions'
 import { useSessionStateCache } from '../session/hooks/use-session-state-cache'
 import { startWorkspaceSession } from '../session/workspace-session-target'
+import { PluginInstallModal } from '../settings/plugin-install-modal'
 import { useOverlayRouting } from '../shell/hooks/use-overlay-routing'
 import { useWindowControlsOverlayWidth } from '../shell/hooks/use-window-controls-overlay-width'
 import {
@@ -1048,6 +1049,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       <GatewayConnectingOverlay />
       <BootFailureOverlay />
       <CommandPalette />
+      <PluginInstallModal />
       <PetGenerateOverlay />
       <SessionSwitcher />
       <FileActionDialogs />

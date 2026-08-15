@@ -2,8 +2,10 @@ import { useEffect, useRef } from 'react'
 
 import { closeActiveTab } from '@/app/chat/close-tab'
 import { openSession } from '@/app/open-session'
+import { resolveDeepLinkAction } from '@/lib/deeplink-routes'
 import { storedSessionIdForNotification } from '@/lib/session-ids'
 import { respondToApprovalAction } from '@/store/native-notifications'
+import { openPluginInstallRequest } from '@/store/plugin-install-request'
 import { openFolderAsProject } from '@/store/projects'
 import {
   getRememberedRoute,
@@ -187,24 +189,35 @@ export function useDesktopIntegrations({
     return () => unsubscribe?.()
   }, [])
 
-  // hermes:// deep links -> a reviewable /blueprint command in the composer.
+  // hermes:// deep links -> composer inserts or plugin install modal.
   useEffect(() => {
     const unsubscribe = window.hermesDesktop?.onDeepLink?.(payload => {
-      if (!payload || payload.kind !== 'blueprint' || !payload.name) {
+      const action = resolveDeepLinkAction(payload)
+
+      if (action.type === 'composer-blueprint') {
+        const slots = Object.entries(action.params || {})
+          .map(([k, v]) => {
+            const sval = /\s/.test(v) ? `"${v.replace(/"/g, '\\"')}"` : v
+
+            return `${k}=${sval}`
+          })
+          .join(' ')
+
+        const command = `/blueprint ${action.name}${slots ? ' ' + slots : ''}`
+        requestComposerInsert(command, { mode: 'block', target: 'main' })
+        requestComposerFocus('main')
+
         return
       }
 
-      const slots = Object.entries(payload.params || {})
-        .map(([k, v]) => {
-          const sval = /\s/.test(v) ? `"${v.replace(/"/g, '\\"')}"` : v
-
-          return `${k}=${sval}`
+      if (action.type === 'plugin-install') {
+        openPluginInstallRequest({
+          repo: action.repo,
+          enable: action.enable,
+          force: action.force,
+          legacyHint: action.legacyHint
         })
-        .join(' ')
-
-      const command = `/blueprint ${payload.name}${slots ? ' ' + slots : ''}`
-      requestComposerInsert(command, { mode: 'block', target: 'main' })
-      requestComposerFocus('main')
+      }
     })
 
     void window.hermesDesktop?.signalDeepLinkReady?.()
