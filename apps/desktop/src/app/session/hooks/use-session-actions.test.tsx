@@ -44,6 +44,7 @@ import {
   setTurnStartedAt
 } from '@/store/session'
 import { $sessionTiles } from '@/store/session-states'
+import { $sessionSeenCounts } from '@/store/session-unread'
 
 import sessionResumeActiveTurn from '../../../../../../tests/fixtures/session-resume-active-turn.json'
 import { sessionRoute } from '../../routes'
@@ -2495,7 +2496,9 @@ describe('removeSession profile routing (#78836)', () => {
   afterEach(() => {
     setSessions([])
     setMessagingSessions([])
+    $sessionSeenCounts.set({})
     mockDeleteSession.mockReset()
+    mockGetSession.mockReset()
   })
 
   it('DELETEs a messaging-platform session against its owning profile backend', async () => {
@@ -2542,6 +2545,7 @@ describe('removeSession profile routing (#78836)', () => {
     )
     setMessagingSessions([storedSession({ id: 'tg-1', source: 'telegram', title: 'TG chat' })])
     setSessions([])
+    $sessionSeenCounts.set({ winefox: { 'tg-1': 4 }, default: { other: 1 } })
 
     let handle: HarnessHandle | null = null
     render(<Harness onReady={value => (handle = value)} requestGateway={vi.fn(async () => ({}) as never)} />)
@@ -2554,5 +2558,10 @@ describe('removeSession profile routing (#78836)', () => {
     expect(mockDeleteSession).toHaveBeenCalledWith('tg-1', 'winefox')
     expect($messagingSessions.get()).toEqual([])
     expect($sessions.get()).toEqual([])
+    // Owning-profile unread must drop; other profiles' buckets stay.
+    // A profile-less listed row may first-sight-seed under default — that
+    // is unrelated leftover, not the winefox watermark this path must clear.
+    expect($sessionSeenCounts.get().winefox).toBeUndefined()
+    expect($sessionSeenCounts.get().default?.other).toBe(1)
   })
 })

@@ -1627,7 +1627,9 @@ export function useSessionActions({
         await deleteSession(storedSessionId, profile)
         // Only after the RPC lands — the optimistic eviction above can roll
         // back, and a rolled-back row must keep its watermark/marker.
-        forgetSessionUnread(removedIds, removed?.profile)
+        // Use the resolved owning profile, not the listed stamp (which is
+        // missing on the profile-less messaging case this path exists for).
+        forgetSessionUnread(removedIds, profile)
         clearQueuedPrompts(storedSessionId)
 
         if (closingRuntimeId) {
@@ -1723,7 +1725,7 @@ export function useSessionActions({
         await setSessionArchived(storedSessionId, true, profile)
         // Archived rows never reach the sidebar, so their persisted unread can
         // only rot. Dropped after the RPC so a failed archive keeps it.
-        forgetSessionUnread(archivedIds, archived?.profile)
+        forgetSessionUnread(archivedIds, profile)
         // An archived session is hidden from the sidebar; its tile must go too.
         const tiledRuntimeId = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
         closeSessionTile(storedSessionId)
