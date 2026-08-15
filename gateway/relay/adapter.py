@@ -1266,8 +1266,16 @@ class RelayAdapter(BasePlatformAdapter):
         # unsealed (frozen live indicator) and the final posts as a separate
         # duplicate message.
         if str(chat_id) in self._open_draft_by_chat:
-            return await self._seal_open_draft(
+            seal = await self._seal_open_draft(
                 chat_id, content, dict(metadata or {})
+            )
+            if seal.success:
+                return seal
+            # Failed seal falls through to the plain send below (review
+            # finding, PR 85796 point 1): never swallow the turn-final.
+            logger.warning(
+                "relay seal failed (%s); delivering turn-final as plain send",
+                seal.error,
             )
         if self._transport is None:
             return SendResult(success=False, error="no transport")
@@ -1307,7 +1315,19 @@ class RelayAdapter(BasePlatformAdapter):
         # matter which egress door it arrives through; the stream IS the
         # message.
         if str(chat_id) in self._open_draft_by_chat:
-            return await self._seal_open_draft(chat_id, content, send_metadata)
+            seal = await self._seal_open_draft(chat_id, content, send_metadata)
+            if seal.success:
+                return seal
+            # Review finding (PR 85796, point 1): a failed seal must NOT
+            # swallow the turn-final — the stream consumer has already
+            # disabled the draft transport, so returning failure here means
+            # the user never gets the answer. Fall through to a plain send
+            # (the orphaned stream is sealed connector-side by recycling /
+            # MAX_OPEN_STREAMS eviction).
+            logger.warning(
+                "relay seal failed (%s); delivering turn-final as plain send",
+                seal.error,
+            )
         if explicit_platform:
             return await self.send_for_platform(
                 explicit_platform,
