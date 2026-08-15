@@ -280,7 +280,7 @@ def _parse_single_target(index: int, raw: Any) -> Optional[WebhookTarget]:
     # ``secret``) — a mistyped key otherwise disables auth/event filtering
     # with no signal (#14 alignment: reject unknown fields).
     _KNOWN_FIELDS = {
-        "url", "events", "name", "secret", "secret_env", "matcher", "timeout",
+        "url", "events", "name", "secret_ref", "secret_env", "matcher", "timeout",
     }
     unknown = sorted(set(raw) - _KNOWN_FIELDS)
     if unknown:
@@ -289,6 +289,7 @@ def _parse_single_target(index: int, raw: Any) -> Optional[WebhookTarget]:
             "fields: %s",
             index, ", ".join(unknown), ", ".join(sorted(_KNOWN_FIELDS)),
         )
+        return None
 
     url = raw.get("url")
     if not isinstance(url, str) or not url.strip():
@@ -355,6 +356,8 @@ def _parse_single_target(index: int, raw: Any) -> Optional[WebhookTarget]:
     timeout = max(1, min(timeout, MAX_TIMEOUT_SECONDS))
 
     secret = _resolve_secret(index, raw)
+    if secret == "":
+        return None
 
     name = raw.get("name")
     if not isinstance(name, str):
@@ -371,21 +374,27 @@ def _parse_single_target(index: int, raw: Any) -> Optional[WebhookTarget]:
 
 
 def _resolve_secret(index: int, raw: Dict[str, Any]) -> Optional[str]:
-    """``secret_env`` (env var name, preferred) wins over inline ``secret``."""
-    secret_env = raw.get("secret_env")
-    if isinstance(secret_env, str) and secret_env.strip():
-        value = os.environ.get(secret_env.strip(), "")
-        if value:
-            return value
-        logger.warning(
-            "hooks.outbound[%d].secret_env=%r is not set in the environment "
-            "— deliveries will be UNSIGNED", index, secret_env.strip(),
-        )
+    """Resolve an opaque reference; inline plaintext is never accepted."""
+    reference = raw.get("secret_ref") or raw.get("secret_env")
+    if not isinstance(reference, str) or not reference.strip():
         return None
-    secret = raw.get("secret")
-    if isinstance(secret, str) and secret:
-        return secret
-    return None
+    reference = reference.strip()
+    value = ""
+    try:
+        from agent.secret_scope import get_secret
+        value = str(get_secret(reference, "") or "")
+    except Exception:
+        value = ""
+    if not value:
+        value = str(os.environ.get(reference, "") or "")
+    if value:
+        return value
+    logger.warning(
+        "hooks.outbound[%d] secret reference %r did not resolve — target skipped",
+        index,
+        reference,
+    )
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -450,17 +459,27 @@ def _serialize_payload(
 def _build_delivery(
     event: str, target: WebhookTarget, body: bytes, delivery_id: str,
 ) -> Dict[str, Any]:
+    timestamp = str(int(time.time()))
     headers = {
         "Content-Type": "application/json",
-        "User-Agent": "Hermes-Agent-Outbound-Webhook",
+        "User-Agent": "Hermes-Agent-Outbound-Webhook/1",
         "X-Hermes-Event": event,
         "X-Hermes-Delivery": delivery_id,
+        "X-Hermes-Schema-Version": "1",
+        "X-Hermes-Timestamp": timestamp,
     }
     if target.secret:
-        digest = hmac.new(
+        # Compatibility header for existing receivers.
+        legacy = hmac.new(
             target.secret.encode("utf-8"), body, hashlib.sha256
         ).hexdigest()
-        headers["X-Hermes-Signature-256"] = f"sha256={digest}"
+        headers["X-Hermes-Signature-256"] = f"sha256={legacy}"
+        # Replay-safe contract: the explicit V2 signature binds timestamp+body.
+        signed = timestamp.encode("ascii") + b"." + body
+        digest = hmac.new(
+            target.secret.encode("utf-8"), signed, hashlib.sha256
+        ).hexdigest()
+        headers["X-Hermes-Signature-V2"] = f"sha256={digest}"
     return {
         "url": target.url,
         "label": target.label,

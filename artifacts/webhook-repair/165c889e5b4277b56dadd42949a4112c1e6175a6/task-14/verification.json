@@ -1,0 +1,16 @@
+{
+  "branch": "wr/task-14-outbound-lifecycle",
+  "changed_files": [
+    "agent/outbound_webhooks.py",
+    "tests/agent/test_outbound_webhook_contract.py",
+    "tests/agent/test_outbound_webhooks.py"
+  ],
+  "head": "9ee07963f8955cf33c8e8ecb7fd1320308a77835",
+  "head_before_commit": "9ee07963f8955cf33c8e8ecb7fd1320308a77835",
+  "phase": "verification",
+  "repository": "D:\\HERMES-TEMP\\webhook-revolution\\task-14-outbound-lifecycle",
+  "schema_version": 1,
+  "status": "pass",
+  "task": 14,
+  "timestamp": "2026-08-15T15:48:09Z"
+}
