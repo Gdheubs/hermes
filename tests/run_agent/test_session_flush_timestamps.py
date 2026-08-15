@@ -11,15 +11,8 @@ class _RecordingSessionDB:
     def __init__(self):
         self.rows: list[dict] = []
 
-    def append_message(self, *, session_id, role, content=None, timestamp=None, **_kwargs):
-        self.rows.append(
-            {
-                "session_id": session_id,
-                "role": role,
-                "content": content,
-                "timestamp": timestamp,
-            }
-        )
+    def append_messages_batch(self, *, session_id, messages, **_kwargs):
+        self.rows.extend(list(messages))
         return len(self.rows)
 
 
