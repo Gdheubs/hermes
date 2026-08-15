@@ -2168,6 +2168,15 @@ class GatewayStreamConsumer:
             and self._message_id is None
             and (not finalize or (_stream_is_msg and not is_turn_final))
         ):
+            # Finding #6 (live canary, the duplicate-content root cause):
+            # strip the gateway's text cursor from draft frames. Native
+            # streams render their own typing indicator, and a cursor-
+            # suffixed frame breaks the connector's prefix-delta check on
+            # EVERY tick ("...text▉" is never a prefix of "...text more▉"),
+            # triggering its whole-text fallback append — the user saw each
+            # cumulative snapshot stacked inside one message, ▉ included.
+            if self.cfg.cursor and text.endswith(self.cfg.cursor):
+                text = text[: -len(self.cfg.cursor)]
             # No-op skip: identical to the last frame we sent.
             if text == self._last_sent_text:
                 return True
