@@ -534,6 +534,9 @@ _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 # constructor clamp on ``proactive_prune_min_result_chars``, and the clarify
 # summary cap (which must stay strictly BELOW this so a preserved user answer
 # is never re-summarized away on a later prune pass).
+# Auto-prune floor (sentinel -1): only >= this window, at window // 8.
+LARGE_WINDOW_PRUNE_FLOOR = 512_000
+
 _PRUNE_MIN_CHARS = 200
 
 # Non-response sentinels the clarify callbacks embed as ``user_response`` when
@@ -2608,6 +2611,11 @@ class ContextCompressor(ContextEngine):
         self.provider = provider
         self.api_mode = api_mode
         self.context_length = context_length
+        # Auto prune default follows the new window (1M <-> small switches).
+        if getattr(self, "_auto_proactive_prune", False):
+            self.proactive_prune_tokens = (
+                context_length // 8 if context_length >= LARGE_WINDOW_PRUNE_FLOOR else 0
+            )
         # Re-resolve per-model threshold for the NEW model, then re-apply the
         # small-context threshold floor. Starting from _config_threshold_percent
         # (the raw config value) so a switch from a model with an override to
@@ -2863,6 +2871,8 @@ class ContextCompressor(ContextEngine):
         self.protect_last_n = protect_last_n
         # Proactive tool-result pruning (cost-oriented; runs INDEPENDENTLY of the
         # full-compression trigger, via prune_tool_results_only()). 0 = disabled.
+        # Sentinel -1 (auto) is resolved later, once the context length is
+        # initialized (see below).
         self.proactive_prune_tokens = int(proactive_prune_tokens or 0)
         # Floor the summarize threshold at 200 chars (matching
         # _prune_old_tool_results' dedup floor). Below ~200 a generated summary
@@ -2941,6 +2951,13 @@ class ContextCompressor(ContextEngine):
         self._config_context_length = config_context_length
         self._configured_threshold_percent = self.threshold_percent
         self._resolved_context_length: int | None = None
+        self._auto_proactive_prune = self.proactive_prune_tokens == -1
+        # Sentinel -1: derive window // 8 from the resolved context length.
+        if self.proactive_prune_tokens == -1:
+            window = self._resolve_context_length()
+            self.proactive_prune_tokens = (
+                window // 8 if window >= LARGE_WINDOW_PRUNE_FLOOR else 0
+            )
         self._threshold_tokens: int | None = None
         self._tail_token_budget: int | None = None
         self._max_summary_tokens: int | None = None

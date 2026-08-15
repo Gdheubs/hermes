@@ -7,7 +7,7 @@ OpenCode hardcoded ``MAX_LINES = 2000`` and ``MAX_BYTES = 50 * 1024``
 as tool-output truncation thresholds. Hermes-agent had the same
 hardcoded constants in two places:
 
-* ``tools/terminal_tool.py`` — ``MAX_OUTPUT_CHARS = 50000`` (terminal
+* ``tools/terminal_tool.py`` — ``MAX_OUTPUT_CHARS = 20000`` (terminal
   stdout/stderr cap)
 * ``tools/file_operations.py`` — ``MAX_LINES = 2000`` /
   ``MAX_LINE_LENGTH = 2000`` (read_file pagination cap + per-line cap)
@@ -36,7 +36,7 @@ from typing import Any, Dict
 # Hardcoded defaults — these match the pre-existing values, so adding
 # this module is behaviour-preserving for users who don't set
 # ``tool_output`` in config.yaml.
-DEFAULT_MAX_BYTES = 50_000       # terminal_tool.MAX_OUTPUT_CHARS
+DEFAULT_MAX_BYTES = 20_000       # terminal_tool.MAX_OUTPUT_CHARS
 DEFAULT_MAX_LINES = 2000         # file_operations.MAX_LINES
 DEFAULT_MAX_LINE_LENGTH = 2000   # file_operations.MAX_LINE_LENGTH
 

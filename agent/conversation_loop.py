@@ -36,6 +36,13 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
+from agent.deepseek_replay import (
+    apply_deepseek_replay_compaction,
+    estimate_request_tokens_after_deepseek_replay,
+    is_echo_replay_target,
+    merge_replay_usage,
+    replay_compaction_limits,
+)
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
@@ -2434,7 +2441,22 @@ def run_conversation(
         # messages walk inside estimate_request_tokens_rough. Tools added
         # separately (compression needs them: 50+ tools = 20-30K tokens).
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
+        # Per-provider tunable replay-compaction thresholds (config
+        # ``replay_compaction``), resolved once per turn and shared by the
+        # preflight estimate and the wire-time compaction below.
+        _replay_limits = replay_compaction_limits(agent.provider)
         approx_tokens = estimate_messages_tokens_rough(api_messages)
+        # Measure request pressure against the post-compaction wire size so
+        # the raw estimate can't fire compression early (estimate-only).
+        # Preflight estimate: echo-only (other wires keep raw compression timing).
+        if is_echo_replay_target(agent.provider, agent.model, agent.base_url):
+            approx_tokens = estimate_request_tokens_after_deepseek_replay(
+                api_messages,
+                provider=agent.provider,
+                model=agent.model,
+                base_url=agent.base_url,
+                limits=_replay_limits,
+            )
         request_pressure_tokens = approx_tokens + (
             _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
         )
@@ -2767,6 +2789,17 @@ def run_conversation(
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
+                # Wire-time replay economy (send copy; idempotent).
+                api_messages, _replay_diag = apply_deepseek_replay_compaction(
+                    api_messages,
+                    provider=agent.provider,
+                    model=agent.model,
+                    base_url=agent.base_url,
+                    api_mode=agent.api_mode,
+                    limits=replay_compaction_limits(agent.provider),
+                )
+                if _replay_diag.tokens_saved > 0 or _replay_diag.stripped_reasoning > 0:
+                    logger.info("%s", _replay_diag.summary())
                 # Same story for prompt-cache decoration (#72626): try_activate_
                 # fallback refreshes the policy flags, but the decorated list
                 # still carries the primary's breakpoints (or none). Strip and
@@ -3981,6 +4014,8 @@ def run_conversation(
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
+                    # Replay savings on the canonical usage dict.
+                    merge_replay_usage(usage_dict, _replay_diag)
                     # Capture the boundary latch before update_from_response()
                     # consumes it. Only a real provider prompt count for the
                     # request immediately following a completed compaction can

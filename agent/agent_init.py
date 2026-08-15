@@ -2078,12 +2078,16 @@ def init_agent(
         except (TypeError, ValueError):
             return default
 
-    # Opt-in proactive tool-result prune trigger (0 = disabled — the
-    # default, so an unset key is behavior-neutral).  Negative values are
-    # treated as disabled rather than erroring.
-    compression_proactive_prune_tokens = max(
-        0, _parse_prune_int(_compression_cfg.get("proactive_prune_tokens", 0), 0)
-    )
+    # Prune trigger: sentinel -1 = auto (compressor derives window // 8);
+    # explicit value (incl. 0 = off) is authoritative. NB: quoted "-1" in
+    # YAML is a string, so it disables instead of auto — accepted corner.
+    _raw_prune_tokens = _compression_cfg.get("proactive_prune_tokens", -1)
+    if _raw_prune_tokens == -1:
+        compression_proactive_prune_tokens = -1
+    else:
+        compression_proactive_prune_tokens = max(
+            0, _parse_prune_int(_raw_prune_tokens, 0)
+        )
     compression_proactive_prune_min_chars = _parse_prune_int(
         _compression_cfg.get("proactive_prune_min_result_chars", 8000), 8000
     )

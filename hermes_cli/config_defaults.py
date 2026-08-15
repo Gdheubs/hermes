@@ -615,16 +615,23 @@ DEFAULT_CONFIG = {
     # shot. Ported from anomalyco/opencode PR #23770.
     #
     # - max_bytes:       terminal_tool output cap, in chars
-    #                    (default 50_000 ≈ 12-15K tokens).
+    #                    (default 20_000 ≈ 5K tokens).
     # - max_lines:       read_file pagination cap — the maximum `limit`
     #                    a single read_file call can request before
     #                    being clamped (default 2000).
     # - max_line_length: per-line cap applied when read_file emits a
     #                    line-numbered view (default 2000 chars).
     "tool_output": {
-        "max_bytes": 50_000,
+        "max_bytes": 20_000,
         "max_lines": 2000,
         "max_line_length": 2000,
+    },
+    # Wire-time replay compaction thresholds (base + provider_overrides).
+    "replay_compaction": {
+        "max_tokens": 2000,
+        "max_chars": 12288,
+        "keep_runes": 3000,
+        "provider_overrides": {},
     },
 
     # Tool loop guardrails nudge models when they repeat failed or
@@ -701,19 +708,11 @@ DEFAULT_CONFIG = {
                                       # (e.g. 6) for tool-schema-heavy sessions where 3
                                       # rounds cannot clear the request estimate.
                                       # Validated >= 1, hard-capped at 10.
-        "proactive_prune_tokens": 0,  # opt-in trigger (tokens) for the deterministic,
-                                      # no-LLM tool-result prune, run independently of
-                                      # `threshold` above. On large-window models
-                                      # `threshold` (≈50% of the window) rarely fires,
-                                      # so old tool output otherwise rides in history
-                                      # and is re-sent every turn; a low value like
-                                      # 48000 reclaims it early. 0 = off. Recent tail
-                                      # protected by `protect_last_n`. Built-in
-                                      # compressor only (other engines inherit a no-op).
-                                      # NOTE: each committed prune rewrites already-sent
-                                      # history, breaking the provider prompt-cache
-                                      # prefix — the min_reclaim gate below keeps those
-                                      # breaks episodic rather than per-turn.
+        "proactive_prune_tokens": -1,  # auto: window-gated (compressor derives
+                                      # window // 8); 0 = off, positive = override.
+                                      # Each committed prune rewrites history,
+                                      # breaking the prompt-cache prefix — the
+                                      # min_reclaim gate keeps breaks episodic.
         "proactive_prune_min_result_chars": 8000,  # the prune's summarize pass only
                                       # touches tool results larger than this (chars);
                                       # clamped to >= 200 so a generated summary can't
