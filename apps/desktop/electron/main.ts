@@ -113,6 +113,7 @@ import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
 import {
   buildTerminalScript,
+  containsTerminalControlCharacters,
   resolveTerminalLaunch,
   terminalScriptEnv,
   terminalScriptExtension,
@@ -11386,12 +11387,18 @@ ipcMain.handle('hermes:window:openInstance', async () => {
 // never ensureRuntime(), which would kick off a first-run install from a menu
 // click; an unresolved runtime is reported instead.
 ipcMain.handle('hermes:window:openInTerminal', async (_event, sessionId, opts) => {
-  if (typeof sessionId !== 'string' || !sessionId.trim()) {
+  if (typeof sessionId !== 'string' || !sessionId.trim() || containsTerminalControlCharacters(sessionId)) {
     return { ok: false, error: 'invalid-session-id' }
   }
 
+  const rawProfile = typeof opts?.profile === 'string' ? opts.profile : ''
+
+  if (rawProfile && containsTerminalControlCharacters(rawProfile)) {
+    return { ok: false, error: 'invalid-profile' }
+  }
+
   try {
-    const profile = typeof opts?.profile === 'string' ? opts.profile.trim() : ''
+    const profile = rawProfile.trim()
     const backend = resolveHermesBackend(tuiResumeArgs(sessionId.trim(), profile || undefined))
 
     if (!backend.command) {
