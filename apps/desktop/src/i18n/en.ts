@@ -549,6 +549,7 @@ export const en: Translations = {
     },
     fieldLabels: FIELD_LABELS,
     fieldDescriptions: FIELD_DESCRIPTIONS,
+    personalities: {},
     about: {
       heading: 'Hermes Desktop',
       version: value => `Version ${value}`,
