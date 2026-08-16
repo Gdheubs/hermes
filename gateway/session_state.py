@@ -35,6 +35,7 @@ add eviction of fully-default SessionStates.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -167,6 +168,10 @@ class PersistentState:
     # since they key on sid. Making this durable is tracked on #79624 as a
     # schema-level follow-up.
     hygiene_failure_streak: int = 0
+    # Serializes durable resume-marker writes/clears with shutdown's
+    # reservation decision.  A successful old turn must not clear a newer
+    # marker written while shutdown is preparing to interrupt that session.
+    resume_pending_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 @dataclass

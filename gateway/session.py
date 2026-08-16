@@ -13,6 +13,7 @@ import hashlib
 import logging
 import os
 import json
+import stat
 import threading
 import uuid
 from pathlib import Path
@@ -1242,6 +1243,14 @@ class SessionStore:
     Uses SQLite (via SessionDB) for session metadata and message transcripts.
     Falls back to legacy JSONL files if SQLite is unavailable.
     """
+
+    _JSON_EXACT_AUTHORITY_KEY = "_EXACT_STATE_AUTHORITY"
+    _JSON_EXACT_AUTHORITY_DB = "state.db"
+    _JSON_EXACT_AUTHORITY_JSON = "sessions.json"
+    _DB_EXACT_AUTHORITY_MARKER = ".sessions_json_exact_state_untrusted"
+    _EXACT_RESUME_REASONS = frozenset(
+        {"restart_timeout", "shutdown_timeout", "active_turn_interrupted"}
+    )
     
     def __init__(self, sessions_dir: Path, config: GatewayConfig,
                  has_active_processes_fn=None):
@@ -1284,6 +1293,9 @@ class SessionStore:
         self._write_sessions_json = bool(
             getattr(config, "write_sessions_json", True)
         )
+        # True only while sessions.json is the last known durable exact-state
+        # authority (genuinely DB-less operation or an uncompleted migration).
+        self._json_exact_state_is_authoritative = False
         
         # Initialize SQLite session database
         self._db = None
@@ -1300,6 +1312,104 @@ class SessionStore:
             print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
         except Exception as e:
             print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
+
+    def _db_exact_authority_marker_path(self) -> Path:
+        return self.sessions_dir / self._DB_EXACT_AUTHORITY_MARKER
+
+    def _ensure_db_exact_authority_marker(self) -> None:
+        """Durably prevent a legacy mirror from claiming exact-state authority."""
+        marker = self._db_exact_authority_marker_path()
+        try:
+            marker_fd = os.open(
+                marker,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+        except FileNotFoundError:
+            marker_fd = None
+        except OSError as exc:
+            raise OSError(
+                f"refusing unsafe exact-authority marker: {marker}"
+            ) from exc
+        if marker_fd is not None:
+            try:
+                opened = os.fstat(marker_fd)
+                if not stat.S_ISREG(opened.st_mode):
+                    raise OSError(
+                        f"refusing non-regular exact-authority marker: {marker}"
+                    )
+                if os.read(marker_fd, 64) != b"state.db\n":
+                    raise OSError(
+                        f"refusing invalid exact-authority marker: {marker}"
+                    )
+                current = os.lstat(marker)
+                if (current.st_dev, current.st_ino) != (
+                    opened.st_dev,
+                    opened.st_ino,
+                ):
+                    raise OSError(
+                        f"exact-authority marker changed during validation: {marker}"
+                    )
+            finally:
+                os.close(marker_fd)
+            self._fsync_sessions_dir()
+            self._json_exact_state_is_authoritative = False
+            return
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        import tempfile
+
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(self.sessions_dir), suffix=".tmp", prefix=".exact_authority_"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write("state.db\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            self._publish_routing_file_strict(tmp_path, marker)
+            self._json_exact_state_is_authoritative = False
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def _fsync_sessions_dir(self) -> None:
+        """Persist an atomically replaced routing-file directory entry."""
+        if os.name != "posix":
+            return
+        directory_fd = os.open(self.sessions_dir, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def _publish_routing_file_strict(self, tmp_path: str, target: Path) -> None:
+        """Atomically publish an authoritative routing file and its directory.
+
+        ``utils.atomic_replace`` intentionally supports symlink targets and
+        non-atomic copy fallbacks.  Exact crash-recovery authority cannot use
+        those compatibility paths: a returned success must mean one same-
+        directory rename plus durable directory metadata.
+        """
+        if target.is_symlink():
+            raise OSError(
+                f"refusing symlink target for authoritative routing file: {target}"
+            )
+        os.replace(tmp_path, target)
+        self._fsync_sessions_dir()
+
+    def _routing_data_has_exact_state(self, data: Dict[str, Any]) -> bool:
+        """Return whether a snapshot still carries crash-replay authority."""
+        return any(
+            entry.get("active_turn_token")
+            or (
+                entry.get("resume_pending")
+                and entry.get("resume_reason") in self._EXACT_RESUME_REASONS
+            )
+            for entry in data.values()
+            if isinstance(entry, dict)
+        )
 
     def _has_active_processes_safe(self, session_key: str, *, context: str) -> bool:
         """Return whether a session has active work, failing closed on registry errors."""
@@ -1351,6 +1461,7 @@ class SessionStore:
         # partially-initialized stores without __init__ (same pattern as
         # _prune_stale_sessions_locked).
         db_had_entries = False
+        db_load_succeeded = False
         _db = getattr(self, "_db", None)
         if _db:
             loader = getattr(_db, "load_gateway_routing_entries", None)
@@ -1366,6 +1477,7 @@ class SessionStore:
                                 "Skipping invalid routing entry %r: %s", key, e
                             )
                     db_had_entries = bool(self._entries)
+                    db_load_succeeded = True
                 except Exception as e:
                     logger.warning(
                         "gateway.session: state.db routing load failed: %s", e
@@ -1375,18 +1487,37 @@ class SessionStore:
         # written by an older gateway after a downgrade). Only fills keys the
         # DB didn't provide — DB entries win.
         sessions_file = self.sessions_dir / "sessions.json"
+        trust_json_exact_state = False
         if sessions_file.exists():
             try:
                 with open(sessions_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 imported = 0
+                # The mirror intentionally lags metadata written through the
+                # state.db single-row fast path. Exact crash-recovery fields
+                # are therefore trusted only when this file says it was the
+                # primary store (a genuinely DB-less installation). Missing
+                # metadata is treated as an old state.db mirror, not as proof
+                # of JSON authority.
+                marker_path = self._db_exact_authority_marker_path()
+                try:
+                    os.lstat(marker_path)
+                    marker_absent = False
+                except FileNotFoundError:
+                    marker_absent = True
+                trust_json_exact_state = (
+                    marker_absent
+                    and data.get(self._JSON_EXACT_AUTHORITY_KEY)
+                    == self._JSON_EXACT_AUTHORITY_JSON
+                )
+                self._json_exact_state_is_authoritative = trust_json_exact_state
                 for key, entry_data in data.items():
                     # Keys starting with "_" are documentation/metadata sentinels
                     # (e.g. the "_README" note written by _save), not session
                     # entries. Skip them so they never reach SessionEntry.from_dict.
                     if key.startswith("_"):
                         continue
-                    if key in self._entries:
+                    if key in self._entries and not trust_json_exact_state:
                         continue
                     # Skip non-dict entries (corrupted sessions.json, e.g. a
                     # bare bool or string where a dict is expected). Without
@@ -1401,6 +1532,10 @@ class SessionStore:
                         )
                         continue
                     try:
+                        if not trust_json_exact_state:
+                            entry_data = self._without_untrusted_exact_state(
+                                entry_data
+                            )
                         self._entries[key] = SessionEntry.from_dict(entry_data)
                         imported += 1
                     except (ValueError, KeyError, TypeError) as e:
@@ -1414,7 +1549,25 @@ class SessionStore:
             except Exception as e:
                 print(f"[gateway] Warning: Failed to load sessions: {e}")
 
-        self._loaded = True
+        if (
+            db_load_succeeded
+            and trust_json_exact_state
+            and not self._routing_data_has_exact_state(
+                {key: entry.to_dict() for key, entry in self._entries.items()}
+            )
+        ):
+            # Quiescent DB-less -> state.db migration: only hand authority to
+            # the new primary when no crash-replay state is live. Preserve the
+            # complete JSON snapshot in the DB first, then publish the sidecar.
+            data, generation = self._snapshot_routing_locked()
+            self._persist_routing_data(
+                data,
+                generation,
+                require_authoritative=True,
+                establish_exact_authority=False,
+                write_json=False,
+            )
+            self._ensure_db_exact_authority_marker()
 
         # Prune any sessions.json entries that point to sessions already ended
         # in state.db. A hard gateway crash (exit code 1) skips the graceful
@@ -1425,7 +1578,31 @@ class SessionStore:
         # live-gateway case; this startup prune still self-heals crash-left
         # entries before the first message arrives. Pruning here (lock already
         # held) is cheap: one lookup per routing key, once at startup.
-        self._prune_stale_sessions_locked()
+        if db_load_succeeded and not self._json_exact_state_is_authoritative:
+            self._prune_stale_sessions_locked()
+        # Do not publish a successfully loaded instance until migration,
+        # sidecar publication, and startup pruning have all completed. A
+        # caller that catches an initialization error can then retry safely.
+        self._loaded = True
+
+    def _without_untrusted_exact_state(
+        self, entry_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Downgrade exact fields from a legacy state.db mirror.
+
+        ``sessions.json`` remains useful for routing when SQLite is temporarily
+        unavailable, but a stale exact marker can duplicate a completed turn.
+        Preserve inbound-only continuity while refusing synthetic dispatch.
+        """
+        sanitized = dict(entry_data)
+        sanitized["active_turn_token"] = None
+        sanitized["active_turn_started_at"] = None
+        if (
+            sanitized.get("resume_pending")
+            and sanitized.get("resume_reason") in self._EXACT_RESUME_REASONS
+        ):
+            sanitized["resume_reason"] = "restart_interrupted"
+        return sanitized
 
     def _prune_stale_sessions_locked(self) -> None:
         """Remove sessions.json entries whose session has ended in state.db.
@@ -1511,10 +1688,15 @@ class SessionStore:
         if stale_keys or recovered_keys:
             self._save()
 
-    def _save(self) -> None:
+    def _save(self, *, require_authoritative: bool = False) -> None:
         """Persist the routing index while the caller holds ``_lock``."""
         data, generation = self._snapshot_routing_locked()
-        self._persist_routing_data(data, generation)
+        if require_authoritative:
+            self._persist_routing_data(
+                data, generation, require_authoritative=True
+            )
+        else:
+            self._persist_routing_data(data, generation)
 
     def _next_routing_generation_locked(self) -> int:
         """Bump and return the shared routing counter. Caller holds ``_lock``.
@@ -1535,7 +1717,15 @@ class SessionStore:
             self._next_routing_generation_locked(),
         )
 
-    def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
+    def _persist_routing_data(
+        self,
+        data: Dict[str, Any],
+        generation: int,
+        *,
+        require_authoritative: bool = False,
+        establish_exact_authority: bool = True,
+        write_json: bool = True,
+    ) -> None:
         """Serialize all whole-index writers through one durable write lock."""
         save_lock = getattr(self, "_save_lock", None)
         if save_lock is None:
@@ -1554,8 +1744,40 @@ class SessionStore:
                 for key, (revision, entry_json) in fast_persisted.items():
                     if revision > generation:
                         data[key] = json.loads(entry_json)
+            if (
+                require_authoritative
+                and establish_exact_authority
+                and getattr(
+                    self, "_json_exact_state_is_authoritative", False
+                )
+            ):
+                # Every exact transition—including the one that clears the last
+                # token—commits first to the current strict JSON authority. A
+                # later, separate quiescent transaction may hand authority to
+                # state.db; never combine the final exact mutation with that
+                # cross-resource handoff.
+                self._save_sessions_json(data)
+                self._persisted_routing_generation = generation
+                if fast_persisted:
+                    for key in [
+                        k
+                        for k, (rev, _) in fast_persisted.items()
+                        if rev <= generation
+                    ]:
+                        del fast_persisted[key]
+                return
             db_saved = False
+            db_error: Optional[Exception] = None
             _db = getattr(self, "_db", None)
+            if (
+                require_authoritative
+                and establish_exact_authority
+                and _db is not None
+            ):
+                # This small durable sidecar closes the window where a gateway
+                # first migrates from JSON-only operation to state.db but the
+                # large legacy mirror still advertises JSON authority.
+                self._ensure_db_exact_authority_marker()
             if _db:
                 replacer = getattr(_db, "replace_gateway_routing_entries", None)
                 if callable(replacer):
@@ -1566,10 +1788,21 @@ class SessionStore:
                         )
                         db_saved = True
                     except Exception as exc:
+                        db_error = exc
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc
                         )
-            if getattr(self, "_write_sessions_json", True) or not db_saved:
+            if require_authoritative and not db_saved:
+                # Do not publish an exact-transition candidate to the legacy
+                # mirror when the configured primary rejected it. A later boot
+                # that temporarily falls back to JSON must not revive state that
+                # was never authoritative.
+                raise RuntimeError(
+                    "authoritative state.db routing save failed"
+                ) from db_error
+            if write_json and (
+                getattr(self, "_write_sessions_json", True) or not db_saved
+            ):
                 try:
                     self._save_sessions_json(data)
                 except Exception as exc:
@@ -1614,6 +1847,16 @@ class SessionStore:
                 "Disable this file with `gateway.write_sessions_json: false` "
                 "in config.yaml."
             ),
+            self._JSON_EXACT_AUTHORITY_KEY: (
+                self._JSON_EXACT_AUTHORITY_JSON
+                if (
+                    getattr(self, "_db", None) is None
+                    or getattr(
+                        self, "_json_exact_state_is_authoritative", False
+                    )
+                )
+                else self._JSON_EXACT_AUTHORITY_DB
+            ),
             **data,
         }
         fd, tmp_path = tempfile.mkstemp(
@@ -1624,7 +1867,21 @@ class SessionStore:
                 json.dump(data, f, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
-            atomic_replace(tmp_path, sessions_file)
+            if (
+                getattr(self, "_db", None) is None
+                or getattr(
+                    self, "_json_exact_state_is_authoritative", False
+                )
+            ):
+                # In DB-less or deferred-migration operation this file is the
+                # exact-state authority.
+                self._publish_routing_file_strict(tmp_path, sessions_file)
+            else:
+                # Preserve the established symlink/bind-mount compatibility
+                # for the non-authoritative legacy mirror. Exact state is safe
+                # because state.db and its strict sidecar are authoritative.
+                atomic_replace(tmp_path, sessions_file)
+                self._fsync_sessions_dir()
         except BaseException:
             try:
                 os.unlink(tmp_path)
@@ -1644,6 +1901,7 @@ class SessionStore:
         *,
         entry_data: Optional[Dict[str, Any]] = None,
         lock_held: bool = False,
+        require_authoritative: bool = False,
     ) -> None:
         """Persist ONE routing entry via UPSERT — the per-turn fast path.
 
@@ -1714,7 +1972,19 @@ class SessionStore:
             return
         entry_json, revision, candidate_entry = captured
         _db = getattr(self, "_db", None)
-        saver = getattr(_db, "save_gateway_routing_entry", None) if _db else None
+        json_exact_authority = bool(
+            require_authoritative
+            and getattr(
+                self, "_json_exact_state_is_authoritative", False
+            )
+        )
+        if require_authoritative and _db is not None and not json_exact_authority:
+            self._ensure_db_exact_authority_marker()
+        saver = (
+            getattr(_db, "save_gateway_routing_entry", None)
+            if _db and not json_exact_authority
+            else None
+        )
         if callable(saver):
             save_lock = getattr(self, "_save_lock", None)
             if save_lock is None:
@@ -1757,7 +2027,11 @@ class SessionStore:
                         for key, current in self._entries.items()
                     }
             fallback_data[session_key] = candidate_entry
-            self._persist_routing_data(fallback_data, revision)
+            self._persist_routing_data(
+                fallback_data,
+                revision,
+                require_authoritative=require_authoritative,
+            )
         else:
             self._save_entries()
 
@@ -2985,6 +3259,7 @@ class SessionStore:
                 session_key,
                 entry_data=candidate,
                 lock_held=True,
+                require_authoritative=self._db is not None,
             )
             entry.active_turn_token = token
             entry.active_turn_started_at = now
@@ -3011,6 +3286,7 @@ class SessionStore:
                 session_key,
                 entry_data=candidate,
                 lock_held=True,
+                require_authoritative=self._db is not None,
             )
             entry.active_turn_token = None
             entry.active_turn_started_at = None
@@ -3034,10 +3310,12 @@ class SessionStore:
         now = _now()
         max_age = timedelta(seconds=max(0, max_age_seconds))
         promoted = 0
-        changed = False
 
         with self._lock:
             self._ensure_loaded_locked()
+            transitions: list[
+                tuple[SessionEntry, Dict[str, Any], bool, Optional[str], Optional[datetime]]
+            ] = []
             for entry in self._entries.values():
                 if not entry.active_turn_token:
                     continue
@@ -3050,48 +3328,92 @@ class SessionStore:
                     )
                 except TypeError:
                     # Mixed aware/naive timestamps are invalid for this local
-                    # marker.  Clear rather than risking an unsafe old resume.
+                    # marker. Clear rather than risking an unsafe old resume.
                     marker_is_stale = True
 
+                resume_pending = entry.resume_pending
+                resume_reason = entry.resume_reason
+                marked_at = entry.last_resume_marked_at
                 if not marker_is_stale and not entry.suspended:
-                    if entry.resume_pending:
-                        # A drain-timeout marker is more specific than the
-                        # generic crash reason; preserve it and its freshness.
-                        if entry.last_resume_marked_at is None:
-                            entry.last_resume_marked_at = now
-                    else:
-                        entry.resume_pending = True
-                        entry.resume_reason = "restart_interrupted"
-                        # Freshness starts when recovery is discovered, not
-                        # when a potentially hours-long turn began.
-                        entry.last_resume_marked_at = now
-                        promoted += 1
+                    # A fresh durable active-turn token is exact evidence from
+                    # the crashed process. It supersedes both recency-only
+                    # recovery and any possibly stale planned-drain timeout
+                    # marker, and is the only unclean-start class eligible for
+                    # synthetic continuation.
+                    resume_pending = True
+                    resume_reason = "active_turn_interrupted"
+                    # Freshness starts when recovery is discovered, not when a
+                    # potentially hours-long turn began.
+                    marked_at = now
+                    promoted += 1
 
-                entry.active_turn_token = None
-                entry.active_turn_started_at = None
-                changed = True
+                candidate = entry.to_dict()
+                candidate["resume_pending"] = resume_pending
+                candidate["resume_reason"] = resume_reason
+                candidate["last_resume_marked_at"] = (
+                    marked_at.isoformat() if marked_at is not None else None
+                )
+                candidate["active_turn_token"] = None
+                candidate["active_turn_started_at"] = None
+                transitions.append(
+                    (entry, candidate, resume_pending, resume_reason, marked_at)
+                )
 
-            if changed:
-                # Cold-start batch: one durable rewrite is clearer and cheaper
-                # than an upsert per interrupted routing entry.
-                self._save()
+            if transitions:
+                data, generation = self._snapshot_routing_locked()
+                for entry, candidate, *_ in transitions:
+                    data[entry.session_key] = candidate
+                # Exact active-turn state lives in the authoritative routing
+                # store (state.db when configured, otherwise the legacy JSON
+                # store). Publish neither its promotion nor its clear until that
+                # rewrite lands; otherwise a failed startup could auto-dispatch
+                # from memory and replay the same durable marker on the next boot.
+                self._persist_routing_data(
+                    data,
+                    generation,
+                    require_authoritative=self._db is not None,
+                )
+                for entry, _candidate, resume_pending, resume_reason, marked_at in transitions:
+                    entry.resume_pending = resume_pending
+                    entry.resume_reason = resume_reason
+                    entry.last_resume_marked_at = marked_at
+                    entry.active_turn_token = None
+                    entry.active_turn_started_at = None
 
         return promoted
 
     def discard_active_turn_markers(self) -> int:
         """Clear orphan turn markers after a verified clean shutdown."""
-        cleared = 0
         with self._lock:
             self._ensure_loaded_locked()
-            for entry in self._entries.values():
-                if not entry.active_turn_token and entry.active_turn_started_at is None:
-                    continue
+            entries = [
+                entry
+                for entry in self._entries.values()
+                if entry.active_turn_token
+                or entry.active_turn_started_at is not None
+            ]
+            if not entries:
+                return 0
+
+            data, generation = self._snapshot_routing_locked()
+            for entry in entries:
+                candidate = entry.to_dict()
+                candidate["active_turn_token"] = None
+                candidate["active_turn_started_at"] = None
+                data[entry.session_key] = candidate
+
+            # A clean receipt may be committed only after the authoritative DB
+            # no longer carries orphan active-turn evidence. Keep the live state
+            # unchanged if persistence fails so this cleanup is retryable.
+            self._persist_routing_data(
+                data,
+                generation,
+                require_authoritative=self._db is not None,
+            )
+            for entry in entries:
                 entry.active_turn_token = None
                 entry.active_turn_started_at = None
-                cleared += 1
-            if cleared:
-                self._save()
-        return cleared
+            return len(entries)
 
     def mark_resume_pending(
         self,
@@ -3115,10 +3437,32 @@ class SessionStore:
                 # forced-wipe signal (from /stop or stuck-loop escalation).
                 if entry.suspended:
                     return False
+                marked_at = _now()
+                candidate = entry.to_dict()
+                candidate["resume_pending"] = True
+                candidate["resume_reason"] = reason
+                candidate["last_resume_marked_at"] = marked_at.isoformat()
+                data, generation = self._snapshot_routing_locked()
+                data[session_key] = candidate
+                self._persist_routing_data(
+                    data,
+                    generation,
+                    require_authoritative=(
+                        self._db is not None
+                        and reason
+                        in {
+                            "restart_timeout",
+                            "shutdown_timeout",
+                            "active_turn_interrupted",
+                        }
+                    ),
+                )
+                # Publish only after the required durable write succeeds. A
+                # failed authoritative save must leave live state retryable and
+                # must not leak through a later unrelated snapshot.
                 entry.resume_pending = True
                 entry.resume_reason = reason
-                entry.last_resume_marked_at = _now()
-                self._save()
+                entry.last_resume_marked_at = marked_at
                 return True
         return False
 
@@ -3136,11 +3480,67 @@ class SessionStore:
             entry = self._entries.get(session_key)
             if entry is None or not entry.resume_pending:
                 return False
+            require_authoritative = (
+                self._db is not None
+                and entry.resume_reason
+                in {
+                    "restart_timeout",
+                    "shutdown_timeout",
+                    "active_turn_interrupted",
+                }
+            )
+            candidate = entry.to_dict()
+            candidate["resume_pending"] = False
+            candidate["resume_reason"] = None
+            candidate["last_resume_marked_at"] = None
+            data, generation = self._snapshot_routing_locked()
+            data[session_key] = candidate
+            self._persist_routing_data(
+                data,
+                generation,
+                require_authoritative=require_authoritative,
+            )
+            # Preserve the live marker if persistence fails so the clear remains
+            # naturally retryable and cannot leak through another save.
             entry.resume_pending = False
             entry.resume_reason = None
             entry.last_resume_marked_at = None
-            self._save()
             return True
+
+    def downgrade_untrusted_exact_resume_pending(self) -> int:
+        """Make exact timeout markers inbound-only after an unclean boot.
+
+        A missing clean-shutdown proof means an exact marker could be residue
+        from a completed turn whose shutdown-time clear failed. Persistently
+        downgrade such markers so a later unrelated clean boot cannot make
+        them eligible for synthetic startup dispatch.
+        """
+        exact_reasons = {"restart_timeout", "shutdown_timeout"}
+        with self._lock:
+            self._ensure_loaded_locked()
+            entries = [
+                entry
+                for entry in self._entries.values()
+                if entry.resume_pending
+                and entry.resume_reason in exact_reasons
+                and not entry.suspended
+            ]
+            if not entries:
+                return 0
+
+            data, generation = self._snapshot_routing_locked()
+            for entry in entries:
+                candidate = entry.to_dict()
+                candidate["resume_reason"] = "restart_interrupted"
+                data[entry.session_key] = candidate
+            self._persist_routing_data(
+                data,
+                generation,
+                require_authoritative=self._db is not None,
+            )
+            for entry in entries:
+                entry.resume_reason = "restart_interrupted"
+            return len(entries)
 
     def prune_old_entries(self, max_age_days: int) -> int:
         """Drop SessionEntry records older than max_age_days.
