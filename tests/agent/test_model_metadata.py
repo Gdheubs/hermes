@@ -1808,3 +1808,17 @@ def test_confirmed_learned_limit_is_sticky():
     for _ in range(_LEARNED_CONTEXT_LIMIT_TURNS * 2 + 1):
         cc.update_from_response({"prompt_tokens": 100, "completion_tokens": 10})
     assert cc.context_length == 8_000, "confirmed limit must stick (no re-expiry)"
+
+
+def test_context_limit_parser_bedrock_shapes():
+    """The Bedrock overflow shapes report the real limit; the learned-limit
+    path must adopt them (a wrong Bedrock static window would otherwise
+    persist — the drift check does not cover bedrock)."""
+    from agent.model_metadata import parse_context_limit_from_error
+
+    for msg in (
+        "ValidationException: input exceeds the maximum input tokens of 200000",
+        "ValidationException: prompt exceeds the maximum number of input tokens: 200000",
+        "ModelStreamErrorException: Input is too long for this model. Max input tokens: 200000",
+    ):
+        assert parse_context_limit_from_error(msg) == 200000, msg
