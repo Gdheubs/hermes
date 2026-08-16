@@ -6,6 +6,7 @@ import { invalidateProfileScopedQueries } from '@/lib/query-client'
 import { clearArtifactRegistry } from '@/store/artifacts'
 import { resetSessionsLimit } from '@/store/layout'
 import { resetLiveSync } from '@/store/live-sync'
+import { resetProjectsForGatewaySwitch } from '@/store/projects'
 import {
   $unreadFinishedSessionIds,
   setActiveSessionId,
@@ -78,6 +79,12 @@ export function wipeSessionListsForGatewaySwitch(): void {
   // Artifacts are keyed by sessions on the previous backend, so both the
   // registry and any rail tab pointing into it go with them.
   clearArtifactRegistry()
+
+  // Projects are per-profile (each gateway has its own projects.db): the tree,
+  // list, active pointer, drill-in scope, and tombstones must not carry across
+  // a switch, or the sidebar paints the previous profile's projects (or a
+  // stale drill-in id that doesn't exist in the new catalog).
+  resetProjectsForGatewaySwitch()
 
   // Narrowed: account/marketplace/onboarding caches are global, not gateway-
   // scoped, so a mode swap must not refetch them.
