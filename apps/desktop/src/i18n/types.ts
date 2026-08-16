@@ -2186,6 +2186,8 @@ export interface Translations {
     search: string
     noAuthenticatedProviders: string
     addProvider: string
+    providerToggle: (provider: string) => string
+    providerToggleFailed: string
   }
 
   shell: {
