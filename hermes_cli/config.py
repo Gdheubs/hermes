@@ -1849,6 +1849,10 @@ def get_custom_provider_reasoning_format(
     ``reasoning`` object in the request body, and some proxies reject either
     unknown field with a 400. This per-provider key lets users pick the
     dialect their endpoint speaks (#72649).
+
+    If multiple entries normalize to the same route, entries are checked in
+    compatibility-list order and the first valid ``reasoning_format`` wins;
+    entries with missing or invalid values are skipped.
     """
     if not base_url:
         return None

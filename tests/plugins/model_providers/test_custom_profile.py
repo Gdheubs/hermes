@@ -198,7 +198,9 @@ class TestCustomReasoningFormatOverride:
         assert eb == {}
         assert tl == {}
 
-    def test_format_none_disabled_emits_nothing(self, custom_profile, monkeypatch):
+    def test_format_none_disabled_emits_nothing_and_warns(
+        self, custom_profile, monkeypatch, caplog
+    ):
         """reasoning_format='none' also suppresses the disable fields.
 
         Fixes the second failure mode in #72649: `/reasoning none` used to
@@ -213,6 +215,7 @@ class TestCustomReasoningFormatOverride:
         )
         assert eb == {}
         assert tl == {}
+        assert "suppresses the explicit reasoning disable request" in caplog.text
 
     def test_explicit_top_level_matches_default_enabled(
         self, custom_profile, monkeypatch
