@@ -36,6 +36,44 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 
+# TNMC production adds a fail-closed NORTH completion gate. Upstream Kanban
+# mechanics tests do not create production evidence, so isolate the gate only
+# inside pytest; dedicated TNMC gate tests exercise the real implementation.
+@pytest.fixture(autouse=True)
+def _isolate_tnmc_north_done_gate_for_upstream_kanban_tests(request, monkeypatch, tmp_path):
+    try:
+        relative = request.path.resolve().relative_to(PROJECT_ROOT).as_posix()
+    except (AttributeError, ValueError):
+        return
+    if not relative.startswith("tests/") or "north_checks" in relative:
+        return
+    from hermes_cli import kanban_db as kb
+
+    def _pass_preflight(conn, task_id, _metadata):
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS north_gate_tokens (
+                task_id TEXT PRIMARY KEY,
+                report_path TEXT NOT NULL,
+                report_sha256 TEXT NOT NULL,
+                issued_at INTEGER NOT NULL,
+                consumed_at INTEGER
+            )"""
+        )
+        report_path = tmp_path / f"{task_id}-north-checks-done.json"
+        payload = {
+            "status": "PASS",
+            "report_sha256": "0" * 64,
+            "_attach_completion_evidence": False,
+        }
+        report_path.write_text(
+            '{"status":"PASS","report_sha256":"' + "0" * 64 + '"}',
+            encoding="utf-8",
+        )
+        return payload, report_path
+
+    monkeypatch.setattr(kb, "_north_done_gate_preflight", _pass_preflight)
+
+
 # ── Sandbox HERMES_HOME before ANY test module is imported ──────────────────
 # `hermes_cli/main.py` calls `setup_logging()` at MODULE level, which resolves
 # `get_hermes_home()` and attaches rotating file handlers to the ROOT logger.
