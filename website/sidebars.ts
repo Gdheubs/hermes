@@ -624,6 +624,25 @@ const sidebars: SidebarsConfig = {
             },
           ],
         },
+        {
+          type: 'category',
+          label: 'MCPs',
+          collapsed: true,
+          items: [
+            'reference/optional-mcps-catalog',
+            {
+              type: 'category',
+              label: 'Optional',
+              key: 'mcps-optional',
+              collapsed: true,
+              items: [
+                'user-guide/mcps/optional/linear',
+                'user-guide/mcps/optional/n8n',
+                'user-guide/mcps/optional/unreal-engine',
+              ],
+            },
+          ],
+        },
       ],
     },
     {
@@ -825,6 +844,7 @@ const sidebars: SidebarsConfig = {
           items: [
             'reference/environment-variables',
             'reference/mcp-config-reference',
+            'reference/optional-mcps-catalog',
             'reference/model-catalog',
           ],
         },
