@@ -1218,7 +1218,31 @@ def create_profile(
     # unit-generation paths handle gateway lifecycle.
     _maybe_register_gateway_service(canon)
 
+    # Pin the desktop app's active-profile.json to the newly created profile.
+    # Without this, CLI-spawned profiles leave the desktop silently pinned to
+    # `default` — the new profile's tools/config are unreachable from the
+    # desktop surface until the user manually picks it in the UI.
+    _pin_active_profile(canon)
+
     return profile_dir
+
+
+def _pin_active_profile(name: str) -> None:
+    """Tell the desktop app which profile is active.
+
+    Writes ``{"profile": <name>}`` to the desktop's ``active-profile.json``
+    (``%APPDATA%\\Hermes\\active-profile.json`` on Windows). Best-effort —
+    never fails profile creation if the desktop dir is unwritable or absent
+    (headless installs).
+    """
+    try:
+        from hermes_cli.gui_uninstall import desktop_userdata_dir
+
+        user_data = desktop_userdata_dir()
+        active_file = user_data / "active-profile.json"
+        active_file.write_text(json.dumps({"profile": name}), encoding="utf-8")
+    except Exception:
+        pass  # headless / no desktop — non-fatal
 
 
 def seed_profile_skills(profile_dir: Path, quiet: bool = False) -> Optional[dict]:
