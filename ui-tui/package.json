@@ -23,6 +23,7 @@
     "@hermes/shared": "file:../apps/shared",
     "@nanostores/react": "1.1.0",
     "ink-text-input": "6.0.0",
+    "nanoid": "3.3.18",
     "nanostores": "1.4.0",
     "react": "19.2.7",
     "undici": "6.28.0",
