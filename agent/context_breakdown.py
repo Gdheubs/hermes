@@ -16,6 +16,12 @@ _SKILLS_BLOCK_RE = re.compile(r"<available_skills>.*?</available_skills>", re.DO
 
 _SUBAGENT_TOOL_NAMES = frozenset({"delegate_task"})
 
+# A category at zero tokens is dropped from the payload, which reads as "not
+# configured" - true for MCP, memory and skills, and false for the
+# conversation. Every session has one, so hiding the row at zero makes an empty
+# transcript indistinguishable from a breakdown that never measured it (#87903).
+_ALWAYS_REPORTED = frozenset({"conversation"})
+
 _CATEGORY_COLORS = {
     "system_prompt": "var(--context-usage-system)",
     "tool_definitions": "var(--context-usage-tools)",
@@ -146,7 +152,7 @@ def compute_session_context_breakdown(
                 "tokens": tokens,
             }
             for category_id, label, tokens in categories
-            if tokens > 0
+            if tokens > 0 or category_id in _ALWAYS_REPORTED
         ],
         "context_max": context_max,
         "context_percent": context_percent,
