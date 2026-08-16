@@ -5,7 +5,8 @@ import { BrandMark } from '@/components/brand-mark'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { type Translations, useI18n } from '@/i18n'
-import { CheckCircle2, ExternalLink, Loader2, RefreshCw } from '@/lib/icons'
+import { desktopProblemReportUrl } from '@/lib/desktop-problem-report'
+import { Bug, CheckCircle2, ExternalLink, Loader2, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import {
   $desktopVersion,
@@ -178,6 +179,24 @@ export function AboutSettings() {
           hint={a.branchCommit(status?.branch ?? 'unknown', status?.currentSha?.slice(0, 7) ?? 'unknown')}
           title={a.automaticUpdates}
         />
+
+        <div className="mt-6">
+          <SectionHeading icon={Bug} title={a.support} />
+          <ListRow
+            action={
+              <Button
+                onClick={() => void window.hermesDesktop?.openExternal?.(desktopProblemReportUrl({ status, version }))}
+                size="sm"
+                variant="textStrong"
+              >
+                <ExternalLink />
+                {a.reportProblemAction}
+              </Button>
+            }
+            description={a.reportProblemDesc}
+            title={a.reportProblem}
+          />
+        </div>
 
         <UninstallSection />
       </div>

@@ -580,6 +580,11 @@ export const en: Translations = {
       automaticUpdatesDesc:
         'Hermes checks for updates automatically in the background and lets you know when one is ready.',
       branchCommit: (branch, commit) => `Branch ${branch} · Commit ${commit}`,
+      support: 'Support',
+      reportProblem: 'Report a problem on GitHub',
+      reportProblemDesc:
+        'Open an editable GitHub issue draft with basic Desktop details. Review it before submitting; nothing is sent automatically.',
+      reportProblemAction: 'Report on GitHub',
       never: 'never',
       justNow: 'just now',
       minAgo: count => `${count} min ago`,

@@ -475,6 +475,10 @@ export interface Translations {
       automaticUpdates: string
       automaticUpdatesDesc: string
       branchCommit: (branch: string, commit: string) => string
+      support: string
+      reportProblem: string
+      reportProblemDesc: string
+      reportProblemAction: string
       never: string
       justNow: string
       minAgo: (count: number) => string
