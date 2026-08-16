@@ -1140,6 +1140,9 @@ DEFAULT_CONFIG = {
         # replay; different model = digest. Quality holds (memory capture
         # identical, skill near-identical in benchmarks).
         "background_review": {
+            # Master switch for automatic post-turn memory/skill review forks.
+            # false = skip automatic spawns (manual /refine still works).
+            "enabled": True,
             "provider": "auto",
             "model": "",
             "base_url": "",
@@ -1147,6 +1150,16 @@ DEFAULT_CONFIG = {
             "timeout": 120,
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
+            # Tool-calling iteration budget for the review fork. Default 16
+            # matches historical behavior. The review has no hard "nothing to
+            # do" early-out — a session with nothing worth saving can still
+            # burn the full budget. Lower this to bound worst-case cost;
+            # clamped to [1, 64].
+            "max_iterations": 16,
+            # Optional path to a custom review prompt (replaces the built-in
+            # memory/skill/combined prompts). Relative paths resolve under
+            # HERMES_HOME. Empty = use built-in prompts.
+            "prompt_file": "",
         },
         "moa_reference": {
             "provider": "auto",
@@ -2188,6 +2201,16 @@ DEFAULT_CONFIG = {
     #   deny    — block the command and let the agent find another way (default, safe)
     #   approve — auto-approve all dangerous commands in cron jobs
     #
+    # single_query_mode — what to do when a single-query (-q) session hits a
+    # dangerous command. -q runs export HERMES_INTERACTIVE=1 (for interactive
+    # sudo prompts) but have NO user waiting to answer approval prompts — an
+    # unanswered prompt just waits the full timeout then fails closed, so the
+    # agent is forced to work around the block (often via execute_code). This
+    # setting makes that intent explicit:
+    #   deny    — block the command and let the agent find another way (default,
+    #             safe; mirrors cron_mode deny)
+    #   approve — auto-approve all dangerous commands in single-query mode
+    #
     # timeout — seconds to wait for the user's approve/deny before failing
     # closed (deny). Shared by the CLI prompt and gateway/messaging waits.
     # Messaging approvals arrive as a push notification the user may not see
@@ -2197,6 +2220,7 @@ DEFAULT_CONFIG = {
         "mode": "smart",
         "timeout": 300,
         "cron_mode": "deny",
+        "single_query_mode": "deny",
         # Operator-customizable policy text for smart approvals. When
         # non-empty, this is appended to the smart-approval guardian's
         # SYSTEM prompt (trusted channel) as additional rules — e.g.
@@ -2285,6 +2309,10 @@ DEFAULT_CONFIG = {
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
         "redact_secrets": True,
+        # Persisted acknowledgement for unattended model overrides whose tier
+        # lets the vendor train on prompts/completions. The startup guard still
+        # prints the full warning on every run and never bypasses cost guards.
+        "allow_data_training_tiers_noninteractive": False,
         # Human approval presentation transport. "builtin" preserves the
         # current CLI/TUI/gateway/ACP surfaces. A plugin transport is used only
         # when named explicitly here. Transport timeout/error/invalid response
