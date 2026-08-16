@@ -1640,6 +1640,59 @@ export interface Translations {
     projectEmpty: string
     noSessions: string
     noFilterMatches: string
+    filterMenu: {
+      grouping: string
+      ordering: string
+      show: string
+      inboxStyle: string
+      filtersLabel: string
+      status: string
+      pullRequest: string
+      profile: string
+      project: string
+      archived: string
+      resetToDefaults: string
+      expandAll: string
+      collapseAll: string
+      markAllRead: string
+      ariaLabel: string
+      groupingOptions: {
+        updated: string
+        project: string
+        status: string
+        profile: string
+      }
+      orderingOptions: {
+        updated: string
+        created: string
+        status: string
+        tokens: string
+        cost: string
+        manual: string
+      }
+      rowMetaOptions: {
+        updated: string
+        preview: string
+        tokens: string
+        cost: string
+        pr: string
+        profile: string
+      }
+      prFilters: {
+        open: string
+        draft: string
+        merged: string
+        closed: string
+        none: string
+      }
+      statusFilters: {
+        needsInput: string
+        working: string
+        unread: string
+        draft: string
+        idle: string
+      }
+    }
     projects: {
       sectionLabel: string
       home: string

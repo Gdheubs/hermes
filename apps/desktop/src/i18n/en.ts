@@ -1955,6 +1955,59 @@ export const en: Translations = {
     projectEmpty: 'No sessions yet',
     noSessions: 'No sessions yet',
     noFilterMatches: 'No sessions match these filters',
+    filterMenu: {
+      grouping: 'Grouping',
+      ordering: 'Ordering',
+      show: 'Show',
+      inboxStyle: 'Inbox style',
+      filtersLabel: 'Filters',
+      status: 'Status',
+      pullRequest: 'Pull request',
+      profile: 'Profile',
+      project: 'Project',
+      archived: 'Archived',
+      resetToDefaults: 'Reset to defaults',
+      expandAll: 'Expand all',
+      collapseAll: 'Collapse all',
+      markAllRead: 'Mark all as read',
+      ariaLabel: 'Filters',
+      groupingOptions: {
+        updated: 'Updated',
+        project: 'Project',
+        status: 'Status',
+        profile: 'Profile'
+      },
+      orderingOptions: {
+        updated: 'Updated',
+        created: 'Created',
+        status: 'Status',
+        tokens: 'Tokens',
+        cost: 'Cost',
+        manual: 'Manual'
+      },
+      rowMetaOptions: {
+        updated: 'Updated',
+        preview: 'Preview',
+        tokens: 'Tokens',
+        cost: 'Cost',
+        pr: 'PR',
+        profile: 'Profile'
+      },
+      prFilters: {
+        open: 'Open',
+        draft: 'Draft',
+        merged: 'Merged',
+        closed: 'Closed',
+        none: 'No PR'
+      },
+      statusFilters: {
+        needsInput: 'Needs input',
+        working: 'Working',
+        unread: 'Unread',
+        draft: 'Draft',
+        idle: 'Idle'
+      }
+    },
     projects: {
       sectionLabel: 'Projects',
       home: 'Home',

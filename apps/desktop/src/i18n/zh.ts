@@ -602,6 +602,7 @@ export const zh: Translations = {
       },
       stt: {
         enabled: '语音转文字',
+        echoTranscripts: '回显转写文本',
         provider: '语音转文字提供方',
         local: {
           model: '本地转写模型',
@@ -749,6 +750,7 @@ export const zh: Translations = {
       },
       stt: {
         enabled: '启用本地或提供方支持的语音转写。',
+        echoTranscripts: '把语音消息的原始转写文本回贴到对话中。',
         elevenlabs: {
           languageCode: '可选的 ISO-639-3 语言代码。留空让 ElevenLabs 自动检测。'
         }
@@ -2143,6 +2145,59 @@ export const zh: Translations = {
     projectEmpty: '暂无会话',
     noSessions: '暂无会话',
     noFilterMatches: '没有会话符合这些筛选条件',
+    filterMenu: {
+      grouping: '分组',
+      ordering: '排序',
+      show: '显示',
+      inboxStyle: '收件箱样式',
+      filtersLabel: '筛选',
+      status: '状态',
+      pullRequest: 'PR 请求',
+      profile: '配置',
+      project: '项目',
+      archived: '已归档',
+      resetToDefaults: '恢复默认',
+      expandAll: '全部展开',
+      collapseAll: '全部折叠',
+      markAllRead: '全部标为已读',
+      ariaLabel: '筛选',
+      groupingOptions: {
+        updated: '更新',
+        project: '项目',
+        status: '状态',
+        profile: '配置'
+      },
+      orderingOptions: {
+        updated: '更新',
+        created: '创建',
+        status: '状态',
+        tokens: 'Token 数',
+        cost: '花费',
+        manual: '手动'
+      },
+      rowMetaOptions: {
+        updated: '更新',
+        preview: '预览',
+        tokens: 'Token 数',
+        cost: '花费',
+        pr: 'PR',
+        profile: '配置'
+      },
+      prFilters: {
+        open: '打开',
+        draft: '草稿',
+        merged: '已合并',
+        closed: '已关闭',
+        none: '无 PR'
+      },
+      statusFilters: {
+        needsInput: '等待输入',
+        working: '处理中',
+        unread: '未读',
+        draft: '草稿',
+        idle: '空闲'
+      }
+    },
     projects: {
       sectionLabel: '项目',
       home: '主页',
