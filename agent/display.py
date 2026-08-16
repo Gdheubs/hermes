@@ -1312,6 +1312,8 @@ class KawaiiSpinner:
 # =========================================================================
 
 _ERROR_SUFFIX_MAX_LEN = 48
+_TOOL_FAILURE_SUMMARY_MAX_LEN = 500
+_FAILED_OPERATION_STATES = frozenset({"failed", "error", "cancelled", "canceled"})
 
 
 def _trim_error(msg: str) -> str:
@@ -1330,6 +1332,59 @@ def _trim_error(msg: str) -> str:
     if len(msg) > _ERROR_SUFFIX_MAX_LEN:
         msg = msg[: _ERROR_SUFFIX_MAX_LEN - 3] + "..."
     return msg
+
+
+def _structured_error_fields(error: Any) -> tuple[str | None, str | None]:
+    if isinstance(error, dict):
+        code = error.get("code") or error.get("type")
+        message = error.get("message") or error.get("detail")
+        return (
+            str(code) if code is not None else None,
+            str(message) if message is not None else None,
+        )
+    if error is not None:
+        return None, str(error)
+    return None, None
+
+
+def _operation_state(data: dict[str, Any]) -> str | None:
+    payload = data.get("data")
+    if not isinstance(payload, dict):
+        return None
+    state = payload.get("state") or payload.get("status")
+    return str(state).lower() if state is not None else None
+
+
+def _summarize_tool_failure(result: Any) -> str:
+    """Return a bounded, redacted summary of a failed tool result."""
+    data = safe_json_loads(result)
+    if isinstance(data, dict):
+        payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+        state = _operation_state(data)
+        operation_failed = state in _FAILED_OPERATION_STATES
+        outcome = "operation_failed" if operation_failed else "tool_error"
+        error = payload.get("error") if operation_failed else data.get("error")
+        if error is None:
+            error = payload.get("message") if operation_failed else data.get("message")
+        code, message = _structured_error_fields(error)
+        fields = [f"outcome={outcome}"]
+        for key, value in (
+            ("request_id", payload.get("request_id") or data.get("request_id")),
+            ("provider", payload.get("provider") or data.get("provider")),
+            ("model", payload.get("model") or data.get("model")),
+            ("state", state),
+            ("code", code),
+            ("message", message),
+        ):
+            if value is not None:
+                safe_value = redact_sensitive_text(str(value), force=True)
+                fields.append(f"{key}={safe_value}")
+        summary = " ".join(fields)
+    else:
+        summary = redact_sensitive_text(str(result), force=True)
+    if len(summary) > _TOOL_FAILURE_SUMMARY_MAX_LEN:
+        return summary[: _TOOL_FAILURE_SUMMARY_MAX_LEN - 3] + "..."
+    return summary
 
 
 def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:
@@ -1366,9 +1421,22 @@ def _detect_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]
 
     # Structured error in JSON result (any tool that surfaces {"error": ...}).
     if isinstance(data, dict):
+        state = _operation_state(data)
+        if data.get("ok") is False or data.get("success") is False:
+            err = data.get("error") or data.get("message") or "tool reported failure"
+            _, message = _structured_error_fields(err)
+            return True, f" [{_trim_error(message or str(err))}]"
+        if state in _FAILED_OPERATION_STATES:
+            payload = data.get("data")
+            err = payload.get("error") or payload.get("message") or state
+            _, message = _structured_error_fields(err)
+            return True, f" [{_trim_error(message or str(err))}]"
+        if data.get("ok") is True or data.get("success") is True:
+            return False, ""
         err = data.get("error") or data.get("message")
-        if err and (data.get("success") is False or "error" in data):
-            return True, f" [{_trim_error(str(err))}]"
+        if err and "error" in data:
+            _, message = _structured_error_fields(err)
+            return True, f" [{_trim_error(message or str(err))}]"
 
     # Generic heuristic for non-terminal tools
     # Multimodal tool results (dicts with _multimodal=True) are not strings —

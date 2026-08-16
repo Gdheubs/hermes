@@ -31,6 +31,7 @@ from agent.display import (
     get_tool_emoji as _get_tool_emoji,
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
+    _summarize_tool_failure,
 )
 from agent.tool_dispatch_helpers import (
     _NEVER_PARALLEL_TOOLS,
@@ -52,6 +53,15 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+
+def _log_tool_failure(function_name: str, duration: float, result: Any) -> None:
+    logger.warning(
+        "Tool %s failed (%.2fs): %s",
+        function_name,
+        duration,
+        _summarize_tool_failure(_multimodal_text_summary(result)),
+    )
 
 
 def _ensure_file_checkpoint(
@@ -1647,6 +1657,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if blocked:
                 effect_disposition = "none"
 
+            if is_error:
+                _log_tool_failure(function_name, tool_duration, function_result)
+
             if not blocked:
                 function_result = agent._append_guardrail_observation(
                     function_name,
@@ -1654,11 +1667,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     function_result,
                     failed=is_error,
                 )
-
-            if is_error:
-                _err_text = _multimodal_text_summary(function_result)
-                result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
-                logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
 
             # Track file-mutation outcome for the turn-end verifier.
             # `blocked` calls never actually ran — don't let a guardrail
@@ -2456,6 +2464,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 duration_ms=int(tool_duration * 1000),
                 middleware_trace=list(middleware_trace),
             )
+        if _is_error_result:
+            _log_tool_failure(function_name, tool_duration, function_result)
         if not _execution_blocked:
             function_result = agent._append_guardrail_observation(
                 function_name,
@@ -2466,9 +2476,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
             )
-        if _is_error_result:
-            logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
-        else:
+        if not _is_error_result:
             logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
 
         # Track file-mutation outcome for the turn-end verifier.  See

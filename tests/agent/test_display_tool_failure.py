@@ -7,13 +7,16 @@ not a generic "[error]".
 """
 
 import json
+import logging
 
 from agent.display import (
     _detect_tool_failure,
+    _summarize_tool_failure,
     _trim_error,
     _ERROR_SUFFIX_MAX_LEN,
     get_cute_tool_message,
 )
+from agent.tool_executor import _log_tool_failure
 
 
 class TestTrimError:
@@ -96,6 +99,113 @@ class TestDetectToolFailureStructured:
         result = json.dumps({"success": True, "data": "hello"})
         assert _detect_tool_failure("web_search", result) == (False, "")
 
+    def test_explicit_ok_true_is_not_failed_by_nested_error_metadata(self):
+        result = json.dumps({
+            "ok": True,
+            "data": {
+                "request_id": "video-123",
+                "state": "completed",
+                "error": {"code": "old_attempt", "message": "prior attempt failed"},
+            },
+        })
+        assert _detect_tool_failure("siren_video_gen", result) == (False, "")
+
+    def test_explicit_ok_true_with_failed_operation_is_failure(self):
+        result = json.dumps({
+            "ok": True,
+            "data": {
+                "request_id": "video-123",
+                "state": "failed",
+                "error": {"code": "permission_denied", "message": "provider returned 403"},
+            },
+        })
+        assert _detect_tool_failure("siren_video_gen", result)[0] is True
+
+    def test_explicit_ok_false_is_failure(self):
+        result = json.dumps({
+            "ok": False,
+            "error": {"code": "request_conflict", "message": "request id is reserved"},
+        })
+        assert _detect_tool_failure("siren_video_gen", result)[0] is True
+
+
+class TestSummarizeToolFailure:
+    def test_summarizes_top_level_contract_error(self):
+        result = json.dumps({
+            "ok": False,
+            "error": {"code": "request_conflict", "message": "request id is reserved"},
+        })
+        assert _summarize_tool_failure(result) == (
+            "outcome=tool_error code=request_conflict message=request id is reserved"
+        )
+
+    def test_summarizes_failed_operation_receipt(self):
+        result = json.dumps({
+            "ok": True,
+            "data": {
+                "request_id": "video-123",
+                "provider": "google",
+                "model": "gemini-omni-flash-preview",
+                "state": "failed",
+                "error": {"code": "permission_denied", "message": "provider returned 403"},
+            },
+        })
+        assert _summarize_tool_failure(result) == (
+            "outcome=operation_failed request_id=video-123 provider=google "
+            "model=gemini-omni-flash-preview state=failed code=permission_denied "
+            "message=provider returned 403"
+        )
+
+    def test_falls_back_to_bounded_redacted_text(self):
+        secret = "AIza" + ("x" * 35)
+        result = f"Error {secret} " + ("x" * 600)
+        summary = _summarize_tool_failure(result)
+        assert secret not in summary
+        assert len(summary) <= 500
+
+    def test_structured_summary_is_bounded_and_redacted(self):
+        secret = "AIza" + ("x" * 35)
+        result = json.dumps({
+            "ok": True,
+            "data": {
+                "request_id": "video-123",
+                "provider": "google",
+                "model": "gemini-omni-flash-preview",
+                "state": "failed",
+                "error": {
+                    "code": "permission_denied",
+                    "message": secret + (" details" * 100),
+                },
+            },
+        })
+        summary = _summarize_tool_failure(result)
+        assert summary.startswith("outcome=operation_failed request_id=video-123")
+        assert secret not in summary
+        assert summary.endswith("...")
+        assert len(summary) == 500
+
+
+class TestLogToolFailure:
+    def test_logs_structured_receipt_before_guardrail_annotation(self, caplog):
+        result = json.dumps({
+            "ok": True,
+            "data": {
+                "request_id": "video-123",
+                "provider": "google",
+                "model": "gemini-omni-flash-preview",
+                "state": "failed",
+                "error": {"code": "permission_denied", "message": "provider returned 403"},
+            },
+        })
+        with caplog.at_level(logging.WARNING, logger="agent.tool_executor"):
+            _log_tool_failure("siren_video_gen", 0.92, result)
+
+        assert caplog.messages == [
+            "Tool siren_video_gen failed (0.92s): outcome=operation_failed "
+            "request_id=video-123 provider=google model=gemini-omni-flash-preview "
+            "state=failed code=permission_denied message=provider returned 403"
+        ]
+
 
 
 class TestGetCuteToolMessageFailureSuffix:
@@ -118,4 +228,3 @@ class TestGetCuteToolMessageFailureSuffix:
         ok = json.dumps({"success": True, "data": "hi"})
         line = get_cute_tool_message("web_search", {"query": "hi"}, 0.2, result=ok)
         assert "[" not in line.split("0.2s", 1)[1]
-
