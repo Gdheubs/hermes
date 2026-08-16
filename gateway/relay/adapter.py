@@ -1313,14 +1313,21 @@ class RelayAdapter(BasePlatformAdapter):
                 success=False,
                 error=f"relay does not front platform {platform_value}",
             )
+        _sfp_metadata = dict(metadata or {})
+        # Gateway-internal interim marker (see send()): strip before the
+        # wire; an interim send through this door also skips interception.
+        _interim = bool(_sfp_metadata.pop("_interim_send", False))
         # Finding #7 (live canary): the delivery resolver calls THIS method
         # directly (gateway/delivery.py), bypassing send() — an open native
         # stream must absorb the turn-final here too, or the stream is left
         # unsealed (frozen live indicator) and the final posts as a separate
         # duplicate message.
-        if self._draft_key(str(chat_id), dict(metadata or {})) in self._open_draft_by_chat:
+        if (
+            not _interim
+            and self._draft_key(str(chat_id), _sfp_metadata) in self._open_draft_by_chat
+        ):
             seal = await self._seal_open_draft(
-                chat_id, content, dict(metadata or {})
+                chat_id, content, _sfp_metadata
             )
             if seal.success:
                 return seal
@@ -1338,7 +1345,7 @@ class RelayAdapter(BasePlatformAdapter):
                 "chat_id": chat_id,
                 "content": content,
                 "reply_to": reply_to,
-                "metadata": self._with_scope(chat_id, metadata),
+                "metadata": self._with_scope(chat_id, _sfp_metadata),
             },
             platform=str(platform_value),
         )
@@ -1358,6 +1365,12 @@ class RelayAdapter(BasePlatformAdapter):
     ) -> SendResult:
         send_metadata = dict(metadata or {})
         explicit_platform = send_metadata.pop("_relay_logical_platform", None)
+        # Consumer-declared interim send (commentary, tail flush): NOT the
+        # turn-final, so it must never trigger seal-interception — sealing
+        # the live stream with interim text orphans the true final into a
+        # plain-send duplicate (live finding, 2026-08-16 canary). The
+        # marker is gateway-internal; strip before the wire.
+        _interim = bool(send_metadata.pop("_interim_send", False))
         # NS-658 seal-interception — checked BEFORE the explicit-platform
         # branch (finding #7, live canary): the delivery-resolver lane
         # (follow-up queue, media-accompanied finals, scheduled sends) routes
@@ -1367,7 +1380,10 @@ class RelayAdapter(BasePlatformAdapter):
         # separate message. An open stream absorbs the turn-final send no
         # matter which egress door it arrives through; the stream IS the
         # message.
-        if self._draft_key(str(chat_id), send_metadata) in self._open_draft_by_chat:
+        if (
+            not _interim
+            and self._draft_key(str(chat_id), send_metadata) in self._open_draft_by_chat
+        ):
             seal = await self._seal_open_draft(chat_id, content, send_metadata)
             if seal.success:
                 return seal
