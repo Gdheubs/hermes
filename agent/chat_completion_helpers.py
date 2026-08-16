@@ -4147,8 +4147,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _delta_content = flatten_message_text(delta.content, sep="")
                 content_parts.append(_delta_content)
                 if not tool_calls_acc:
-                    if pending_text_parts or _provider_stream_text_may_be_sse(delta.content):
-                        pending_text_parts.append(delta.content)
+                    if pending_text_parts or _provider_stream_text_may_be_sse(
+                        _delta_content
+                    ):
+                        pending_text_parts.append(_delta_content)
                         pending_text = "".join(pending_text_parts)
                         if _provider_stream_text_may_be_sse(pending_text):
                             continue
