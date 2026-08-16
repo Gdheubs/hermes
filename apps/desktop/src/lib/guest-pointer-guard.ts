@@ -34,3 +34,39 @@ export function guardGuestPointers(): () => void {
     }
   }
 }
+
+let regionDepth = 0
+
+/**
+ * macOS frameless windows turn every `-webkit-app-region: drag` strip into a
+ * NATIVE overlay region the OS hit-tests above the web contents (pointer
+ * events over it never reach the renderer, and `pointer-events: none` does
+ * NOT disable the region — electron#26114 / #4187). A pointer-captured renderer
+ * gesture whose pointer crosses one is handed to the window-drag machinery:
+ * the OS eats the mouseup and Chromium fires `pointercancel` instead of
+ * `pointerup`. While a renderer drag is live, force every region to no-drag so
+ * the gesture's pointer stream is never stolen. Same depth-counted,
+ * idempotent-release shape as `guardGuestPointers` (separate counter — the two
+ * classes must not share a 0↔1 edge).
+ */
+export function guardNativeDragRegions(): () => void {
+  if (regionDepth === 0) {
+    document.body.classList.add('drag-region-lock')
+  }
+
+  regionDepth += 1
+  let released = false
+
+  return () => {
+    if (released) {
+      return
+    }
+
+    released = true
+    regionDepth -= 1
+
+    if (regionDepth === 0) {
+      document.body.classList.remove('drag-region-lock')
+    }
+  }
+}

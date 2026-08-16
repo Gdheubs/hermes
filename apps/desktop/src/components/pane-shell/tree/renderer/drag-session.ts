@@ -32,7 +32,7 @@ import type { PointerEvent as ReactPointerEvent } from 'react'
 
 import { createDragGhost, type DragGhost } from '@/lib/drag-ghost'
 import { ESCAPE_PRIORITY, pushEscapeLayer } from '@/lib/escape-layers'
-import { guardGuestPointers } from '@/lib/guest-pointer-guard'
+import { guardGuestPointers, guardNativeDragRegions } from '@/lib/guest-pointer-guard'
 import { reorderCommitHaptic, reorderStepHaptic } from '@/lib/reorder'
 
 import type { DropPosition } from '../model'
@@ -237,12 +237,16 @@ export function startDragSession(e: ReactPointerEvent<HTMLElement>, spec: DragSe
   let engaged = false
   let releaseEscapeLayer: (() => void) | null = null
   let releaseGuests: (() => void) | null = null
+  let releaseDragRegions: (() => void) | null = null
   let ghost: DragGhost | null = null
   let cursor: string | null = null
   // rAF-coalesced move processing: the raw handler only records the latest
   // point; all hit testing happens at most once per frame.
   let pending: { x: number; y: number; shift: boolean } | null = null
   let raf = 0
+  // `lostpointercapture` (registered below) can re-enter `finish` through
+  // `releasePointerCapture` — the guard keeps the gesture single-ended.
+  let finished = false
 
   // Cursor writes are per-frame; only touch the style when the value changes.
   const setCursor = (value: string) => {
@@ -280,6 +284,13 @@ export function startDragSession(e: ReactPointerEvent<HTMLElement>, spec: DragSe
     // Webview/iframe guests hit-test in their own process — dragging a tab
     // across the in-app browser would go silent without this.
     releaseGuests = guardGuestPointers()
+    // macOS frameless windows implement `-webkit-app-region: drag` as NATIVE
+    // overlay regions; a captured gesture whose pointer crosses one is handed
+    // to the window-drag machinery — the OS eats the mouseup and Chromium
+    // fires pointercancel instead of pointerup. Neutralize every region for
+    // the gesture (see lib/guest-pointer-guard.ts) so the window-level
+    // listeners keep receiving the stream to the release.
+    releaseDragRegions = guardNativeDragRegions()
     // While dragging, Esc belongs to the drag ALONE — lower layers (edit
     // mode, overlays) must not also fire on the same press.
     releaseEscapeLayer = pushEscapeLayer(ESCAPE_PRIORITY.drag)
@@ -326,14 +337,22 @@ export function startDragSession(e: ReactPointerEvent<HTMLElement>, spec: DragSe
   }
 
   const finish = (commit: boolean) => {
+    // `releasePointerCapture` below fires `lostpointercapture`, which is now a
+    // gesture-end listener too — the re-entrant call must be a no-op.
+    if (finished) {
+      return
+    }
+
+    finished = true
+
     if (raf) {
       cancelAnimationFrame(raf)
       raf = 0
     }
 
     // The drop must land at the FINAL pointer position, not the last painted
-    // frame's — flush the pending move before reading the hint. An abort
-    // (Esc / pointercancel) skips it: everything is discarded anyway.
+    // frame's — flush the pending move before reading the hint. An Esc abort
+    // skips it: everything is discarded anyway.
     if (commit) {
       flushMove()
     }
@@ -346,6 +365,8 @@ export function startDragSession(e: ReactPointerEvent<HTMLElement>, spec: DragSe
     releaseEscapeLayer = null
     releaseGuests?.()
     releaseGuests = null
+    releaseDragRegions?.()
+    releaseDragRegions = null
 
     try {
       handle.releasePointerCapture?.(pointerId)
@@ -357,6 +378,8 @@ export function startDragSession(e: ReactPointerEvent<HTMLElement>, spec: DragSe
     window.removeEventListener('pointerup', onUp, true)
     window.removeEventListener('pointercancel', onCancel, true)
     window.removeEventListener('keydown', onKey, true)
+    window.removeEventListener('blur', onInterrupt)
+    handle.removeEventListener('lostpointercapture', onInterrupt)
 
     if (engaged) {
       suppressDragClick(commit)
@@ -382,7 +405,17 @@ export function startDragSession(e: ReactPointerEvent<HTMLElement>, spec: DragSe
   }
 
   const onUp = () => finish(true)
-  const onCancel = () => finish(false)
+
+  // macOS frameless windows steal a captured gesture when the pointer crosses
+  // a native `-webkit-app-region: drag` region: the OS eats the mouseup and
+  // Chromium fires `pointercancel` (or the window blurs / the capture is
+  // dropped) instead of delivering `pointerup`. By then the user HAS completed
+  // a real drop — commit it at the last resolved position rather than
+  // silently discarding the move. A cancel that fires before the gesture
+  // engaged is still an abort (a press can never become a tap through it).
+  // Esc remains a hard abort via `onKey` → `finish(false)`.
+  const onCancel = () => finish(engaged)
+  const onInterrupt = () => finish(engaged)
 
   // Esc aborts the drag — the target selection vanishes and nothing moves,
   // the universal "never mind" for an in-flight drag. Capture-phase + stop so
@@ -400,6 +433,12 @@ export function startDragSession(e: ReactPointerEvent<HTMLElement>, spec: DragSe
   window.addEventListener('pointerup', onUp, true)
   window.addEventListener('pointercancel', onCancel, true)
   window.addEventListener('keydown', onKey, true)
+  // macOS ends a stolen gesture with window blur / lostpointercapture rather
+  // than pointercancel — commit-if-engaged there too (same `onInterrupt`), so
+  // a drop is never silently discarded. `releasePointerCapture` in `finish`
+  // fires lostpointercapture re-entrantly; `finished` absorbs it.
+  window.addEventListener('blur', onInterrupt)
+  handle.addEventListener('lostpointercapture', onInterrupt)
 }
 
 // ---------------------------------------------------------------------------

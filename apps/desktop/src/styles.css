@@ -1135,6 +1135,16 @@ body.guest-pointer-lock :is(webview, iframe) {
   pointer-events: none;
 }
 
+/* Same gesture window: macOS frameless windows implement `-webkit-app-region:
+   drag` as a native overlay that swallows the pointer stream of a captured
+   drag the moment it crosses (pointer-events:none does not disable it). While
+   a renderer drag is live, neutralize every region so the OS never hands the
+   gesture to the window-drag machinery — see lib/guest-pointer-guard.ts. */
+body.drag-region-lock,
+body.drag-region-lock * {
+  -webkit-app-region: no-drag !important;
+}
+
 @layer components {
   /* Chromium 121+ (Electron) prefers standard scrollbar-* over
      ::-webkit-scrollbar and ignores the latter when both are set — platform

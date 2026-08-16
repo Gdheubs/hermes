@@ -11,7 +11,7 @@ import { type PointerEvent as ReactPointerEvent, useCallback, useMemo, useRef, u
 
 import { beginSashDrag, endSashDrag } from '@/components/pane-shell/geometry'
 import { useContributions } from '@/contrib/react/use-contributions'
-import { guardGuestPointers } from '@/lib/guest-pointer-guard'
+import { guardGuestPointers, guardNativeDragRegions } from '@/lib/guest-pointer-guard'
 import { rafCoalesce } from '@/lib/raf-coalesce'
 import { cn } from '@/lib/utils'
 import { $paneStates, type PaneStateSnapshot, setPaneHeightOverride, setPaneWidthOverride } from '@/store/panes'
@@ -265,6 +265,13 @@ export function TreeSplit({ node, root, rootRow }: { node: SplitNode; root?: boo
       // drag froze the moment the pointer entered the in-app browser, so the
       // seam could only shrink it a few px per press.
       const releaseGuests = guardGuestPointers()
+      // macOS frameless windows hand a captured gesture to the native
+      // window-drag machinery the moment it crosses a `-webkit-app-region:
+      // drag` region (the OS eats the mouseup, Chromium fires pointercancel) —
+      // neutralize every region for the gesture's duration (see
+      // lib/guest-pointer-guard.ts) so the window-level listeners below keep
+      // receiving the stream.
+      const releaseDragRegions = guardNativeDragRegions()
       // Suppress :root geometry-var writes for the gesture (see geometry.ts —
       // each one restyles the whole document; they republish on release).
       beginSashDrag()
@@ -384,6 +391,7 @@ export function TreeSplit({ node, root, rootRow }: { node: SplitNode; root?: boo
         // release publishes exactly one fresh measurement.
         endSashDrag()
         releaseGuests()
+        releaseDragRegions()
         document.body.style.cursor = restoreCursor
         document.body.style.userSelect = restoreSelect
 
@@ -612,6 +620,7 @@ export function TreeSplit({ node, root, rootRow }: { node: SplitNode; root?: boo
             {partner >= 0 && (
               <Sash
                 disabled={minimized || tracks[partner].minimized}
+                editMode={editMode}
                 horizontal={horizontal}
                 onDoubleClick={() => resetBoundary(partner, i)}
                 onPointerDown={e => startSash(partner, i, e)}
@@ -634,11 +643,16 @@ export function TreeSplit({ node, root, rootRow }: { node: SplitNode; root?: boo
 
 function Sash({
   disabled,
+  editMode,
   horizontal,
   onDoubleClick,
   onPointerDown
 }: {
   disabled?: boolean
+  /** Edit mode raises the sash above the zone edit veil (z-50) that would
+   *  otherwise cover the seam — the layout editor's divider handles must stay
+   *  grabbable while the veil's drag surface owns the rest of the zone. */
+  editMode: boolean
   horizontal: boolean
   onDoubleClick?: () => void
   onPointerDown: (e: ReactPointerEvent<HTMLDivElement>) => void
@@ -646,7 +660,10 @@ function Sash({
   return (
     <div
       className={cn(
-        'group absolute z-20 [-webkit-app-region:no-drag]',
+        'group absolute [-webkit-app-region:no-drag]',
+        // z-20 at rest; z-[60] in edit mode so the grab band outranks the
+        // pane-drag veil (z-50) that covers every zone while editing.
+        editMode ? 'z-[60]' : 'z-20',
         // Asymmetric grab band: only 1px reaches into the leading pane so its
         // edge-hugging 4px scrollbar stays clickable (the old centered 9px band
         // swallowed it entirely — the pointer got col-resize instead of the
