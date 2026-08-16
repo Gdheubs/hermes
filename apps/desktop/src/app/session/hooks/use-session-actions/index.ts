@@ -64,6 +64,7 @@ import {
   $sessionTiles,
   closeSessionTile,
   dropSessionState,
+  homeFreshDraftToWorkspace,
   openSessionTile,
   patchSessionTile,
   publishSessionState,
@@ -423,6 +424,12 @@ export function useSessionActions({
       setCurrentBranch('')
       // Never clear the composer here — ChatBar's per-thread draft swap owns it.
       setFreshDraftReady(true)
+      // A fresh draft is a PRIMARY navigation, so it must front the workspace
+      // even when the selection did not change value. Setting null over an
+      // already-null selection notifies no listener, which left ⌘N / the New
+      // session row / the worktree button silently dead while a session tile
+      // was fronted. Homing is idempotent, so the listener firing too is fine.
+      homeFreshDraftToWorkspace()
     },
     [activeSessionIdRef, busyRef, navigate, onFreshDraftRouteIntent, resetViewSync, selectedStoredSessionIdRef]
   )
