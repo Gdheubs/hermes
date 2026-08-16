@@ -1734,3 +1734,29 @@ class TestFallbackWarning:
             if r.levelno == logging.WARNING and "falling back" in r.getMessage()
         ]
         assert len(fallback_warnings) == 0
+
+
+def test_context_limit_from_error_decision_paths():
+    """Pin the provider-reported context-limit learning's decision paths:
+    too-large -> keep the current window; too-small (below the parser's
+    4-digit floor) -> never adopted; input-overflow shape accepted; the
+    output-cap shape excluded."""
+    from agent.model_metadata import (
+        get_context_length_from_provider_error,
+        parse_context_limit_from_error,
+    )
+
+    # Input-overflow shape: the "N > M maximum" 413 message.
+    assert parse_context_limit_from_error(
+        "prompt is too long: 233153 tokens > 200000 maximum"
+    ) == 200000
+    # Output-cap shape (Anthropic "max_tokens too large") is NOT a window.
+    assert parse_context_limit_from_error(
+        "max_tokens: 32768 > context_window: 200000 - input_tokens: 190000 = available_tokens: 10000"
+    ) is None
+    # Too-large reported limit: lower-only — keep the current window.
+    assert get_context_length_from_provider_error("max_model_len 500000", 131072) is None
+    # Too-small: the parser's 4-digit floor rejects sub-1000; a 4-digit small
+    # window is adopted (a real small model) but never persisted (sub-64K).
+    assert get_context_length_from_provider_error("max_model_len 100", 131072) is None
+    assert get_context_length_from_provider_error("max_model_len 8000", 131072) == 8000
