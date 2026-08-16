@@ -22,11 +22,105 @@ import copy
 import json
 import logging
 import os
+import threading
 from typing import Any, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
 
 logger = logging.getLogger(__name__)
+
+# Bounded wait for a cancelled background review to leave its provider /
+# run_conversation request phase before a new live turn continues. Foreground
+# priority means we never block indefinitely if the abort path is slow
+# (#84423); a warning is logged and the live turn proceeds.
+BACKGROUND_REVIEW_CANCEL_WAIT_SECONDS = 5.0
+
+
+def claim_background_review_slot(agent: Any) -> Optional[int]:
+    """Claim the parent's review slot before the review thread starts.
+
+    Clears ``_background_review_request_done`` and bumps
+    ``_background_review_generation`` under the review lock so a concurrent
+    live turn cannot miss an in-flight-or-starting review (startup TOCTOU
+    from #84423). Returns the generation token the review thread must honor,
+    or ``None`` when the parent lacks review-tracking state (test stubs).
+    """
+    if not hasattr(agent, "_background_review_lock"):
+        return None
+    lock = agent._background_review_lock
+    with lock:
+        generation = int(getattr(agent, "_background_review_generation", 0)) + 1
+        agent._background_review_generation = generation
+        done = getattr(agent, "_background_review_request_done", None)
+        if done is None:
+            done = threading.Event()
+            agent._background_review_request_done = done
+        done.clear()
+        return generation
+
+
+def mark_background_review_request_done(agent: Any) -> None:
+    """Signal that no background-review request phase is active on ``agent``."""
+    done = getattr(agent, "_background_review_request_done", None)
+    if done is not None:
+        done.set()
+
+
+def cancel_in_flight_background_review(
+    agent: Any,
+    *,
+    reason: str = "superseded by a new live turn",
+    wait_seconds: float = BACKGROUND_REVIEW_CANCEL_WAIT_SECONDS,
+) -> None:
+    """Cancel any in-flight/starting background review before a live turn.
+
+    1. Bump the cancel generation so a review still in startup cannot enter
+       its first provider call.
+    2. ``interrupt()`` any registered review fork (best-effort).
+    3. Bounded-wait until the review acknowledges request-phase exit via
+       ``_background_review_request_done``. Never waits indefinitely.
+    """
+    lock = getattr(agent, "_background_review_lock", None)
+    pending = None
+    done = getattr(agent, "_background_review_request_done", None)
+
+    if lock is not None:
+        with lock:
+            agent._background_review_generation = (
+                int(getattr(agent, "_background_review_generation", 0)) + 1
+            )
+            pending = getattr(agent, "_background_review_agent", None)
+            done = getattr(agent, "_background_review_request_done", done)
+    else:
+        pending = getattr(agent, "_background_review_agent", None)
+        # Still bump generation when lock is missing (defensive / stubs).
+        if hasattr(agent, "_background_review_generation"):
+            agent._background_review_generation = (
+                int(agent._background_review_generation) + 1
+            )
+
+    if pending is not None:
+        try:
+            pending.interrupt(reason)
+        except Exception:
+            logger.debug(
+                "Failed to cancel in-flight background review for a new turn",
+                exc_info=True,
+            )
+
+    if done is None or done.is_set():
+        return
+
+    if wait_seconds <= 0:
+        return
+
+    if not done.wait(timeout=wait_seconds):
+        logger.warning(
+            "Background review did not acknowledge cancel within %.1fs; "
+            "proceeding with live turn (session=%s)",
+            wait_seconds,
+            getattr(agent, "session_id", None),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -655,12 +749,19 @@ def _run_review_in_thread(
     agent: Any,
     messages_snapshot: List[Dict],
     prompt: str,
+    *,
+    generation: Optional[int] = None,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
     Spawns a forked ``AIAgent`` inheriting the parent's runtime, runs the
     review prompt, and surfaces a compact action summary back to the user
     via ``agent._safe_print`` and ``agent.background_review_callback``.
+
+    ``generation`` is the slot token from :func:`claim_background_review_slot`.
+    If a live turn bumps the parent's generation before this review reaches
+    its first provider call, the review aborts without entering
+    ``run_conversation()`` (#84423 startup TOCTOU).
     """
     # Local import to avoid a hard circular dep at module load.
     from run_agent import AIAgent
@@ -684,6 +785,20 @@ def _run_review_in_thread(
 
     review_agent = None
     review_messages: List[Dict] = []
+    request_phase_released = False
+
+    def _review_generation_is_current() -> bool:
+        if generation is None:
+            return True
+        current = getattr(agent, "_background_review_generation", None)
+        return current is None or current == generation
+
+    def _release_request_phase() -> None:
+        nonlocal request_phase_released
+        if request_phase_released:
+            return
+        request_phase_released = True
+        mark_background_review_request_done(agent)
 
     def _unregister_review_agent(agent_ref) -> None:
         """Idempotent: clears the review fork from both tracking slots.
@@ -711,6 +826,12 @@ def _run_review_in_thread(
                 pass
 
     try:
+        # Live turn already cancelled us before fork construction — never
+        # touch the provider (#84423).
+        if not _review_generation_is_current():
+            _release_request_phase()
+            return
+
         # Silence stdout/stderr for THIS worker thread only.  A process-global
         # ``contextlib.redirect_stdout(devnull)`` here would also blank
         # ``sys.stdout``/``sys.stderr`` for every other thread — including a
@@ -915,13 +1036,39 @@ def _run_review_in_thread(
             # doubled prompt-token accounting and a Ctrl+C-proof lockup.
             # Best-effort: agents built without agent_init.py (test stubs)
             # degrade to "no cross-cancellation" rather than aborting the review.
+            # Re-check the generation under the same lock: a live turn that
+            # cancelled during fork construction must win, and this review
+            # must not enter run_conversation() (#84423).
+            _still_current = True
             if hasattr(agent, "_background_review_agent"):
                 _br_lock = getattr(agent, "_background_review_lock", None)
                 if _br_lock is not None:
                     with _br_lock:
-                        agent._background_review_agent = review_agent
+                        if generation is not None and getattr(
+                            agent, "_background_review_generation", None
+                        ) != generation:
+                            _still_current = False
+                        else:
+                            agent._background_review_agent = review_agent
                 else:
-                    agent._background_review_agent = review_agent
+                    if generation is not None and getattr(
+                        agent, "_background_review_generation", None
+                    ) != generation:
+                        _still_current = False
+                    else:
+                        agent._background_review_agent = review_agent
+            if not _still_current:
+                _release_request_phase()
+                try:
+                    review_agent.shutdown_memory_provider()
+                except Exception:
+                    pass
+                try:
+                    review_agent.close()
+                except Exception:
+                    pass
+                review_agent = None
+                return
             if hasattr(agent, "_active_children"):
                 _ac_lock = getattr(agent, "_active_children_lock", None)
                 if _ac_lock is not None:
@@ -988,7 +1135,10 @@ def _run_review_in_thread(
                 # calls, i.e. the only phase that can race the parent's
                 # next live turn. Runs on both the success and exception
                 # path (this whole block is inside the try/finally above).
+                # Signal request-phase exit here so a live turn blocked in
+                # cancel_in_flight_background_review() can proceed (#84423).
                 _unregister_review_agent(review_agent)
+                _release_request_phase()
 
             # Snapshot review actions before teardown. close() is allowed to
             # clean per-session state, but the user-visible self-improvement
@@ -1067,8 +1217,10 @@ def _run_review_in_thread(
         # that the primary _unregister_review_agent call site never reaches.
         # _unregister_review_agent is idempotent (checks `is`/`in` membership),
         # so calling it again here after the primary call site already ran is
-        # a harmless no-op.
+        # a harmless no-op. Always release the request-done slot too so a
+        # live turn waiting on cancel cannot hang (#84423).
         _unregister_review_agent(review_agent)
+        _release_request_phase()
         if review_agent is not None:
             try:
                 with thread_scoped_silence():
@@ -1128,8 +1280,22 @@ def spawn_background_review_thread(
             f"{focus}"
         )
 
+    # Claim the review slot BEFORE the caller starts the daemon thread so a
+    # concurrent live turn cannot observe "no review" during the construction
+    # window and then race the review's first provider call (#84423 TOCTOU).
+    generation = claim_background_review_slot(agent)
+
     def _target() -> None:
-        _run_review_in_thread(agent, messages_snapshot, prompt)
+        try:
+            _run_review_in_thread(
+                agent, messages_snapshot, prompt, generation=generation
+            )
+        except Exception:
+            # If claim succeeded but the worker crashed before releasing the
+            # request-done slot, unblock any live turn waiting on cancel.
+            if generation is not None:
+                mark_background_review_request_done(agent)
+            raise
 
     return _target, prompt
 
@@ -1138,6 +1304,10 @@ __all__ = [
     "_MEMORY_REVIEW_PROMPT",
     "_SKILL_REVIEW_PROMPT",
     "_COMBINED_REVIEW_PROMPT",
+    "BACKGROUND_REVIEW_CANCEL_WAIT_SECONDS",
+    "claim_background_review_slot",
+    "mark_background_review_request_done",
+    "cancel_in_flight_background_review",
     "spawn_background_review_thread",
     "summarize_background_review_actions",
     "build_memory_write_metadata",

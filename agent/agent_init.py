@@ -873,8 +873,19 @@ def init_agent(
     # session_id/credentials (observed as doubled prompt-token counts and a
     # Ctrl+C-proof lockup when a live turn started before a review fired at
     # the end of the prior turn had finished).
+    # ``_background_review_generation`` is bumped on every spawn claim and
+    # every live-turn cancel so a review that is still constructing its fork
+    # cannot race past a newer cancel into its first provider call (#84423).
+    # ``_background_review_request_done`` is cleared when a review claims the
+    # slot and set when that review leaves its request phase (or aborts
+    # before entering it); live turns wait on it after interrupt() so they
+    # do not enter turn setup / compression / Relay while the review is still
+    # mid-request.
     agent._background_review_agent = None
     agent._background_review_lock = threading.Lock()
+    agent._background_review_generation = 0
+    agent._background_review_request_done = threading.Event()
+    agent._background_review_request_done.set()
 
     # Store OpenRouter provider preferences
     agent.providers_allowed = providers_allowed

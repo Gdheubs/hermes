@@ -32,6 +32,9 @@ def _bare_agent() -> AIAgent:
     import threading as _threading
     agent._background_review_agent = None
     agent._background_review_lock = _threading.Lock()
+    agent._background_review_generation = 0
+    agent._background_review_request_done = _threading.Event()
+    agent._background_review_request_done.set()
     agent._active_children = []
     agent._active_children_lock = _threading.Lock()
     return agent
@@ -282,40 +285,115 @@ def test_background_review_registers_on_active_children_for_interrupt(monkeypatc
 
 
 def test_new_live_turn_cancels_still_running_background_review(monkeypatch):
-    """conversation_loop.run_conversation() must proactively interrupt a
-    background review still in flight from a prior turn, rather than let the
-    two race concurrently against the same session_id/credentials. This is
-    the other half of the fix: registration alone only enables interrupt()
-    propagation, it doesn't by itself stop the race — something has to
-    actually call interrupt() at the start of the next turn.
+    """Cancel helper must interrupt a still-running background review and wait
+    for its request phase to exit before the live turn continues — not
+    fire-and-forget (#84423 residual race after #82418).
     """
-    import agent.conversation_loop as conversation_loop_module
+    import threading
+    import time
+
+    from agent.background_review import cancel_in_flight_background_review
 
     calls = []
+    request_active = threading.Event()
+    request_active.set()
 
     class FakeReviewAgent:
         def interrupt(self, message=None):
             calls.append(message)
 
+            def _finish():
+                # Simulate provider abort + run_conversation finally releasing
+                # the request-done slot a beat after interrupt returns.
+                time.sleep(0.05)
+                request_active.clear()
+                agent._background_review_agent = None
+                agent._background_review_request_done.set()
+
+            threading.Thread(target=_finish, daemon=True).start()
+
     agent = _bare_agent()
     agent._background_review_agent = FakeReviewAgent()
+    agent._background_review_request_done.clear()
 
-    # Invoke just the cancellation snippet in isolation via the same
-    # attribute contract run_conversation() reads, to avoid dragging in the
-    # rest of the turn machinery (network calls, tool setup, etc.) that
-    # isn't relevant to this regression.
-    _pending_review = getattr(agent, "_background_review_agent", None)
-    assert _pending_review is not None
-    _pending_review.interrupt("superseded by a new live turn")
+    assert request_active.is_set()
+    cancel_in_flight_background_review(agent, wait_seconds=2.0)
 
     assert calls == ["superseded by a new live turn"]
+    assert not request_active.is_set()
+    assert agent._background_review_request_done.is_set()
 
 
+def test_live_turn_cancel_is_bounded_when_abort_is_slow():
+    """Cancel wait must not deadlock if the review abort path is slow (#84423)."""
+    import time
+
+    from agent.background_review import cancel_in_flight_background_review
+
+    class SlowReviewAgent:
+        def interrupt(self, message=None):
+            return None  # never releases request_done
+
+    agent = _bare_agent()
+    agent._background_review_agent = SlowReviewAgent()
+    agent._background_review_request_done.clear()
+
+    started = time.monotonic()
+    cancel_in_flight_background_review(agent, wait_seconds=0.1)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    # Still uncleared — live turn proceeded without waiting forever.
+    assert not agent._background_review_request_done.is_set()
 
 
+def test_startup_generation_blocks_first_provider_call(monkeypatch):
+    """A live turn that begins during review-thread startup must prevent that
+    review from making its first provider call (#84423 TOCTOU).
+    """
+    from agent.background_review import (
+        cancel_in_flight_background_review,
+        claim_background_review_slot,
+        _run_review_in_thread,
+    )
 
+    ran = {"run_conversation": False}
 
+    class FakeReviewAgent:
+        def __init__(self, **kwargs):
+            self._session_messages = []
+            self._memory_enabled = True
+            self._user_profile_enabled = False
 
+        def run_conversation(self, **kwargs):
+            ran["run_conversation"] = True
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+
+    agent = _bare_agent()
+    # Simulate spawn claiming the slot, then a live turn cancelling before
+    # the review worker reaches run_conversation.
+    generation = claim_background_review_slot(agent)
+    assert generation is not None
+    assert not agent._background_review_request_done.is_set()
+
+    cancel_in_flight_background_review(agent, wait_seconds=0.01)
+    _run_review_in_thread(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        prompt="review",
+        generation=generation,
+    )
+
+    assert ran["run_conversation"] is False
+    assert agent._background_review_request_done.is_set()
+    assert agent._background_review_agent is None
 
 
 # ---------------------------------------------------------------------------

@@ -1671,29 +1671,19 @@ def run_conversation(
     agent._last_compression_attempt_in_place = None
 
     # If a background memory/skill review spawned at the end of a PRIOR turn
-    # (agent/background_review.py) is still running its own run_conversation()
-    # when THIS turn starts, cancel it now rather than letting both make
-    # outbound API calls concurrently against the same session_id/credentials.
-    # That concurrency can produce doubled prompt-token accounting on this
-    # turn's own calls and, because the review fork is a fully separate
-    # AIAgent with no route back to THIS agent's interrupt() by default, a
-    # lockup that survives a normal /stop and needs a hard Ctrl+C.
-    # ``review_agent.interrupt()`` is fire-and-forget here — it just flags
-    # cancellation and aborts the review's in-flight socket; it does not
-    # block waiting for the review's daemon thread to exit, so it can't add
-    # latency to this turn. Only ever set on the real owning agent (the
-    # review fork's own copy of this attribute stays None — reviews don't
-    # spawn nested reviews), so this is a no-op on every other run_conversation
-    # caller (subagents, the review fork itself, etc).
-    _pending_review = getattr(agent, "_background_review_agent", None)
-    if _pending_review is not None:
-        try:
-            _pending_review.interrupt("superseded by a new live turn")
-        except Exception:
-            logger.debug(
-                "Failed to cancel in-flight background review for a new turn",
-                exc_info=True,
-            )
+    # (agent/background_review.py) is still running — or still constructing —
+    # when THIS turn starts, cancel it and wait (bounded) for its request
+    # phase to exit before continuing into turn setup / preflight compression
+    # / Relay / the provider call. Fire-and-forget interrupt alone left a
+    # residual same-session concurrent-turn window (#84423). Generation
+    # bumping also prevents a review that has not yet registered from racing
+    # into its first provider call after we check. Only ever set on the real
+    # owning agent (the review fork's own copy of this attribute stays None —
+    # reviews don't spawn nested reviews), so this is a no-op on every other
+    # run_conversation caller (subagents, the review fork itself, etc).
+    from agent.background_review import cancel_in_flight_background_review
+
+    cancel_in_flight_background_review(agent)
 
     # Adopt any ~/.hermes/.env credential/base-url edits made since the last
     # turn — a Settings save updates .env but not this worker's client, which
