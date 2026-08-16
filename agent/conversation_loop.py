@@ -39,7 +39,6 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.deepseek_replay import (
     apply_deepseek_replay_compaction,
     estimate_request_tokens_after_deepseek_replay,
-    is_echo_replay_target,
     merge_replay_usage,
     replay_compaction_limits,
 )
@@ -2448,15 +2447,14 @@ def run_conversation(
         approx_tokens = estimate_messages_tokens_rough(api_messages)
         # Measure request pressure against the post-compaction wire size so
         # the raw estimate can't fire compression early (estimate-only).
-        # Preflight estimate: echo-only (other wires keep raw compression timing).
-        if is_echo_replay_target(agent.provider, agent.model, agent.base_url):
-            approx_tokens = estimate_request_tokens_after_deepseek_replay(
-                api_messages,
-                provider=agent.provider,
-                model=agent.model,
-                base_url=agent.base_url,
-                limits=_replay_limits,
-            )
+        # Preflight estimate: post-replay wire size for every provider.
+        approx_tokens = estimate_request_tokens_after_deepseek_replay(
+            api_messages,
+            provider=agent.provider,
+            model=agent.model,
+            base_url=agent.base_url,
+            limits=_replay_limits,
+        )
         request_pressure_tokens = approx_tokens + (
             _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
         )

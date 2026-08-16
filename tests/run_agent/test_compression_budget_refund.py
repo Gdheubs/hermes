@@ -194,10 +194,17 @@ def _run_marathon_turn(
     agent, n_tool_iterations: int, *, provider_prompt_tokens: int | None
 ):
     """Drive one turn of ``n_tool_iterations`` oversized tool results."""
+    tokens = (
+        provider_prompt_tokens
+        if isinstance(provider_prompt_tokens, list)
+        else [provider_prompt_tokens] * n_tool_iterations
+    )
     responses = [
-        _tool_response(i, provider_prompt_tokens) for i in range(n_tool_iterations)
+        _tool_response(i, tokens[i]) for i in range(n_tool_iterations)
     ]
-    responses.append(_stop_response(provider_prompt_tokens))
+    responses.append(
+        _stop_response(tokens[-1] if isinstance(provider_prompt_tokens, list) else provider_prompt_tokens)
+    )
     agent.client.chat.completions.create.side_effect = responses
 
     compress_calls = []
@@ -245,10 +252,13 @@ class TestCompressionBudgetRefund:
         completes.
         """
         assert agent.max_compression_attempts == 3  # config default
+        # Wire-based preflight never fires for compacted oversized results;
+        # drive the refund via the real-usage path: a pressure spike fires
+        # compression, a clear between spikes re-arms the budget.
         result, compress_calls = _run_marathon_turn(
             agent,
             n_tool_iterations=8,
-            provider_prompt_tokens=THRESHOLD - 1,
+            provider_prompt_tokens=[THRESHOLD + 1, THRESHOLD // 2] * 4,
         )
 
         assert result["completed"] is True

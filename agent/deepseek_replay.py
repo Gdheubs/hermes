@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from agent.message_sanitization import matches_reasoning_echo_family, needs_reasoning_echo
+from agent.message_sanitization import matches_reasoning_echo_family
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_tokens_rough
 
 # Thresholds mirror Whale internal/compact/compact.go.
@@ -82,17 +82,6 @@ _REPLAY_MARKER_TEMPLATE = (
 def is_deepseek_replay_target(provider: str | None, model: str | None, base_url: str | None) -> bool:
     """DeepSeek-family endpoints (echo-back rule table)."""
     return matches_reasoning_echo_family("deepseek", provider, model, base_url)
-
-
-def is_echo_replay_target(provider: str | None, model: str | None, base_url: str | None) -> bool:
-    """Any reasoning echo-back endpoint (DeepSeek, Kimi, MiMo)."""
-    return needs_reasoning_echo(provider, model, base_url)
-
-
-# Compaction is wire-agnostic: it runs on the internal role-tool shape BEFORE
-# the Anthropic adapter wraps results into tool_result blocks (converted at
-# send time), so compacted strings reach every wire unchanged.
-COMPACTION_ELIGIBLE = True
 
 
 def _plain_turn_strip_allowed(
@@ -222,11 +211,9 @@ def estimate_request_tokens_after_deepseek_replay(
     base_url: str | None = None,
     limits: "ReplayCompactionLimits | None" = None,
 ) -> int:
-    """Post-replay wire size (no mutation). Echo-only: other wires keep
-    raw-estimate compression timing (compression-loop tests depend on it)."""
+    """Post-replay wire size (no mutation); reasoning subtraction stays
+    echo-gated by proven family."""
     raw = estimate_messages_tokens_rough(messages)
-    if not is_echo_replay_target(provider, model, base_url):
-        return raw
     saved = 0
     for msg in messages:
         if not isinstance(msg, dict):

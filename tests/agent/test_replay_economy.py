@@ -79,12 +79,14 @@ def test_estimator_reflects_strip_and_compaction():
     post_mimo = estimate_request_tokens_after_deepseek_replay(mixed, **_MIMO)
     post_kimi = estimate_request_tokens_after_deepseek_replay(mixed, **_KIMI)
     assert post_ds < raw and post_mimo == post_ds < post_kimi  # ds+mimo strip reasoning; kimi keeps it
-    # The post-compaction estimate is echo-family-only (other wires keep
-    # raw-estimate compression timing — see the compression-loop tests).
-    assert estimate_request_tokens_after_deepseek_replay(mixed, **_OPENAI) == raw
-    assert estimate_request_tokens_after_deepseek_replay(
+    # Compaction subtraction applies on every wire; reasoning strip stays
+    # echo-gated (openai/anthropic subtract compaction only, so > post_ds).
+    post_openai = estimate_request_tokens_after_deepseek_replay(mixed, **_OPENAI)
+    assert raw > post_openai > post_ds
+    post_anthropic = estimate_request_tokens_after_deepseek_replay(
         mixed, provider="anthropic", model="claude-sonnet-4.7", base_url=""
-    ) == raw
+    )
+    assert post_anthropic == post_openai  # both compaction-only wires
 
 
 def test_skips_non_dict_and_non_string_tool_content():
@@ -219,8 +221,8 @@ def test_estimate_all_wires():
     assert estimate_request_tokens_after_deepseek_replay(
         mixed, provider="deepseek", model="deepseek-v4-flash", base_url="https://api.deepseek.com/v1"
     ) < raw
-    # Non-echo chat-completions (OpenAI): raw — compression timing unchanged.
-    assert estimate_request_tokens_after_deepseek_replay(mixed, provider="openai", model="gpt-4o", base_url="") == raw
+    # Non-echo chat-completions (OpenAI): compaction subtracted.
+    assert estimate_request_tokens_after_deepseek_replay(mixed, provider="openai", model="gpt-4o", base_url="") < raw
 
 
 def test_apply_is_idempotent_across_retries():
