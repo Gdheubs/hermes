@@ -35,6 +35,7 @@ def _make_args(**kwargs):
         "deliver": "log",
         "deliver_chat_id": "",
         "secret": "",
+        "signature_mode": "",
         "payload": "",
         "script": "",
     }
@@ -66,6 +67,24 @@ class TestSubscribe:
         secret = _load_subscriptions()["s"]["secret"]
         assert len(secret) > 20
 
+    def test_signature_mode_persisted(self):
+        webhook_command(_make_args(
+            webhook_action="subscribe", name="s", signature_mode="gitlab_standard"
+        ))
+        assert _load_subscriptions()["s"]["signature_mode"] == "gitlab_standard"
+
+    def test_signature_mode_omitted_defaults_to_implicit(self):
+        webhook_command(_make_args(webhook_action="subscribe", name="s"))
+        route = _load_subscriptions()["s"]
+        # No explicit mode written → gateway default (generic_v2) applies.
+        assert "signature_mode" not in route
+
+    def test_signature_mode_normalized_lowercase(self):
+        webhook_command(_make_args(
+            webhook_action="subscribe", name="s", signature_mode="GITHUB"
+        ))
+        assert _load_subscriptions()["s"]["signature_mode"] == "github"
+
 
 class TestList:
 
@@ -93,7 +112,6 @@ class TestRemove:
 
 
 class TestPersistence:
-
     def test_corrupted_file(self):
         path = _subscriptions_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -152,4 +170,120 @@ class TestWebhookEnabledGate:
         )
         import hermes_cli.webhook as wh_mod
         assert wh_mod._is_webhook_enabled() is False
+
+
+class TestModeBoundTestSigning:
+    """hermes webhook test signs with the route's configured mode."""
+
+    def _h(self, cap, name):
+        for k, v in cap["headers"].items():
+            if k.lower() == name.lower():
+                return v
+        return None
+
+
+    def _sign_headers(self, route, monkeypatch, payload="{}"):
+        import hermes_cli.webhook as wh
+
+        captured = {}
+
+        class FakeResponse:
+            status = 200
+            def read(self):
+                return b"{}"
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        class FakeUrlopen:
+            def __init__(self, req, timeout=10):
+                captured["url"] = req.full_url
+                captured["headers"] = dict(req.headers)
+            def __enter__(self):
+                return FakeResponse()
+            def __exit__(self, *a):
+                return False
+
+        monkeypatch.setattr("urllib.request.urlopen", FakeUrlopen)
+        monkeypatch.setattr(
+            "hermes_cli.webhook._get_webhook_base_url", lambda: "http://localhost:9123"
+        )
+        wh.webhook_command(_make_args(
+            webhook_action="test", name="r", payload=payload
+        ))
+        return captured
+
+    def _subscribe_with_mode(self, mode):
+        webhook_command(_make_args(
+            webhook_action="subscribe", name="r", secret="sec",
+            signature_mode=mode,
+        ))
+
+    def test_generic_v2_signing(self, monkeypatch):
+        self._subscribe_with_mode("generic_v2")
+        cap = self._sign_headers(None, monkeypatch)
+        assert self._h(cap, "X-Webhook-Signature-V2") is not None
+        assert self._h(cap, "X-Webhook-Timestamp") is not None
+        assert self._h(cap, "X-Hub-Signature-256") is None
+
+    def test_github_signing(self, monkeypatch):
+        self._subscribe_with_mode("github")
+        cap = self._sign_headers(None, monkeypatch)
+        assert self._h(cap, "X-Hub-Signature-256").startswith("sha256=")
+
+    def test_hindsight_signing(self, monkeypatch):
+        self._subscribe_with_mode("hindsight")
+        cap = self._sign_headers(None, monkeypatch)
+        assert self._h(cap, "X-Hindsight-Signature") is not None
+        assert self._h(cap, "X-Hindsight-Signature").startswith("sha256=")
+
+    def test_gitlab_signing(self, monkeypatch):
+        self._subscribe_with_mode("gitlab")
+        cap = self._sign_headers(None, monkeypatch)
+        assert self._h(cap, "X-Gitlab-Token") == "sec"
+
+    def test_gitlab_standard_signing_uses_webhook_headers(self, monkeypatch):
+        self._subscribe_with_mode("gitlab_standard")
+        cap = self._sign_headers(None, monkeypatch)
+        assert self._h(cap, "webhook-id") is not None
+        assert self._h(cap, "webhook-timestamp") is not None
+        assert self._h(cap, "webhook-signature").startswith("v1,")
+
+    def test_svix_signing_uses_svix_headers(self, monkeypatch):
+        self._subscribe_with_mode("svix")
+        cap = self._sign_headers(None, monkeypatch)
+        assert self._h(cap, "svix-id") is not None
+        assert self._h(cap, "svix-signature").startswith("v1,")
+
+    def test_signature_matches_gateway_validation(self, monkeypatch):
+        # The CLI-signed generic_v2 request must pass the gateway's own
+        # validator with the same route config — the contract test.
+        import hashlib
+        import hmac
+        import time as _time
+        from unittest.mock import MagicMock
+
+        from gateway.platforms.webhook_auth import WebhookAuthMixin
+
+        self._subscribe_with_mode("generic_v2")
+        cap = self._sign_headers(None, monkeypatch, payload='{"test": true}')
+        ts = self._h(cap, "X-Webhook-Timestamp")
+        sig = self._h(cap, "X-Webhook-Signature-V2")
+        body = b'{"test": true}'
+        expected = hmac.new(
+            b"sec", ts.encode() + b"." + body, hashlib.sha256
+        ).hexdigest()
+        assert sig == expected
+
+        adapter = WebhookAuthMixin()
+        req = MagicMock()
+        req.headers = {
+            "X-Webhook-Signature-V2": sig,
+            "X-Webhook-Timestamp": ts,
+        }
+        req.match_info = {"route_name": "r"}
+        assert adapter._validate_signature(
+            req, body, "sec", signature_mode="generic_v2"
+        ) is True
 
