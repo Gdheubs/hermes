@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
@@ -119,16 +121,74 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
 
 
 
-def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("cronjob", {"action": "list"}),
+        ("process", {"action": "list"}),
+        ("process", {"action": "poll", "session_id": "proc-1"}),
+        ("process", {"action": "log", "session_id": "proc-1"}),
+        ("process", {"action": "wait", "session_id": "proc-1"}),
+        ("todo", {}),
+    ],
+)
+def test_read_only_actions_on_mixed_tools_detect_repeated_identical_success(tool_name, args):
     controller = ToolCallGuardrailController(
-        ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=2,
+        )
+    )
+
+    assert controller.before_call(tool_name, args).action == "allow"
+    assert controller.after_call(tool_name, args, "same", failed=False).action == "allow"
+    assert controller.before_call(tool_name, args).action == "allow"
+    warning = controller.after_call(tool_name, args, "same", failed=False)
+    assert warning.code == "idempotent_no_progress_warning"
+
+    blocked = controller.before_call(tool_name, args)
+    assert blocked.code == "idempotent_no_progress_block"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("cronjob", {"action": "create"}),
+        ("cronjob", {"action": "remove"}),
+        ("process", {"action": "kill"}),
+        ("process", {"action": "write"}),
+        ("todo", {"todos": []}),
+        ("write_file", {"path": "/tmp/x", "content": "x"}),
+    ],
+)
+def test_mutating_actions_are_not_blocked_for_repeated_identical_success_output(tool_name, args):
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=2,
+        )
     )
 
     for _ in range(3):
-        assert controller.before_call("write_file", {"path": "/tmp/x", "content": "x"}).action == "allow"
-        assert controller.after_call("write_file", {"path": "/tmp/x", "content": "x"}, "ok", failed=False).action == "allow"
-        assert controller.before_call("custom_tool", {"x": 1}).action == "allow"
-        assert controller.after_call("custom_tool", {"x": 1}, "ok", failed=False).action == "allow"
+        assert controller.before_call(tool_name, args).action == "allow"
+        assert controller.after_call(tool_name, args, "same", failed=False).action == "allow"
+
+
+def test_unknown_tools_are_not_treated_as_read_only_from_action_name_alone():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(
+            hard_stop_enabled=True,
+            no_progress_warn_after=2,
+            no_progress_block_after=2,
+        )
+    )
+    args = {"action": "list"}
+
+    for _ in range(3):
+        assert controller.before_call("custom_tool", args).action == "allow"
+        assert controller.after_call("custom_tool", args, "same", failed=False).action == "allow"
 
 
 

@@ -59,6 +59,14 @@ MUTATING_TOOL_NAMES = frozenset(
     }
 )
 
+# Some nominally mutating tools also expose observational actions. Keep these
+# overrides explicit instead of trusting generic action names from unknown or
+# plugin tools whose semantics the core cannot know.
+READ_ONLY_TOOL_ACTIONS: Mapping[str, frozenset[str]] = {
+    "cronjob": frozenset({"list"}),
+    "process": frozenset({"list", "poll", "log", "wait"}),
+}
+
 
 @dataclass(frozen=True)
 class ToolCallGuardrailConfig:
@@ -325,7 +333,7 @@ class ToolCallGuardrailController:
             self._halt_decision = decision
             return decision
 
-        if self._is_idempotent(tool_name):
+        if self._is_idempotent(tool_name, _coerce_args(args)):
             record = self._no_progress.get(signature)
             if record is not None:
                 _result_hash, repeat_count = record
@@ -412,7 +420,7 @@ class ToolCallGuardrailController:
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
 
-        if not self._is_idempotent(tool_name):
+        if not self._is_idempotent(tool_name, args):
             self._no_progress.pop(signature, None)
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
@@ -439,7 +447,12 @@ class ToolCallGuardrailController:
 
         return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
 
-    def _is_idempotent(self, tool_name: str) -> bool:
+    def _is_idempotent(self, tool_name: str, args: Mapping[str, Any]) -> bool:
+        if tool_name == "todo" and "todos" not in args:
+            return True
+        read_only_actions = READ_ONLY_TOOL_ACTIONS.get(tool_name)
+        if read_only_actions is not None and args.get("action") in read_only_actions:
+            return True
         if tool_name in self.config.mutating_tools:
             return False
         return tool_name in self.config.idempotent_tools
