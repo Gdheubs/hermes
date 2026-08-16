@@ -151,8 +151,79 @@ BOARD_COLUMNS: list[str] = [
     "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
 ]
 
+# Cross-column swim lanes for profile-scoped rows. The dashboard renders tasks
+# assigned to ``L3X_SWIM_LANE_ASSIGNEE`` and ``W3BB_SWIM_LANE_ASSIGNEE`` in
+# dedicated horizontal rows spanning every lifecycle column; all other assignees
+# (including unassigned) land in the companion "Org" row, which is listed first.
+L3X_SWIM_LANE_ASSIGNEE = "l3x"
+W3BB_SWIM_LANE_ASSIGNEE = "w3bb"
+W3BB_SWIM_LANE_LABEL = "W3bb"
+L3X_SWIM_LANE_OTHER_ID = "__other__"
+L3X_SWIM_LANE_OTHER_LABEL = "Org"
+
 
 _CARD_SUMMARY_PREVIEW_CHARS = 200
+
+
+def partition_swim_lanes(
+    columns: list[dict[str, Any]],
+    *,
+    l3x_assignee: str = L3X_SWIM_LANE_ASSIGNEE,
+    w3bb_assignee: str = W3BB_SWIM_LANE_ASSIGNEE,
+    w3bb_swim_lane: bool = True,
+) -> list[dict[str, Any]]:
+    """Split board columns into Org, optional W3bb, and L3x cross-column swim lanes.
+
+    Each lane carries the full status column set so the UI can render a
+    status grid per row without duplicating cards across lanes.
+    """
+    l3x_cols: list[dict[str, Any]] = []
+    w3bb_cols: list[dict[str, Any]] = []
+    other_cols: list[dict[str, Any]] = []
+    for col in columns:
+        tasks = col.get("tasks") or []
+        l3x_tasks = [t for t in tasks if t.get("assignee") == l3x_assignee]
+        w3bb_tasks = (
+            [t for t in tasks if t.get("assignee") == w3bb_assignee]
+            if w3bb_swim_lane
+            else []
+        )
+        dedicated = {l3x_assignee}
+        if w3bb_swim_lane:
+            dedicated.add(w3bb_assignee)
+        other_tasks = [t for t in tasks if t.get("assignee") not in dedicated]
+        l3x_cols.append({"name": col["name"], "tasks": l3x_tasks})
+        w3bb_cols.append({"name": col["name"], "tasks": w3bb_tasks})
+        other_cols.append({"name": col["name"], "tasks": other_tasks})
+    lanes: list[dict[str, Any]] = [
+        {
+            "id": L3X_SWIM_LANE_OTHER_ID,
+            "label": L3X_SWIM_LANE_OTHER_LABEL,
+            "assignee": None,
+            "task_count": sum(len(c["tasks"]) for c in other_cols),
+            "columns": other_cols,
+        },
+    ]
+    if w3bb_swim_lane:
+        lanes.append(
+            {
+                "id": w3bb_assignee,
+                "label": W3BB_SWIM_LANE_LABEL,
+                "assignee": w3bb_assignee,
+                "task_count": sum(len(c["tasks"]) for c in w3bb_cols),
+                "columns": w3bb_cols,
+            }
+        )
+    lanes.append(
+        {
+            "id": l3x_assignee,
+            "label": l3x_assignee,
+            "assignee": l3x_assignee,
+            "task_count": sum(len(c["tasks"]) for c in l3x_cols),
+            "columns": l3x_cols,
+        }
+    )
+    return lanes
 
 
 def _task_dict(
@@ -499,10 +570,32 @@ def get_board(
             )
         ]
 
+        column_payload = [
+            {"name": name, "tasks": columns[name]} for name in columns.keys()
+        ]
+        try:
+            from hermes_cli.config import load_config
+            cfg = load_config() or {}
+        except Exception:
+            cfg = {}
+        k_cfg = ((cfg.get("dashboard") or {}).get("kanban") or {})
+        l3x_swim_lane = bool(k_cfg.get("l3x_swim_lane", True))
+        l3x_assignee = str(k_cfg.get("l3x_swim_lane_assignee") or L3X_SWIM_LANE_ASSIGNEE)
+        w3bb_swim_lane = bool(k_cfg.get("w3bb_swim_lane", True))
+        w3bb_assignee = str(k_cfg.get("w3bb_swim_lane_assignee") or W3BB_SWIM_LANE_ASSIGNEE)
+
         return {
-            "columns": [
-                {"name": name, "tasks": columns[name]} for name in columns.keys()
-            ],
+            "columns": column_payload,
+            "swim_lanes": (
+                partition_swim_lanes(
+                    column_payload,
+                    l3x_assignee=l3x_assignee,
+                    w3bb_assignee=w3bb_assignee,
+                    w3bb_swim_lane=w3bb_swim_lane,
+                )
+                if l3x_swim_lane
+                else None
+            ),
             "tenants": tenants,
             "assignees": assignees,
             "latest_event_id": int(latest_event_id),
@@ -606,6 +699,7 @@ class CreateTaskBody(BaseModel):
     parents: list[str] = Field(default_factory=list)
     triage: bool = False
     idempotency_key: Optional[str] = None
+    initial_status: str = "running"
     max_runtime_seconds: Optional[int] = None
     skills: Optional[list[str]] = None
     goal_mode: bool = False
@@ -638,6 +732,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             parents=payload.parents,
             triage=payload.triage,
             idempotency_key=payload.idempotency_key,
+            initial_status=payload.initial_status,
             max_runtime_seconds=payload.max_runtime_seconds,
             skills=payload.skills,
             goal_mode=payload.goal_mode,
@@ -827,6 +922,7 @@ def remove_attachment(attachment_id: int, board: Optional[str] = Query(None)):
 
 class UpdateTaskBody(BaseModel):
     status: Optional[str] = None
+    transition_reason: Optional[str] = None
     assignee: Optional[str] = None
     priority: Optional[int] = None
     title: Optional[str] = None
@@ -896,6 +992,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if payload.status is not None:
             s = payload.status
             ok = True
+            transition_error: Optional[str] = None
             if s == "done":
                 ok = kanban_db.complete_task(
                     conn, task_id,
@@ -940,15 +1037,45 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     status_code=400,
                     detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
                 )
-            elif s in ("todo", "triage", "scheduled"):
-                # Only a review task moving to 'todo' needs the reopen
-                # transition; fetch lazily so triage/scheduled skip the query.
-                current = kanban_db.get_task(conn, task_id) if s == "todo" else None
-                reopened = _reopen_if_review(conn, task_id, current)
-                ok = reopened if reopened is not None else _set_status_direct(conn, task_id, s)
+            elif s in ("todo", "triage"):
+                # Only review -> todo uses the dedicated review-reopen path.
+                # Every other todo/triage request goes through the audited
+                # automation transition so active, blocked, scheduled, and
+                # terminal lifecycle rules cannot be bypassed by drag/drop.
+                current = kanban_db.get_task(conn, task_id)
+                reopened = (
+                    _reopen_if_review(conn, task_id, current)
+                    if s == "todo"
+                    else None
+                )
+                if reopened is not None:
+                    ok = reopened
+                elif (
+                    s == "todo"
+                    and current is not None
+                    and current.status in {"done", "archived"}
+                ):
+                    # Preserve the established completed-parent reopen path:
+                    # _set_status_direct owns descendant invalidation and run
+                    # cleanup for this deliberate operator recovery action.
+                    ok = _set_status_direct(conn, task_id, s)
+                else:
+                    transition = kanban_db.transition_task_status(
+                        conn,
+                        task_id,
+                        target_status=s,
+                        # Audit identity is transport-derived, never accepted
+                        # from the request body where it could be spoofed.
+                        actor="dashboard",
+                        reason=payload.transition_reason,
+                    )
+                    ok = transition.ok
+                    transition_error = transition.error
             else:
                 raise HTTPException(status_code=400, detail=f"unknown status: {s}")
             if not ok:
+                if transition_error:
+                    raise HTTPException(status_code=409, detail=transition_error)
                 # For ``ready``, name the blocking parent(s) so the dashboard
                 # can render an actionable toast instead of a silent no-op.
                 # See #26744.
@@ -1176,11 +1303,13 @@ def _set_status_direct(
 
         cur = conn.execute(
             "UPDATE tasks SET status = ?, "
+            "  manual_hold = CASE WHEN ? = 'todo' THEN 1 ELSE 0 END, "
             "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
             "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
             "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
             "WHERE id = ?",
             (
+                effective_status,
                 effective_status,
                 effective_status,
                 effective_status,
@@ -1297,6 +1426,7 @@ def delete_link(
 class BulkTaskBody(BaseModel):
     ids: list[str]
     status: Optional[str] = None
+    transition_reason: Optional[str] = None
     assignee: Optional[str] = None  # "" or None = unassign
     priority: Optional[int] = None
     archive: bool = False
@@ -1340,6 +1470,7 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         entry.update(ok=False, error="archive refused")
                 if payload.status is not None and not payload.archive:
                     s = payload.status
+                    transition_error: Optional[str] = None
                     if s == "done":
                         ok = kanban_db.complete_task(
                             conn, tid,
@@ -1378,16 +1509,54 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     elif s == "scheduled":
                         ok = kanban_db.schedule_task(conn, tid)
                     elif s in {"todo", "triage"}:
-                        # Fetch lazily: only review->todo needs reopen.
-                        cur = kanban_db.get_task(conn, tid) if s == "todo" else None
-                        reopened = _reopen_if_review(conn, tid, cur)
-                        ok = reopened if reopened is not None else _set_status_direct(conn, tid, s)
+                        # Match the single-card path: review -> todo uses the
+                        # review lifecycle; all other todo/triage requests use
+                        # the audited automation transition and fail closed for
+                        # active/blocked/scheduled/terminal cards.
+                        cur = kanban_db.get_task(conn, tid)
+                        reopened = (
+                            _reopen_if_review(conn, tid, cur)
+                            if s == "todo"
+                            else None
+                        )
+                        if reopened is not None:
+                            ok = reopened
+                        elif (
+                            s == "todo"
+                            and cur is not None
+                            and cur.status in {"done", "archived"}
+                        ):
+                            # Deliberate completed-parent reopen; mirrors the
+                            # single-card path and invalidates descendants.
+                            ok = _set_status_direct(conn, tid, s)
+                        else:
+                            transition = kanban_db.transition_task_status(
+                                conn,
+                                tid,
+                                target_status=s,
+                                actor="dashboard",
+                                reason=payload.transition_reason,
+                            )
+                            ok = transition.ok
+                            transition_error = transition.error
                     else:
                         entry.update(ok=False, error=f"unknown status {s!r}")
                         results.append(entry)
                         continue
                     if not ok:
-                        entry.update(ok=False, error=f"transition to {s!r} refused")
+                        entry.update(
+                            ok=False,
+                            error=(
+                                transition_error
+                                or f"transition to {s!r} refused"
+                            ),
+                        )
+                        if transition_error:
+                            # Match single-card PATCH fail-closed semantics:
+                            # do not partially apply unrelated fields after a
+                            # refused lifecycle transition on this card.
+                            results.append(entry)
+                            continue
                 if payload.assignee is not None:
                     try:
                         if payload.reclaim_first:
@@ -2033,6 +2202,14 @@ def get_config():
     return {
         "default_tenant": k_cfg.get("default_tenant") or "",
         "lane_by_profile": bool(k_cfg.get("lane_by_profile", True)),
+        "l3x_swim_lane": bool(k_cfg.get("l3x_swim_lane", True)),
+        "l3x_swim_lane_assignee": str(
+            k_cfg.get("l3x_swim_lane_assignee") or L3X_SWIM_LANE_ASSIGNEE
+        ),
+        "w3bb_swim_lane": bool(k_cfg.get("w3bb_swim_lane", True)),
+        "w3bb_swim_lane_assignee": str(
+            k_cfg.get("w3bb_swim_lane_assignee") or W3BB_SWIM_LANE_ASSIGNEE
+        ),
         "include_archived_by_default": bool(k_cfg.get("include_archived_by_default", False)),
         "render_markdown": bool(k_cfg.get("render_markdown", True)),
     }

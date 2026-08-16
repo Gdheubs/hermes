@@ -14,7 +14,7 @@ Hermes Kanban is a durable task board, shared across all your Hermes profiles, t
 
 The board has two front doors, both backed by the same `~/.hermes/kanban.db`:
 
-- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
+- **Agents drive the board through a dedicated `kanban_*` toolset** — `kanban_show`, `kanban_list`, `kanban_complete`, `kanban_request_review`, `kanban_request_changes`, `kanban_block`, `kanban_heartbeat`, `kanban_comment`, `kanban_attach`, `kanban_attach_url`, `kanban_attachments`, `kanban_create`, `kanban_transition`, `kanban_link`, `kanban_unblock`. The dispatcher spawns each worker with these tools already in its schema; orchestrator profiles can also enable the `kanban` toolset explicitly. The model reads and routes tasks by calling tools directly, *not* by shelling out to `hermes kanban`. See [How workers interact with the board](#how-workers-interact-with-the-board) below.
 - **You (and scripts, and cron) drive the board through `hermes kanban …`** on the CLI, `/kanban …` as a slash command, or the dashboard. These are for humans and automation — the places without a tool-calling model behind them.
 
 Both surfaces route through the same `kanban_db` layer, so reads see a consistent view and writes can't drift. The rest of this page shows CLI examples because they're easy to copy-paste, but every CLI verb has a tool-call equivalent the model uses.
@@ -59,8 +59,8 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   (e.g. one per project, repo, or domain); see [Boards (multi-project)](#boards-multi-project)
   below. Single-project users stay on the `default` board and never see the
   word "board" outside this docs section.
-- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | review | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
-- **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`.
+- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | scheduled | ready | running | blocked | review | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
+- **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes dependency-created `todo → ready` when all parents are `done`. An explicitly created or transitioned `todo` is a manual hold instead and stays parked until `promote` or another explicit transition.
 - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
 - **Workspace** — the directory a worker operates in. Three kinds:
   - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` are copied into durable per-task attachment storage before cleanup; existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. A missing declared scratch artifact keeps the task in-flight so the worker can correct the path and retry. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
@@ -256,6 +256,74 @@ hermes kanban create "nightly ops review" \
     --json
 ```
 
+### Cron-safe LinkedIn cards (`todo` → `triage`)
+
+Use an explicit `todo` hold when a cron workflow must create one persistent
+card for a week's LinkedIn Monday/Wednesday/Friday posts, then hand that same
+card to triage when Friday analytics begins. Unlike dependency-created `todo`,
+this phase does **not** auto-promote or spawn a worker. The idempotency key makes
+retries reuse the same row; the later transition changes that exact task
+instead of creating a replacement card.
+
+```bash
+period="$(date -u +%G-W%V)"
+account="company-page"
+
+# A retry with the same key returns the existing card. Keep an assignee on the
+# card so it is ready for any later dispatchable phase.
+card_json="$(hermes kanban create "LinkedIn M/W/F posts: ${period}" \
+    --assignee linkedin-publisher \
+    --initial-status todo \
+    --idempotency-key "linkedin-post:${account}:${period}" \
+    --json)"
+task_id="$(printf '%s' "$card_json" | \
+    python3 -c 'import json, sys; print(json.load(sys.stdin)["id"])')"
+
+# Friday analytics begins: route the same audited card to triage.
+hermes kanban transition "$task_id" \
+    --to triage \
+    --reason "Friday analytics started for ${period}"
+```
+
+`transition` accepts only unclaimed `ready`, `todo`, or `triage` cards and only
+targets `todo` or `triage`. It refuses active, blocked, scheduled, review, and
+terminal cards so their dedicated reclaim/unblock/review/reopen operations
+cannot be bypassed. A real transition appends one `status_transitioned` event
+with source, target, actor, reason, and timestamp; retrying an already-effective
+transition is a no-op and does not duplicate the event or spawn a worker.
+
+An orchestrator agent uses the equivalent structured calls:
+
+```text
+kanban_create(
+    title="LinkedIn M/W/F posts: 2026-W33",
+    assignee="linkedin-publisher",
+    initial_status="todo",
+    idempotency_key="linkedin-post:company-page:2026-W33",
+)
+# Later, using the task_id returned above:
+kanban_transition(
+    task_id="t_…",
+    target_status="triage",
+    reason="Friday analytics started for 2026-W33",
+)
+```
+
+The authenticated dashboard REST API uses the same domain mutation through the
+existing task PATCH route. Its audit actor is derived by the server as
+`dashboard`; callers provide the human-readable automation identity in the
+reason instead of claiming an actor identity:
+
+```http
+PATCH /api/plugins/kanban/tasks/t_…
+Content-Type: application/json
+
+{
+  "status": "triage",
+  "transition_reason": "linkedin-analytics-cron: Friday analytics started for 2026-W33"
+}
+```
+
 ### Bulk CLI verbs
 
 All the lifecycle verbs accept multiple ids so you can clean up a batch
@@ -305,7 +373,8 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
 | `kanban_attach_url` | Attach a file to a task by URL. | `url` |
 | `kanban_attachments` | List a task's attachments. | — |
-| `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, etc. | `title`, `assignee` |
+| `kanban_create` | (Orchestrators) fan out into child tasks, or stage a held `todo`/`triage` automation card. | `title`, `assignee` |
+| `kanban_transition` | (Orchestrators/cron agents) idempotently park an unclaimed `ready`/`todo`/`triage` card in explicit held `todo` or `triage`, with an audited reason. | `task_id`, `target_status` |
 | `kanban_link` | (Orchestrators) add a `parent_id → child_id` dependency edge after the fact. | `parent_id`, `child_id` |
 | `kanban_unblock` | (Orchestrators) restore a blocked task to its source phase (`review` or `ready`), or `todo` while a parent remains open. | `task_id` |
 
@@ -344,7 +413,7 @@ kanban_create(
 kanban_complete(summary="decomposed into 2 research tasks + 1 writer; linked dependencies")
 ```
 
-The "(Orchestrators)" tools — `kanban_list`, `kanban_create`, `kanban_link`, `kanban_unblock`, and `kanban_comment` on foreign tasks — are available through the same toolset; the convention (encoded in the auto-injected kanban guidance) is that worker profiles don't fan out or route unrelated work, and orchestrator profiles don't execute implementation work. Dispatcher-spawned workers are still task-scoped for destructive lifecycle operations and cannot mutate unrelated tasks.
+The "(Orchestrators)" tools — `kanban_list`, `kanban_create`, `kanban_transition`, `kanban_link`, `kanban_unblock`, and `kanban_comment` on foreign tasks — are available through the same toolset; the convention (encoded in the auto-injected kanban guidance) is that worker profiles don't fan out or route unrelated work, and orchestrator profiles don't execute implementation work. Dispatcher-spawned workers are still task-scoped for destructive lifecycle operations and cannot mutate unrelated tasks.
 
 ### Why tools instead of shelling to `hermes kanban`
 
@@ -671,7 +740,7 @@ All routes are mounted under `/api/plugins/kanban/` and protected by the dashboa
 | `POST` | `/links` | Add a dependency (`parent_id` → `child_id`) |
 | `DELETE` | `/links?parent_id=…&child_id=…` | Remove a dependency |
 | `POST` | `/dispatch?max=…&dry_run=…` | Nudge the dispatcher — skip the 60 s wait |
-| `GET` | `/config` | Read `dashboard.kanban` preferences from `config.yaml` — `default_tenant`, `lane_by_profile`, `include_archived_by_default`, `render_markdown` |
+| `GET` | `/config` | Read `dashboard.kanban` preferences from `config.yaml` — `default_tenant`, `lane_by_profile`, `l3x_swim_lane`, `l3x_swim_lane_assignee`, `w3bb_swim_lane`, `w3bb_swim_lane_assignee`, `include_archived_by_default`, `render_markdown` |
 | `WS` | `/events?since=<event_id>` | Live stream of `task_events` rows |
 
 Every handler is a thin wrapper — the plugin is ~700 lines of Python (router + WebSocket tail + bulk batcher + config reader) and adds no new business logic. A tiny `_conn()` helper auto-initializes `kanban.db` on every read and write, so a fresh install works whether the user opened the dashboard first, hit the REST API directly, or ran `hermes kanban init`.
@@ -685,9 +754,15 @@ dashboard:
   kanban:
     default_tenant: acme              # preselects the tenant filter
     lane_by_profile: true             # default for the "lanes by profile" toggle
+    l3x_swim_lane: true               # cross-column swim rows (Org / W3bb / L3x)
+    l3x_swim_lane_assignee: l3x       # assignee profile for the engineering swim row
+    w3bb_swim_lane: true              # dedicated W3bb marketing swim row
+    w3bb_swim_lane_assignee: w3bb    # assignee profile for the W3bb swim row
     include_archived_by_default: false
     render_markdown: true             # set false for plain <pre> rendering
 ```
+
+When `l3x_swim_lane` is enabled (default), the board renders three horizontal swim rows spanning every lifecycle column: **Org** first (all assignees except the dedicated profile rows, including unassigned), **W3bb** for tasks assigned to `w3bb_swim_lane_assignee` when `w3bb_swim_lane` is true (default), then **L3x** for tasks assigned to `l3x_swim_lane_assignee`. The flat `columns` payload is unchanged so filters, search, and drag/drop continue to operate on the full board; assignee filters collapse to a single visible row when narrowed to W3bb, L3x, or another profile.
 
 Each key is optional and falls back to the shown default.
 

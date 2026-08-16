@@ -155,7 +155,10 @@ def _default_task_id(arg: Optional[str]) -> Optional[str]:
 
 def _worker_run_id(task_id: str) -> Optional[int]:
     """Return this worker's dispatcher run id when it is scoped to task_id."""
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+    if (
+        not _is_dispatcher_owned_worker()
+        or os.environ.get("HERMES_KANBAN_TASK") != task_id
+    ):
         return None
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")
     if not raw:
@@ -170,7 +173,10 @@ def _stamp_worker_session_metadata(
     task_id: str, metadata: Optional[dict]
 ) -> Optional[dict]:
     """Add trusted worker session id metadata for this worker's own task."""
-    if os.environ.get("HERMES_KANBAN_TASK") != task_id:
+    if (
+        not _is_dispatcher_owned_worker()
+        or os.environ.get("HERMES_KANBAN_TASK") != task_id
+    ):
         return metadata
     session_id = os.environ.get("HERMES_SESSION_ID")
     if not session_id:
@@ -199,7 +205,11 @@ def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
     when it must be rejected. Callers should ``return`` the error
     verbatim.
     """
-    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    env_tid = (
+        os.environ.get("HERMES_KANBAN_TASK")
+        if _is_dispatcher_owned_worker()
+        else None
+    )
     if not env_tid:
         # Orchestrator or CLI context — no task-scope restriction.
         return None
@@ -320,6 +330,8 @@ def heartbeat_current_worker_from_env() -> bool:
     the worst case is one extra DB write per race, which is harmless.
     """
     global _auto_heartbeat_last_attempt
+    if not _is_dispatcher_owned_worker():
+        return False
     tid = os.environ.get("HERMES_KANBAN_TASK")
     if not tid:
         return False
@@ -381,6 +393,8 @@ def inject_new_comments_from_env(agent: Any) -> bool:
     the run started are injected. The worker's own authored comments (matched
     by ``HERMES_PROFILE``) are skipped to avoid echoing itself.
     """
+    if not _is_dispatcher_owned_worker():
+        return False
     tid = os.environ.get("HERMES_KANBAN_TASK")
     if not tid or agent is None or not hasattr(agent, "steer"):
         return False
@@ -473,7 +487,10 @@ def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
     structured tool_error so the model gets a clear refusal instead of
     silently mutating board state from a worker context.
     """
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    if (
+        os.environ.get("HERMES_KANBAN_TASK")
+        and _is_dispatcher_owned_worker()
+    ):
         return tool_error(
             f"{tool_name} is orchestrator-only; dispatcher-spawned workers "
             "must use kanban_complete, kanban_block, kanban_heartbeat, or "
@@ -1467,6 +1484,7 @@ def _handle_create(args: dict, **kw) -> str:
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
+                manual_hold=new_task.manual_hold if new_task else None,
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
@@ -1639,6 +1657,54 @@ def _handle_unblock(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_unblock failed")
         return tool_error(f"kanban_unblock: {e}")
+
+
+def _handle_transition(args: dict, **kw) -> str:
+    """Safely park an unclaimed task in todo or triage."""
+    delegated_err = _reject_delegated_child_mutation("kanban_transition")
+    if delegated_err:
+        return delegated_err
+    guard = _require_orchestrator_tool("kanban_transition")
+    if guard:
+        return guard
+    tid = args.get("task_id")
+    if not tid:
+        return tool_error("task_id is required")
+    target_status = args.get("target_status")
+    if not target_status:
+        return tool_error("target_status is required")
+    ownership_err = _enforce_worker_task_ownership(str(tid))
+    if ownership_err:
+        return ownership_err
+
+    board = args.get("board")
+    actor = os.environ.get("HERMES_PROFILE") or "worker"
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            transition = kb.transition_task_status(
+                conn,
+                str(tid),
+                target_status=str(target_status),
+                actor=actor,
+                reason=args.get("reason"),
+            )
+            if not transition.ok:
+                return tool_error(f"kanban_transition: {transition.error}")
+            task = kb.get_task(conn, str(tid))
+            return _ok(
+                task_id=str(tid),
+                source_status=transition.source_status,
+                status=task.status if task else None,
+                transitioned=transition.changed,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_transition: {e}")
+    except Exception as e:
+        logger.exception("kanban_transition failed")
+        return tool_error(f"kanban_transition: {e}")
 
 
 def _handle_link(args: dict, **kw) -> str:
@@ -2239,12 +2305,13 @@ KANBAN_CREATE_SCHEMA = {
             },
             "initial_status": {
                 "type": "string",
-                "enum": ["running", "blocked"],
+                "enum": ["running", "blocked", "todo", "triage"],
                 "description": (
-                    "Initial card status. Use 'blocked' for tasks that "
-                    "require immediate human ops (R3 gate) to skip the "
-                    "brief running-to-blocked transition. Defaults to "
-                    "'running', which preserves the usual dispatch path."
+                    "Initial lifecycle phase. 'todo' creates an explicit "
+                    "manual hold that will not auto-dispatch; 'triage' parks "
+                    "for specification; 'blocked' creates an immediate human "
+                    "ops gate. Defaults to 'running', which preserves normal "
+                    "ready/dependency inference."
                 ),
             },
             "skills": {
@@ -2306,6 +2373,37 @@ KANBAN_CREATE_SCHEMA = {
             "board": _board_schema_prop(),
         },
         "required": ["title", "assignee"],
+    },
+}
+
+KANBAN_TRANSITION_SCHEMA = {
+    "name": "kanban_transition",
+    "description": (
+        "Safely park an existing unclaimed Kanban task in todo or triage. "
+        "The operation is idempotent and audited with actor, reason, source, "
+        "target, and timestamp. Todo is a manual hold: it will not auto-spawn "
+        "until explicitly promoted or transitioned. Active, blocked, review, "
+        "scheduled, and terminal tasks keep their dedicated lifecycle paths."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "Existing task id to transition.",
+            },
+            "target_status": {
+                "type": "string",
+                "enum": ["todo", "triage"],
+                "description": "Target non-dispatching lifecycle phase.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Optional reason recorded in the audit event.",
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["task_id", "target_status"],
     },
 }
 
@@ -2468,6 +2566,15 @@ registry.register(
     handler=_handle_unblock,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="▶",
+)
+
+registry.register(
+    name="kanban_transition",
+    toolset="kanban",
+    schema=KANBAN_TRANSITION_SCHEMA,
+    handler=_handle_transition,
+    check_fn=_check_kanban_orchestrator_mode,
+    emoji="↔",
 )
 
 registry.register(

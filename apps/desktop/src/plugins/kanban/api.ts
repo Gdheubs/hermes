@@ -15,8 +15,11 @@ import type {
   BoardMeta,
   BoardsResponse,
   KanbanBoard,
+  KanbanBoardConfig,
+  KanbanColumn,
   KanbanProfile,
   KanbanProject,
+  KanbanSwimLane,
   KanbanTask,
   KanbanTaskDetail,
   OrchestrationSettings,
@@ -138,11 +141,14 @@ export const BOARDS_KEY = ['kanban', 'boards'] as const
 export const PROFILES_KEY = ['kanban', 'profiles'] as const
 export const PROJECTS_KEY = ['kanban', 'projects'] as const
 export const ORCHESTRATION_KEY = ['kanban', 'orchestration'] as const
+export const CONFIG_KEY = ['kanban', 'config'] as const
 
 // ── reads ─────────────────────────────────────────────────────────────────────
 
 export const fetchBoard = (archived: boolean) =>
   call<KanbanBoard>(withBoard('/board', archived ? { include_archived: 'true' } : {}))
+
+export const fetchKanbanConfig = () => call<KanbanBoardConfig>('/config')
 
 export const fetchTask = (id: string) => call<KanbanTaskDetail>(withBoard(`/tasks/${id}`))
 

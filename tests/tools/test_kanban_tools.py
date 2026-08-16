@@ -416,6 +416,142 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_assigned_held_todo_is_idempotent(worker_env):
+    """Cron-owned staging cards keep the existing assignee contract."""
+    from tools import kanban_tools as kt
+
+    args = {
+        "title": "LinkedIn M/W/F weekly post",
+        "assignee": "publisher",
+        "initial_status": "todo",
+        "idempotency_key": "linkedin-post:2026-W33",
+    }
+    first = json.loads(kt._handle_create(args))
+    second = json.loads(kt._handle_create(args))
+
+    assert first["ok"] is True
+    assert first["status"] == "todo"
+    assert second["task_id"] == first["task_id"]
+
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, first["task_id"])
+        assert task is not None
+        assert task.assignee == "publisher"
+        assert task.manual_hold is True
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?",
+            ("linkedin-post:2026-W33",),
+        ).fetchone()[0] == 1
+
+
+def test_transition_tool_moves_existing_todo_to_triage(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_PROFILE", "linkedin-analytics-cron")
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="LinkedIn M/W/F weekly post",
+            assignee="publisher",
+            initial_status="todo",
+        )
+
+    result = json.loads(
+        kt._handle_transition(
+            {
+                "task_id": task_id,
+                "target_status": "triage",
+                "reason": "Friday analytics started",
+            }
+        )
+    )
+    assert result == {
+        "ok": True,
+        "task_id": task_id,
+        "source_status": "todo",
+        "status": "triage",
+        "transitioned": True,
+    }
+
+    with kb.connect() as conn:
+        event = [
+            item
+            for item in kb.list_events(conn, task_id)
+            if item.kind == "status_transitioned"
+        ][0]
+        assert event.payload is not None
+        assert event.payload["actor"] == "linkedin-analytics-cron"
+        assert event.payload["reason"] == "Friday analytics started"
+
+
+def test_transition_tool_ignores_inherited_worker_scope_for_cron_context(
+    monkeypatch, worker_env
+):
+    """An in-process cron keeps env vars but is not the parent worker."""
+    from agent.delegation_context import non_dispatcher_owned_context
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_PROFILE", "linkedin-analytics-cron")
+    monkeypatch.setattr(kt, "_profile_has_kanban_toolset", lambda: True)
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="LinkedIn M/W/F weekly post",
+            assignee="publisher",
+            initial_status="todo",
+        )
+
+    with non_dispatcher_owned_context():
+        assert kt._check_kanban_orchestrator_mode() is True
+        result = json.loads(
+            kt._handle_transition(
+                {
+                    "task_id": task_id,
+                    "target_status": "triage",
+                    "reason": "Friday analytics started",
+                }
+            )
+        )
+
+    assert result == {
+        "ok": True,
+        "task_id": task_id,
+        "source_status": "todo",
+        "status": "triage",
+        "transitioned": True,
+    }
+
+
+def test_transition_tool_is_exposed_on_kanban_and_codex_surfaces():
+    from agent.transports.hermes_tools_mcp_server import EXPOSED_TOOLS
+    from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
+    from tools import kanban_tools as kt
+
+    assert "kanban_transition" in _HERMES_CORE_TOOLS
+    kanban_tools = TOOLSETS["kanban"]["tools"]
+    assert isinstance(kanban_tools, list)
+    assert "kanban_transition" in kanban_tools
+    assert "kanban_transition" in EXPOSED_TOOLS
+    create_parameters = kt.KANBAN_CREATE_SCHEMA["parameters"]
+    assert isinstance(create_parameters, dict)
+    assert create_parameters["required"] == [
+        "title",
+        "assignee",
+    ]
+    transition_parameters = kt.KANBAN_TRANSITION_SCHEMA["parameters"]
+    assert isinstance(transition_parameters, dict)
+    assert transition_parameters["required"] == [
+        "task_id",
+        "target_status",
+    ]
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()

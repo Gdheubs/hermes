@@ -197,6 +197,47 @@
   color: var(--color-foreground);
 }
 
+/* ---- Cross-column swim lanes (Org / W3bb / L3x assignees) ------------ */
+
+.hermes-kanban-swim-board {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.hermes-kanban-swim-row {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.hermes-kanban-swim-row-head {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  padding: 0.15rem 0.25rem 0;
+  font-size: 0.72rem;
+  letter-spacing: 0.02em;
+  color: var(--color-muted-foreground);
+  border-bottom: 1px solid color-mix(in srgb, var(--color-border) 65%, transparent);
+}
+
+.hermes-kanban-swim-row-name {
+  font-weight: 700;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  color: var(--color-foreground);
+}
+
+.hermes-kanban-swim-row-count {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+
 /* ---- Lanes (per-profile sub-grouping inside Running) ---------------- */
 
 .hermes-kanban-lane {

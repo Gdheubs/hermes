@@ -100,7 +100,9 @@ _log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
-VALID_INITIAL_STATUSES = {"running", "blocked"}
+VALID_INITIAL_STATUSES = {"running", "blocked", "todo", "triage"}
+VALID_MANUAL_TRANSITION_STATUSES = {"todo", "triage"}
+VALID_MANUAL_TRANSITION_SOURCES = {"ready", "todo", "triage"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -1141,6 +1143,10 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Explicitly parked todo cards are not dependency-ready work. The
+    # dispatcher leaves them in todo until an operator promotes or transitions
+    # them. This lets cron automation stage one idempotent card safely.
+    manual_hold: bool = False
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1240,11 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            manual_hold=(
+                bool(row["manual_hold"])
+                if "manual_hold" in keys and row["manual_hold"] is not None
+                else False
             ),
         )
 
@@ -1422,7 +1433,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- A deliberate todo hold. Dependency-created todo rows use 0 and
+    -- auto-promote when their parents finish; explicitly staged todo rows use
+    -- 1 and stay parked until promote/transition clears the hold.
+    manual_hold          INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2679,6 +2694,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "manual_hold" not in cols:
+        # Existing todo rows are dependency waits and must keep their historical
+        # auto-promotion behavior. Only newly explicit todo transitions set 1.
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "manual_hold",
+            "manual_hold INTEGER NOT NULL DEFAULT 0",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3186,11 +3211,12 @@ def create_task(
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
-    Returns the new task id.  Status is ``ready`` when there are no
-    parents (or all parents already ``done``), otherwise ``todo``.
-    If ``triage=True``, status is forced to ``triage`` regardless of
-    parents — a specifier/triager is expected to promote the task to
-    ``todo`` once the spec is fleshed out.
+    Returns the new task id. By default, status is ``ready`` when there are no
+    parents (or all parents are terminal), otherwise dependency-gated ``todo``.
+    ``initial_status='todo'`` creates an explicit manual hold that the
+    dispatcher will not auto-promote. ``initial_status='triage'`` is the
+    non-legacy spelling of ``triage=True``. ``initial_status='blocked'`` parks
+    work behind an immediate human-ops gate.
 
     If ``idempotency_key`` is provided and a non-archived task with the
     same key already exists, returns the existing task's id instead of
@@ -3234,6 +3260,11 @@ def create_task(
     if initial_status not in VALID_INITIAL_STATUSES:
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
+        )
+    if triage and initial_status not in {"running", "triage"}:
+        raise ValueError(
+            "triage=True conflicts with initial_status="
+            f"{initial_status!r}; use initial_status='triage'"
         )
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
@@ -3393,11 +3424,10 @@ def create_task(
             )
         skills_list = cleaned
 
-    # Idempotency check — return the existing task instead of creating a
-    # duplicate. Done BEFORE entering write_txn to keep the fast path fast
-    # and to avoid holding a write lock during the lookup. Race is
-    # acceptable: two concurrent creators with the same key might both
-    # insert, at which point both rows exist but the next lookup stabilises.
+    # Idempotency fast path — return the existing task without taking a write
+    # lock. Correctness does not rely on this optimistic read: the lookup is
+    # repeated after BEGIN IMMEDIATE below so concurrent creators cannot both
+    # insert the same non-archived key.
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
@@ -3438,23 +3468,43 @@ def create_task(
             # compose create_task calls under one outer commit so the
             # dispatcher can never observe a partially constructed graph.
             with write_txn(conn, allow_nested=True):
-                # Determine task status from parent status, unless the caller
-                # parks it directly in blocked for human-ops review or in
-                # triage for a specifier.
+                if idempotency_key:
+                    # Serialize the decisive lookup with the insert. A second
+                    # creator that raced the optimistic check above waits for
+                    # this write transaction, then observes and reuses the row
+                    # committed by the winner.
+                    existing = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if existing:
+                        return str(existing["id"])
+
+                # Validate every dependency before selecting an initial lane.
+                # Keeping this common prevents special initial statuses from
+                # accidentally persisting dangling task_links rows.
+                if parents:
+                    missing = _find_missing_parents(conn, parents)
+                    if missing:
+                        raise ValueError(
+                            f"unknown parent task(s): {', '.join(missing)}"
+                        )
+
+                # Determine task status from the explicit lifecycle request or
+                # (for the normal 'running' mode) from parent status.
+                manual_hold = 0
                 if initial_status == "blocked":
                     task_status = "blocked"
-                    if parents:
-                        missing = _find_missing_parents(conn, parents)
-                        if missing:
-                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
-                elif triage:
+                elif initial_status == "todo":
+                    task_status = "todo"
+                    manual_hold = 1
+                elif triage or initial_status == "triage":
                     task_status = "triage"
                 else:
                     task_status = "ready"
                     if parents:
-                        missing = _find_missing_parents(conn, parents)
-                        if missing:
-                            raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
                         # If any parent is not yet done, we're todo.
                         rows = conn.execute(
                             "SELECT status FROM tasks WHERE id IN "
@@ -3463,12 +3513,6 @@ def create_task(
                         ).fetchall()
                         if any(r["status"] != "done" for r in rows):
                             task_status = "todo"
-                # Even in triage mode we still need to validate parent ids
-                # so the eventual link rows don't dangle.
-                if triage and parents:
-                    missing = _find_missing_parents(conn, parents)
-                    if missing:
-                        raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
 
                 # Project-linked worktree: a fresh worktree dir under the repo
                 # plus a deterministic branch (project slug + task id). Together
@@ -3497,8 +3541,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, manual_hold
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3524,6 +3568,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        manual_hold,
                     ),
                 )
                 for pid in parents:
@@ -3542,6 +3587,9 @@ def create_task(
                     {
                         "assignee": assignee,
                         "status": task_status,
+                        "initial_status": (
+                            initial_status if initial_status != "running" else None
+                        ),
                         "parents": list(parents),
                         "tenant": tenant,
                         "workspace_kind": workspace_kind,
@@ -3552,6 +3600,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "manual_hold": bool(manual_hold) or None,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -4544,12 +4593,18 @@ def recompute_ready(
     promoted = 0
     with write_txn(conn):
         todo_rows = conn.execute(
-            "SELECT id, status, consecutive_failures, max_retries "
+            "SELECT id, status, consecutive_failures, max_retries, manual_hold "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
         ).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if cur_status == "todo" and bool(row["manual_hold"]):
+                # Explicit staging hold (e.g. a cron-owned packaging card).
+                # Only a manual promote/transition releases it; parent state
+                # must not silently convert staged control-plane work into a
+                # dispatchable worker run.
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for explicit human intervention — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -4582,13 +4637,14 @@ def recompute_ready(
                     if failures >= effective_limit:
                         continue
                     conn.execute(
-                        "UPDATE tasks SET status = ? "
+                        "UPDATE tasks SET status = ?, manual_hold = 0 "
                         "WHERE id = ? AND status = 'blocked'",
                         (resume_status, task_id),
                     )
                 else:
                     conn.execute(
-                        "UPDATE tasks SET status = ? WHERE id = ? AND status = 'todo'",
+                        "UPDATE tasks SET status = ?, manual_hold = 0 "
+                        "WHERE id = ? AND status = 'todo'",
                         (resume_status, task_id),
                     )
                 _append_event(
@@ -6687,6 +6743,135 @@ def request_changes(
     return True, implementer
 
 
+@dataclass(frozen=True)
+class StatusTransitionResult:
+    """Outcome of an audited todo/triage lifecycle transition."""
+
+    ok: bool
+    source_status: Optional[str]
+    target_status: str
+    changed: bool
+    error: Optional[str] = None
+
+
+def transition_task_status(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    target_status: str,
+    actor: str,
+    reason: Optional[str] = None,
+) -> StatusTransitionResult:
+    """Safely park an unclaimed task in ``todo`` or ``triage``.
+
+    This is the narrow automation transition for cron/orchestrator-owned cards.
+    It accepts only the unclaimed ``ready``/``todo``/``triage`` phases; active,
+    blocked, scheduled, review, and terminal tasks have dedicated lifecycle
+    operations whose recovery/accounting semantics must not be bypassed.
+
+    ``todo`` is an explicit manual hold, distinct from dependency-created todo:
+    ``recompute_ready`` will leave it parked until ``promote_task`` or another
+    transition clears the hold. Repeating an already-effective transition is
+    idempotent and does not append another event. Every real state/hold change
+    emits ``status_transitioned`` with source, target, actor, reason, and the
+    event table's canonical timestamp.
+    """
+    target_status = (target_status or "").strip().lower()
+    actor = (actor or "").strip() or "unknown"
+    reason = (reason or "").strip() or None
+    if target_status not in VALID_MANUAL_TRANSITION_STATUSES:
+        return StatusTransitionResult(
+            ok=False,
+            source_status=None,
+            target_status=target_status,
+            changed=False,
+            error=(
+                "target_status must be one of "
+                f"{sorted(VALID_MANUAL_TRANSITION_STATUSES)}"
+            ),
+        )
+
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, manual_hold, current_run_id, claim_lock, "
+            "claim_expires, worker_pid FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return StatusTransitionResult(
+                False, None, target_status, False, f"task {task_id} not found"
+            )
+
+        source_status = str(row["status"])
+        if source_status not in VALID_MANUAL_TRANSITION_SOURCES:
+            return StatusTransitionResult(
+                ok=False,
+                source_status=source_status,
+                target_status=target_status,
+                changed=False,
+                error=(
+                    f"task {task_id} is {source_status!r}; todo/triage "
+                    "transitions only apply to unclaimed 'ready', 'todo', "
+                    "or 'triage' tasks"
+                ),
+            )
+        if any(
+            row[field] is not None
+            for field in (
+                "current_run_id",
+                "claim_lock",
+                "claim_expires",
+                "worker_pid",
+            )
+        ):
+            return StatusTransitionResult(
+                ok=False,
+                source_status=source_status,
+                target_status=target_status,
+                changed=False,
+                error=(
+                    f"task {task_id} has active ownership metadata; reclaim "
+                    "it before changing its lifecycle phase"
+                ),
+            )
+
+        target_hold = target_status == "todo"
+        if source_status == target_status and bool(row["manual_hold"]) == target_hold:
+            return StatusTransitionResult(
+                True, source_status, target_status, False
+            )
+
+        updated = conn.execute(
+            "UPDATE tasks SET status = ?, manual_hold = ? "
+            "WHERE id = ? AND status = ? AND current_run_id IS NULL "
+            "AND claim_lock IS NULL AND claim_expires IS NULL "
+            "AND worker_pid IS NULL",
+            (target_status, int(target_hold), task_id, source_status),
+        )
+        if updated.rowcount != 1:
+            return StatusTransitionResult(
+                False,
+                source_status,
+                target_status,
+                False,
+                f"task {task_id} status changed during transition",
+            )
+        _append_event(
+            conn,
+            task_id,
+            "status_transitioned",
+            {
+                "source_status": source_status,
+                "target_status": target_status,
+                "actor": actor,
+                "reason": reason,
+            },
+        )
+
+    notify_task_updated(conn, task_id, ("status", "manual_hold"))
+    return StatusTransitionResult(True, source_status, target_status, True)
+
+
 def promote_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -6741,7 +6926,7 @@ def promote_task(
 
     with write_txn(conn):
         upd = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
+            "UPDATE tasks SET status = 'ready', manual_hold = 0 "
             "WHERE id = ? AND status IN ('todo', 'blocked')",
             (task_id,),
         )
@@ -6754,6 +6939,7 @@ def promote_task(
             {"actor": actor, "reason": reason, "forced": force},
         )
 
+    notify_task_updated(conn, task_id, ("status", "manual_hold"))
     return True, None
 
 
@@ -7433,7 +7619,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
-            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "    manual_hold = 0, claim_lock = NULL, "
+            "    claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status != 'archived'",
             (task_id,),
         )
@@ -7846,6 +8033,7 @@ def schedule_task(
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
+                   manual_hold  = 0,
                    claim_lock   = NULL,
                    claim_expires= NULL,
                    worker_pid   = NULL

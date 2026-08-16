@@ -29,6 +29,11 @@ from hermes_cli import kanban_db as kb
 
 def _load_plugin_router():
     """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+    return _load_plugin_module().router
+
+
+def _load_plugin_module():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py."""
     repo_root = Path(__file__).resolve().parents[2]
     plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
     assert plugin_file.exists(), f"plugin file missing: {plugin_file}"
@@ -40,7 +45,7 @@ def _load_plugin_router():
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
-    return mod.router
+    return mod
 
 
 @pytest.fixture
@@ -79,6 +84,15 @@ def test_board_empty(client):
     assert data["tenants"] == []
     assert data["assignees"] == []
     assert data["latest_event_id"] == 0
+    # Default-on cross-column swim lanes: Org, W3bb, l3x — no cards.
+    assert data["swim_lanes"] is not None
+    assert len(data["swim_lanes"]) == 3
+    assert data["swim_lanes"][0]["id"] == "__other__"
+    assert data["swim_lanes"][0]["label"] == "Org"
+    assert data["swim_lanes"][1]["id"] == "w3bb"
+    assert data["swim_lanes"][1]["label"] == "W3bb"
+    assert data["swim_lanes"][2]["id"] == "l3x"
+    assert all(lane["task_count"] == 0 for lane in data["swim_lanes"])
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +128,132 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_api_reuses_held_todo_then_audits_transition_to_triage(client):
+    create_payload = {
+        "title": "LinkedIn M/W/F weekly post",
+        "assignee": "publisher",
+        "initial_status": "todo",
+        "idempotency_key": "linkedin-post:2026-W33",
+    }
+    first = client.post("/api/plugins/kanban/tasks", json=create_payload)
+    assert first.status_code == 200, first.text
+    task = first.json()["task"]
+    assert task["status"] == "todo"
+
+    reused = client.post("/api/plugins/kanban/tasks", json=create_payload)
+    assert reused.status_code == 200, reused.text
+    assert reused.json()["task"]["id"] == task["id"]
+
+    transitioned = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "status": "triage",
+            # Untrusted caller labels must not become audit identity.
+            "transition_actor": "linkedin-analytics-cron",
+            "transition_reason": "Friday analytics started",
+        },
+    )
+    assert transitioned.status_code == 200, transitioned.text
+    assert transitioned.json()["task"]["status"] == "triage"
+
+    detail = client.get(
+        f"/api/plugins/kanban/tasks/{task['id']}"
+    ).json()
+    events = [
+        event for event in detail["events"]
+        if event["kind"] == "status_transitioned"
+    ]
+    assert len(events) == 1
+    assert events[0]["payload"] == {
+        "source_status": "todo",
+        "target_status": "triage",
+        "actor": "dashboard",
+        "reason": "Friday analytics started",
+    }
+
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+
+
+def test_api_transition_refuses_running_task_instead_of_direct_status_write(client):
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "active work", "assignee": "publisher"},
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["task"]["id"]
+
+    with kb.connect() as conn:
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task_id}",
+        json={
+            "status": "triage",
+            "transition_actor": "linkedin-analytics-cron",
+            "transition_reason": "Friday analytics started",
+        },
+    )
+    assert response.status_code == 409, response.text
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert not any(
+            event.kind == "status_transitioned"
+            for event in kb.list_events(conn, task_id)
+        )
+
+
+def test_bulk_transition_refusal_does_not_apply_unrelated_fields(client):
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "active bulk work", "assignee": "publisher"},
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["task"]["id"]
+
+    with kb.connect() as conn:
+        assert kb.claim_task(conn, task_id) is not None
+
+    response = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={
+            "ids": [task_id],
+            "status": "triage",
+            "transition_reason": "Friday analytics started",
+            "priority": 99,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["results"] == [
+        {
+            "id": task_id,
+            "ok": False,
+            "error": (
+                f"task {task_id} is 'running'; todo/triage transitions only "
+                "apply to unclaimed 'ready', 'todo', or 'triage' tasks"
+            ),
+        }
+    ]
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.priority == 0
+
+
+def test_api_rejects_unknown_initial_status(client):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "bad lane", "initial_status": "running-now"},
+    )
+    assert response.status_code == 400, response.text
 
 
 def test_patch_board_sets_project_directory(client, tmp_path):
@@ -944,6 +1084,166 @@ def test_bulk_empty_ids_400(client):
 
 
 # ---------------------------------------------------------------------------
+# L3x cross-column swim lanes
+# ---------------------------------------------------------------------------
+
+
+def test_board_swim_lanes_partition_l3x_and_org(client):
+    """L3x-assigned tasks land in the l3x swim lane; Org is first and labeled."""
+    placements = [
+        ("L3x ready", "l3x", "ready"),
+        ("L3x review", "l3x", "review"),
+        ("R1ft todo", "R1ft", "todo"),
+        ("Unassigned triage", None, "triage"),
+    ]
+    created = []
+    for title, assignee, status in placements:
+        payload = {"title": title}
+        if assignee:
+            payload["assignee"] = assignee
+        r = client.post("/api/plugins/kanban/tasks", json=payload)
+        assert r.status_code == 200, r.text
+        task = r.json()["task"]
+        with kb.connect() as conn:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = ?, assignee = ? WHERE id = ?",
+                    (status, assignee, task["id"]),
+                )
+        created.append({**task, "status": status, "assignee": assignee})
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    data = r.json()
+    swim = data["swim_lanes"]
+    assert swim is not None
+    assert swim[0]["id"] == "__other__"
+    assert swim[0]["label"] == "Org"
+    assert swim[1]["id"] == "w3bb"
+    assert swim[2]["id"] == "l3x"
+    l3x_lane = next(lane for lane in swim if lane["id"] == "l3x")
+    other_lane = next(lane for lane in swim if lane["id"] == "__other__")
+
+    assert l3x_lane["task_count"] == 2
+    assert other_lane["task_count"] == 2
+
+    l3x_ready = next(c for c in l3x_lane["columns"] if c["name"] == "ready")
+    l3x_review = next(c for c in l3x_lane["columns"] if c["name"] == "review")
+    assert {t["id"] for t in l3x_ready["tasks"]} == {created[0]["id"]}
+    assert {t["id"] for t in l3x_review["tasks"]} == {created[1]["id"]}
+
+    other_triage = next(c for c in other_lane["columns"] if c["name"] == "triage")
+    other_todo = next(c for c in other_lane["columns"] if c["name"] == "todo")
+    assert {t["id"] for t in other_triage["tasks"]} == {created[3]["id"]}
+    assert {t["id"] for t in other_todo["tasks"]} == {created[2]["id"]}
+
+    flat_ids = {t["id"] for col in data["columns"] for t in col["tasks"]}
+    assert flat_ids == {t["id"] for t in created}
+
+
+def test_partition_swim_lanes_org_first_with_label():
+    mod = _load_plugin_module()
+    columns = [
+        {
+            "name": "ready",
+            "tasks": [
+                {"id": "t1", "assignee": "l3x"},
+                {"id": "t2", "assignee": "R1ft"},
+                {"id": "t3", "assignee": None},
+            ],
+        }
+    ]
+    lanes = mod.partition_swim_lanes(columns)
+    assert [lane["id"] for lane in lanes] == ["__other__", "w3bb", "l3x"]
+    assert lanes[0]["label"] == "Org"
+    assert lanes[1]["label"] == "W3bb"
+    assert lanes[2]["label"] == "l3x"
+    assert {t["id"] for t in lanes[0]["columns"][0]["tasks"]} == {"t2", "t3"}
+    assert {t["id"] for t in lanes[2]["columns"][0]["tasks"]} == {"t1"}
+
+
+def test_board_swim_lanes_partition_w3bb(client):
+    """W3bb-assigned tasks land in the W3bb swim lane; Org and L3x bucketing unchanged."""
+    placements = [
+        ("W3bb todo", "w3bb", "todo"),
+        ("W3bb ready", "w3bb", "ready"),
+        ("L3x running", "l3x", "running"),
+        ("R1ft triage", "R1ft", "triage"),
+    ]
+    created = []
+    for title, assignee, status in placements:
+        r = client.post(
+            "/api/plugins/kanban/tasks",
+            json={"title": title, "assignee": assignee},
+        )
+        assert r.status_code == 200, r.text
+        task = r.json()["task"]
+        with kb.connect() as conn:
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status = ? WHERE id = ?",
+                    (status, task["id"]),
+                )
+        created.append({**task, "status": status, "assignee": assignee})
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    swim = r.json()["swim_lanes"]
+    w3bb_lane = next(lane for lane in swim if lane["id"] == "w3bb")
+    l3x_lane = next(lane for lane in swim if lane["id"] == "l3x")
+    org_lane = next(lane for lane in swim if lane["id"] == "__other__")
+
+    assert w3bb_lane["label"] == "W3bb"
+    assert w3bb_lane["task_count"] == 2
+    assert l3x_lane["task_count"] == 1
+    assert org_lane["task_count"] == 1
+
+    w3bb_todo = next(c for c in w3bb_lane["columns"] if c["name"] == "todo")
+    w3bb_ready = next(c for c in w3bb_lane["columns"] if c["name"] == "ready")
+    assert {t["id"] for t in w3bb_todo["tasks"]} == {created[0]["id"]}
+    assert {t["id"] for t in w3bb_ready["tasks"]} == {created[1]["id"]}
+
+    l3x_running = next(c for c in l3x_lane["columns"] if c["name"] == "running")
+    assert {t["id"] for t in l3x_running["tasks"]} == {created[2]["id"]}
+
+    org_triage = next(c for c in org_lane["columns"] if c["name"] == "triage")
+    assert {t["id"] for t in org_triage["tasks"]} == {created[3]["id"]}
+
+
+def test_board_swim_lanes_w3bb_disabled_via_config(tmp_path, monkeypatch, client):
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "dashboard:\n"
+        "  kanban:\n"
+        "    w3bb_swim_lane: false\n"
+    )
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "W3bb only", "assignee": "w3bb"},
+    )
+    assert r.status_code == 200
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    swim = r.json()["swim_lanes"]
+    assert len(swim) == 2
+    assert [lane["id"] for lane in swim] == ["__other__", "l3x"]
+    org_lane = swim[0]
+    assert org_lane["task_count"] == 1
+
+
+def test_board_swim_lanes_disabled_via_config(tmp_path, monkeypatch, client):
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "dashboard:\n"
+        "  kanban:\n"
+        "    l3x_swim_lane: false\n"
+    )
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    assert r.json()["swim_lanes"] is None
+
+
+# ---------------------------------------------------------------------------
 # /config endpoint
 # ---------------------------------------------------------------------------
 
@@ -963,6 +1263,10 @@ def test_config_reads_dashboard_kanban_section(tmp_path, monkeypatch, client):
     data = r.json()
     assert data["default_tenant"] == "acme"
     assert data["lane_by_profile"] is False
+    assert data["l3x_swim_lane"] is True
+    assert data["l3x_swim_lane_assignee"] == "l3x"
+    assert data["w3bb_swim_lane"] is True
+    assert data["w3bb_swim_lane_assignee"] == "w3bb"
     assert data["include_archived_by_default"] is True
     assert data["render_markdown"] is False
 

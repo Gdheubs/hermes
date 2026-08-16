@@ -626,6 +626,10 @@
     const [includeArchived, setIncludeArchived] = useState(false);
     const [search, setSearch] = useState("");
     const [laneByProfile, setLaneByProfile] = useState(true);
+    const [l3xSwimLane, setL3xSwimLane] = useState(true);
+    const [l3xSwimLaneAssignee, setL3xSwimLaneAssignee] = useState("l3x");
+    const [w3bbSwimLane, setW3bbSwimLane] = useState(true);
+    const [w3bbSwimLaneAssignee, setW3bbSwimLaneAssignee] = useState("w3bb");
     const [configApplied, setConfigApplied] = useState(false);
 
     const [selectedTaskId, setSelectedTaskId] = useState(null);
@@ -655,6 +659,10 @@
           if (!configApplied) {
             if (c.default_tenant) setTenantFilter(c.default_tenant);
             if (typeof c.lane_by_profile === "boolean") setLaneByProfile(c.lane_by_profile);
+            if (typeof c.l3x_swim_lane === "boolean") setL3xSwimLane(c.l3x_swim_lane);
+            if (c.l3x_swim_lane_assignee) setL3xSwimLaneAssignee(c.l3x_swim_lane_assignee);
+            if (typeof c.w3bb_swim_lane === "boolean") setW3bbSwimLane(c.w3bb_swim_lane);
+            if (c.w3bb_swim_lane_assignee) setW3bbSwimLaneAssignee(c.w3bb_swim_lane_assignee);
             if (typeof c.include_archived_by_default === "boolean") setIncludeArchived(c.include_archived_by_default);
             setConfigApplied(true);
           }
@@ -1316,6 +1324,11 @@
           board: filteredBoard,
           boardMeta: boardList.find(function (item) { return item.slug === board; }) || null,
           laneByProfile,
+          l3xSwimLane,
+          l3xSwimLaneAssignee,
+          w3bbSwimLane,
+          w3bbSwimLaneAssignee,
+          assigneeFilter,
           selectedIds,
           failedIds,
           draggingTaskId,
@@ -2683,6 +2696,66 @@
   }
 
   // -------------------------------------------------------------------------
+  // Cross-column swim lanes (Org vs W3bb vs L3x assignees)
+  // -------------------------------------------------------------------------
+
+  var L3X_SWIM_LANE_OTHER_ID = "__other__";
+  var W3BB_SWIM_LANE_LABEL = "W3bb";
+
+  function partitionSwimLanes(columns, l3xAssignee, w3bbAssignee, w3bbSwimLane) {
+    var l3xCols = [];
+    var w3bbCols = [];
+    var otherCols = [];
+    for (var i = 0; i < columns.length; i++) {
+      var col = columns[i];
+      var tasks = col.tasks || [];
+      var l3xTasks = [];
+      var w3bbTasks = [];
+      var otherTasks = [];
+      for (var j = 0; j < tasks.length; j++) {
+        var assignee = tasks[j].assignee;
+        if (assignee === l3xAssignee) l3xTasks.push(tasks[j]);
+        else if (w3bbSwimLane && assignee === w3bbAssignee) w3bbTasks.push(tasks[j]);
+        else otherTasks.push(tasks[j]);
+      }
+      l3xCols.push({ name: col.name, tasks: l3xTasks });
+      w3bbCols.push({ name: col.name, tasks: w3bbTasks });
+      otherCols.push({ name: col.name, tasks: otherTasks });
+    }
+    function laneCount(cols) {
+      var n = 0;
+      for (var k = 0; k < cols.length; k++) n += (cols[k].tasks || []).length;
+      return n;
+    }
+    var lanes = [
+      {
+        id: L3X_SWIM_LANE_OTHER_ID,
+        label: "Org",
+        assignee: null,
+        task_count: laneCount(otherCols),
+        columns: otherCols,
+      },
+    ];
+    if (w3bbSwimLane) {
+      lanes.push({
+        id: w3bbAssignee,
+        label: W3BB_SWIM_LANE_LABEL,
+        assignee: w3bbAssignee,
+        task_count: laneCount(w3bbCols),
+        columns: w3bbCols,
+      });
+    }
+    lanes.push({
+      id: l3xAssignee,
+      label: l3xAssignee,
+      assignee: l3xAssignee,
+      task_count: laneCount(l3xCols),
+      columns: l3xCols,
+    });
+    return lanes;
+  }
+
+  // -------------------------------------------------------------------------
   // Columns
   // -------------------------------------------------------------------------
 
@@ -2783,6 +2856,97 @@
     const handleDragEnd = useCallback(function () {
       if (props.onDragEnd) props.onDragEnd();
     }, [props.onDragEnd]);
+
+    const swimLanes = useMemo(function () {
+      if (!props.l3xSwimLane || !props.board || !props.board.columns) return null;
+      return partitionSwimLanes(
+        props.board.columns,
+        props.l3xSwimLaneAssignee || "l3x",
+        props.w3bbSwimLaneAssignee || "w3bb",
+        props.w3bbSwimLane !== false
+      );
+    }, [props.l3xSwimLane, props.l3xSwimLaneAssignee, props.w3bbSwimLane, props.w3bbSwimLaneAssignee, props.board]);
+
+    const visibleSwimLanes = useMemo(function () {
+      if (!swimLanes) return null;
+      var filter = props.assigneeFilter || "";
+      var l3x = props.l3xSwimLaneAssignee || "l3x";
+      var w3bb = props.w3bbSwimLaneAssignee || "w3bb";
+      if (filter === l3x) {
+        return swimLanes.filter(function (lane) { return lane.id === l3x; });
+      }
+      if (filter === w3bb) {
+        return swimLanes.filter(function (lane) { return lane.id === w3bb; });
+      }
+      if (filter && filter !== l3x && filter !== w3bb) {
+        return swimLanes.filter(function (lane) { return lane.id === L3X_SWIM_LANE_OTHER_ID; });
+      }
+      return swimLanes;
+    }, [swimLanes, props.assigneeFilter, props.l3xSwimLaneAssignee, props.w3bbSwimLaneAssignee]);
+
+    function renderColumnGrid(boardSlice, gridKey, showTrash) {
+      return [
+        boardSlice.columns.map(function (col) {
+          return h(Column, {
+            key: gridKey + ":" + col.name,
+            column: col,
+            boardMeta: props.boardMeta,
+            laneByProfile: props.laneByProfile,
+            selectedIds: props.selectedIds,
+            failedIds: props.failedIds,
+            draggingTaskId: props.draggingTaskId,
+            toggleSelected: props.toggleSelected,
+            toggleRange: props.toggleRange,
+            selectAllInColumn: props.selectAllInColumn,
+            onMove: props.onMove,
+            onMoveSelected: props.onMoveSelected,
+            onOpen: props.onOpen,
+            onCreate: props.onCreate,
+            allTasks: props.allTasks,
+          });
+        }),
+        showTrash ? h(TrashDropZone, {
+          draggingTaskId: props.draggingTaskId,
+          selectedIds: props.selectedIds,
+          onDelete: props.onDelete,
+          onDeleteSelected: props.onDeleteSelected,
+        }) : null,
+      ];
+    }
+
+    if (visibleSwimLanes && visibleSwimLanes.length > 0) {
+      return h("div", { className: "hermes-kanban-swim-board" },
+        visibleSwimLanes.map(function (lane, laneIdx) {
+          var isLast = laneIdx === visibleSwimLanes.length - 1;
+          return h("section", {
+            key: lane.id,
+            className: "hermes-kanban-swim-row",
+            "aria-label": lane.label + " swim lane",
+          },
+            h("header", { className: "hermes-kanban-swim-row-head" },
+              h("span", { className: "hermes-kanban-swim-row-name" }, lane.label),
+              h("span", { className: "hermes-kanban-swim-row-count",
+                          title: lane.task_count + " task" + (lane.task_count === 1 ? "" : "s") },
+                lane.task_count),
+            ),
+            h("div", {
+              ref: isLast ? columnsRef : null,
+              className: cn(
+                "hermes-kanban-columns",
+                isLast && isScrollable ? "hermes-kanban-columns--scrollable" : "",
+                isLast && isPanning ? "hermes-kanban-columns--panning" : "",
+              ),
+              onDragStart: handleDragStart,
+              onDragEnd: handleDragEnd,
+              onMouseDown: isLast ? handleMouseDown : undefined,
+            },
+              renderColumnGrid({ columns: lane.columns }, lane.id, isLast),
+            ),
+          );
+        }),
+      );
+    }
+
     return h("div", {
       ref: columnsRef,
       className: cn(
@@ -2794,31 +2958,7 @@
       onDragEnd: handleDragEnd,
       onMouseDown: handleMouseDown,
     },
-      props.board.columns.map(function (col) {
-        return h(Column, {
-          key: col.name,
-          column: col,
-          boardMeta: props.boardMeta,
-          laneByProfile: props.laneByProfile,
-          selectedIds: props.selectedIds,
-          failedIds: props.failedIds,
-          draggingTaskId: props.draggingTaskId,
-          toggleSelected: props.toggleSelected,
-          toggleRange: props.toggleRange,
-          selectAllInColumn: props.selectAllInColumn,
-          onMove: props.onMove,
-          onMoveSelected: props.onMoveSelected,
-          onOpen: props.onOpen,
-          onCreate: props.onCreate,
-          allTasks: props.allTasks,
-        });
-      }),
-      h(TrashDropZone, {
-        draggingTaskId: props.draggingTaskId,
-        selectedIds: props.selectedIds,
-        onDelete: props.onDelete,
-        onDeleteSelected: props.onDeleteSelected,
-      }),
+      renderColumnGrid(props.board, "flat", true),
     );
   }
 

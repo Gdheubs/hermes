@@ -63,6 +63,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "body": t.body,
         "assignee": t.assignee,
         "status": t.status,
+        "manual_hold": t.manual_hold,
         "priority": t.priority,
         "tenant": t.tenant,
         "workspace_kind": t.workspace_kind,
@@ -396,9 +397,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--initial-status",
                           choices=sorted(kb.VALID_INITIAL_STATUSES),
                           default="running",
-                          help="Initial card status. Use 'blocked' for cards "
-                               "that require immediate human ops (R3 gate) "
-                               "to skip the brief running-to-blocked transition.")
+                          help="Initial lifecycle phase. 'running' preserves "
+                               "normal ready/dependency inference; 'todo' "
+                               "creates a manual dispatch hold; 'triage' parks "
+                               "for specification; 'blocked' creates an "
+                               "immediate human-ops gate.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -728,6 +731,29 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_promote.add_argument(
         "--json",
         dest="json",
+        action="store_true",
+        help="Emit machine-readable JSON result",
+    )
+
+    p_transition = sub.add_parser(
+        "transition",
+        help="Safely park an unclaimed card in todo or triage",
+    )
+    p_transition.add_argument("task_id", help="Task id")
+    p_transition.add_argument(
+        "--to",
+        dest="target_status",
+        choices=sorted(kb.VALID_MANUAL_TRANSITION_STATUSES),
+        required=True,
+        help="Target lifecycle phase",
+    )
+    p_transition.add_argument(
+        "--reason",
+        default=None,
+        help="Reason recorded in the task event audit trail",
+    )
+    p_transition.add_argument(
+        "--json",
         action="store_true",
         help="Emit machine-readable JSON result",
     )
@@ -1134,6 +1160,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "request-changes": _cmd_request_changes,
             "reopen-review":  _cmd_reopen_review,
             "promote":  _cmd_promote,
+            "transition": _cmd_transition,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
@@ -1199,6 +1226,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule",
     "unblock",
     "promote",
+    "transition",
     "archive",
     "dispatch",
     "daemon",
@@ -1588,6 +1616,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
+    if task is None:  # Defensive: create_task returning a missing row is fatal.
+        raise RuntimeError(f"created task {task_id} could not be loaded")
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -2568,6 +2598,45 @@ def _cmd_promote(args: argparse.Namespace) -> int:
         else:
             print(f"cannot promote {r['task_id']}: {r['error']}", file=sys.stderr)
     return 0 if not failed else 1
+
+
+def _cmd_transition(args: argparse.Namespace) -> int:
+    task_id = str(args.task_id)
+    target_status = str(args.target_status)
+    reason = (getattr(args, "reason", None) or "").strip() or None
+    actor = _profile_author()
+
+    with kb.connect_closing() as conn:
+        transition = kb.transition_task_status(
+            conn,
+            task_id,
+            target_status=target_status,
+            actor=actor,
+            reason=reason,
+        )
+
+    result = {
+        "task_id": task_id,
+        "source_status": transition.source_status,
+        "target_status": transition.target_status,
+        "actor": actor,
+        "reason": reason,
+        "transitioned": transition.changed,
+        "error": transition.error,
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    elif transition.changed:
+        suffix = f": {reason}" if reason else ""
+        print(
+            f"Transitioned {task_id}: {transition.source_status} -> "
+            f"{transition.target_status}{suffix}"
+        )
+    elif transition.ok:
+        print(f"No change: {task_id} is already {transition.target_status}")
+    else:
+        print(f"cannot transition {task_id}: {transition.error}", file=sys.stderr)
+    return 0 if transition.ok else 1
 
 
 def _cmd_archive(args: argparse.Namespace) -> int:

@@ -30,12 +30,32 @@ export interface KanbanColumn {
   tasks: KanbanTask[]
 }
 
+export interface KanbanSwimLane {
+  id: string
+  label: string
+  assignee?: null | string
+  task_count: number
+  columns: KanbanColumn[]
+}
+
 export interface KanbanBoard {
   columns: KanbanColumn[]
+  swim_lanes?: KanbanSwimLane[] | null
   tenants: string[]
   assignees: string[]
   latest_event_id: number
   now: number
+}
+
+export interface KanbanBoardConfig {
+  default_tenant: string
+  lane_by_profile: boolean
+  l3x_swim_lane: boolean
+  l3x_swim_lane_assignee: string
+  w3bb_swim_lane: boolean
+  w3bb_swim_lane_assignee: string
+  include_archived_by_default: boolean
+  render_markdown: boolean
 }
 
 /** A structured recovery action attached to a diagnostic. */

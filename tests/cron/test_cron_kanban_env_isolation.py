@@ -173,6 +173,26 @@ class TestKanbanGatesRespectContext:
         with non_dispatcher_owned_context():
             assert kanban_tools._default_task_id("t_explicit") == "t_explicit"
 
+    def test_all_worker_identity_guards_ignore_inherited_cron_env(
+        self, worker_env, monkeypatch
+    ):
+        from agent.delegation_context import non_dispatcher_owned_context
+        from tools import kanban_tools
+
+        monkeypatch.setattr(
+            kanban_tools, "_profile_has_kanban_toolset", lambda: True
+        )
+        with non_dispatcher_owned_context():
+            assert kanban_tools._check_kanban_orchestrator_mode() is True
+            assert kanban_tools._require_orchestrator_tool("kanban_transition") is None
+            assert kanban_tools._enforce_worker_task_ownership("t_foreign") is None
+            assert kanban_tools._worker_run_id("t_worker_real_task") is None
+            assert kanban_tools._stamp_worker_session_metadata(
+                "t_worker_real_task", {"kept": True}
+            ) == {"kept": True}
+            assert kanban_tools.heartbeat_current_worker_from_env() is False
+            assert kanban_tools.inject_new_comments_from_env(object()) is False
+
     def test_skill_environment_gate(self, worker_env):
         from agent.delegation_context import non_dispatcher_owned_context
         import agent.skill_utils as su

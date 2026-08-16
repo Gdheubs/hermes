@@ -73,14 +73,17 @@ import {
   estimateNew,
   fetchBoard,
   fetchBoards,
+  fetchKanbanConfig,
   fetchProfiles,
   patchTask,
+  CONFIG_KEY,
   PROFILES_KEY
 } from './api'
 import { BoardSwitcher } from './board-switcher'
 import { TaskDrawer } from './drawer'
 import { EMPTY_OVERRIDE, ModelOverrideField, overrideCreateFields, type TaskModelOverride } from './model-override'
 import { OrchestrationPanel } from './orchestration'
+import { partitionSwimLanes, SWIM_LANE_ORG_ID } from './swim-lanes'
 import { columnMeta, type KanbanBoard, type KanbanTask, type TaskEstimate } from './types'
 import {
   $newTaskLane,
@@ -1093,6 +1096,17 @@ export function KanbanBoardPage() {
     refetchInterval: 60_000
   })
 
+  const { data: kanbanConfig } = useQuery({
+    queryFn: fetchKanbanConfig,
+    queryKey: CONFIG_KEY,
+    staleTime: 60_000
+  })
+
+  const l3xSwimLane = kanbanConfig?.l3x_swim_lane ?? true
+  const l3xSwimLaneAssignee = kanbanConfig?.l3x_swim_lane_assignee ?? 'l3x'
+  const w3bbSwimLane = kanbanConfig?.w3bb_swim_lane ?? true
+  const w3bbSwimLaneAssignee = kanbanConfig?.w3bb_swim_lane_assignee ?? 'w3bb'
+
   const [openId, setOpenId] = useState<null | string>(null)
   const [addStatus, setAddStatus] = useState<null | string>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -1184,6 +1198,33 @@ export function KanbanBoardPage() {
   }, [board, search, tenant, assignee])
 
   const total = filtered?.columns.reduce((sum, col) => sum + col.tasks.length, 0) ?? 0
+
+  const visibleSwimLanes = useMemo(() => {
+    if (!filtered || !l3xSwimLane) {
+      return null
+    }
+
+    const lanes = partitionSwimLanes(
+      filtered.columns,
+      l3xSwimLaneAssignee,
+      w3bbSwimLaneAssignee,
+      w3bbSwimLane
+    )
+
+    if (assignee === l3xSwimLaneAssignee) {
+      return lanes.filter(lane => lane.id === l3xSwimLaneAssignee)
+    }
+
+    if (assignee === w3bbSwimLaneAssignee) {
+      return lanes.filter(lane => lane.id === w3bbSwimLaneAssignee)
+    }
+
+    if (assignee && assignee !== l3xSwimLaneAssignee && assignee !== w3bbSwimLaneAssignee) {
+      return lanes.filter(lane => lane.id === SWIM_LANE_ORG_ID)
+    }
+
+    return lanes
+  }, [filtered, l3xSwimLane, l3xSwimLaneAssignee, w3bbSwimLane, w3bbSwimLaneAssignee, assignee])
 
   const moveMut = useMutation({
     mutationFn: ({ id, status }: { id: string; status: string }) => patchTask(id, { status }),
@@ -1387,6 +1428,47 @@ export function KanbanBoardPage() {
           </div>
         </div>
       ) : (
+        visibleSwimLanes ? (
+          <div className="flex flex-1 flex-col gap-3 overflow-y-auto px-4 pt-1 pb-3">
+            {visibleSwimLanes.map(lane => (
+              <section
+                aria-label={`${lane.label} swim lane`}
+                className="flex min-w-0 flex-col gap-1.5"
+                key={lane.id}
+              >
+                <header className="flex items-center gap-2 border-b border-(--ui-stroke-secondary) pb-1 text-[0.6875rem] text-(--ui-text-tertiary)">
+                  <span className="font-mono font-semibold text-foreground">{lane.label}</span>
+                  <span className="ml-auto font-mono tabular-nums">{lane.task_count}</span>
+                </header>
+                <div
+                  className={cn('flex gap-2 overflow-x-auto pb-1', grabbing && 'cursor-grabbing')}
+                  onMouseDown={onMouseDown}
+                >
+                  {lane.columns.map(col => {
+                    const auto = boardHasWork && col.tasks.length === 0
+
+                    return (
+                      <Column
+                        collapsed={laneOverrides[col.name] ?? auto}
+                        column={col}
+                        columns={columnNames}
+                        key={`${lane.id}:${col.name}`}
+                        onAdd={setAddStatus}
+                        onDelete={id => deleteMut.mutate(id)}
+                        onDropTask={onMove}
+                        onMove={onMove}
+                        onOpen={setOpenId}
+                        onToggle={() => toggleLane(col.name, auto)}
+                        onToggleSelect={toggleSelect}
+                        selected={selected}
+                      />
+                    )
+                  })}
+                </div>
+              </section>
+            ))}
+          </div>
+        ) : (
         <div
           className={cn('flex flex-1 gap-2 overflow-x-auto px-4 pt-1 pb-3', grabbing && 'cursor-grabbing')}
           onMouseDown={onMouseDown}
@@ -1413,6 +1495,7 @@ export function KanbanBoardPage() {
             )
           })}
         </div>
+        )
       )}
 
       {selected.size > 0 && (
