@@ -133,6 +133,8 @@ def test_deepseek_wire_compacts_tool_result_and_strips_plain_reasoning():
         from agent.model_metadata import estimate_messages_tokens_rough
 
         assert agent.context_compressor._pending_request_rough_tokens < estimate_messages_tokens_rough(history)
+        # Send-copy only: the passed-in history keeps the raw result.
+        assert history[2]["content"] == "L" * 13000, "stored history must keep the raw result"
     finally:
         srv.shutdown()
         # Same teardown hygiene as test_empty_tool_name_loop_dampening: the
