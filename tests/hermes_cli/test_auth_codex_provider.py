@@ -173,6 +173,38 @@ def test_save_codex_tokens_syncs_credential_pool(tmp_path, monkeypatch):
     assert auth["providers"]["openai-codex"]["tokens"]["access_token"] == "new-at"
 
 
+def test_save_codex_tokens_from_profile_fallback_updates_global_owner_only(tmp_path, monkeypatch):
+    """A profile consuming root Codex auth must never recreate a local clone."""
+    global_home = tmp_path / "hermes-root"
+    profile_home = global_home / "profiles" / "dispatcher"
+    global_home.mkdir(parents=True)
+    profile_home.mkdir(parents=True)
+    root_auth = {
+        "version": 1,
+        "active_provider": "openai-codex",
+        "providers": {
+            "openai-codex": {
+                "tokens": {"access_token": "old-at", "refresh_token": "old-rt"},
+                "auth_mode": "chatgpt",
+            }
+        },
+        "credential_pool": {"openai-codex": [{"source": "device_code", "access_token": "old-at", "refresh_token": "old-rt"}]},
+    }
+    (global_home / "auth.json").write_text(json.dumps(root_auth))
+    (profile_home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: global_home)
+
+    _save_codex_tokens({"access_token": "new-at", "refresh_token": "new-rt"}, last_refresh="2026-08-12T00:00:00Z")
+
+    root_after = json.loads((global_home / "auth.json").read_text())
+    profile_after = json.loads((profile_home / "auth.json").read_text())
+    assert root_after["providers"]["openai-codex"]["tokens"]["access_token"] == "new-at"
+    assert root_after["credential_pool"]["openai-codex"][0]["refresh_token"] == "new-rt"
+    assert "openai-codex" not in profile_after.get("providers", {})
+    assert "openai-codex" not in profile_after.get("credential_pool", {})
+
+
 def test_save_codex_tokens_syncs_manual_device_code_entries(tmp_path, monkeypatch):
     """Re-auth must refresh ``manual:device_code`` entries that are true
     aliases of the singleton, while leaving INDEPENDENT entries alone.
