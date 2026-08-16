@@ -1,0 +1,20 @@
+--- a/tools/memory_tool.py	2026-08-14 20:21:06.943489400 -0400
++++ b/tools/memory_tool.py	2026-08-14 20:21:08.499418400 -0400
+@@ -278,10 +278,15 @@
+     @staticmethod
+     @contextmanager
+     def _file_lock(path: Path):
+-        """Acquire an exclusive file lock for read-modify-write safety.
++        """Acquire an exclusive cross-process file lock for read-modify-write.
+ 
+         Uses a separate .lock file so the memory file itself can still be
+-        atomically replaced via os.replace().
++        atomically replaced via os.replace(). On Unix, fcntl.flock(LOCK_EX)
++        blocks until the lock is free. On Windows, msvcrt.locking is advisory
++        and only covers a 1-byte region, so we acquire it non-blocking
++        (LK_NBLCK) and retry with backoff -- this makes two processes QUEUE
++        for the lock instead of racing, and bounds the wait with a timeout so
++        a wedged lock can never deadlock the caller.
+         """
+         lock_path = path.with_suffix(path.suffix + ".lock")
+         lock_path.parent.mkdir(parents=True, exist_ok=True)

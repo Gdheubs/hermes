@@ -23,6 +23,7 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
+import hashlib
 import json
 import logging
 import time
@@ -65,6 +66,23 @@ MEMORY_BLOCK_HEADERS = {
 }
 
 ENTRY_DELIMITER = "\n§\n"
+
+# Tombstones prevent resurrection of intentionally removed/replaced entries
+# under concurrent instances. When an entry is removed or replaced, a marker
+# line (__mem_tomb__:<hash>) is written to disk for ONE round so a sibling
+# instance holding a stale snapshot (and about to flush it) will skip that
+# entry instead of resurrecting it. Tombstone lines are never surfaced as
+# memory entries and are not re-persisted on subsequent saves, so they fade.
+_TOMBSTONE_PREFIX = "__mem_tomb__:"
+
+
+def _tombstone_for(text: str) -> str:
+    digest = hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+    return f"{_TOMBSTONE_PREFIX}{digest}"
+
+
+def _is_tombstone(line: str) -> bool:
+    return line.startswith(_TOMBSTONE_PREFIX)
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +190,9 @@ class MemoryStore:
         # Per-turn counter of failed at-capacity consolidation attempts; reset
         # at each turn boundary by reset_consolidation_failures() (#42405).
         self._consolidation_failures = 0
+        # Tombstones of entries removed/replaced this session, so a merge in
+        # save_to_disk won't resurrect them (issue #85858).
+        self._tombstones: set = set()
 
     def reset_consolidation_failures(self) -> None:
         """Reset the per-turn consolidation-failure counter (call at turn start)."""
@@ -278,10 +299,15 @@ class MemoryStore:
     @staticmethod
     @contextmanager
     def _file_lock(path: Path):
-        """Acquire an exclusive file lock for read-modify-write safety.
+        """Acquire an exclusive cross-process file lock for read-modify-write.
 
         Uses a separate .lock file so the memory file itself can still be
-        atomically replaced via os.replace().
+        atomically replaced via os.replace(). On Unix, fcntl.flock(LOCK_EX)
+        blocks until the lock is free. On Windows, msvcrt.locking is advisory
+        and only covers a 1-byte region, so we acquire it non-blocking
+        (LK_NBLCK) and retry with backoff -- this makes two processes QUEUE
+        for the lock instead of racing, and bounds the wait with a timeout so
+        a wedged lock can never deadlock the caller.
         """
         lock_path = path.with_suffix(path.suffix + ".lock")
         lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -295,21 +321,32 @@ class MemoryStore:
             if fcntl:
                 fcntl.flock(fd, fcntl.LOCK_EX)
             else:
-                fd.seek(0)
-                msvcrt.locking(fd.fileno(), msvcrt.LK_LOCK, 1)
+                # Acquire the 1-byte advisory lock with retry + backoff so
+                # concurrent writers serialize rather than clobber.
+                deadline = time.monotonic() + 30.0
+                acquired = False
+                while time.monotonic() < deadline:
+                    try:
+                        fd.seek(0)
+                        msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
+                        acquired = True
+                        break
+                    except (OSError, IOError):
+                        time.sleep(0.05)
+                # If we could not acquire within the timeout, proceed unlocked
+                # rather than deadlock -- the merge/tombstone logic in
+                # save_to_disk is the real safety net (issue #85858).
+                _unlocked = not acquired
             yield
         finally:
-            if fcntl:
-                try:
+            try:
+                if fcntl:
                     fcntl.flock(fd, fcntl.LOCK_UN)
-                except (OSError, IOError):
-                    pass
-            elif msvcrt:
-                try:
+                elif msvcrt and not _unlocked:
                     fd.seek(0)
                     msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
-                except (OSError, IOError):
-                    pass
+            except (OSError, IOError):
+                pass
             fd.close()
 
     @staticmethod
@@ -360,10 +397,73 @@ class MemoryStore:
         self._set_entries(target, fresh)
         return bak
 
-    def save_to_disk(self, target: str):
-        """Persist entries to the appropriate file. Called after every mutation."""
+    def save_to_disk(
+        self,
+        target: str,
+        *,
+        merge_live: bool = False,
+        extra_tombstones: Optional[List[str]] = None,
+    ):
+        """Persist entries to the appropriate file. Called after every mutation.
+
+        When *merge_live* is True, entries currently on disk that this instance
+        does not have in memory are preserved (content-deduped union). This
+        defends against the last-writer-wins clobber that occurs when two Hermes
+        instances share one profile: a background sync thread or a second
+        instance may hold an in-memory snapshot older than the live file, and a
+        plain full-file rewrite from that stale snapshot silently discards the
+        other writer's concurrent entries (issue #85858). Merge makes both
+        writers' entries survive.
+
+        *extra_tombstones* are marker lines written to disk for THIS round only
+        (so a concurrent sibling sees them and skips the just-removed/replaced
+        entry instead of resurrecting it). They are not stored in the in-memory
+        entry list and are not re-persisted on subsequent saves, so they fade.
+        They are written in BOTH merge and non-merge paths.
+
+        Safe for append/add paths. NOT used for replace/remove, where merging
+        the live file could resurrect an intentionally removed entry — those
+        paths rely on *extra_tombstones* instead.
+        """
         get_memory_dir().mkdir(parents=True, exist_ok=True)
-        self._write_file(self._path_for(target), self._entries_for(target))
+        entries = list(self._entries_for(target))
+
+        if merge_live:
+            path = self._path_for(target)
+            raw, raw_ok = self._read_raw_checked(path)
+            live, live_ok = self._read_entries_checked(path)
+            # Tombstones are read from RAW tombstone LINES on disk (written by a
+            # sibling's recent remove/replace for one round). Do NOT compute
+            # _tombstone_for() over the parsed entries -- that would tombstone
+            # every entry and drop all content.
+            live_tombstones = set()
+            if raw_ok:
+                live_tombstones = {
+                    line.strip()
+                    for line in raw.split(ENTRY_DELIMITER)
+                    if _is_tombstone(line.strip())
+                }
+            tombstones = set(self._tombstones) | live_tombstones
+            if extra_tombstones:
+                tombstones.update(extra_tombstones)
+            # Drop our own stale entries whose tombstone is known, so a snapshot
+            # seeded before a sibling's remove/replace can't resurrect it.
+            entries = [e for e in entries if _tombstone_for(e) not in tombstones]
+            if live_ok:
+                # seen tracks both entry texts AND their tombstone markers, so
+                # the live-merge excludes an entry whose marker is known.
+                seen = set(entries) | {_tombstone_for(e) for e in entries} | tombstones
+                for e in live:
+                    if _tombstone_for(e) not in seen:
+                        entries.append(e)
+                        seen.add(_tombstone_for(e))
+
+        # extra_tombstones are written this round only (then they fade). This
+        # happens in BOTH branches so remove/replace (merge_live=False) still
+        # publish their tombstone for concurrent siblings.
+        final = list(entries) + list(extra_tombstones or [])
+
+        self._write_file(self._path_for(target), final)
 
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
@@ -421,6 +521,10 @@ class MemoryStore:
             if content in entries:
                 return self._success_response(target, "Entry already exists (no duplicate added).")
 
+            # Don't resurrect an entry another instance just removed/replaced.
+            if _tombstone_for(content) in self._tombstones:
+                return self._success_response(target, "Entry was recently removed; not re-added.")
+
             # Calculate what the new total would be
             new_entries = entries + [content]
             new_total = len(ENTRY_DELIMITER.join(new_entries))
@@ -442,7 +546,7 @@ class MemoryStore:
 
             entries.append(content)
             self._set_entries(target, entries)
-            self.save_to_disk(target)
+            self.save_to_disk(target, merge_live=True)
 
         return self._success_response(target, "Entry added.")
 
@@ -513,7 +617,11 @@ class MemoryStore:
 
             entries[idx] = new_content
             self._set_entries(target, entries)
-            self.save_to_disk(target)
+            # Tombstone the old entry so a sibling holding a stale snapshot
+            # (with the old text) skips it on its next merge instead of
+            # resurrecting the pre-replacement version (issue #85858).
+            self._tombstones.add(_tombstone_for(old_text))
+            self.save_to_disk(target, extra_tombstones=[_tombstone_for(old_text)])
 
         return self._success_response(target, "Entry replaced.")
 
@@ -553,9 +661,14 @@ class MemoryStore:
                 # All identical -- safe to remove just the first
 
             idx = matches[0][0]
+            removed_text = entries[idx]
             entries.pop(idx)
             self._set_entries(target, entries)
-            self.save_to_disk(target)
+            # Tombstone the removed entry so a sibling holding a stale snapshot
+            # (still containing it) skips it on its next merge instead of
+            # resurrecting it (issue #85858).
+            self._tombstones.add(_tombstone_for(removed_text))
+            self.save_to_disk(target, extra_tombstones=[_tombstone_for(removed_text)])
 
         return self._success_response(target, "Entry removed.")
 
@@ -627,6 +740,7 @@ class MemoryStore:
                             f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
                         )
                     working[matches[0]] = content
+                    self._tombstones.add(_tombstone_for(old_text))
 
                 elif act == "remove":
                     if not old_text:
@@ -639,7 +753,9 @@ class MemoryStore:
                             target,
                             f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
                         )
+                    removed_text = working[matches[0]]
                     working.pop(matches[0])
+                    self._tombstones.add(_tombstone_for(removed_text))
 
                 else:
                     return self._batch_error(
@@ -662,9 +778,14 @@ class MemoryStore:
                     "usage": f"{current:,}/{limit:,}",
                 })
 
-            # Commit.
+            # Commit. Tombstones (collected above for replace/remove ops) are
+            # written this round so a concurrent sibling skips the
+            # removed/replaced entries instead of resurrecting them (#85858).
             self._set_entries(target, working)
-            self.save_to_disk(target)
+            self.save_to_disk(
+                target,
+                extra_tombstones=sorted(self._tombstones) if self._tombstones else None,
+            )
 
         return self._success_response(target, f"Applied {len(operations)} operation(s).")
 
@@ -780,13 +901,15 @@ class MemoryStore:
 
     @staticmethod
     def _parse_entries(raw: str) -> List[str]:
-        """Split raw memory-file text into stripped, non-empty entries."""
+        """Split raw memory-file text into stripped, non-empty entries.
+
+        Tombstone marker lines (__mem_tomb__:<hash>) are skipped — they are
+        not real entries, only concurrency guards (see issue #85858).
+        """
         if not raw.strip():
             return []
-        # Use ENTRY_DELIMITER for consistency with _write_file. Splitting by "§"
-        # alone would incorrectly split entries that contain "§" in their content.
         entries = [e.strip() for e in raw.split(ENTRY_DELIMITER)]
-        return [e for e in entries if e]
+        return [e for e in entries if e and not _is_tombstone(e)]
 
     @staticmethod
     def _read_entries_checked(path: Path) -> Tuple[List[str], bool]:
@@ -847,13 +970,20 @@ class MemoryStore:
         if not raw.strip():
             return None
 
-        parsed = [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
-        roundtrip = ENTRY_DELIMITER.join(parsed)
+        # Strip tombstone markers before the tool-shape checks: they are
+        # concurrency guards (issue #85858), not user content, and must not
+        # trip the round-trip / entry-size drift signals. Compare the
+        # tombstone-free view of the file to its own round-trip so a present
+        # tombstone never reads as "external drift".
+        cleaned = [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
+        cleaned = [e for e in cleaned if not _is_tombstone(e)]
+        roundtrip = ENTRY_DELIMITER.join(cleaned)
+        raw_no_tomb = ENTRY_DELIMITER.join(cleaned)
 
         char_limit = self._char_limit(target)
-        max_entry_len = max((len(e) for e in parsed), default=0)
+        max_entry_len = max((len(e) for e in cleaned), default=0)
 
-        drift_detected = (raw.strip() != roundtrip) or (max_entry_len > char_limit)
+        drift_detected = (raw_no_tomb.strip() != roundtrip.strip()) or (max_entry_len > char_limit)
         if not drift_detected:
             return None
 
