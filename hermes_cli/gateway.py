@@ -97,6 +97,59 @@ class ProfileGatewayProcess:
     pid: int
 
 
+def _expected_launchd_gateway_labels() -> set[str]:
+    """Return exact launchd labels for the default and registered named profiles."""
+    base_label = "ai.hermes.gateway"
+    try:
+        from hermes_cli.profiles import list_profiles
+
+        return {
+            base_label if profile.is_default else f"{base_label}-{profile.name}"
+            for profile in list_profiles()
+        }
+    except (ImportError, OSError):
+        return {get_launchd_label()}
+
+
+def _list_launchd_gateway_services() -> list[tuple[str, str, int | None]]:
+    """Return loaded Hermes launchd labels, domains, and live PIDs."""
+    uid = os.getuid()  # windows-footgun: ok — macOS-only caller
+    domains = (f"gui/{uid}", f"user/{uid}")
+    services: list[tuple[str, str, int | None]] = []
+
+    for label in sorted(_expected_launchd_gateway_labels()):
+        for domain in domains:
+            try:
+                result = subprocess.run(
+                    ["launchctl", "print", f"{domain}/{label}"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=5,
+                )
+            except subprocess.TimeoutExpired:
+                continue
+            except FileNotFoundError:
+                return []
+            if result.returncode != 0:
+                continue
+            services.append(
+                (label, domain, _parse_launchd_pid_from_list_output(result.stdout))
+            )
+    return services
+
+
+def get_launchd_gateway_services() -> list[tuple[str, str, int | None]]:
+    """Return loaded launchd gateway services as ``(label, domain, pid)``."""
+    return _list_launchd_gateway_services()
+
+
+def get_launchd_gateway_labels() -> list[str]:
+    """Return unique loaded launchd labels owned by Hermes gateway profiles."""
+    return list(dict.fromkeys(label for label, _domain, _pid in get_launchd_gateway_services()))
+
+
 def _get_service_pids() -> set:
     """Return PIDs currently managed by systemd or launchd gateway services.
 
@@ -146,33 +199,9 @@ def _get_service_pids() -> set:
 
     # --- launchd (macOS) ---
     if is_macos():
-        try:
-            label = get_launchd_label()
-            result = subprocess.run(
-                ["launchctl", "list", label],
-                capture_output=True,
-                text=True, encoding='utf-8', errors='replace',
-                timeout=5,
-            )
-            if result.returncode == 0:
-                # Try plist format first (macOS 26+): "PID" = <N>;
-                pid = _parse_launchd_pid_from_list_output(result.stdout)
-                if pid is not None and pid > 0:
-                    pids.add(pid)
-                else:
-                    # Fall back to legacy tab-separated format:
-                    # "PID\tStatus\tLabel"
-                    for line in result.stdout.strip().splitlines():
-                        parts = line.split()
-                        if len(parts) >= 3 and parts[2] == label:
-                            try:
-                                pid = int(parts[0])
-                                if pid > 0:
-                                    pids.add(pid)
-                            except ValueError:
-                                pass
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
+        for _label, _domain, pid in get_launchd_gateway_services():
+            if pid is not None and pid > 0:
+                pids.add(pid)
 
     return pids
 
@@ -1385,15 +1414,15 @@ def _parse_launchd_pid_from_list_output(output: str) -> int | None:
     """
     for line in output.splitlines():
         stripped = line.strip()
-        if stripped.startswith('"PID"') or stripped.startswith("PID"):
-            parts = stripped.split("=", 1)
-            if len(parts) == 2:
-                val = parts[1].strip().rstrip(";").strip('"')
-                try:
-                    pid = int(val)
-                    return pid if pid > 0 else None
-                except ValueError:
-                    return None
+        parts = stripped.split("=", 1)
+        key = parts[0].strip().strip('"').casefold()
+        if key == "pid" and len(parts) == 2:
+            val = parts[1].strip().rstrip(";").strip('"')
+            try:
+                pid = int(val)
+                return pid if pid > 0 else None
+            except ValueError:
+                return None
     return None
 
 
@@ -4178,12 +4207,12 @@ def get_launchd_label() -> str:
     return f"ai.hermes.gateway-{suffix}" if suffix else "ai.hermes.gateway"
 
 
-# Cached launchd domain result — probing is cheap but should only run once per
-# process invocation (each ``hermes gateway start/stop/status`` call).
-_resolved_launchd_domain: str | None = None
+# Cached launchd domain results, keyed by service label. Different profile
+# gateways can be loaded in different bootstrap domains (gui vs user).
+_resolved_launchd_domain: dict[str, str] | None = None
 
 
-def _launchd_domain() -> str:
+def _launchd_domain(label: str | None = None) -> str:
     """Return the launchd domain that actually manages the gateway service.
 
     Probes ``gui/<uid>`` first (Aqua sessions), then ``user/<uid>``
@@ -4196,11 +4225,14 @@ def _launchd_domain() -> str:
     See #40831, #23387.
     """
     global _resolved_launchd_domain
-    if _resolved_launchd_domain is not None:
-        return _resolved_launchd_domain
+    label = label or get_launchd_label()
+    if _resolved_launchd_domain is None:
+        _resolved_launchd_domain = {}
+    cached_domain = _resolved_launchd_domain.get(label)
+    if cached_domain is not None:
+        return cached_domain
 
     uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
-    label = get_launchd_label()
     gui_domain = f"gui/{uid}"
     user_domain = f"user/{uid}"
 
@@ -4212,7 +4244,7 @@ def _launchd_domain() -> str:
             timeout=5,
             capture_output=True,
         )
-        _resolved_launchd_domain = gui_domain
+        _resolved_launchd_domain[label] = gui_domain
         return gui_domain
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         pass
@@ -4225,7 +4257,7 @@ def _launchd_domain() -> str:
             timeout=5,
             capture_output=True,
         )
-        _resolved_launchd_domain = user_domain
+        _resolved_launchd_domain[label] = user_domain
         return user_domain
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         pass
@@ -4240,14 +4272,14 @@ def _launchd_domain() -> str:
             timeout=5,
         )
         if "Aqua" in (result.stdout or ""):
-            _resolved_launchd_domain = gui_domain
+            _resolved_launchd_domain[label] = gui_domain
             return gui_domain
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
         pass
 
     # 4. Default to user/<uid> (matches the pre-probing behavior for
     #    Background/SSH sessions and is the recommended domain on macOS 26+).
-    _resolved_launchd_domain = user_domain
+    _resolved_launchd_domain[label] = user_domain
     return user_domain
 
 
@@ -5115,17 +5147,43 @@ def _wait_for_gateway_exit(
     return True
 
 
-def launchd_restart():
-    label = get_launchd_label()
-    target = f"{_launchd_domain()}/{label}"
+def launchd_restart(
+    label: str | None = None,
+    *,
+    domain: str | None = None,
+    pid: int | None = None,
+):
+    explicit_label = label is not None
+    label = label or get_launchd_label()
+    domain = domain or _launchd_domain(label)
+    target = f"{domain}/{label}"
     drain_timeout = _get_restart_drain_timeout()
     from gateway.status import get_running_pid
 
     try:
-        pid = get_running_pid()
-        if pid is not None and _request_gateway_self_restart(pid):
+        if pid is None and explicit_label:
+            pid = next(
+                (
+                    service_pid
+                    for service_label, service_domain, service_pid in get_launchd_gateway_services()
+                    if service_label == label and service_domain == domain
+                ),
+                None,
+            )
+        elif pid is None:
+            pid = get_running_pid()
+        restart_requested = False
+        if pid is not None:
+            if explicit_label:
+                restart_requested = _graceful_restart_via_sigusr1(
+                    pid, drain_timeout
+                )
+            else:
+                restart_requested = _request_gateway_self_restart(pid)
+        if restart_requested:
             print("✓ Service restart requested")
-            _clear_launchd_unsupported_marker()
+            if not explicit_label:
+                _clear_launchd_unsupported_marker()
             return
         if pid is not None and probe_gateway_loop_liveness(pid) == GATEWAY_LOOP_WEDGED:
             # Health probe says the event loop is provably dead (#81642):
@@ -5157,26 +5215,36 @@ def launchd_restart():
             except (ProcessLookupError, PermissionError, OSError):
                 pid = None
             if pid is not None:
-                exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
+                if explicit_label:
+                    exited = _wait_for_pid_exit(pid, drain_timeout)
+                else:
+                    exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
                 if not exited:
                     print(
                         f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
                     )
         subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
         print("✓ Service restarted")
-        _clear_launchd_unsupported_marker()
+        if not explicit_label:
+            _clear_launchd_unsupported_marker()
     except subprocess.CalledProcessError as e:
         if not _launchd_error_indicates_unloaded(e):
             # Not a "job unloaded" code. If the domain is fundamentally
             # unmanageable (error 5), degrade to detached; the old process was
             # already drained/terminated above. Otherwise re-raise.
             if _launchctl_domain_unsupported(e.returncode):
+                if explicit_label:
+                    raise
                 _launchd_fallback_to_detached(f"launchctl kickstart exit {e.returncode}")
                 return
             raise
         # Job not loaded — bootstrap and start fresh
         print("↻ launchd job was unloaded; reloading")
-        plist_path = get_launchd_plist_path()
+        plist_path = (
+            _launchd_user_home() / "Library" / "LaunchAgents" / f"{label}.plist"
+            if explicit_label
+            else get_launchd_plist_path()
+        )
         try:
             # Restart is the one path where the job is almost always still
             # registered (we just drained it), so a plain bootstrap would hit
@@ -5189,7 +5257,7 @@ def launchd_restart():
                 timeout=90,
             )
             subprocess.run(
-                ["launchctl", "bootstrap", _launchd_domain(), str(plist_path)],
+                ["launchctl", "bootstrap", domain, str(plist_path)],
                 check=True,
                 timeout=30,
             )
@@ -5197,10 +5265,13 @@ def launchd_restart():
         except subprocess.CalledProcessError as e2:
             if not _launchctl_domain_unsupported(e2.returncode):
                 raise
+            if explicit_label:
+                raise
             _launchd_fallback_to_detached(f"launchctl exit {e2.returncode}")
             return
         print("✓ Service restarted")
-        _clear_launchd_unsupported_marker()
+        if not explicit_label:
+            _clear_launchd_unsupported_marker()
 
 
 def launchd_status(deep: bool = False):

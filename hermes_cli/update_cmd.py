@@ -3835,6 +3835,27 @@ def _for_each_systemd_gateway_unit(
         except subprocess.TimeoutExpired as exc:
             on_unit_timeout(svc_name, exc)
 
+
+def _restart_launchd_gateway_fleet(
+    restarted_services: list[str], failed_units: list[str]
+) -> None:
+    """Restart every loaded Hermes launchd gateway, isolating per-label failures."""
+    from hermes_cli import gateway as gateway_cli
+
+    for label, domain, pid in gateway_cli.get_launchd_gateway_services():
+        target = f"{domain}/{label}"
+        try:
+            gateway_cli.launchd_restart(label, domain=domain, pid=pid)
+            restarted_services.append(target)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            failed_units.append(target)
+            detail = (getattr(exc, "stderr", "") or "").strip() or str(exc)
+            print(
+                f"  ⚠ Failed to restart {target}: {detail}; "
+                "continuing with remaining gateways"
+            )
+
+
 def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
     """Print an explicit incomplete-update warning for unrestarted units."""
     if not failed_units:
@@ -6130,30 +6151,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
             # --- Launchd services (macOS) ---
             if is_macos():
-                try:
-                    from hermes_cli.gateway import (
-                        launchd_restart,
-                        get_launchd_label,
-                        get_launchd_plist_path,
-                    )
-
-                    plist_path = get_launchd_plist_path()
-                    if plist_path.exists():
-                        check = subprocess.run(
-                            ["launchctl", "list", get_launchd_label()],
-                            capture_output=True,
-                            text=True, encoding="utf-8", errors="replace",
-                            timeout=5,
-                        )
-                        if check.returncode == 0:
-                            try:
-                                launchd_restart()
-                                restarted_services.append(get_launchd_label())
-                            except subprocess.CalledProcessError as e:
-                                stderr = (getattr(e, "stderr", "") or "").strip()
-                                print(f"  ⚠ Gateway restart failed: {stderr}")
-                except (FileNotFoundError, subprocess.TimeoutExpired, ImportError):
-                    pass
+                _restart_launchd_gateway_fleet(
+                    restarted_services, failed_or_stale_units
+                )
 
             # --- Manual (non-service) gateways ---
             # Kill any remaining gateway processes not managed by a service.
