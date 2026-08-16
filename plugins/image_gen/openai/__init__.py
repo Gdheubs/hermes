@@ -76,9 +76,9 @@ _MODELS: Dict[str, Dict[str, Any]] = {
 DEFAULT_MODEL = "gpt-image-2-medium"
 
 _SIZES = {
-    "landscape": "1536x1024",
+    "landscape": "1792x1008",
     "square": "1024x1024",
-    "portrait": "1024x1536",
+    "portrait": "1008x1792",
 }
 
 

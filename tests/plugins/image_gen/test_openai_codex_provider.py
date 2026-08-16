@@ -112,6 +112,7 @@ class TestGenerate:
         assert result["model"] == "gpt-image-2-medium"
         assert result["provider"] == "openai-codex"
         assert result["quality"] == "medium"
+        assert result["size"] == "1792x1008"
 
         saved = Path(result["image"])
         assert saved.exists()
@@ -153,7 +154,7 @@ class TestGenerate:
         assert tool["type"] == "image_generation"
         assert tool["model"] == "gpt-image-2"
         assert tool["quality"] == "medium"
-        assert tool["size"] == "1024x1536"
+        assert tool["size"] == "1008x1792"
         assert tool["output_format"] == "png"
         assert tool["background"] == "opaque"
         assert tool["partial_images"] == 1
