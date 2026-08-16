@@ -18,7 +18,7 @@ import { useI18n } from '@/i18n'
 import { isMissingPendingPromptRequest } from '@/lib/gateway-rpc'
 import { triggerHaptic } from '@/lib/haptics'
 import { KeyRound, Loader2, Lock } from '@/lib/icons'
-import { $gateway } from '@/store/gateway'
+import { gatewayForScope } from '@/store/gateway'
 import { notifyError } from '@/store/notifications'
 import { clearSecretRequest, clearSudoRequest, sessionSecretRequest, sessionSudoRequest } from '@/store/prompts'
 
@@ -40,7 +40,7 @@ function SudoDialog({ sessionId }: { sessionId: string | null }) {
   const copy = t.prompts
   const $request = useMemo(() => sessionSudoRequest(sessionId), [sessionId])
   const request = useStore($request)
-  const gateway = useStore($gateway)
+  const gateway = gatewayForScope(request?.scope)
   const [password, setPassword] = useState('')
   const [submitting, setSubmitting] = useState(false)
 
@@ -143,7 +143,7 @@ function SecretDialog({ sessionId }: { sessionId: string | null }) {
   const copy = t.prompts
   const $request = useMemo(() => sessionSecretRequest(sessionId), [sessionId])
   const request = useStore($request)
-  const gateway = useStore($gateway)
+  const gateway = gatewayForScope(request?.scope)
   const [value, setValue] = useState('')
   const [submitting, setSubmitting] = useState(false)
 

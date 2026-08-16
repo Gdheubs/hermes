@@ -1,4 +1,10 @@
-import { backendScopeKey, type ConnectionState, type GatewayEvent, resolveGatewayWsUrl } from '@hermes/shared'
+import {
+  backendScopeKey,
+  type ConnectionState,
+  type GatewayEvent,
+  type GatewaySourceScope,
+  resolveGatewayWsUrl
+} from '@hermes/shared'
 import { atom } from 'nanostores'
 
 import { HermesGateway } from '@/hermes'
@@ -17,6 +23,59 @@ import { setConnection, setGatewayState } from '@/store/session'
 // only ever have the primary, so their path is byte-for-byte unchanged.
 
 const normKey = (profile: string | null | undefined): string => (profile ?? '').trim() || 'default'
+
+function normalizeConnectionId(connectionId: null | string | undefined): null | string {
+  const value = typeof connectionId === 'string' ? connectionId.trim() : ''
+
+  return value || null
+}
+
+function normalizeGatewaySourceScope(scope: GatewaySourceScope | null | undefined): GatewaySourceScope | null {
+  if (!scope || typeof scope.profile !== 'string') {
+    return null
+  }
+
+  const profile = scope.profile.trim()
+
+  if (!profile) {
+    return null
+  }
+
+  if (scope.connectionId === null) {
+    return { connectionId: null, profile }
+  }
+
+  if (typeof scope.connectionId !== 'string' || !scope.connectionId.trim()) {
+    return null
+  }
+
+  return { connectionId: scope.connectionId.trim(), profile }
+}
+
+/**
+ * Turn a renderer-tagged gateway event into the exact backend scope that
+ * emitted it. Events without a profile, or with a malformed explicit
+ * connection id, cannot safely answer a blocking request and are rejected.
+ */
+export function gatewaySourceScopeFromEvent(
+  event: Pick<GatewayEvent, 'connectionId' | 'profile'>
+): GatewaySourceScope | null {
+  const profile = typeof event.profile === 'string' ? event.profile.trim() : ''
+
+  if (!profile) {
+    return null
+  }
+
+  if (event.connectionId === undefined) {
+    return { connectionId: null, profile }
+  }
+
+  if (typeof event.connectionId !== 'string' || !event.connectionId.trim()) {
+    return null
+  }
+
+  return { connectionId: event.connectionId.trim(), profile }
+}
 
 // Read connection state through a call so TS control-flow analysis doesn't
 // narrow the getter to a constant across guards (it genuinely changes).
@@ -57,6 +116,7 @@ interface Secondary {
 // runtime behavior is identical to plain module state.
 interface GatewayRegistryState {
   config: RegistryConfig | null
+  primaryConnectionId: null | string
   primaryGateway: HermesGateway | null
   primaryProfile: string
   activeKey: string
@@ -69,6 +129,7 @@ const STATE_KEY = Symbol.for('hermes.desktop.gatewayRegistryState')
 function createRegistryState(): GatewayRegistryState {
   return {
     config: null,
+    primaryConnectionId: null,
     primaryGateway: null,
     primaryProfile: 'default',
     activeKey: 'default',
@@ -100,6 +161,10 @@ function gatewayState(): GatewayRegistryState {
 
 const g = gatewayState()
 
+// A running dev renderer can keep this container across an HMR update from a
+// build that predates connection-scoped prompt routing.
+g.primaryConnectionId ??= null
+
 // Re-exported as a stable binding: the atom instance lives in `g`, so every hot
 // reload of this module hands back the SAME atom subscribers are already wired
 // to. (A fresh `atom()` per reload would orphan existing subscriptions.)
@@ -120,9 +185,42 @@ export function emitLocalGatewayEvent(event: GatewayEvent): void {
   g.config?.onEvent(event)
 }
 
-export function setPrimaryGateway(gateway: HermesGateway | null, profile = 'default'): void {
+export function setPrimaryGateway(
+  gateway: HermesGateway | null,
+  profile = 'default',
+  connectionId: null | string = null
+): void {
+  g.primaryConnectionId = normalizeConnectionId(connectionId)
   g.primaryGateway = gateway
   g.primaryProfile = normKey(profile)
+}
+
+/** The exact scope of the primary socket, for renderer-side event tagging. */
+export function primaryGatewayScope(): GatewaySourceScope | null {
+  if (!g.primaryGateway) {
+    return null
+  }
+
+  return { connectionId: g.primaryConnectionId, profile: g.primaryProfile }
+}
+
+/**
+ * Resolve only an already-registered, exact source socket. In particular this
+ * never falls back to the active or primary socket: a prompt from an unknown
+ * backend must remain unanswered rather than being delivered to another agent.
+ */
+export function gatewayForScope(scope: GatewaySourceScope | null | undefined): HermesGateway | null {
+  const source = normalizeGatewaySourceScope(scope)
+
+  if (!source) {
+    return null
+  }
+
+  if (g.primaryProfile === source.profile && g.primaryConnectionId === source.connectionId) {
+    return g.primaryGateway
+  }
+
+  return g.secondaries.get(backendScopeKey(source.connectionId, source.profile))?.gateway ?? null
 }
 
 export function isActivePrimary(): boolean {
@@ -243,12 +341,13 @@ async function reconnectSecondary(entry: Secondary): Promise<void> {
 
 function createSecondary(profile: string, connectionId: null | string = null): Secondary {
   const gateway = new HermesGateway()
-  const scope = backendScopeKey(connectionId, profile)
+  const sourceConnectionId = normalizeConnectionId(connectionId)
+  const scope = backendScopeKey(sourceConnectionId, profile)
 
   const entry: Secondary = {
     scope,
     profile,
-    connectionId,
+    connectionId: sourceConnectionId,
     gateway,
     offEvent: () => {},
     offState: () => {},
@@ -261,7 +360,7 @@ function createSecondary(profile: string, connectionId: null | string = null): S
   // Events keep carrying the bare profile — session routing is profile-keyed
   // everywhere. connectionId rides along for surfaces that need the source.
   entry.offEvent = gateway.onEvent(event =>
-    g.config?.onEvent({ ...event, profile, ...(connectionId ? { connectionId } : {}) })
+    g.config?.onEvent({ ...event, profile, ...(sourceConnectionId ? { connectionId: sourceConnectionId } : {}) })
   )
   entry.offState = gateway.onState(state => {
     reportGatewayState(scope, state)

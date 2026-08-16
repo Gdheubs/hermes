@@ -972,6 +972,8 @@ export interface HermesApiRequest {
   // (window) backend. Read-only cross-profile data is served by the primary, so
   // this is only needed for profile-scoped live/settings calls.
   profile?: string | null
+  /** Exact registry connection for a source-bound request. */
+  connectionId?: string | null
 }
 
 export interface HermesNotification {

@@ -1,4 +1,4 @@
-import { JsonRpcGatewayClient } from '@hermes/shared'
+import { type GatewaySourceScope, JsonRpcGatewayClient } from '@hermes/shared'
 
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import type {
@@ -256,7 +256,20 @@ export function setApiRequestProfile(profile: null | string): void {
   _apiProfile = profile || null
 }
 
-function profileScoped(profile?: null | string): { profile?: string } {
+function profileScoped(
+  profile?: null | string,
+  sourceScope?: GatewaySourceScope | null
+): { connectionId?: null | string; profile?: string } {
+  if (sourceScope !== undefined) {
+    const scopedProfile = sourceScope?.profile?.trim()
+
+    if (!sourceScope || !scopedProfile) {
+      throw new Error('A source-bound request requires an exact backend scope.')
+    }
+
+    return { connectionId: sourceScope.connectionId, profile: scopedProfile }
+  }
+
   const selected = profile === undefined ? _apiProfile : profile
 
   return selected ? { profile: selected } : {}
@@ -1185,27 +1198,39 @@ export function saveMcpServers(
 }
 
 /** Start an MCP OAuth flow and return the authorization URL. */
-export function authMcpServer(name: string, profile?: null | string): Promise<McpOAuthFlow> {
+export function authMcpServer(
+  name: string,
+  profile?: null | string,
+  sourceScope?: GatewaySourceScope | null
+): Promise<McpOAuthFlow> {
   return window.hermesDesktop.api<McpOAuthFlow>({
-    ...profileScoped(profile),
+    ...profileScoped(profile, sourceScope),
     path: `/api/mcp/servers/${encodeURIComponent(name)}/auth`,
     method: 'POST',
     timeoutMs: 60_000
   })
 }
 
-export function getMcpOAuthFlow(flowId: string, profile?: null | string): Promise<McpOAuthFlow> {
+export function getMcpOAuthFlow(
+  flowId: string,
+  profile?: null | string,
+  sourceScope?: GatewaySourceScope | null
+): Promise<McpOAuthFlow> {
   return window.hermesDesktop.api<McpOAuthFlow>({
-    ...profileScoped(profile),
+    ...profileScoped(profile, sourceScope),
     path: `/api/mcp/oauth/flows/${encodeURIComponent(flowId)}`
   })
 }
 
 /** Cancel an in-flight MCP OAuth flow server-side, freeing the per-server
  *  "already in progress" slot so a retry doesn't 409. */
-export function cancelMcpOAuthFlow(flowId: string, profile?: null | string): Promise<{ ok: boolean; status: string }> {
+export function cancelMcpOAuthFlow(
+  flowId: string,
+  profile?: null | string,
+  sourceScope?: GatewaySourceScope | null
+): Promise<{ ok: boolean; status: string }> {
   return window.hermesDesktop.api<{ ok: boolean; status: string }>({
-    ...profileScoped(profile),
+    ...profileScoped(profile, sourceScope),
     path: `/api/mcp/oauth/flows/${encodeURIComponent(flowId)}`,
     method: 'DELETE'
   })
@@ -1778,9 +1803,14 @@ export function checkHermesUpdate(force = false): Promise<BackendUpdateCheckResp
   })
 }
 
-export function getActionStatus(name: string, lines = 200, profile?: null | string): Promise<ActionStatusResponse> {
+export function getActionStatus(
+  name: string,
+  lines = 200,
+  profile?: null | string,
+  sourceScope?: GatewaySourceScope | null
+): Promise<ActionStatusResponse> {
   return window.hermesDesktop.api<ActionStatusResponse>({
-    ...profileScoped(profile),
+    ...profileScoped(profile, sourceScope),
     path: `/api/actions/${encodeURIComponent(name)}/status?lines=${Math.max(1, lines)}`
   })
 }
@@ -1910,16 +1940,19 @@ export function listMcpServers(): Promise<{ servers: McpServerSummary[] }> {
 
 /** Add one server to `mcp_servers` (validated + name-collision-checked
  *  server-side — the same endpoint the dashboard's add form uses). */
-export function addMcpServer(body: {
-  name: string
-  url?: string
-  command?: string
-  args?: string[]
-  env?: Record<string, string>
-  auth?: string
-}): Promise<McpServerSummary> {
+export function addMcpServer(
+  body: {
+    name: string
+    url?: string
+    command?: string
+    args?: string[]
+    env?: Record<string, string>
+    auth?: string
+  },
+  sourceScope?: GatewaySourceScope | null
+): Promise<McpServerSummary> {
   return window.hermesDesktop.api<McpServerSummary>({
-    ...profileScoped(),
+    ...profileScoped(undefined, sourceScope),
     path: '/api/mcp/servers',
     method: 'POST',
     body
@@ -1928,26 +1961,33 @@ export function addMcpServer(body: {
 
 /** Remove one server from `mcp_servers` (the inline setup card's rollback
  *  when a directory install is cancelled after the config write). */
-export function removeMcpServer(name: string): Promise<{ ok: boolean }> {
+export function removeMcpServer(name: string, sourceScope?: GatewaySourceScope | null): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
-    ...profileScoped(),
+    ...profileScoped(undefined, sourceScope),
     path: `/api/mcp/servers/${encodeURIComponent(name)}`,
     method: 'DELETE'
   })
 }
 
-export function setMcpServerEnabled(name: string, enabled: boolean): Promise<{ ok: boolean }> {
+export function setMcpServerEnabled(
+  name: string,
+  enabled: boolean,
+  sourceScope?: GatewaySourceScope | null
+): Promise<{ ok: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean }>({
-    ...profileScoped(),
+    ...profileScoped(undefined, sourceScope),
     path: `/api/mcp/servers/${encodeURIComponent(name)}/enabled`,
     method: 'PUT',
     body: { enabled }
   })
 }
 
-export function getMcpCatalog(profile?: null | string): Promise<McpCatalogResponse> {
+export function getMcpCatalog(
+  profile?: null | string,
+  sourceScope?: GatewaySourceScope | null
+): Promise<McpCatalogResponse> {
   return window.hermesDesktop.api<McpCatalogResponse>({
-    ...profileScoped(profile),
+    ...profileScoped(profile, sourceScope),
     path: '/api/mcp/catalog'
   })
 }
@@ -1965,10 +2005,11 @@ export function getGhAuthStatus(refresh = false): Promise<{ available: boolean; 
 export function installMcpCatalogEntry(
   name: string,
   env: Record<string, string> = {},
-  profile?: null | string
+  profile?: null | string,
+  sourceScope?: GatewaySourceScope | null
 ): Promise<{ ok: boolean; name?: string; pid?: number; action?: string; background?: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean; name?: string; pid?: number; action?: string; background?: boolean }>({
-    ...profileScoped(profile),
+    ...profileScoped(profile, sourceScope),
     path: '/api/mcp/catalog/install',
     method: 'POST',
     body: { name, env, enable: true },

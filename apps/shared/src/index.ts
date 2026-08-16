@@ -1,8 +1,4 @@
-export {
-  backendScopeKey,
-  backendScopePrefix,
-  LOCAL_CONNECTION_ID
-} from './backend-scope'
+export { backendScopeKey, backendScopePrefix, LOCAL_CONNECTION_ID } from './backend-scope'
 export {
   BILLING_REFUSAL_POLICY,
   type BillingRecovery,
@@ -50,6 +46,7 @@ export {
   type GatewayEvent,
   type GatewayEventName,
   type GatewayRequestId,
+  type GatewaySourceScope,
   type JsonRpcFrame,
   JsonRpcGatewayClient,
   type WebSocketLike

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $gateway } from './gateway'
+import { $gateway, setPrimaryGateway } from './gateway'
 import {
   dispatchNativeNotification,
   dispatchPluginNativeNotification,
@@ -11,7 +11,7 @@ import {
   setNativeNotifyKind
 } from './native-notifications'
 import { __resetNativeNotifyBaselineForTests, markNativeNotifyBaseline } from './notify-baseline'
-import { $approvalRequest, setApprovalRequest } from './prompts'
+import { $approvalRequest, clearAllPrompts, setApprovalRequest } from './prompts'
 import { $activeSessionId, setActiveSessionId } from './session'
 
 const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
@@ -228,28 +228,51 @@ describe('$activeSessionId wiring', () => {
 describe('respondToApprovalAction', () => {
   const request = vi.fn().mockResolvedValue({ resolved: true })
 
+  const setBackgroundApproval = () =>
+    setApprovalRequest({
+      command: 'rm -rf /',
+      description: 'dangerous',
+      requestId: 'approval-bg',
+      sessionId: 'bg',
+      scope: { connectionId: null, profile: 'default' }
+    })
+
   beforeEach(() => {
+    clearAllPrompts()
     request.mockClear()
-    $gateway.set({ request } as unknown as ReturnType<typeof $gateway.get>)
+    const gateway = { request } as unknown as ReturnType<typeof $gateway.get>
+    setPrimaryGateway(gateway as never, 'default')
+    $gateway.set(gateway)
   })
 
   afterEach(() => {
+    clearAllPrompts()
+    setPrimaryGateway(null)
     $gateway.set(null)
   })
 
   it('approves via approval.respond {choice: "once"} and clears the prompt', async () => {
     setActiveSessionId('bg')
-    setApprovalRequest({ command: 'rm -rf /', description: 'dangerous', sessionId: 'bg' })
+    setBackgroundApproval()
 
     await respondToApprovalAction('bg', 'approve')
 
-    expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'bg' })
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      choice: 'once',
+      request_id: 'approval-bg',
+      session_id: 'bg'
+    })
     expect($approvalRequest.get()).toBeNull()
   })
 
   it('rejects via approval.respond {choice: "deny"}', async () => {
+    setBackgroundApproval()
     await respondToApprovalAction('bg', 'reject')
-    expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'bg' })
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      choice: 'deny',
+      request_id: 'approval-bg',
+      session_id: 'bg'
+    })
   })
 
   it('ignores unknown action ids', async () => {
@@ -258,6 +281,8 @@ describe('respondToApprovalAction', () => {
   })
 
   it('no-ops without a gateway', async () => {
+    setBackgroundApproval()
+    setPrimaryGateway(null)
     $gateway.set(null)
     await respondToApprovalAction('bg', 'approve')
     expect(request).not.toHaveBeenCalled()

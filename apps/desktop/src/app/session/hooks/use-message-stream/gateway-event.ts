@@ -27,7 +27,7 @@ import { billingCtaLabel, clearBillingBlock, runBillingRecovery, setBillingBlock
 import { clearClarifyRequest, normalizeChoices, setClarifyRequest, warnDroppedChoices } from '@/store/clarify'
 import { setSessionCompacting } from '@/store/compaction'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
-import { $gateway } from '@/store/gateway'
+import { gatewayForScope, gatewaySourceScopeFromEvent } from '@/store/gateway'
 import { applyGoalStatusText } from '@/store/goals'
 import {
   notifyCronChanged,
@@ -341,6 +341,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       }
 
       const sessionId = route.sessionId
+      const sourceScope = gatewaySourceScopeFromEvent(event)
+      const sourceGateway = gatewayForScope(sourceScope)
 
       // Late stragglers: an unscoped stream event attributed via the
       // active-session fallback (no pin) to a session that has no live turn
@@ -372,7 +374,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       const replaySessionId = approvalReplaySessionId(event.type, activeSessionIdRef.current, sessionId)
 
       if (replaySessionId) {
-        void replayPendingApproval($gateway.get(), replaySessionId).catch(() => undefined)
+        void replayPendingApproval(sourceGateway, replaySessionId, sourceScope).catch(() => undefined)
       }
 
       // Mid-turn compaction does not emit another message.start. The first
@@ -1120,7 +1122,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             question,
             choices: choices.length > 0 ? choices : null,
             multiSelect,
-            sessionId: sessionId ?? null
+            sessionId: sessionId ?? null,
+            scope: sourceScope
           })
 
           if (sessionId) {
@@ -1175,7 +1178,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         const reason = typeof payload?.reason === 'string' ? payload.reason : ''
 
         if (requestId && server) {
-          setMcpSetupRequest({ action, reason, requestId, server, sessionId: sessionId ?? null })
+          setMcpSetupRequest({ action, reason, requestId, server, sessionId: sessionId ?? null, scope: sourceScope })
 
           if (sessionId) {
             upsertToolCall(
@@ -1203,7 +1206,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         const command = typeof payload?.command === 'string' ? payload.command : ''
         const description = typeof payload?.description === 'string' ? payload.description : 'dangerous command'
 
-        void receiveApprovalRequest($gateway.get(), {
+        void receiveApprovalRequest(sourceGateway, {
           // false only when a tirith warning forbids it; backend omits the field otherwise.
           allowPermanent: payload?.allow_permanent !== false,
           choices: Array.isArray(payload?.choices)
@@ -1213,6 +1216,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           description,
           requestId: typeof payload?.request_id === 'string' ? payload.request_id : undefined,
           sessionId: sessionId ?? null,
+          scope: sourceScope,
           smartDenied: payload?.smart_denied === true
         }).catch(() => undefined)
 
@@ -1236,7 +1240,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
 
         if (requestId) {
-          setSudoRequest({ requestId, sessionId: sessionId ?? null })
+          setSudoRequest({ requestId, sessionId: sessionId ?? null, scope: sourceScope })
 
           if (sessionId) {
             updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
@@ -1262,7 +1266,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             requestId,
             envVar,
             prompt: promptText,
-            sessionId: sessionId ?? null
+            sessionId: sessionId ?? null,
+            scope: sourceScope
           })
 
           if (sessionId) {
@@ -1286,7 +1291,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           const count = typeof payload?.count === 'number' ? payload.count : undefined
           const result = readActiveTerminal({ start, count })
 
-          void $gateway.get()?.request('terminal.read.respond', {
+          void sourceGateway?.request('terminal.read.respond', {
             request_id: requestId,
             text: result ? JSON.stringify(result) : ''
           })
@@ -1301,7 +1306,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           const count = typeof payload?.count === 'number' ? payload.count : undefined
 
           void readActivePreview({ count, start }).then(result => {
-            void $gateway.get()?.request('preview.read.respond', {
+            void sourceGateway?.request('preview.read.respond', {
               request_id: requestId,
               text: result ? JSON.stringify(result) : ''
             })
@@ -1317,7 +1322,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           const read = window.hermesDesktop?.readWindowBelow
 
           const answer = (result: unknown) =>
-            $gateway.get()?.request('window.read.respond', {
+            sourceGateway?.request('window.read.respond', {
               request_id: requestId,
               text: result ? JSON.stringify(result) : ''
             })

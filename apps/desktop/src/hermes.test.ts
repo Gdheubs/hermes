@@ -13,6 +13,7 @@ import {
   getGlobalModelOptions,
   getHermesConfig,
   getHermesConfigDefaults,
+  getMcpCatalog,
   getProfiles,
   getSessionMessages,
   getStatus,
@@ -21,6 +22,7 @@ import {
   listSidebarSessions,
   resetSidebarBatchCapability,
   setApiRequestProfile,
+  setMcpServerEnabled,
   speakText,
   transcribeAudio,
   triggerCronJob
@@ -72,6 +74,36 @@ describe('Hermes REST helpers', () => {
         timeoutMs: 60_000
       })
     )
+  })
+
+  it('keeps MCP setup requests bound to their exact source connection and profile', async () => {
+    setApiRequestProfile('ambient')
+    const source = { connectionId: 'remote-b', profile: 'worker' }
+
+    await getMcpCatalog(undefined, source)
+    await setMcpServerEnabled('example', true, source)
+
+    expect(api).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ connectionId: 'remote-b', path: '/api/mcp/catalog', profile: 'worker' })
+    )
+    expect(api).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        body: { enabled: true },
+        connectionId: 'remote-b',
+        method: 'PUT',
+        path: '/api/mcp/servers/example/enabled',
+        profile: 'worker'
+      })
+    )
+  })
+
+  it('does not fall back to the ambient profile when an MCP setup source is unavailable', () => {
+    setApiRequestProfile('ambient')
+
+    expect(() => getMcpCatalog(undefined, null)).toThrow('A source-bound request requires an exact backend scope.')
+    expect(api).not.toHaveBeenCalled()
   })
 
   it('batches the sidebar slices into a single request with per-slice limits + excludes', async () => {
