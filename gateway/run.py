@@ -17462,6 +17462,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _final_text = str(_agent_result.get("final_response") or "")
                 elif isinstance(_agent_result, str):
                     _final_text = _agent_result
+                # Streamed turns return None from _handle_message_with_agent
+                # (already_sent), so the final text never reaches this hook
+                # and the goal judge is skipped (#58828 / #54222). Recover the
+                # streamed final response carried on the event instead.
+                if not (isinstance(_agent_result, (dict, str)) and _final_text.strip()):
+                    _streamed_text = getattr(event, "_streamed_final_response", None)
+                    if isinstance(_streamed_text, str) and _streamed_text.strip():
+                        _final_text = _streamed_text
                 # Skip for empty responses (interrupted / errored) — the
                 # judge would almost always say "continue" and we'd loop
                 # on error. Let the user drive the next turn.
@@ -20246,6 +20254,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
+                # The goal judge normally reads the final response off the
+                # handler's return value, but this branch returns None because
+                # streaming already delivered the body. Carry the final text on
+                # the event so _handle_message's goal-continuation hook can still
+                # run the judge after streamed turns (#58828 / #54222).
+                try:
+                    event._streamed_final_response = str(response or "")
+                except Exception:
+                    pass
                 return None
 
             return response
