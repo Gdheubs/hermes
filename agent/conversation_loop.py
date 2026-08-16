@@ -2444,7 +2444,7 @@ def run_conversation(
         # ``replay_compaction``), resolved once per turn and shared by the
         # preflight estimate and the wire-time compaction below.
         _replay_limits = replay_compaction_limits(agent.provider)
-        approx_tokens = estimate_messages_tokens_rough(api_messages)
+        _raw_approx = estimate_messages_tokens_rough(api_messages)
         # Measure request pressure against the post-compaction wire size so
         # the raw estimate can't fire compression early (estimate-only).
         # Preflight estimate: post-replay wire size for every provider.
@@ -2455,9 +2455,8 @@ def run_conversation(
             base_url=agent.base_url,
             limits=_replay_limits,
         )
-        request_pressure_tokens = approx_tokens + (
-            _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
-        )
+        _preflight_tools = _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
+        request_pressure_tokens = approx_tokens + _preflight_tools
         total_chars = approx_tokens * 4
         # Stash this request's rough estimate so update_from_response() can
         # pair it with the provider's real prompt count — the (rough, real)
@@ -2538,18 +2537,36 @@ def run_conversation(
         _defer_preflight = getattr(
             _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
         )
+        _preflight_defer = (
+            _defer_preflight(request_pressure_tokens)
+            if callable(_defer_preflight)
+            else False
+        )
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
-        if (
+        _preflight_fire = bool(
             agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
-            and not _defer_preflight(request_pressure_tokens)
+            and not _preflight_defer
             and not _compression_cooldown
             and _compressor.should_compress(request_pressure_tokens)
-        ):
+        )
+        # One structured line per preflight (debug level: diagnostics for
+        # integration runs, not prod noise): every compression/compaction
+        # boundary value, so a debug run pins where reality diverges.
+        logger.debug(
+            "economy preflight: raw=%d replay=%d tools=%d pressure=%d "
+            "threshold=%d defer=%s cooldown=%s blocked=%s enabled=%s "
+            "attempts=%d/%d fire=%s",
+            _raw_approx, approx_tokens, _preflight_tools, request_pressure_tokens,
+            _preflight_threshold, _preflight_defer, _compression_cooldown,
+            _preflight_compression_blocked, agent.compression_enabled,
+            compression_attempts, max_compression_attempts, _preflight_fire,
+        )
+        if _preflight_fire:
             if _moa_prepared_request is not None:
                 pending_moa_prepared_request = _moa_prepared_request
             compression_attempts += 1
@@ -7324,11 +7341,17 @@ def run_conversation(
                         messages, tools=agent.tools or None
                     )
 
-                if (
+                _post_fire = (
                     agent.compression_enabled
                     and compression_attempts < max_compression_attempts
                     and _compressor.should_compress(_real_tokens)
-                ):
+                )
+                logger.debug(
+                    "economy post-response: real=%d threshold=%d fire=%s attempts=%d/%d",
+                    _real_tokens, getattr(_compressor, "threshold_tokens", 0),
+                    _post_fire, compression_attempts, max_compression_attempts,
+                )
+                if _post_fire:
                     compression_attempts += 1
                     # Compression is actually running (block cleared / was
                     # never blocked) — reset the blocked-overflow warning
