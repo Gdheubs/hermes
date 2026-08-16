@@ -15724,6 +15724,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if policy in ("dispatch", "interrupt_then_dispatch"):
             plain = {
                 "status": self._handle_status_command,
+                "fetch": self._handle_fetch_command,
                 "context": self._handle_context_command,
                 "restart": self._handle_restart_command,
                 "approve": self._handle_approve_command,
@@ -16886,6 +16887,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "status":
             return await self._handle_status_command(event)
+
+        if canonical == "fetch":
+            return await self._handle_fetch_command(event)
 
         if canonical == "egress":
             from hermes_cli.proxy_cli import format_status_text

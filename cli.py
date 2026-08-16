@@ -11382,6 +11382,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._show_gateway_status()
         elif canonical == "status":
             self._show_session_status()
+        elif canonical == "fetch":
+            from hermes_cli.fetch import render_fetch_slash_args
+            _parts = cmd_original.split(maxsplit=1)
+            print(render_fetch_slash_args(_parts[1] if len(_parts) > 1 else ""))
         elif canonical == "context":
             self._show_context_breakdown(cmd_original)
         elif canonical == "egress":
