@@ -160,6 +160,66 @@ class TestInterimSendContract:
         seals = [o for o in t.ops if o["op"] == "draft" and o.get("final")]
         assert len(seals) == 1
 
+    @pytest.mark.asyncio
+    async def test_send_for_platform_interim_does_not_seal(self):
+        """The delivery-resolver egress door honors the interim contract too.
+
+        send_for_platform is the second seal-interception site (finding #7);
+        an interim send routed through it must neither seal the open stream
+        nor leak the gateway-internal marker onto the wire.
+        """
+        from tests.gateway.relay.test_relay_live_cards import _connected_adapter
+
+        adapter, _ = _connected_adapter(
+            supported_ops=("send", "edit", "typing", "draft"),
+        )
+
+        class _T:
+            def __init__(self):
+                self.ops = []
+                # fronts_platform reads the handshake identity set off the
+                # transport; advertise slack so send_for_platform proceeds.
+                self._identities = [("slack", "U-bot")]
+            async def send_outbound(self, payload, platform=None):
+                self.ops.append(dict(payload))
+                return {"success": True, "message_id": "111.333"}
+
+        t = _T()
+        adapter._transport = t
+        md = {"thread_ts": "1700.77"}
+        await adapter.send_draft("C2", 9, "streaming...", metadata=md)
+        key = adapter._draft_key("C2", md)
+        assert adapter._open_draft_by_chat.get(key) == 9
+
+        res = await adapter.send_for_platform(
+            "slack", "C2", "interim status", metadata={**md, "_interim_send": True},
+        )
+        assert res.success
+        assert adapter._open_draft_by_chat.get(key) == 9, "interim send_for_platform sealed the stream"
+        sent_ops = [o for o in t.ops if o["op"] == "send"]
+        assert len(sent_ops) == 1
+        assert "_interim_send" not in (sent_ops[0].get("metadata") or {})
+
+
+class TestFinalAdoptionGuards:
+    @pytest.mark.asyncio
+    async def test_no_stream_turn_does_not_adopt_final(self):
+        """finish(final_text) on a turn that never streamed must not move
+        delivery ownership into the consumer — the gateway's normal final
+        send path owns those turns (non-streaming models, tool-only turns)."""
+        adapter = _make_draft_adapter()
+        cfg = StreamConsumerConfig(
+            transport="auto", chat_type="dm",
+            edit_interval=0.01, buffer_threshold=1, cursor="",
+        )
+        sc = GatewayStreamConsumer(adapter, "D1", cfg)
+        task = asyncio.create_task(sc.run())
+        # No on_delta at all — straight to completion with a payload.
+        sc.finish("the final answer from a non-streaming turn")
+        await task
+        assert adapter.send_calls == [], "no-stream turn must not deliver via the consumer"
+        assert adapter.draft_calls == []
+
 
 class TestQueuedLaneReconcile:
     @pytest.mark.asyncio
