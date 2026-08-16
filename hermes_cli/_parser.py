@@ -125,6 +125,15 @@ def build_top_level_parser():
             "can always account for spend. No effect outside -z/--oneshot."
         ),
     )
+    parser.add_argument(
+        "--cpu-profile",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Write a Python cProfile snapshot to PATH when the process exits. "
+            "Also writes PATH.txt with the top cumulative functions."
+        ),
+    )
     # --model / --provider are accepted at the top level so they can pair
     # with -z without needing the `chat` subcommand.  If neither -z nor a
     # subcommand consumes them, they fall through harmlessly as None.

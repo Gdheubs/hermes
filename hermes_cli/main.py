@@ -572,6 +572,7 @@ def _apply_profile_override() -> None:
     # The exception is command-argv passthrough regions such as `mcp add --args`.
     value_flags = {
         "-z", "--oneshot",
+        "--cpu-profile",
         "-m", "--model",
         "--provider",
         "-t", "--toolsets",
@@ -11208,6 +11209,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
 _TOP_LEVEL_VALUE_FLAGS = frozenset(
     {
         "-z", "--oneshot",
+        "--cpu-profile",
         "-m", "--model",
         "--provider",
         "-t", "--toolsets",
@@ -11440,6 +11442,17 @@ def _apply_safe_mode(args) -> None:
     os.environ["HERMES_IGNORE_RULES"] = "1"
 
 
+def _enable_cpu_profile_from_args(args) -> None:
+    profile_path = getattr(args, "cpu_profile", None)
+    if not profile_path:
+        return
+    from hermes_cli.cpu_profile import enable_cpu_profile
+
+    enabled = enable_cpu_profile(profile_path)
+    if enabled is not None:
+        print(f"CPU profiling enabled: {enabled}", file=sys.stderr)
+
+
 def _set_chat_arg_defaults(args) -> None:
     for attr, default in [
         ("query", None),
@@ -11507,6 +11520,7 @@ def _try_fast_chat_launch() -> bool:
     if getattr(args, "command", None) not in {None, "chat"}:
         return False
 
+    _enable_cpu_profile_from_args(args)
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
     _prepare_agent_startup(args)
@@ -11567,6 +11581,7 @@ def _try_termux_fast_cli_launch() -> bool:
         _print_version_info(check_updates=False)
         return True
 
+    _enable_cpu_profile_from_args(args)
     if getattr(args, "oneshot", None):
         _prepare_agent_startup(args)
         _confirm_startup_expensive_model_override(args)
@@ -11637,6 +11652,7 @@ def _try_termux_fast_tui_launch() -> bool:
     if not _resolve_use_tui(args):
         return False
 
+    _enable_cpu_profile_from_args(args)
     cmd_chat(args)
     return True
 
@@ -13348,6 +13364,8 @@ def main():
     if args.version:
         cmd_version(args)
         return
+
+    _enable_cpu_profile_from_args(args)
 
     # --yolo: set HERMES_YOLO_MODE *before* plugin discovery.  The call to
     # _prepare_agent_startup() below triggers discover_plugins() → tool
