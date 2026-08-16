@@ -327,8 +327,9 @@ def _create_session_db_for_oneshot():
 def _oneshot_explicit_cwd(in_dir: Optional[str], task_id: str) -> Iterator[None]:
     """Enter ``--in`` after backend resolution and pin local tool cwd.
 
-    Restore the pin marker even if task-env cleanup raises. Cleanup failures
-    are logged rather than allowed to mask an error from the one-shot run.
+    Restore process cwd and environment state even if task-env cleanup raises.
+    Cleanup failures are logged rather than allowed to mask an error from the
+    one-shot run.
     """
     if not in_dir:
         yield
@@ -338,8 +339,11 @@ def _oneshot_explicit_cwd(in_dir: Optional[str], task_id: str) -> Iterator[None]
         HERMES_EXPLICIT_CWD_PIN,
         HERMES_EXPLICIT_CWD_PIN_VALUE,
     )
-    from tools.terminal_tool import _get_env_config, record_session_cwd
+    from tools.terminal_tool import _get_env_config, _safe_getcwd, record_session_cwd
 
+    previous_cwd = _safe_getcwd()
+    previous_terminal_cwd = os.environ.get("TERMINAL_CWD")
+    had_terminal_cwd = "TERMINAL_CWD" in os.environ
     previous_pin = None
     pinned = False
     try:
@@ -366,6 +370,14 @@ def _oneshot_explicit_cwd(in_dir: Optional[str], task_id: str) -> Iterator[None]
                 os.environ.pop(HERMES_EXPLICIT_CWD_PIN, None)
             else:
                 os.environ[HERMES_EXPLICIT_CWD_PIN] = previous_pin
+        if had_terminal_cwd:
+            os.environ["TERMINAL_CWD"] = previous_terminal_cwd or ""
+        else:
+            os.environ.pop("TERMINAL_CWD", None)
+        try:
+            os.chdir(previous_cwd)
+        except OSError:
+            logging.debug("oneshot cwd cleanup failed", exc_info=True)
 
 
 def _run_agent(
