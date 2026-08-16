@@ -1844,7 +1844,10 @@ def resolve_qwen_context_overflow_policy(agent) -> str | None:
         if policy is not None:
             return policy or None  # explicit wins; empty disables
         host = (getattr(agent, "_base_url_lower", "") or "").lower()
-        if "qwen.ai" in host or "dashscope.aliyuncs.com" in host:
+        if (
+            base_url_host_matches(host, "portal.qwen.ai")
+            or base_url_host_matches(host, "dashscope.aliyuncs.com")
+        ):
             return "stopAtLimit"
         return None
     except Exception:

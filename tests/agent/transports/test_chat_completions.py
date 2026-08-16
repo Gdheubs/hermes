@@ -911,3 +911,8 @@ def test_qwen_endpoint_list_is_pinned(monkeypatch):
         # a new UNKNOWN qwen-looking host must NOT silently get the default
         _A._base_url_lower = "https://new-qwen-region.example.com/v1"
         assert resolve_qwen_context_overflow_policy(_A()) is None
+        # the substring false-positive class: 'qwen.ai' inside another host
+        _A._base_url_lower = "https://qwen.ai.malicious-proxy.example.com/v1"
+        assert resolve_qwen_context_overflow_policy(_A()) is None
+        _A._base_url_lower = "https://portal.qwen.ai.evil.com/v1"
+        assert resolve_qwen_context_overflow_policy(_A()) is None
