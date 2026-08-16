@@ -342,6 +342,7 @@ def check_systemd_timing_alignment(drain_timeout: float) -> Optional[Dict[str, A
 
     # Try to identify our unit name and ask systemctl for its config.
     unit_name: Optional[str] = None
+    cgroup_path = ""
     try:
         # /proc/self/cgroup gives us "0::/user.slice/.../hermes-gateway.service"
         with open("/proc/self/cgroup", encoding="utf-8") as fh:
@@ -354,37 +355,61 @@ def check_systemd_timing_alignment(drain_timeout: float) -> Optional[Dict[str, A
                             unit_name = p
                             break
                     if unit_name:
+                        cgroup_path = line.strip()
                         break
     except (OSError, FileNotFoundError):
         pass
     if not unit_name:
         return None
 
-    # Query systemctl for TimeoutStopUSec.  Use --user OR system depending
-    # on which manager actually owns the unit.  Try user first since
-    # that's the common case for hermes.
+    # Determine which systemd manager actually owns the unit.  A process
+    # running under /user.slice/ is managed by the per-user manager
+    # (systemctl --user); anything else (system.slice, init.scope) belongs
+    # to the system manager.  This distinction is critical: `systemctl
+    # --user show` on a unit unknown to the user manager does NOT fail — it
+    # returns rc=0 carrying the user manager's own DefaultTimeoutStopUSec
+    # (typically 90s), which would silently poison the alignment check for
+    # system-level installs (hermes gateway install --system).
+    if "/user.slice/" in cgroup_path:
+        scope_flags: list = ["--user"]
+        fallback_flags: list = []
+    else:
+        scope_flags = []
+        fallback_flags = ["--user"]
+
+    # Query systemctl for TimeoutStopUSec.  Ask for LoadState in the same
+    # call so we can detect when the queried manager doesn't own the unit
+    # (LoadState=not-found) and fall back to the other scope instead of
+    # trusting a manager default value.
     timeout_us: Optional[int] = None
-    for flag in (["--user"], []):
+    for flag in (scope_flags, fallback_flags):
         try:
             result = subprocess.run(
-                ["systemctl", *flag, "show", unit_name, "--property=TimeoutStopUSec"],
+                ["systemctl", *flag, "show", unit_name, "--property=LoadState,TimeoutStopUSec"],
                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=2.0,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             continue
         if result.returncode != 0:
             continue
-        # Output: "TimeoutStopUSec=1min 30s" or "TimeoutStopUSec=90000000"
+        props: Dict[str, str] = {}
         for line in result.stdout.splitlines():
-            if line.startswith("TimeoutStopUSec="):
-                value = line.split("=", 1)[1].strip()
-                # Try numeric microseconds first
-                if value.isdigit():
-                    timeout_us = int(value)
-                else:
-                    timeout_us = _parse_systemd_duration_to_us(value)
-                if timeout_us is not None:
-                    break
+            if "=" in line:
+                key, _, value = line.partition("=")
+                props[key.strip()] = value.strip()
+        # `systemctl show` on a unit the manager doesn't own returns rc=0
+        # with LoadState=not-found and a default TimeoutStopUSec.  Treat that
+        # as "not our unit" and try the other scope.
+        if props.get("LoadState") == "not-found":
+            continue
+        raw = props.get("TimeoutStopUSec")
+        if raw is None:
+            continue
+        # Try numeric microseconds first
+        if raw.isdigit():
+            timeout_us = int(raw)
+        else:
+            timeout_us = _parse_systemd_duration_to_us(raw)
         if timeout_us is not None:
             break
 
