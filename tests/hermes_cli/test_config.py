@@ -173,6 +173,28 @@ class TestLoadConfigParseFailure:
 
 
 
+    def test_read_raw_config_oserror_logs_warning(self, tmp_path, caplog):
+        """read_raw_config() must log a WARNING when config.yaml is unreadable,
+        not silently return {} without any diagnostic."""
+        import logging
+        from hermes_cli.config import read_raw_config, _RAW_CONFIG_CACHE
+        _RAW_CONFIG_CACHE.clear()
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text("model:\n  default: test\n")
+        config_path.chmod(0o000)
+        try:
+            with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+                with caplog.at_level(logging.WARNING, logger="hermes_cli.config"):
+                    result = read_raw_config()
+            assert result == {}
+            assert any("read_raw_config" in r.message for r in caplog.records), (
+                "Expected a WARNING log from read_raw_config on OSError"
+            )
+        finally:
+            config_path.chmod(0o644)
+            _RAW_CONFIG_CACHE.clear()
+
+
 class TestEmptyConfigSections:
     """Empty section keys (``terminal:`` with no value) parse as YAML None
     and must not replace the default dict for that section (#58277)."""

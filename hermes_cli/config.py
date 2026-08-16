@@ -3137,7 +3137,12 @@ def read_raw_config() -> Dict[str, Any]:
             config_path = get_config_path()
             st = config_path.stat()
             cache_key = (st.st_mtime_ns, st.st_size)
-        except (FileNotFoundError, OSError):
+        except (FileNotFoundError, OSError) as exc:
+            logger.warning(
+                "read_raw_config: could not stat %s: %s — returning empty config",
+                get_config_path(),
+                exc,
+            )
             return {}
 
         path_key = str(config_path)
