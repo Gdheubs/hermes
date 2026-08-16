@@ -24,9 +24,11 @@ def test_openai_chat_completions_gets_compaction_not_strip():
     assert diag.compacted == 1 and "--- head ---" in messages[1]["content"]
     assert messages[0]["reasoning_content"] == "x" * 100  # strip NOT applied
     assert diag.stripped_reasoning == 0
-    # Anthropic-schema wires are the exception: fully untouched.
-    out2, diag2 = apply_deepseek_replay_compaction(messages, api_mode="anthropic_messages", **_OPENAI)
-    assert out2 is messages and diag2.compacted == 0 and diag2.tokens_saved == 0
+    # Wire-agnostic: fresh Anthropic input compacts too.
+    fresh = [{"role": "assistant", "content": "plain", "reasoning_content": "x" * 100},
+             {"role": "tool", "tool_call_id": "t1", "content": "z" * 13000}]
+    out2, diag2 = apply_deepseek_replay_compaction(fresh, **_OPENAI)
+    assert diag2.compacted == 1 and "--- head ---" in fresh[1]["content"]
 
 
 def test_compaction_thresholds():
@@ -149,30 +151,30 @@ def test_apply_uses_custom_limits():
 # wire-agnostic, so the provider column is display-only here.
 _COMPACTION_WIRES = [
     # (provider, model, base_url, api_mode, expect_compacted)
-    ("Anthropic", "claude-fable-5", "", "anthropic_messages", True),
-    ("Anthropic", "claude-opus-5", "", "anthropic_messages", True),
-    ("Anthropic", "claude-sonnet-5", "", "anthropic_messages", True),
-    ("Anthropic", "claude-opus-4-8", "", "anthropic_messages", True),
-    ("OpenAI", "gpt-5.6", "", "chat_completions", True),
-    ("OpenAI", "gpt-5.5", "", "chat_completions", True),
-    ("Google", "gemini-3.7-flash", "", "chat_completions", True),
-    ("Google", "gemini-3.6-flash", "", "chat_completions", True),
-    ("Google", "gemini-3.1-pro", "", "chat_completions", True),
-    ("Meta", "muse-spark-1.2", "", "chat_completions", True),
-    ("Meta", "muse-glimmer", "", "chat_completions", True),
-    ("xAI", "grok-4.6", "", "chat_completions", True),
-    ("xAI", "grok-4.5", "", "chat_completions", True),
-    ("DeepSeek", "deepseek-v4-pro", "https://api.deepseek.com/v1", "chat_completions", True),
-    ("DeepSeek", "deepseek-v4-flash", "https://api.deepseek.com/v1", "chat_completions", True),
-    ("DeepSeek", "deepseek-v4-pro", "https://api.deepseek.com/v1", "anthropic_messages", True),
-    ("Moonshot AI", "kimi-k3", "https://api.moonshot.ai/v1", "chat_completions", True),
-    ("Moonshot AI", "kimi-k2.7", "https://api.moonshot.ai/v1", "chat_completions", True),
-    ("Z.ai", "glm-5.2", "", "chat_completions", True),
-    ("Z.ai", "glm-5.1", "", "chat_completions", True),
-    ("MiMo", "MiMo-V2.5-Pro", "https://api.xiaomimimo.com/v1", "chat_completions", True),
-    ("MiMo", "MiMo-V2.5", "https://api.xiaomimimo.com/v1", "chat_completions", True),
-    ("Mistral", "mistral-medium-3.5", "", "chat_completions", True),
-    ("Mistral", "mistral-small-4", "", "chat_completions", True),
+    ("Anthropic", "claude-fable-5", "", True),
+    ("Anthropic", "claude-opus-5", "", True),
+    ("Anthropic", "claude-sonnet-5", "", True),
+    ("Anthropic", "claude-opus-4-8", "", True),
+    ("OpenAI", "gpt-5.6", "", True),
+    ("OpenAI", "gpt-5.5", "", True),
+    ("Google", "gemini-3.7-flash", "", True),
+    ("Google", "gemini-3.6-flash", "", True),
+    ("Google", "gemini-3.1-pro", "", True),
+    ("Meta", "muse-spark-1.2", "", True),
+    ("Meta", "muse-glimmer", "", True),
+    ("xAI", "grok-4.6", "", True),
+    ("xAI", "grok-4.5", "", True),
+    ("DeepSeek", "deepseek-v4-pro", "https://api.deepseek.com/v1", True),
+    ("DeepSeek", "deepseek-v4-flash", "https://api.deepseek.com/v1", True),
+    ("DeepSeek", "deepseek-v4-pro", "https://api.deepseek.com/v1", True),
+    ("Moonshot AI", "kimi-k3", "https://api.moonshot.ai/v1", True),
+    ("Moonshot AI", "kimi-k2.7", "https://api.moonshot.ai/v1", True),
+    ("Z.ai", "glm-5.2", "", True),
+    ("Z.ai", "glm-5.1", "", True),
+    ("MiMo", "MiMo-V2.5-Pro", "https://api.xiaomimimo.com/v1", True),
+    ("MiMo", "MiMo-V2.5", "https://api.xiaomimimo.com/v1", True),
+    ("Mistral", "mistral-medium-3.5", "", True),
+    ("Mistral", "mistral-small-4", "", True),
 ]
 
 _STRIP_WIRES = [
@@ -190,12 +192,12 @@ import pytest
 
 
 @pytest.mark.parametrize(
-    "provider,model,base_url,api_mode,expect_compacted", _COMPACTION_WIRES
+    "provider,model,base_url,expect_compacted", _COMPACTION_WIRES
 )
-def test_compaction_all_wires(provider, model, base_url, api_mode, expect_compacted):
+def test_compaction_all_wires(provider, model, base_url, expect_compacted):
     messages = [{"role": "tool", "tool_call_id": "t1", "content": "b" * 13000}]
     _, diag = apply_deepseek_replay_compaction(
-        messages, model=model, base_url=base_url, api_mode=api_mode
+        messages, model=model, base_url=base_url
     )
     assert (diag.compacted == 1) == expect_compacted, f"{provider}: compacted={diag.compacted}"
 
@@ -248,7 +250,7 @@ def test_compacted_content_reaches_anthropic_tool_result_block():
     msgs = [{"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}]},
             {"role": "tool", "tool_call_id": "c1", "content": "b" * 13000}]
     out, diag = apply_deepseek_replay_compaction(
-        msgs, provider="anthropic", model="claude-sonnet-4.7", base_url="", api_mode="anthropic_messages"
+        msgs, provider="anthropic", model="claude-sonnet-4.7", base_url=""
     )
     assert diag.compacted == 1
     _, converted = convert_messages_to_anthropic(out)
@@ -272,7 +274,7 @@ def test_deepseek_via_anthropic_strip_survives_conversion():
             {"role": "tool", "tool_call_id": "c1", "content": "b" * 13000}]
     out, diag = apply_deepseek_replay_compaction(
         msgs, provider="deepseek", model="deepseek-v4-flash",
-        base_url="https://api.deepseek.com/v1", api_mode="anthropic_messages"
+        base_url="https://api.deepseek.com/v1"
     )
     assert diag.stripped_reasoning == 1 and diag.compacted == 1
     # The adapter requires reasoning_content on every replayed tool-call turn;
@@ -293,7 +295,7 @@ def test_unicode_compaction_survives_anthropic_conversion():
     msgs = [{"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}]},
             {"role": "tool", "tool_call_id": "c1", "content": content}]
     out, diag = apply_deepseek_replay_compaction(
-        msgs, provider="anthropic", model="claude-sonnet-4.7", base_url="", api_mode="anthropic_messages"
+        msgs, provider="anthropic", model="claude-sonnet-4.7", base_url=""
     )
     assert diag.compacted == 1
     _, converted = convert_messages_to_anthropic(out)
@@ -314,7 +316,7 @@ def test_strip_never_removes_thinking_content_blocks():
             {"role": "tool", "tool_call_id": "c1", "content": "b" * 13000}]
     out, diag = apply_deepseek_replay_compaction(
         msgs, provider="deepseek", model="deepseek-v4-flash",
-        base_url="https://api.deepseek.com/anthropic", api_mode="anthropic_messages"
+        base_url="https://api.deepseek.com/anthropic"
     )
     assert diag.stripped_reasoning == 2  # both plain turns: field removed
     thinking_turn = next(m for m in out if isinstance(m.get("content"), list))
@@ -331,7 +333,7 @@ def test_compacted_content_reaches_bedrock_tool_result_block():
     msgs = [{"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "function": {"name": "f", "arguments": "{}"}}]},
             {"role": "tool", "tool_call_id": "c1", "content": "b" * 13000}]
     out, diag = apply_deepseek_replay_compaction(
-        msgs, provider="bedrock", model="claude-sonnet-4.7", base_url="", api_mode="bedrock_converse"
+        msgs, provider="bedrock", model="claude-sonnet-4.7", base_url=""
     )
     assert diag.compacted == 1
     _, converted = convert_messages_to_converse(out)

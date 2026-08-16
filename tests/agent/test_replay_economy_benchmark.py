@@ -52,7 +52,7 @@ def test_wire_gates_still_hold():
     assert diag.compacted >= 8, f"openai compacted={diag.compacted}: compaction lost for OpenAI"
     # Anthropic-schema wires get compaction too (string compaction runs
     # pre-conversion into tool_result blocks); the strip never applies there.
-    _, diag = apply_deepseek_replay_compaction(_deepseek_session(), api_mode="anthropic_messages", **_OPENAI)
+    _, diag = apply_deepseek_replay_compaction(_deepseek_session(), **_OPENAI)
     assert diag.compacted >= 8, "anthropic wire lost compaction"
     assert diag.stripped_reasoning == 0, "strip must not fire on non-echo providers"
     # DeepSeekReplayDiagnostics shape is stable (used by merge/display).

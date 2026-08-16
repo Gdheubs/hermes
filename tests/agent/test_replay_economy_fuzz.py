@@ -123,26 +123,6 @@ def test_apply_idempotent_under_fuzz(n_tools, n_plain, content, reasoning):
 
 @settings(max_examples=_MAX_EXAMPLES, deadline=None)
 @given(
-    api_mode=st.one_of(st.none(), st.text(min_size=0, max_size=24)),
-    content=st.text(max_size=20_000),
-)
-def test_apply_never_crashes_for_any_wire_mode(api_mode, content):
-    # Unknown/None api_mode must not crash and must behave deterministically;
-    # only anthropic-schema modes are exempt (covered by the wire matrix).
-    msgs = [{"role": "tool", "tool_call_id": "t1", "content": content}]
-    out1, diag1 = apply_deepseek_replay_compaction(
-        msgs, provider="openai", model="gpt-4o", base_url="", api_mode=api_mode
-    )
-    out2, diag2 = apply_deepseek_replay_compaction(
-        [dict(m) for m in out1], provider="openai", model="gpt-4o", base_url="", api_mode=api_mode
-    )
-    assert [dict(m) for m in out2] == [dict(m) for m in out1]  # idempotent
-    assert diag1 == diag2  # deterministic
-    assert diag1.compacted <= 1 and diag1.raw_tokens >= 0
-
-
-@settings(max_examples=_MAX_EXAMPLES, deadline=None)
-@given(
     n_tools=st.integers(min_value=0, max_value=3),
     content=st.text(max_size=20_000),
 )
@@ -175,7 +155,7 @@ def test_apply_never_touches_api_content_sidecars(api_content):
     msgs = [{"role": "user", "content": "scaffold", "api_content": api_content},
             {"role": "tool", "tool_call_id": "t1", "content": "b" * 13000}]
     out, _ = apply_deepseek_replay_compaction(
-        msgs, provider="anthropic", model="claude-sonnet-4.7", base_url="", api_mode="anthropic_messages"
+        msgs, provider="anthropic", model="claude-sonnet-4.7", base_url=""
     )
     assert out[0]["api_content"] == api_content and out[0]["content"] == "scaffold"
 
@@ -193,7 +173,7 @@ def test_deepseek_via_anthropic_wire_is_safe_and_idempotent(n_tools, n_plain, co
     def _run(msgs):
         return apply_deepseek_replay_compaction(
             msgs, provider="deepseek", model="deepseek-v4-flash",
-            base_url="https://api.deepseek.com/v1", api_mode="anthropic_messages",
+            base_url="https://api.deepseek.com/v1",
         )
     msgs = _random_session(n_tools, n_plain, content, reasoning)
     out1, diag1 = _run(msgs)

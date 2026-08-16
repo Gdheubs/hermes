@@ -2810,7 +2810,6 @@ def run_conversation(
                     provider=agent.provider,
                     model=agent.model,
                     base_url=agent.base_url,
-                    api_mode=agent.api_mode,
                     limits=replay_compaction_limits(agent.provider),
                 )
                 if _replay_diag.tokens_saved > 0 or _replay_diag.stripped_reasoning > 0:

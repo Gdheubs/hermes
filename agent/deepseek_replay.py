@@ -165,7 +165,6 @@ def apply_deepseek_replay_compaction(
     provider: str | None = None,
     model: str | None = None,
     base_url: str | None = None,
-    api_mode: str | None = "chat_completions",
     limits: "ReplayCompactionLimits | None" = None,
 ) -> tuple[list, DeepSeekReplayDiagnostics]:
     """Apply the wire-time economy on the send copy (per-send clones only)."""

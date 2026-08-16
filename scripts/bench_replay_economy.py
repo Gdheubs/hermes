@@ -49,7 +49,7 @@ _WIRES = {
     "kimi": {"provider": "kimi-coding", "model": "kimi-k3", "base_url": "https://api.moonshot.ai/v1"},
     "zai": {"provider": "zai-org", "model": "glm-5.2", "base_url": ""},
     "openai": {"provider": "openai", "model": "gpt-4o", "base_url": ""},
-    "anthropic": {"provider": "anthropic", "model": "claude-sonnet-4.7", "base_url": "", "api_mode": "anthropic_messages"},
+    "anthropic": {"provider": "anthropic", "model": "claude-sonnet-4.7", "base_url": ""},
 }
 
 
@@ -65,7 +65,6 @@ def score(wire: str = "deepseek") -> dict:
         provider=cfg.get("provider"),
         model=cfg.get("model"),
         base_url=cfg.get("base_url"),
-        api_mode=cfg.get("api_mode", "chat_completions"),
     )
     wire_tokens = estimate_messages_tokens_rough(out)
     return {
