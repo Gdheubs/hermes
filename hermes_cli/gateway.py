@@ -4638,6 +4638,16 @@ def generate_launchd_plist() -> str:
         <string>{venv_dir}</string>
         <key>HERMES_HOME</key>
         <string>{hermes_home}</string>
+        <!-- The stderr_timestamp wrapper makes the gateway a grandchild of
+             launchd. macOS 26 rewrites XPC_SERVICE_NAME to "0" for any
+             process launchd did not spawn directly, so the gateway's own
+             supervised-conflict guard misidentifies itself as a rogue
+             foreground start (it probes `launchctl list`, sees the live
+             wrapper PID, and refuses — wedging the service into a
+             KeepAlive respawn/refuse loop). This opt-in survives wrappers
+             and marks the process as the supervised service. -->
+        <key>HERMES_GATEWAY_EXTERNAL_SUPERVISOR</key>
+        <string>1</string>
     </dict>
 
     <key>LimitLoadToSessionType</key>

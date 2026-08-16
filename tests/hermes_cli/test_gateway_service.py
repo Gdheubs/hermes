@@ -264,6 +264,25 @@ class TestGeneratedSystemdUnits:
 
 
 
+    def test_launchd_plist_marks_gateway_as_externally_supervised(self):
+        """The plist wraps `gateway run` in stderr_timestamp, making the gateway a
+        grandchild of launchd. macOS 26 rewrites XPC_SERVICE_NAME to "0" for any
+        process launchd didn't spawn directly, so the gateway loses its supervisor
+        marker and _guard_supervised_gateway_conflict misidentifies the service's
+        own startup as a rogue foreground run and refuses — wedging KeepAlive into
+        a respawn/refuse loop. The plist must emit
+        HERMES_GATEWAY_EXTERNAL_SUPERVISOR=1, the wrapper-survival opt-in from
+        gateway/restart.py, so the guard sees the service for what it is."""
+        import plistlib
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        data = plistlib.loads(plist.encode())
+        assert (
+            data["EnvironmentVariables"]["HERMES_GATEWAY_EXTERNAL_SUPERVISOR"] == "1"
+        )
+
+
 class TestGatewayStopCleanup:
     @pytest.mark.linux_only
     def test_stop_only_kills_current_profile_by_default(self, tmp_path, monkeypatch):
