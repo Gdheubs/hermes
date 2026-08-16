@@ -1135,18 +1135,27 @@ def _confirm_startup_expensive_model_override(args) -> None:
 
     try:
         from hermes_cli.config import load_config
-        from hermes_cli.model_selection_guards import combined_selection_warning
+        from hermes_cli.model_selection_guards import (
+            combined_message,
+            selection_warnings,
+        )
     except Exception as exc:
         logger.warning("startup model cost guard unavailable: %s", exc)
         return
 
     try:
-        model_cfg = (load_config().get("model") or {})
+        config = load_config()
     except Exception as exc:
         logger.warning("startup model cost guard could not load config: %s", exc)
-        model_cfg = {}
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
+    model_cfg = config.get("model") or {}
     if not isinstance(model_cfg, dict):
         model_cfg = {}
+    security_cfg = config.get("security") or {}
+    if not isinstance(security_cfg, dict):
+        security_cfg = {}
 
     model = explicit_model or (model_cfg.get("default") or "").strip()
     if not model:
@@ -1155,7 +1164,7 @@ def _confirm_startup_expensive_model_override(args) -> None:
     try:
         # Unified registry: cost guard + id-keyed guards (e.g. the
         # data-training-tier warning) all fire at startup too.
-        warning = combined_selection_warning(
+        warnings = selection_warnings(
             model,
             provider=provider,
             base_url=(model_cfg.get("base_url") or ""),
@@ -1164,15 +1173,41 @@ def _confirm_startup_expensive_model_override(args) -> None:
     except Exception as exc:
         logger.warning("startup model cost guard failed for %s/%s: %s", provider, model, exc)
         return
-    if warning is None:
+    if not warnings:
         return
 
     # Cost and provider-routing confirmation is intentionally independent of
     # --yolo / --accept-hooks: those flags approve local command/tool risk, not
     # paid aggregator spend or a surprising provider route.
-    message = warning.message
-    if not sys.stdin.isatty():
+    is_interactive = sys.stdin.isatty()
+    allow_unattended_data_training = (
+        security_cfg.get("allow_data_training_tiers_noninteractive") is True
+    )
+    if not is_interactive and allow_unattended_data_training:
+        acknowledged = [
+            warning for warning in warnings if warning.kind == "data_policy"
+        ]
+        if acknowledged:
+            sys.stderr.write(combined_message(acknowledged) + "\n")
+            sys.stderr.write(
+                "Proceeding in non-interactive mode because "
+                "security.allow_data_training_tiers_noninteractive is true.\n"
+            )
+            warnings = [
+                warning for warning in warnings if warning.kind != "data_policy"
+            ]
+            if not warnings:
+                return
+
+    message = combined_message(warnings)
+    if not is_interactive:
         sys.stderr.write(message + "\n")
+        if any(warning.kind == "data_policy" for warning in warnings):
+            sys.stderr.write(
+                "To acknowledge data-training tiers for unattended runs, set "
+                "security.allow_data_training_tiers_noninteractive to true "
+                "in config.yaml.\n"
+            )
         sys.stderr.write(
             "Refusing this startup model override in non-interactive mode. "
             "Run interactively and confirm if you intend to use it.\n"
@@ -1777,6 +1812,127 @@ def _resolve_session_by_name_or_id(name_or_id: str) -> Optional[str]:
     return None
 
 
+def _create_titled_session(title: str) -> Optional[str]:
+    """Create a fresh session with the given title; return its session id.
+
+    Used by ``chat -c <title> --create-if-missing`` (#86794): programmatic
+    callers (plugins, scripts) that want "send to this named thread, making
+    it if needed" get a deterministic outcome instead of a silent no-op.
+
+    The session id follows the same timestamp+uuid shape the CLI uses for a
+    brand-new session; the title is recorded with user provenance so
+    auto-titling never overwrites it.
+    """
+    db = None
+    try:
+        import uuid as _uuid
+
+        from hermes_state import SessionDB
+
+        now = datetime.now()
+        timestamp_str = now.strftime("%Y%m%d_%H%M%S")
+        short_uuid = _uuid.uuid4().hex[:6]
+        new_session_id = f"{timestamp_str}_{short_uuid}"
+
+        db = SessionDB()
+        db.create_session(new_session_id, source="cli")
+        db.set_session_title(new_session_id, title)
+        return new_session_id
+    except Exception:
+        # Programmatic callers (the #86794 use case) rely on --create-if-missing
+        # being deterministic; swallow the failure to keep the error path simple,
+        # but log the underlying cause so it lands in errors.log and stays
+        # debuggable (DB lock, I/O error, import error — all otherwise invisible).
+        logger.exception("Failed to create titled session %r", title)
+        return None
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+def _resolve_continue_arg(args, *, use_tui: bool) -> None:
+    """Resolve ``-c/--continue`` into ``args.resume``.
+
+    Handles both forms:
+    - ``-c <name>``: resolve by title/ID. On miss, fail loudly on **stderr**
+      (exit 1) so programmatic callers see the error even under quiet mode
+      (#86794); with ``--create-if-missing``, create a fresh titled session
+      and resume into it instead.
+    - bare ``-c``: continue this terminal's breadcrumb session if valid,
+      else the most recent session (workspace-scoped MRU, then global
+      fallback).
+    """
+    continue_val = getattr(args, "continue_last", None)
+    if continue_val and not getattr(args, "resume", None):
+        if isinstance(continue_val, str):
+            # -c "session name" — resolve by title or ID
+            resolved = _resolve_session_by_name_or_id(continue_val)
+            if resolved:
+                args.resume = resolved
+            elif getattr(args, "create_if_missing", False):
+                # --create-if-missing: no session matches the title — create a
+                # new session with that title and proceed. This is the
+                # programmatic-caller primitive ("send to this named thread,
+                # making it if needed"); without it a background/quiet send to
+                # a not-yet-existing named session silently no-ops (#86794).
+                new_sid = _create_titled_session(continue_val)
+                if new_sid:
+                    args.resume = new_sid
+                else:
+                    print(
+                        f"No session found matching '{continue_val}' and "
+                        "a new titled session could not be created.",
+                        file=sys.stderr,
+                    )
+                    sys.exit(1)
+            else:
+                print(f"No session found matching '{continue_val}'.", file=sys.stderr)
+                print(
+                    "Use 'hermes sessions list' to see available sessions, or "
+                    "pass --create-if-missing to start a new session with that title.",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+        else:
+            # -c with no argument — prefer this terminal's own breadcrumb
+            # (written at session start / rotation) so side-by-side terminals
+            # each continue their own conversation. Falls back to the
+            # most-recent session when there is no valid breadcrumb, or when
+            # session.terminal_continue is false in config.yaml.
+            if getattr(args, "create_if_missing", False):
+                # --create-if-missing only makes sense with a named session;
+                # with a bare -c there is nothing to create, so surface the
+                # no-op to programmatic callers instead of silently ignoring it.
+                print(
+                    "--create-if-missing requires a session name: "
+                    "`-c <name> --create-if-missing`",
+                    file=sys.stderr,
+                )
+            try:
+                from hermes_cli.terminal_breadcrumbs import resolve_breadcrumb_session
+
+                _crumb_id = resolve_breadcrumb_session()
+            except Exception:
+                _crumb_id = None
+            if _crumb_id:
+                args.resume = _crumb_id
+            else:
+                # No valid breadcrumb — continue the most recent session
+                source = "tui" if use_tui else "cli"
+                last_id = _resolve_last_session(source=source)
+                if not last_id and source == "tui":
+                    last_id = _resolve_last_session(source="cli")
+                if last_id:
+                    args.resume = last_id
+                else:
+                    kind = "TUI" if use_tui else "CLI"
+                    print(f"No previous {kind} session found to continue.")
+                    sys.exit(1)
+
+
 def _read_tui_active_session_file(path: Optional[str]) -> Optional[str]:
     if not path:
         return None
@@ -2187,6 +2343,15 @@ def _ensure_tui_workspace(tui_dir: Path) -> None:
     sys.exit(1)
 
 
+def _npm_lifecycle_env(env: dict[str, str] | None = None) -> dict[str, str]:
+    """Build a clean environment for the pinned UI toolchain lifecycle."""
+    run_env = {**os.environ, **(env or {}), "CI": "1"}
+    # esbuild treats this as an executable override. If a shell points it at a
+    # different release, the pinned package's postinstall rejects that binary.
+    run_env.pop("ESBUILD_BINARY_PATH", None)
+    return run_env
+
+
 def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
     """TUI: --dev → tsx src; else node dist (HERMES_TUI_DIR prebuilt or esbuild)."""
     _ensure_tui_node()
@@ -2317,7 +2482,7 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                env={**with_hermes_node_path(), "CI": "1"},
+                env=_npm_lifecycle_env(with_hermes_node_path()),
             )
 
         result = _run_tui_install()
@@ -2358,6 +2523,7 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=_npm_lifecycle_env(),
         )
         if result.returncode != 0:
             combined = f"{result.stdout or ''}{result.stderr or ''}".strip()
@@ -2388,6 +2554,7 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=_npm_lifecycle_env(),
         )
         if result.returncode != 0:
             combined = f"{result.stdout or ''}{result.stderr or ''}".strip()
@@ -2813,43 +2980,7 @@ def cmd_chat(args):
             sys.exit(1)
 
     # Resolve --continue into --resume with the latest session or by name
-    continue_val = getattr(args, "continue_last", None)
-    if continue_val and not getattr(args, "resume", None):
-        if isinstance(continue_val, str):
-            # -c "session name" — resolve by title or ID
-            resolved = _resolve_session_by_name_or_id(continue_val)
-            if resolved:
-                args.resume = resolved
-            else:
-                print(f"No session found matching '{continue_val}'.")
-                print("Use 'hermes sessions list' to see available sessions.")
-                sys.exit(1)
-        else:
-            # -c with no argument — prefer this terminal's own breadcrumb
-            # (written at session start / rotation) so side-by-side terminals
-            # each continue their own conversation. Falls back to the
-            # most-recent session when there is no valid breadcrumb, or when
-            # session.terminal_continue is false in config.yaml.
-            try:
-                from hermes_cli.terminal_breadcrumbs import resolve_breadcrumb_session
-
-                _crumb_id = resolve_breadcrumb_session()
-            except Exception:
-                _crumb_id = None
-            if _crumb_id:
-                args.resume = _crumb_id
-            else:
-                # No valid breadcrumb — continue the most recent session
-                source = "tui" if use_tui else "cli"
-                last_id = _resolve_last_session(source=source)
-                if not last_id and source == "tui":
-                    last_id = _resolve_last_session(source="cli")
-                if last_id:
-                    args.resume = last_id
-                else:
-                    kind = "TUI" if use_tui else "CLI"
-                    print(f"No previous {kind} session found to continue.")
-                    sys.exit(1)
+    _resolve_continue_arg(args, use_tui=use_tui)
 
     # --resume @claude / --resume @codex: import a foreign session (Claude
     # Code / Codex CLI) and resume the newly created Hermes session.
@@ -5924,7 +6055,7 @@ def _run_npm_install_deterministic(
     # unicode-animations' postinstall animates to /dev/tty (bypasses
     # --silent/capture_output). It no-ops when CI is set — same as the TUI
     # install path and nix/lib.nix npm ci hooks.
-    run_env = {**os.environ, **(env or {}), "CI": "1"}
+    run_env = _npm_lifecycle_env(env)
 
     def _run(cmd: list[str]) -> subprocess.CompletedProcess:
         return _run_npm_watching_for_engine_failure(
@@ -6115,7 +6246,7 @@ def _do_build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
             _say("Web UI frontend not built and npm is not available.")
             _say("Install Node.js, then run:  cd web && npm install && npm run build")
         return not fatal
-    build_env = with_hermes_node_path()
+    build_env = _npm_lifecycle_env(with_hermes_node_path())
     _say("→ Building web UI...")
 
     def _relay(result: "subprocess.CompletedProcess") -> None:
@@ -7702,6 +7833,7 @@ def cmd_gui(args: argparse.Namespace):
             if _force_adhoc_macos_signing(env, source_mode=source_mode):
                 print("  → No Developer ID configured; ad-hoc signing this local rebuild "
                       "(CSC_IDENTITY_AUTO_DISCOVERY=false)")
+            npm_build_env = _npm_lifecycle_env(env)
             if not source_mode:
                 # A running desktop instance launched from release/win-unpacked
                 # holds Hermes.exe locked on Windows, so the pack can't replace
@@ -7711,7 +7843,9 @@ def cmd_gui(args: argparse.Namespace):
                 stopped = _stop_desktop_processes_locking_build(desktop_dir)
                 if stopped:
                     print(f"  ⚠ Stopped running desktop app to free the build output (pid {', '.join(map(str, stopped))})")
-            build_result = subprocess.run([npm, "run", build_script], cwd=desktop_dir, env=env, check=False)
+            build_result = subprocess.run(
+                [npm, "run", build_script], cwd=desktop_dir, env=npm_build_env, check=False
+            )
             if (
                 build_result.returncode != 0
                 and not source_mode
@@ -7738,7 +7872,9 @@ def cmd_gui(args: argparse.Namespace):
                     # The purge can't remove a win-unpacked tree whose Hermes.exe
                     # is still locked by a running instance; stop it before retry.
                     _stop_desktop_processes_locking_build(desktop_dir)
-                    build_result = subprocess.run([npm, "run", build_script], cwd=desktop_dir, env=env, check=False)
+                    build_result = subprocess.run(
+                        [npm, "run", build_script], cwd=desktop_dir, env=npm_build_env, check=False
+                    )
             if (
                 build_result.returncode != 0
                 and not source_mode
@@ -7749,7 +7885,7 @@ def cmd_gui(args: argparse.Namespace):
                       "GitHub looks blocked. Re-downloading via a public mirror "
                       "(npmmirror.com)... (set ELECTRON_MIRROR to use another mirror)")
                 mirror = _ELECTRON_FALLBACK_MIRROR
-                mirror_env = dict(env)
+                mirror_env = dict(npm_build_env)
                 mirror_env["ELECTRON_MIRROR"] = mirror
                 if not _electron_dist_ok(PROJECT_ROOT):
                     _redownload_electron_dist(PROJECT_ROOT, env, mirror=mirror)
