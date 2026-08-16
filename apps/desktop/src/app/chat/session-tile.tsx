@@ -15,42 +15,23 @@
  */
 
 import { useStore } from '@nanostores/react'
-import { useQueryClient } from '@tanstack/react-query'
-import { atom, computed } from 'nanostores'
-import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
+import { atom } from 'nanostores'
+import { useCallback, useRef, useSyncExternalStore } from 'react'
 
-import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
-import { useModelControls } from '@/app/session/hooks/use-model-controls'
-import { blobToDataUrl } from '@/app/session/hooks/use-prompt-actions/utils'
-import { resolveStoredSession } from '@/app/session/hooks/use-session-actions/utils'
-import { ModelMenuPanel } from '@/app/shell/model-menu-panel'
-import { formatRefValue } from '@/components/assistant-ui/directive-text'
-import { CenteredThreadSpinner } from '@/components/assistant-ui/thread/status'
 import { findGroupOfPane } from '@/components/pane-shell/tree/model'
 import { $layoutTree, closeTreePane, moveTreePane, setTreeGroupHeaderHidden } from '@/components/pane-shell/tree/store'
-import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
-import { transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
-import type { ChatMessage } from '@/lib/chat-messages'
 import { NEW_SESSION_TITLE, sessionTitle } from '@/lib/chat-runtime'
-import { createComposerAttachmentScope, draftTitleFor } from '@/store/composer'
+import { draftTitleFor } from '@/store/composer'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $projectTree } from '@/store/projects'
-import { sessionAwaitingInput } from '@/store/prompts'
-import {
-  $gatewayState,
-  $selectedStoredSessionId,
-  $sessions,
-  sessionMatchesStoredId,
-  sessionPinId
-} from '@/store/session'
+import { $selectedStoredSessionId, $sessions, sessionMatchesStoredId, sessionPinId } from '@/store/session'
 import {
   $sessionStates,
   $sessionTiles,
   closeSessionTile,
-  discardSessionTile,
   patchSessionTile,
   type SessionTile,
   sessionTileDelegate
@@ -58,307 +39,52 @@ import {
 import type { SessionInfo } from '@/types/hermes'
 
 import type { SessionDragPayload } from './composer/inline-refs'
-import { type ComposerScope, ComposerScopeProvider } from './composer/scope'
-import { useComposerActions } from './hooks/use-composer-actions'
 import { paneMirror } from './pane-mirror'
 import { SessionDraftTitle } from './session-draft-title'
 import { startSessionDrag } from './session-drag'
 import { SessionStatusDot } from './session-status-dot'
-import { useSessionTileActions } from './session-tile-actions'
-import { type SessionView, SessionViewProvider } from './session-view'
+import { SessionSurfaceCore } from './session-surface'
 import { SessionContextMenu } from './sidebar/session-actions-menu'
-import { lastVisibleMessageIsUser } from './thread-loading'
 
-import { ChatView } from '.'
+/** Resolve a tile's owning profile for the embedded surface: the stored row's
+ * owner when listed, else the active gateway profile (a fresh ⌘T tab's session
+ * was created there). Empty only before either resolves. */
+function useTileProfile(storedSessionId: string): string {
+  const subscribe = useCallback((onChange: () => void) => {
+    const offSessions = $sessions.listen(onChange)
+    const offTree = $projectTree.listen(onChange)
+    const offProfile = $activeGatewayProfile.listen(onChange)
 
-const NO_MESSAGES: ChatMessage[] = []
-
-/** The tile's SessionView: the same atom shape the primary chat renders
- *  from, computed from this session's slice of `$sessionStates`. */
-function buildTileView(storedSessionId: string): SessionView {
-  const $runtimeId = computed(
-    $sessionTiles,
-    tiles => tiles.find(t => t.storedSessionId === storedSessionId)?.runtimeId ?? null
-  )
-
-  const $state = computed([$runtimeId, $sessionStates], (runtimeId, states) =>
-    runtimeId ? states[runtimeId] : undefined
-  )
-
-  const $messages = computed($state, state => state?.messages ?? NO_MESSAGES)
-
-  return {
-    kind: 'tile',
-    $awaitingResponse: computed($state, state => Boolean(state?.awaitingResponse)),
-    $busy: computed($state, state => Boolean(state?.busy)),
-    $cwd: computed($state, state => state?.cwd ?? ''),
-    $fast: computed($state, state => Boolean(state?.fast)),
-    $lastVisibleIsUser: computed($messages, lastVisibleMessageIsUser),
-    $messages,
-    $messagesEmpty: computed($messages, messages => messages.length === 0),
-    $model: computed($state, state => state?.model ?? ''),
-    $provider: computed($state, state => state?.provider ?? ''),
-    $reasoningEffort: computed($state, state => state?.reasoningEffort ?? ''),
-    $runtimeId,
-    // Constant for the tile's lifetime — a plain atom, not a computed.
-    $storedId: atom(storedSessionId)
-  }
-}
-
-// Module-level constants so these ChatView props are referentially stable —
-// tiles have no pin/delete affordance, and transcription needs no per-tile state.
-const noop = () => undefined
-
-const tileTranscribeAudio = async (audio: Blob) =>
-  (await transcribeAudio(await blobToDataUrl(audio), audio.type)).transcript
-
-function TileChat({
-  runtimeId,
-  storedSessionId,
-  view
-}: {
-  runtimeId: string
-  storedSessionId: string
-  view: SessionView
-}) {
-  const { gateway, requestGateway } = useGatewayRequest()
-  const queryClient = useQueryClient()
-  const { selectModel } = useModelControls({ queryClient, requestGateway })
-  const activeGatewayProfile = useStore($activeGatewayProfile)
-  const cwd = useStore(view.$cwd)
-  const gatewayOpen = useStore($gatewayState) === 'open'
-
-  // One attachment set + focus key per tile, stable for the tile's lifetime.
-  const attachments = useRef(createComposerAttachmentScope()).current
-
-  const scope = useMemo<ComposerScope>(
-    () => ({
-      $awaitingInput: sessionAwaitingInput(runtimeId),
-      $messages: view.$messages,
-      attachments,
-      target: `tile:${storedSessionId}`
-    }),
-    [attachments, runtimeId, storedSessionId, view.$messages]
-  )
-
-  const actions = useSessionTileActions({ runtimeId, scope, storedSessionId })
-
-  // The same attach/pick/paste/drop pipeline the primary composer uses,
-  // pointed at this tile's chips + session.
-  const composer = useComposerActions({
-    activeSessionId: runtimeId,
-    currentCwd: cwd,
-    requestGateway,
-    scope: {
-      add: attachments.add,
-      remove: attachments.remove,
-      target: scope.target,
-      update: attachments.update,
-      updateIfCurrent: attachments.updateIfCurrent
+    return () => {
+      offSessions()
+      offTree()
+      offProfile()
     }
-  })
+  }, [])
 
-  // ChatView is memo()d — every callback prop must be referentially stable or
-  // the memo never holds and each tile-level render (idle ticks, unrelated
-  // store updates) re-renders the whole chat shell. The individual composer
-  // functions are useCallback'd inside useComposerActions, so hoisting these
-  // wrappers onto them keeps identity stable across renders.
-  const { addContextRefAttachment, pasteClipboardImage, pickContextPaths, pickImages, removeAttachment } = composer
-
-  const onAddUrl = useCallback(
-    (url: string) => addContextRefAttachment(`@url:${formatRefValue(url)}`, url),
-    [addContextRefAttachment]
-  )
-
-  const onPasteClipboardImage = useCallback(
-    (opts?: { silent?: boolean }) => pasteClipboardImage(opts),
-    [pasteClipboardImage]
-  )
-
-  const onPickFiles = useCallback(() => void pickContextPaths('file'), [pickContextPaths])
-  const onPickFolders = useCallback(() => void pickContextPaths('folder'), [pickContextPaths])
-  const onPickImages = useCallback(() => void pickImages(), [pickImages])
-  const onRemoveAttachment = useCallback((id: string) => void removeAttachment(id), [removeAttachment])
-  const onRetryResume = useCallback(() => patchSessionTile(storedSessionId, { error: undefined }), [storedSessionId])
-
-  // Per-tile model menu — rendered under this tile's SessionView so the pill
-  // + switch target THIS runtime, not the primary (which may be mid-turn).
-  const modelMenuContent = useMemo(
-    () =>
-      gatewayOpen ? (
-        <ModelMenuPanel
-          gateway={gateway || undefined}
-          onSelectModel={selectModel}
-          profile={activeGatewayProfile}
-          requestGateway={requestGateway}
-        />
-      ) : null,
-    [activeGatewayProfile, gateway, gatewayOpen, requestGateway, selectModel]
-  )
-
-  return (
-    <SessionViewProvider value={view}>
-      <ComposerScopeProvider value={scope}>
-        <ChatView
-          gateway={gateway}
-          modelMenuContent={modelMenuContent}
-          onAddContextRef={addContextRefAttachment}
-          onAddUrl={onAddUrl}
-          onAttachDroppedItems={composer.attachDroppedItems}
-          onAttachImageBlob={composer.attachImageBlob}
-          onAttachPrCommentUrl={composer.attachPrCommentUrl}
-          onCancel={actions.cancelRun}
-          onDeleteSelectedSession={noop}
-          onDismissError={actions.dismissError}
-          onEdit={actions.editMessage}
-          onPasteClipboardImage={onPasteClipboardImage}
-          onPickFiles={onPickFiles}
-          onPickFolders={onPickFolders}
-          onPickImages={onPickImages}
-          onReload={actions.reloadFromMessage}
-          onRemoveAttachment={onRemoveAttachment}
-          onRestoreToMessage={actions.restoreToMessage}
-          onRetryResume={onRetryResume}
-          onSteer={actions.steerPrompt}
-          onSubmit={actions.submitText}
-          onThreadMessagesChange={actions.handleThreadMessagesChange}
-          onToggleSelectedPin={noop}
-          onTranscribeAudio={tileTranscribeAudio}
-        />
-      </ComposerScopeProvider>
-    </SessionViewProvider>
-  )
+  return useSyncExternalStore(subscribe, () => tileStoredRow(storedSessionId)?.profile ?? $activeGatewayProfile.get())
 }
 
 export function SessionTilePane({ storedSessionId }: { storedSessionId: string }) {
   const tiles = useStore($sessionTiles)
   const tile = tiles.find(t => t.storedSessionId === storedSessionId)
-  const runtimeId = tile?.runtimeId ?? null
-  const gatewayOpen = useStore($gatewayState) === 'open'
-  const resumingRef = useRef(false)
-  const view = useMemo(() => buildTileView(storedSessionId), [storedSessionId])
+  const profile = useTileProfile(storedSessionId)
 
-  // A tab-strip "+"/⌘T tab is created UNLISTED — its session stays out of
-  // $sessions (no sidebar clutter) until it's actually used, so the tab shows
-  // "New session". The moment this tile has a message, pull its row into
-  // $sessions via the lightweight by-id lookup so the tab (and a sidebar row)
-  // resolve the real title. `resolveStoredSession` no-ops when it's already
-  // listed, and 404s harmlessly for an in-memory draft that hasn't persisted a
-  // turn yet — so we retry across that brief persist lag and stop as soon as it
-  // lands (a global turn-complete refresh may beat us to it).
-  const hasMessages = useStore(view.$messagesEmpty) === false
+  // The surface owns the runtime binding; the tile only mirrors the live id so
+  // the tab's status dot, close-gate, and focus derivations keep reading it.
+  const onRuntimeSessionId = useCallback(
+    (runtimeId: string) => patchSessionTile(storedSessionId, { runtimeId }),
+    [storedSessionId]
+  )
 
-  useEffect(() => {
-    const alreadyListed = () => $sessions.get().some(s => sessionMatchesStoredId(s, storedSessionId))
-
-    if (!runtimeId || !hasMessages || alreadyListed()) {
-      return
-    }
-
-    let cancelled = false
-    let timer: number | undefined
-
-    const attempt = (remaining: number) => {
-      if (cancelled || alreadyListed()) {
-        return
-      }
-
-      void resolveStoredSession(storedSessionId)
-        .then(resolved => {
-          if (cancelled || resolved || remaining <= 0) {
-            return
-          }
-
-          timer = window.setTimeout(() => attempt(remaining - 1), 500)
-        })
-        .catch(() => undefined)
-    }
-
-    attempt(6)
-
-    return () => {
-      cancelled = true
-
-      if (timer !== undefined) {
-        window.clearTimeout(timer)
-      }
-    }
-  }, [hasMessages, runtimeId, storedSessionId])
-
-  // Same gating as the primary's route resume (use-route-resume): never fire
-  // session.resume before the gateway is OPEN. Persisted tiles mount at boot
-  // while it's still connecting — an ungated resume rejected there and
-  // latched every restored tile into the error card.
-  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
-  useEffect(() => {
-    if (!gatewayOpen || runtimeId || tile?.error || resumingRef.current) {
-      return
-    }
-
-    const delegate = sessionTileDelegate()
-
-    if (!delegate) {
-      return
-    }
-
-    resumingRef.current = true
-
-    delegate
-      .resumeTile(storedSessionId)
-      .then(id => patchSessionTile(storedSessionId, { error: undefined, runtimeId: id }))
-      .catch((err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err)
-
-        // A gone session (404 / "Session not found") is terminal — a stale or
-        // cross-profile persisted tile. Discard it instead of latching an error
-        // that re-retries on every reconnect (the "Session not found" spam).
-        if (/session not found|\b404\b/i.test(message)) {
-          discardSessionTile(storedSessionId)
-        } else {
-          patchSessionTile(storedSessionId, { error: message })
-        }
-      })
-      .finally(() => {
-        resumingRef.current = false
-      })
-  }, [gatewayOpen, runtimeId, storedSessionId, tile?.error])
-
-  // The gateway (re)opening invalidates any latched error — it likely came
-  // from a not-yet-open gateway or the previous connection. Clearing it
-  // retriggers the resume effect: one bounded auto-retry per (re)connect,
-  // mirroring the primary path's became-open resync.
-  useEffect(() => {
-    if (gatewayOpen && tile?.error) {
-      patchSessionTile(storedSessionId, { error: undefined })
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [gatewayOpen, storedSessionId])
-
-  if (tile?.error) {
-    return (
-      <div className="grid h-full place-items-center p-4">
-        <div className="max-w-[24rem] space-y-2 text-center font-mono text-[11px]">
-          <div className="text-(--ui-danger,#f87171)">Couldn't open this session</div>
-          <div className="break-words text-(--ui-text-quaternary)">{tile.error}</div>
-          <Button onClick={() => patchSessionTile(storedSessionId, { error: undefined })} size="sm" variant="outline">
-            Retry
-          </Button>
-        </div>
-      </div>
-    )
-  }
-
-  if (!runtimeId) {
-    // The SAME session loader the primary thread shows (Thread's
-    // loading === 'session' branch) — one loading language everywhere.
-    return (
-      <div className="relative h-full">
-        <CenteredThreadSpinner />
-      </div>
-    )
-  }
-
-  return <TileChat runtimeId={runtimeId} storedSessionId={storedSessionId} view={view} />
+  return (
+    <SessionSurfaceCore
+      onRuntimeSessionId={onRuntimeSessionId}
+      profile={profile}
+      runtimeSessionId={tile?.runtimeId}
+      storedSessionId={storedSessionId}
+    />
+  )
 }
 
 // ---------------------------------------------------------------------------

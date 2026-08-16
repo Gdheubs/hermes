@@ -200,6 +200,12 @@ export function notifyError(error: unknown, fallback: string): string {
   })
 }
 
+/** Keep raw legacy-primary detail, but replace profile-owned backend failures
+ * before they cross into any user-facing surface. */
+export function profiledPresentationError(error: unknown, fallback: string, ownerProfile?: null | string): unknown {
+  return ownerProfile ? new Error(fallback) : error
+}
+
 export function dismissNotification(id: string) {
   window.clearTimeout(timers.get(id))
   timers.delete(id)

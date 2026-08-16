@@ -11,6 +11,7 @@
 import type { AppendMessage, ThreadMessage } from '@assistant-ui/react'
 import { useCallback, useMemo, useRef } from 'react'
 
+import type { GatewayRequester } from '@/app/contrib/types'
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import type { ClientSessionState } from '@/app/types'
 import { useI18n } from '@/i18n'
@@ -20,7 +21,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { clearClarifyRequest } from '@/store/clarify'
 import type { ComposerAttachment } from '@/store/composer'
 import { resetSessionBackground } from '@/store/composer-status'
-import { notifyError } from '@/store/notifications'
+import { notifyError, profiledPresentationError } from '@/store/notifications'
 import { clearPreviewArtifacts } from '@/store/preview-status'
 import { clearAllPrompts } from '@/store/prompts'
 import { $connection, $sessions, sessionMatchesStoredId } from '@/store/session'
@@ -96,15 +97,59 @@ export function listTileSessionRow(deps: {
 }
 
 interface SessionTileActionsArgs {
+  /** Explicit owner profile; omitted is the primary chat's legacy routing. */
+  profile?: string
+  /**
+   * Surface-owned requester (non-activating, routed to the identity's owning
+   * profile backend). Supplied by the embedded SessionSurface; tiles omit it
+   * and fall back to the active gateway via useGatewayRequest.
+   */
+  requestGateway?: GatewayRequester
   runtimeId: string
   scope: ComposerScope
   storedSessionId: string
 }
 
-export function useSessionTileActions({ runtimeId, scope, storedSessionId }: SessionTileActionsArgs) {
+export function restoreErrorForSessionSurface(error: unknown, profile?: string): unknown {
+  return profiledPresentationError(error, 'Restore failed', profile)
+}
+
+export async function uploadSessionSurfaceAttachment(
+  attachment: ComposerAttachment,
+  opts: {
+    backendCwd?: null | string
+    onSessionRecovered?: (sessionId: string) => void
+    profile?: string
+    requestGateway: GatewayRequester
+    sessionId: string
+    storedSessionId?: null | string
+    terminalBackend?: string
+  }
+): Promise<ComposerAttachment> {
+  const connection = opts.profile
+    ? await window.hermesDesktop?.getConnection(opts.profile).catch(() => undefined)
+    : $connection.get()
+
+  return uploadComposerAttachment(attachment, {
+    backendCwd: opts.backendCwd,
+    // An explicitly-owned surface must fail safe when its descriptor is
+    // unavailable: byte upload cannot leak a host path to a remote backend.
+    remote: opts.profile ? connection?.mode !== 'local' : connection?.mode === 'remote',
+    requestGateway: opts.requestGateway,
+    sessionId: opts.sessionId,
+    storedSessionId: opts.storedSessionId,
+    onSessionRecovered: opts.onSessionRecovered,
+    terminalBackend: opts.terminalBackend
+  })
+}
+
+export function useSessionTileActions({ profile, requestGateway: surfaceRequestGateway, runtimeId, scope, storedSessionId }: SessionTileActionsArgs) {
+  const { requestGateway: activeGatewayRequest } = useGatewayRequest()
+  // A surface-owned requester (SessionSurface) routes to the identity's owning
+  // profile backend; tiles fall back to the active gateway.
+  const requestGateway = surfaceRequestGateway ?? activeGatewayRequest
   const { t } = useI18n()
   const copy = t.desktop
-  const { requestGateway } = useGatewayRequest()
 
   const runtimeIdRef = useRef(runtimeId)
   runtimeIdRef.current = runtimeId
@@ -137,8 +182,8 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
   const update = useCallback(
     (updater: (state: ClientSessionState) => ClientSessionState) =>
-      sessionTileDelegate()?.updateSession(runtimeIdRef.current, updater),
-    []
+      sessionTileDelegate()?.updateSession(runtimeIdRef.current, updater, profile),
+    [profile]
   )
 
   const readState = useCallback(() => $sessionStates.get()[runtimeIdRef.current], [])
@@ -169,12 +214,11 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
       attachments: ComposerAttachment[],
       options: { updateComposerAttachments?: boolean } = {}
     ): Promise<{ attachments: ComposerAttachment[]; sessionId: string }> => {
-      const remote = $connection.get()?.mode === 'remote'
       let liveSessionId = sessionId
       const synced: ComposerAttachment[] = []
 
-      // A tile owns its own runtime binding, so a recovery here rebinds the
-      // tile's ref rather than the foreground session's.
+      // A surface owns its own runtime binding, so a recovery here rebinds the
+      // surface's ref rather than the foreground session's.
       const onSessionRecovered = (recoveredId: string) => {
         liveSessionId = recoveredId
         runtimeIdRef.current = recoveredId
@@ -188,9 +232,9 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
         }
 
         if (attachment.kind === 'image' || attachment.kind === 'file') {
-          const next = await uploadComposerAttachment(attachment, {
+          const next = await uploadSessionSurfaceAttachment(attachment, {
             backendCwd: readState()?.cwd,
-            remote,
+            profile,
             requestGateway,
             sessionId: liveSessionId,
             storedSessionId: storedIdRef.current,
@@ -224,7 +268,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
       return { attachments: synced, sessionId: liveSessionId }
     },
-    [requestGateway, scope.attachments]
+    [profile, readState, requestGateway, scope.attachments]
   )
 
   // The REAL submit pipeline with tile seams: session always exists, and the
@@ -246,7 +290,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
     resumeStoredSession: () => undefined,
     selectedStoredSessionIdRef: storedIdRef,
     syncAttachmentsForSubmit,
-    updateSessionState: (sessionId, updater) => sessionTileDelegate()!.updateSession(sessionId, updater),
+    updateSessionState: (sessionId, updater) => sessionTileDelegate()!.updateSession(sessionId, updater, profile),
     scope: {
       removeAttachments: attachments => scope.attachments.removeOccurrences(attachments),
       readAttachments: () => scope.attachments.$attachments.get(),
@@ -314,9 +358,9 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
         }
       )
     } catch (err) {
-      notifyError(err, copy.stopFailed)
+      notifyError(profile ? new Error(copy.stopFailed) : err, copy.stopFailed)
     }
-  }, [copy.stopFailed, requestGateway, update])
+  }, [copy.stopFailed, profile, requestGateway, update])
 
   const steerPrompt = useCallback(
     async (rawText: string): Promise<boolean> => {
@@ -330,7 +374,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
       const messageId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
       const mutate = (updater: (state: ClientSessionState) => ClientSessionState) =>
-        sessionTileDelegate()?.updateSession(sessionId, updater)
+        sessionTileDelegate()?.updateSession(sessionId, updater, profile)
 
       // Match the primary composer: record the correction in arrival order —
       // sealed already-streamed output above, correction below, post-redirect
@@ -398,7 +442,7 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
       return false
     },
-    [requestGateway]
+    [profile, requestGateway]
   )
 
   // Rewind primitive (interrupt-first for live turns, busy-retry) — shared with
@@ -479,10 +523,10 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
         )
       } catch (err) {
         update(current => ({ ...current, busy: false, awaitingResponse: false, turnLive: false, turnStartedAt: null }))
-        notifyError(err, copy.regenerateFailed)
+        notifyError(profile ? new Error(copy.regenerateFailed) : err, copy.regenerateFailed)
       }
     },
-    [applySurvivorRowIds, copy.regenerateFailed, readState, submitRewind, update]
+    [applySurvivorRowIds, copy.regenerateFailed, profile, readState, submitRewind, update]
   )
 
   const restoreToMessage = useCallback(
@@ -522,10 +566,10 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
           turnStartedAt: null,
           messages
         }))
-        throw err
+        throw restoreErrorForSessionSurface(err, profile)
       }
     },
-    [applySurvivorRowIds, readMessages, readState, submitRewind, update]
+    [applySurvivorRowIds, profile, readMessages, readState, submitRewind, update]
   )
 
   const editMessage = useCallback(
@@ -570,10 +614,10 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
           turnStartedAt: null,
           messages
         }))
-        notifyError(err, copy.editFailed)
+        notifyError(profile ? new Error(copy.editFailed) : err, copy.editFailed)
       }
     },
-    [applySurvivorRowIds, copy.editFailed, readMessages, readState, submitRewind, update]
+    [applySurvivorRowIds, copy.editFailed, profile, readMessages, readState, submitRewind, update]
   )
 
   // Branch-visibility sync (assistant-ui hides non-active branches).

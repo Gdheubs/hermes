@@ -95,6 +95,111 @@ export function liveSessionScopes(): Set<string> {
   return scopes
 }
 
+/** Runtime ids are process-scoped and unique per window; the reactive mirror
+ * stays keyed by the bare runtime id (matching the primary/tile cache). The
+ * profile is threaded for API symmetry with the durable surface identity but
+ * does not qualify the key — two profile gateways never mint the same runtime
+ * id in this process. Omitted profile preserves the legacy primary-chat key. */
+export function sessionRuntimeStateKey(profile: null | string | undefined, runtimeSessionId: string): string {
+  return runtimeSessionId
+}
+
+/** Read one session's live slice by runtime id. Profile is accepted for the
+ * durable-identity contract; the underlying key is the bare runtime id. */
+export function sessionRuntimeState(
+  states: Record<string, ClientSessionState>,
+  profile: null | string | undefined,
+  runtimeSessionId: string
+): ClientSessionState | undefined {
+  return states[sessionRuntimeStateKey(profile, runtimeSessionId)]
+}
+
+// ---------------------------------------------------------------------------
+// Embedded surface references — renderer-local, deliberately transient.
+// ---------------------------------------------------------------------------
+
+interface SessionSurfaceReference {
+  count: number
+  runtimeKeys: Set<string>
+}
+
+const sessionSurfaceReferences = new Map<string, SessionSurfaceReference>()
+
+const sessionSurfaceKey = (profile: string, storedSessionId: string) =>
+  `${normalizeProfileKey(profile)}\u0000${storedSessionId}`
+
+/** Profiles currently holding an embedded surface reference (for eviction /
+ * pruning awareness). */
+export const $sessionSurfaceProfiles = atom<string[]>([])
+
+function publishSessionSurfaceProfiles(): void {
+  $sessionSurfaceProfiles.set(
+    [...new Set([...sessionSurfaceReferences.keys()].map(key => normalizeProfileKey(key.split('\u0000', 1)[0])))].sort()
+  )
+}
+
+/** Retain an embedded conversation without making it a layout tile or the
+ * foreground chat. References are renderer-local and deliberately transient. */
+export function retainSessionSurfaceReference(profile: string, storedSessionId: string): void {
+  const key = sessionSurfaceKey(profile, storedSessionId)
+  const current = sessionSurfaceReferences.get(key)
+
+  if (current) {
+    current.count += 1
+  } else {
+    sessionSurfaceReferences.set(key, { count: 1, runtimeKeys: new Set() })
+  }
+
+  publishSessionSurfaceProfiles()
+}
+
+export function bindSessionSurfaceRuntime(profile: string, storedSessionId: string, runtimeSessionId: string): void {
+  const reference = sessionSurfaceReferences.get(sessionSurfaceKey(profile, storedSessionId))
+
+  if (!reference) {
+    return
+  }
+
+  const supersededRuntimeKeys = [...reference.runtimeKeys].filter(key => key !== runtimeSessionId)
+
+  reference.runtimeKeys.clear()
+  reference.runtimeKeys.add(runtimeSessionId)
+
+  for (const supersededKey of supersededRuntimeKeys) {
+    evictUnreferencedSurfaceRuntime(supersededKey)
+  }
+}
+
+export function releaseSessionSurfaceReference(profile: string, storedSessionId: string): void {
+  const key = sessionSurfaceKey(profile, storedSessionId)
+  const current = sessionSurfaceReferences.get(key)
+
+  if (!current) {
+    return
+  }
+
+  current.count -= 1
+
+  if (current.count > 0) {
+    publishSessionSurfaceProfiles()
+
+    return
+  }
+
+  const releasedRuntimeKeys = [...current.runtimeKeys]
+  current.runtimeKeys.clear()
+  sessionSurfaceReferences.delete(key)
+  publishSessionSurfaceProfiles()
+
+  for (const runtimeKey of releasedRuntimeKeys) {
+    evictUnreferencedSurfaceRuntime(runtimeKey)
+  }
+}
+
+export function sessionSurfaceReferenceCount(profile: string, storedSessionId: string): number {
+  return sessionSurfaceReferences.get(sessionSurfaceKey(profile, storedSessionId))?.count ?? 0
+}
+
 // Stored session ids whose authoritative state is still busy, but whose
 // runtime has produced no state publish for the watchdog window. Silence is
 // not completion: long tool calls can legitimately stay quiet, so this is a
@@ -249,11 +354,16 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
   }
 }
 
-/** Is any surface on THIS window still holding the runtime — the primary view
- *  or an open tile? (A tile mid-resume references by stored id only; its
- *  runtime binding is patched in after `resumeTile` returns.) */
+/** Is any surface on THIS window still holding the runtime — the primary view,
+ *  an open tile, or an embedded surface reference? (A tile mid-resume
+ *  references by stored id only; its runtime binding is patched in after
+ *  `resumeTile` returns.) */
 function runtimeReferenced(runtimeId: string, storedSessionId: null | string): boolean {
   if (runtimeId === $activeSessionId.get()) {
+    return true
+  }
+
+  if ([...sessionSurfaceReferences.values()].some(reference => reference.runtimeKeys.has(runtimeId))) {
     return true
   }
 
@@ -263,12 +373,24 @@ function runtimeReferenced(runtimeId: string, storedSessionId: null | string): b
 }
 
 /** A state no surface needs anymore: its turn is over (not busy, not waiting
- *  on the user) and neither the primary view nor any tile holds the runtime.
- *  `needsInput` states stay — the sidebar's attention dot reads them. */
+ *  on the user) and neither the primary view nor any tile/surface holds the
+ *  runtime. `needsInput` states stay — the sidebar's attention dot reads them. */
 function evictable(runtimeId: string, state: ClientSessionState): boolean {
   return (
     !state.busy && !state.needsInput && !state.awaitingResponse && !runtimeReferenced(runtimeId, state.storedSessionId)
   )
+}
+
+function evictUnreferencedSurfaceRuntime(runtimeKey: string): void {
+  const state = $sessionStates.get()[runtimeKey]
+
+  if (!state) {
+    return
+  }
+
+  if (evictable(runtimeKey, state)) {
+    dropSessionState(runtimeKey)
+  }
 }
 
 /** Publish one session's state. Automatically fires transition side-effects
@@ -650,13 +772,43 @@ export function unbindTileRuntime(runtimeId: string) {
 // store's pane closers.
 // ---------------------------------------------------------------------------
 
+export interface SessionSurfaceIdentity {
+  profile: string
+  runtimeSessionId?: string
+  storedSessionId: string
+}
+
+export interface SessionSurfaceRuntimeIdentity extends SessionSurfaceIdentity {
+  runtimeSessionId: string
+}
+
+/** Explicitly marks an ephemeral runtime hint that is no longer usable for its
+ * durable identity. Only this error enables SessionSurface's bounded resume
+ * fallback; transport, authorization, and other adoption failures stay visible. */
+export class StaleSessionSurfaceRuntimeError extends Error {
+  constructor(message = 'Session surface runtime hint is stale') {
+    super(message)
+    this.name = 'StaleSessionSurfaceRuntimeError'
+  }
+}
+
+export function isStaleSessionSurfaceRuntimeError(error: unknown): boolean {
+  return (
+    error instanceof StaleSessionSurfaceRuntimeError ||
+    (error instanceof Error && error.name === 'StaleSessionSurfaceRuntimeError')
+  )
+}
+
 export interface SessionTileDelegate {
+  /** Adopt a runtime returned by session.create. This path must not resume: a
+   *  fresh seeded session has no durable row until its first prompt. */
+  adoptSurface(identity: SessionSurfaceRuntimeIdentity): Promise<string>
   /** Archive a stored session (the sidebar's archive, incl. tile cleanup). */
-  archiveSession(storedSessionId: string): Promise<void>
+  archiveSession(storedSessionId: string, profile?: string): Promise<void>
   /** Branch a stored session into a new chat (the sidebar's branch). */
-  branchSession(storedSessionId: string): Promise<void>
+  branchSession(storedSessionId: string, profile?: string): Promise<void>
   /** Delete a stored session (the sidebar's delete, incl. tile cleanup). */
-  deleteSession(storedSessionId: string): Promise<void>
+  deleteSession(storedSessionId: string, profile?: string): Promise<void>
   /** Run a slash command against a tile's session (app-level effects — e.g.
    *  branch/handoff — act on the main surface, as they should). */
   executeSlash(rawCommand: string, sessionId: string): Promise<void>
@@ -671,17 +823,39 @@ export interface SessionTileDelegate {
   /** Bind a live runtime id for a stored session (resume without touching
    *  the main view). Returns the runtime id, or throws. */
   resumeTile(storedSessionId: string): Promise<string>
+  /** Bind a live runtime id for a stored session WITHOUT touching the main
+   *  view (resume against the identity's OWNING profile gateway). Returns the
+   *  runtime id, or throws. Used by the embedded SessionSurface. */
+  resumeSurface(identity: SessionSurfaceIdentity): Promise<string>
   /** Submit a prompt to a tile's live session. */
   submitToSession(runtimeId: string, text: string): Promise<void>
   /** THE session-state write path — routes through the wiring cache so the
    *  cache, the primary view (when active), and every tile mirror agree. */
-  updateSession(runtimeId: string, updater: (state: ClientSessionState) => ClientSessionState): ClientSessionState
+  updateSession(
+    runtimeId: string,
+    updater: (state: ClientSessionState) => ClientSessionState,
+    profile?: string
+  ): ClientSessionState
 }
 
 let delegate: SessionTileDelegate | null = null
+const delegateListeners = new Set<() => void>()
 
-export function setSessionTileDelegate(next: SessionTileDelegate) {
+export function setSessionSurfaceDelegate(next: SessionTileDelegate | null) {
   delegate = next
+  delegateListeners.forEach(listener => listener())
+}
+
+export function subscribeSessionSurfaceDelegate(listener: () => void): () => void {
+  delegateListeners.add(listener)
+
+  return () => delegateListeners.delete(listener)
+}
+
+export const setSessionTileDelegate = setSessionSurfaceDelegate
+
+export function sessionSurfaceDelegate(): SessionTileDelegate | null {
+  return delegate
 }
 
 export function sessionTileDelegate(): SessionTileDelegate | null {

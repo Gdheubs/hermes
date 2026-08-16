@@ -36,6 +36,8 @@ function renderTileActions() {
 describe('useSessionTileActions sleep/wake session recovery', () => {
   beforeEach(() => {
     setSessionTileDelegate({
+      adoptSurface: vi.fn(async () => RUNTIME_SESSION_ID),
+      resumeSurface: vi.fn(async () => RUNTIME_SESSION_ID),
       archiveSession: vi.fn(async () => undefined),
       branchSession: vi.fn(async () => undefined),
       deleteSession: vi.fn(async () => undefined),
