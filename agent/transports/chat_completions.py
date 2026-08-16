@@ -661,6 +661,12 @@ class ChatCompletionsTransport(ProviderTransport):
         if additions:
             extra_body.update(additions)
 
+        # Qwen: force stopAtLimit so the provider never silently
+        # truncates the compacted wire; the agent self-compresses instead.
+        _qwen_policy = params.get("qwen_context_overflow_policy")
+        if _qwen_policy:
+            extra_body["context_overflow_policy"] = _qwen_policy
+
         if extra_body:
             api_kwargs["extra_body"] = extra_body
 
@@ -799,6 +805,13 @@ class ChatCompletionsTransport(ProviderTransport):
         additions = params.get("extra_body_additions")
         if additions:
             extra_body.update(additions)
+        # Qwen: force stopAtLimit so the provider never silently
+        # truncates the compacted wire; the agent self-compresses instead.
+        _qwen_policy = params.get("qwen_context_overflow_policy")
+        if _qwen_policy:
+            extra_body["context_overflow_policy"] = _qwen_policy
+
+
 
         # Request overrides (user config)
         overrides = params.get("request_overrides")

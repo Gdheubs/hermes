@@ -3833,6 +3833,17 @@ OPTIONAL_ENV_VARS = {
         "category": "provider",
         "advanced": True,
     },
+    "HERMES_QWEN_CONTEXT_OVERFLOW_POLICY": {
+        "description": "Qwen context-overflow policy injected per request (qwen-family models). "
+        "stopAtLimit (default) makes the provider reject at the limit so the agent "
+        "self-compresses; rollingWindow/truncateMiddle silently truncate the "
+        "compacted wire (markers mid-list). Empty disables the injection.",
+        "prompt": "Qwen context overflow policy (stopAtLimit / rollingWindow / truncateMiddle; empty = off)",
+        "url": None,
+        "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
     "OPENCODE_ZEN_API_KEY": {
         "description": "OpenCode Zen API key (pay-as-you-go access to curated models)",
         "prompt": "OpenCode Zen API key",

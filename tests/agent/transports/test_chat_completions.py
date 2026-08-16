@@ -810,3 +810,104 @@ class TestPromptCacheKeyCapability:
             provider_profile=profile,
         )
         assert "prompt_cache_key" not in kwargs
+
+
+class TestQwenContextOverflowPolicy:
+    """The Qwen Cloud overflow policy is injected per request so the provider
+    rejects at the limit (stopAtLimit) instead of silently truncating the
+    compacted wire (rollingWindow / truncateMiddle)."""
+
+    def _build(self, transport, model, policy, profile=None):
+        kw = transport.build_kwargs(
+            model=model,
+            messages=[{"role": "user", "content": "hi"}],
+            qwen_context_overflow_policy=policy,
+            model_lower=model,
+            base_url="https://portal.qwen.ai/v1",
+            provider_profile=profile,
+        )
+        return (kw.get("extra_body") or {}).get("context_overflow_policy")
+
+    def test_qwen_profile_path_injects_stop_at_limit(self, transport):
+        from providers import get_provider_profile
+
+        assert self._build(transport, "qwen3.8-max", "stopAtLimit",
+                           get_provider_profile("qwen")) == "stopAtLimit"
+
+    def test_qwen_legacy_path_injects_stop_at_limit(self, transport):
+        assert self._build(transport, "qwen3.8-max", "stopAtLimit") == "stopAtLimit"
+
+    def test_no_policy_param_injects_nothing(self, transport):
+        assert self._build(transport, "qwen3.8-max", None) is None
+        assert self._build(transport, "gpt-4o", None) is None
+
+
+def test_resolve_qwen_context_overflow_policy(monkeypatch):
+    from unittest.mock import patch
+
+    from agent.chat_completion_helpers import resolve_qwen_context_overflow_policy
+
+    class _A:
+        model = "qwen3.8-max"
+        _base_url_lower = "https://portal.qwen.ai/v1"
+
+    class _C:  # qwen model on a non-Qwen endpoint
+        model = "qwen3.8-max"
+        _base_url_lower = "https://lmstudio.local/v1"
+
+    class _B:
+        model = "gpt-4o"
+        _base_url_lower = "https://portal.qwen.ai/v1"
+
+    with patch("hermes_cli.config.load_config_readonly", return_value={}):
+        assert resolve_qwen_context_overflow_policy(_A()) == "stopAtLimit"  # qwen platform default
+        assert resolve_qwen_context_overflow_policy(_C()) is None           # qwen model, non-qwen endpoint
+        assert resolve_qwen_context_overflow_policy(_B()) is None           # non-qwen
+    with patch("hermes_cli.config.load_config_readonly", return_value={"HERMES_QWEN_CONTEXT_OVERFLOW_POLICY": ""}):
+        assert resolve_qwen_context_overflow_policy(_A()) is None           # empty disables
+    with patch("hermes_cli.config.load_config_readonly", return_value={"HERMES_QWEN_CONTEXT_OVERFLOW_POLICY": "truncateMiddle"}):
+        assert resolve_qwen_context_overflow_policy(_C()) == "truncateMiddle"  # explicit wins anywhere
+
+
+def test_qwen_overflow_policy_resolution(monkeypatch):
+    """is_qwen_model -> default stopAtLimit; explicit empty -> disabled."""
+    from unittest.mock import patch
+
+    import agent.chat_completion_helpers as helpers
+
+    class _Agent:
+        provider = "qwen"
+        model = "qwen3.8-max"
+        session_id = "s1"
+        def _is_qwen_portal(self):
+            return True
+
+    with patch("hermes_cli.config.load_config_readonly", return_value={}):
+        # build the kwargs via the helpers path for a qwen agent
+        import agent.transports.chat_completions as tc
+        kw = tc.ChatCompletionsTransport().build_kwargs(
+            model="qwen3.8-max", messages=[{"role": "user", "content": "hi"}],
+            qwen_context_overflow_policy="stopAtLimit", model_lower="qwen3.8-max")
+        assert (kw.get("extra_body") or {}).get("context_overflow_policy") == "stopAtLimit"
+
+
+def test_qwen_endpoint_list_is_pinned(monkeypatch):
+    """Tripwire: the resolver's hard-coded Qwen-platform endpoint list.
+
+    If Qwen adds a platform endpoint, this test fails and the resolver's
+    host gate must be updated explicitly (mirrors the reasoning-extra_body
+    allowlist, which is likewise pinned only by its tests)."""
+    from unittest.mock import patch
+
+    from agent.chat_completion_helpers import resolve_qwen_context_overflow_policy
+
+    class _A:
+        model = "qwen3.8-max"
+
+    with patch("hermes_cli.config.load_config_readonly", return_value={}):
+        for host in ("https://portal.qwen.ai/v1", "https://dashscope.aliyuncs.com/compatible-mode/v1"):
+            _A._base_url_lower = host
+            assert resolve_qwen_context_overflow_policy(_A()) == "stopAtLimit", f"{host} must be a Qwen platform"
+        # a new UNKNOWN qwen-looking host must NOT silently get the default
+        _A._base_url_lower = "https://new-qwen-region.example.com/v1"
+        assert resolve_qwen_context_overflow_policy(_A()) is None
