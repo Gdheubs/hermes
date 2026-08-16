@@ -969,13 +969,13 @@ function PluginRowCard(props: PluginRowCardProps) {
 
             <Badge
               title={
-                row.runtime_status === "active"
-                  ? "Live memory provider (memory.provider in config.yaml)"
-                  : undefined
+                row.runtime_status === "active" ? t.pluginsPage.activeProviderHint : undefined
               }
               tone={badgeTone}
             >
-              {row.runtime_status === "active" ? "active (memory provider)" : row.runtime_status}
+              {row.runtime_status === "active"
+                ? t.pluginsPage.activeProvider
+                : row.runtime_status}
             </Badge>
 
             {row.auth_required ? (
@@ -991,7 +991,7 @@ function PluginRowCard(props: PluginRowCardProps) {
               // without stopping the provider. Provider lifecycle lives in
               // the Providers card at the top of this page.
               <span className="text-xs text-muted-foreground">
-                Managed via the memory provider selector above.
+                {t.pluginsPage.activeProviderManaged}
               </span>
             ) : row.runtime_status === "enabled" ? (
               <Button
