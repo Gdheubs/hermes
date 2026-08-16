@@ -124,6 +124,44 @@ class TestZaiGLM52ReasoningEffort:
         )
         assert top_level == {"reasoning_effort": "max"}
 
+class TestZaiGLM53ReasoningEffort:
+    """GLM-5.3 shares GLM-5.2's native ``reasoning_effort`` knob."""
+
+    @pytest.mark.parametrize(
+        "model",
+        ["glm-5.3", "z-ai/glm-5.3", "glm-5-3", "glm-5p3"],
+    )
+    def test_alias_spellings_recognized(self, zai_profile, model):
+        _, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "max"},
+            model=model,
+        )
+        assert top_level == {"reasoning_effort": "max"}
+
+    def test_high_maps_to_high(self, zai_profile):
+        extra_body, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "high"},
+            model="glm-5.3",
+        )
+        assert extra_body == {"thinking": {"type": "enabled"}}
+        assert top_level == {"reasoning_effort": "high"}
+
+    def test_strong_efforts_map_to_max(self, zai_profile):
+        extra_body, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "xhigh"},
+            model="glm-5.3",
+        )
+        assert extra_body == {"thinking": {"type": "enabled"}}
+        assert top_level == {"reasoning_effort": "max"}
+
+    def test_disabled_sends_no_effort(self, zai_profile):
+        extra_body, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False, "effort": "high"},
+            model="glm-5.3",
+        )
+        assert extra_body == {"thinking": {"type": "disabled"}}
+        assert top_level == {}
+
     @pytest.mark.parametrize(
         "model",
         ["glm-5.1", "glm-5", "glm-4.7", "glm-4-9b", "", None],

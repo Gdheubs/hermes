@@ -59,6 +59,19 @@ def _is_glm_5_2(model: str | None) -> bool:
     return any(token in m for token in ("glm-5.2", "glm-5-2", "glm-5p2"))
 
 
+def _is_glm_5_3(model: str | None) -> bool:
+    """Detect GLM-5.3 across the alias spellings providers use.
+
+    GLM-5.3 exposes the same native ``reasoning_effort`` knob (``high`` /
+    ``max``) as GLM-5.2 on the OpenAI-compatible endpoint, so it shares the
+    same effort-mapping path.
+    """
+    m = (model or "").strip().lower()
+    if not m:
+        return False
+    return any(token in m for token in ("glm-5.3", "glm-5-3", "glm-5p3"))
+
+
 def _glm_5_2_reasoning_effort(reasoning_config: dict | None) -> str | None:
     """Map Hermes reasoning effort onto GLM-5.2's native ``high``/``max``.
 
@@ -91,7 +104,7 @@ class ZaiProfile(ProviderProfile):
         extra_body: dict[str, Any] = {}
         top_level: dict[str, Any] = {}
 
-        if not _model_supports_thinking(model) and not _is_glm_5_2(model):
+        if not _model_supports_thinking(model) and not _is_glm_5_2(model) and not _is_glm_5_3(model):
             return extra_body, top_level
 
         # Only emit when the user expressed a preference; omitting the field
@@ -100,7 +113,7 @@ class ZaiProfile(ProviderProfile):
             enabled = reasoning_config.get("enabled") is not False
             extra_body["thinking"] = {"type": "enabled" if enabled else "disabled"}
 
-        if _is_glm_5_2(model):
+        if _is_glm_5_2(model) or _is_glm_5_3(model):
             effort = _glm_5_2_reasoning_effort(reasoning_config)
             if effort is not None:
                 top_level["reasoning_effort"] = effort
@@ -116,6 +129,7 @@ zai = ZaiProfile(
     description="Z.AI / GLM — Zhipu AI models",
     signup_url="https://z.ai/",
     fallback_models=(
+        "glm-5.3",
         "glm-5.2",
         "glm-5",
         "glm-4-9b",
