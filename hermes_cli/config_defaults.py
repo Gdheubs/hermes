@@ -1537,7 +1537,7 @@ DEFAULT_CONFIG = {
     # Gemini 32000, Edge 5000, Mistral 4000, NeuTTS/KittenTTS 2000).
     "tts": {
         # Set explicitly to pin a backend:
-        # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" | "gemini" | "deepinfra" | "neutts" (local) | "kittentts" (local) | "piper" (local)
+        # "edge" (free) | "elevenlabs" (premium) | "openai" | "xai" | "minimax" | "mistral" | "gemini" | "deepinfra" | "nvidia" | "neutts" (local) | "kittentts" (local) | "piper" (local)
         "provider": "edge",
         "edge": {
             "voice": "en-US-AriaNeural",
@@ -1612,6 +1612,15 @@ DEFAULT_CONFIG = {
             "voice": "default",
             # "base_url": "",  # override DEEPINFRA_BASE_URL for TTS only
         },
+        "nvidia": {
+            "base_url": "",  # empty = resolve Magpie's current hosted endpoint from the NVIDIA speech catalog
+            "voice": "Magpie-Multilingual.EN-US.Aria",
+            "language": "en-US",
+            "sample_rate_hz": 44100,
+            "custom_dictionary": "",
+            "custom_configuration": "",
+            "customizations": {},
+        },
     },
 
     "stt": {
@@ -1620,7 +1629,7 @@ DEFAULT_CONFIG = {
         # the raw transcript is also echoed back to the user as a 🎙️ message.
         # Set false to keep STT for the agent while suppressing that user-facing echo.
         "echo_transcripts": True,
-        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "elevenlabs" (Scribe) | "deepinfra"
+        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "elevenlabs" (Scribe) | "deepinfra" | "nvidia"
         # Global language hint applied to EVERY provider unless a per-provider
         # language overrides it. Defaults to "en" — Whisper auto-detection
         # frequently misidentifies short/accented clips, which reads as
@@ -1671,6 +1680,16 @@ DEFAULT_CONFIG = {
         "deepinfra": {
             "model": "",  # empty = first stt-tagged model from the live catalog
             # "base_url": "",  # override DEEPINFRA_BASE_URL for STT only
+        },
+        "nvidia": {
+            "model": "parakeet-tdt-default",  # stable catalog ID; hosted deployment may rotate
+            "tdt_base_url": "",  # empty = resolve the current hosted endpoint from the NVIDIA speech catalog
+            "ctc_base_url": "",  # empty = resolve the current hosted endpoint from the NVIDIA speech catalog
+            "language": "en-US",
+            "boosted_words": [],
+            "boosted_words_score": None,
+            "custom_configuration": "",
+            "customizations": {},
         },
     },
 
