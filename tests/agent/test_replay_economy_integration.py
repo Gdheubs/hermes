@@ -108,6 +108,7 @@ def _text_resp(text: str) -> dict:
 
 
 @pytest.mark.integration
+@pytest.mark.wire_it
 def test_deepseek_wire_compacts_tool_result_and_strips_plain_reasoning():
     import pytest
 
@@ -182,6 +183,7 @@ def test_deepseek_wire_compacts_tool_result_and_strips_plain_reasoning():
 
 
 @pytest.mark.integration
+@pytest.mark.wire_it
 def test_openai_wire_preflight_tracks_compacted_wire():
     """Ungated preflight on a non-echo wire: the recorded request pressure
     sits below the raw session estimate (the raw overstatement used to fire
@@ -244,6 +246,7 @@ def test_openai_wire_preflight_tracks_compacted_wire():
 
 
 @pytest.mark.integration
+@pytest.mark.wire_it
 def test_gpt56_native_responses_wire_preflight_tracks_compacted_wire():
     """gpt-5.6's native Codex/Responses SSE wire: compaction runs
     pre-conversion and the ungated preflight tracks the compacted wire."""

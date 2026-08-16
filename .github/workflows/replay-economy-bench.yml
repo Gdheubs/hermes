@@ -38,7 +38,7 @@ jobs:
       - name: Compare PR economy vs base
         run: .venv/bin/python scripts/bench_replay_economy.py --against "${{ github.event.pull_request.base.sha }}"
 
-  wire-it:
+  integration-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -50,5 +50,7 @@ jobs:
             pyproject.toml
             uv.lock
       - run: uv sync --locked --python 3.11 --extra dev
-      - name: Real-wire economy ITs (integration-marked)
-        run: .venv/bin/python -m pytest tests/agent/test_replay_economy_integration.py -q -m integration
+      # wire_it is unique to the self-contained wire ITs — no file bound;
+      # --continue-on-collection-errors ignores unrelated broken files.
+      - name: Real-wire economy ITs
+        run: .venv/bin/python -m pytest -q -m wire_it --continue-on-collection-errors
