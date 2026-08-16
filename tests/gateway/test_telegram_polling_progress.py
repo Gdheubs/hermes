@@ -357,6 +357,7 @@ async def test_current_polling_generation_success_records_progress():
     assert adapter._polling_network_error_count == 0
     assert adapter._send_path_degraded is False
     assert generation > 0
+    assert adapter._polling_last_io_at is not None
 
 
 @pytest.mark.asyncio
@@ -377,6 +378,9 @@ async def test_unsuccessful_polling_request_does_not_record_progress(error_type)
     assert not progress.is_set()
     assert adapter._polling_network_error_count == 3
     assert adapter._send_path_degraded is True
+    # Errors still count as getUpdates I/O so the liveness watchdog does not
+    # treat a completed TimedOut/CancelledError round-trip as a hung socket.
+    assert adapter._polling_last_io_at is not None
 
 
 @pytest.mark.asyncio
@@ -396,6 +400,7 @@ async def test_http_error_response_does_not_record_polling_progress():
     assert not progress.is_set()
     assert adapter._polling_network_error_count == 3
     assert adapter._send_path_degraded is True
+    assert adapter._polling_last_io_at is not None
 
 
 @pytest.mark.asyncio
