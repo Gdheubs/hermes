@@ -3075,3 +3075,22 @@ html:has([data-hud-shell]) [data-slot='popover-content'] {
 [data-hud-shell] [data-slot='composer-bounds'] *::-webkit-scrollbar {
   display: none;
 }
+
+/* ─── User wallpaper background ───────────────────────────────────────────
+ * A subtle image layer behind the whole app. Low opacity keeps text, buttons
+ * and chrome fully readable; the layer never intercepts pointer events. */
+html::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  background: url('./assets/bg.jpg') center / cover no-repeat fixed;
+  opacity: 0.12;
+  pointer-events: none;
+}
+
+/* Dim the wallpaper further in dark mode so light text stays legible. */
+html.dark::before,
+.dark html::before {
+  opacity: 0.08;
+}

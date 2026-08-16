@@ -70,6 +70,16 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 120_000
 // handshake doesn't land in this window, fail to 'error' so callers can retry.
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000
 
+// A 503 Service Unavailable from the backend is transient (e.g. the server is
+// still booting) — retry with a short backoff instead of failing the boot.
+const HTTP_503_MARKERS = ['503', 'service unavailable']
+const RETRY_DELAY_MS = 3_000
+const MAX_RETRIES = 2
+
+function is503Error(msg: string): boolean {
+  return HTTP_503_MARKERS.some(marker => msg.toLowerCase().includes(marker))
+}
+
 export class JsonRpcGatewayClient {
   private nextId = 0
   private pending = new Map<GatewayRequestId, PendingCall>()
@@ -127,97 +137,124 @@ export class JsonRpcGatewayClient {
       return
     }
 
-    this.setState('connecting')
+    let lastError: Error | undefined
 
-    const socket = this.options.socketFactory?.(wsUrl) ?? new WebSocket(wsUrl)
-    this.socket = socket
-
-    socket.addEventListener('message', message => {
-      if (this.socket !== socket) {
-        return
-      }
-
-      this.handleMessage(message.data)
-    })
-
-    socket.addEventListener('close', event => {
-      if (this.socket !== socket) {
-        return
-      }
-
-      if (this.options.onSocketClose(event)) {
-        return
-      }
-
-      this.socket = null
-      this.setState('closed')
-      this.rejectAllPending(new Error(this.options.closedErrorMessage))
-    })
-
-    await new Promise<void>((resolve, reject) => {
-      let settled = false
-      let timer: ReturnType<typeof setTimeout> | undefined
-
-      const cleanup = () => {
-        if (timer !== undefined) {
-          clearTimeout(timer)
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      // 503 → wait 3 s and retry (up to MAX_RETRIES retries); anything else fails fast.
+      if (attempt > 0) {
+        if (!lastError || !is503Error(lastError.message)) {
+          throw lastError ?? new Error(this.options.connectErrorMessage)
         }
 
-        socket.removeEventListener('open', onOpen)
-        socket.removeEventListener('error', onError)
+        await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS))
       }
 
-      const onOpen = () => {
-        if (settled || this.socket !== socket) {
+      this.setState('connecting')
+
+      const socket = this.options.socketFactory?.(wsUrl) ?? new WebSocket(wsUrl)
+      this.socket = socket
+
+      socket.addEventListener('message', message => {
+        if (this.socket !== socket) {
           return
         }
 
-        settled = true
-        cleanup()
-        this.setState('open')
-        resolve()
-      }
+        this.handleMessage(message.data)
+      })
 
-      const onError = () => {
-        if (settled || this.socket !== socket) {
+      socket.addEventListener('close', event => {
+        if (this.socket !== socket) {
           return
         }
 
-        settled = true
-        cleanup()
-        this.setState('error')
-        reject(new Error(this.options.connectErrorMessage))
-      }
+        if (this.options.onSocketClose(event)) {
+          return
+        }
 
-      socket.addEventListener('open', onOpen, { once: true })
-      socket.addEventListener('error', onError, { once: true })
+        this.socket = null
+        this.setState('closed')
+        this.rejectAllPending(new Error(this.options.closedErrorMessage))
+      })
 
-      if (this.options.connectTimeoutMs > 0) {
-        timer = setTimeout(() => {
-          if (settled) {
-            return
-          }
+      try {
+        await new Promise<void>((resolve, reject) => {
+          let settled = false
+          let timer: ReturnType<typeof setTimeout> | undefined
 
-          settled = true
-          cleanup()
-
-          // Drop the half-open socket so the next connect() starts clean
-          // instead of short-circuiting on a zombie 'connecting' state.
-          if (this.socket === socket) {
-            try {
-              socket.close()
-            } catch {
-              // ignore
+          const cleanup = () => {
+            if (timer !== undefined) {
+              clearTimeout(timer)
             }
 
-            this.socket = null
+            socket.removeEventListener('open', onOpen)
+            socket.removeEventListener('error', onError)
           }
 
-          this.setState('error')
-          reject(new Error(this.options.connectErrorMessage))
-        }, this.options.connectTimeoutMs)
+          const onOpen = () => {
+            if (settled || this.socket !== socket) {
+              return
+            }
+
+            settled = true
+            cleanup()
+            this.setState('open')
+            resolve()
+          }
+
+          const onError = () => {
+            if (settled || this.socket !== socket) {
+              return
+            }
+
+            settled = true
+            cleanup()
+            this.setState('error')
+            reject(new Error(this.options.connectErrorMessage))
+          }
+
+          socket.addEventListener('open', onOpen, { once: true })
+          socket.addEventListener('error', onError, { once: true })
+
+          if (this.options.connectTimeoutMs > 0) {
+            timer = setTimeout(() => {
+              if (settled) {
+                return
+              }
+
+              settled = true
+              cleanup()
+
+              // Drop the half-open socket so the next connect() starts clean
+              // instead of short-circuiting on a zombie 'connecting' state.
+              if (this.socket === socket) {
+                try {
+                  socket.close()
+                } catch {
+                  // ignore
+                }
+
+                this.socket = null
+              }
+
+              this.setState('error')
+              reject(new Error(this.options.connectErrorMessage))
+            }, this.options.connectTimeoutMs)
+          }
+        })
+
+        // Connected — exit the retry loop.
+        return
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err))
+
+        if (this.socket === socket) {
+          this.socket = null
+        }
       }
-    })
+    }
+
+    // All 503 retries exhausted — surface the last error.
+    throw lastError ?? new Error(this.options.connectErrorMessage)
   }
 
   close(): void {
