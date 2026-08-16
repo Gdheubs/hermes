@@ -20,7 +20,7 @@ from unittest.mock import patch
 import pytest
 
 import tools.approval as approval_module
-from tools.approval import check_all_command_guards
+from tools.approval import check_all_command_guards, check_dangerous_command
 from tools.terminal_tool import set_approval_callback
 
 
@@ -75,8 +75,8 @@ class TestCliApprovalSurvivesExecAskLeak:
         assert result.get("approved") is True
         assert result.get("user_approved") is True
 
-    def test_pending_approval_still_used_without_cli_callback(self, monkeypatch):
-        """Headless ask-mode without a CLI callback keeps the pending fallback."""
+    def test_headless_ask_mode_without_cli_callback_fails_closed(self, monkeypatch):
+        """Headless ask-mode without a responder returns a terminal block."""
         monkeypatch.setenv("HERMES_EXEC_ASK", "1")
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
         set_approval_callback(None)
@@ -84,8 +84,24 @@ class TestCliApprovalSurvivesExecAskLeak:
         result = check_all_command_guards("rm -rf /tmp/testdir", "local")
 
         assert result.get("approved") is False
-        assert result.get("status") == "pending_approval"
-        assert result.get("approval_pending") is True
+        assert result.get("outcome") == "no_responder"
+        assert result.get("status") != "pending_approval"
+        assert result.get("approval_pending") is not True
+        assert not approval_module._pending
+
+    def test_dangerous_command_headless_without_cli_callback_fails_closed(self, monkeypatch):
+        """The single-command guard uses the same terminal outcome."""
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        set_approval_callback(None)
+
+        result = check_dangerous_command("rm -rf /tmp/testdir", "local")
+
+        assert result["approved"] is False
+        assert result["outcome"] == "no_responder"
+        assert result.get("status") != "pending_approval"
+        assert not approval_module._pending
 
 
 class TestGatewayRunImportDoesNotSetExecAsk:
