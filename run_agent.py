@@ -7551,6 +7551,8 @@ class AIAgent:
         OpenRouter forwards unknown extra_body fields to upstream providers.
         Some providers/routes reject `reasoning` with 400s, so gate it to
         known reasoning-capable model families and direct Nous Portal.
+        Host allowlist is pinned by test_supports_reasoning_extra_body_allowlist
+        — adding a host must update that test explicitly.
         """
         if base_url_host_matches(self._base_url_lower, "nousresearch.com"):
             return True
