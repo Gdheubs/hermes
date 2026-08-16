@@ -99,6 +99,25 @@ describe('useSessionTileDelegate resumeTile', () => {
       omit_messages: true
     })
   })
+  it('rejects a cold tile resume that lands after the foreground profile moved', async () => {
+    // The tile's owner is 'ai-engineer'. The resume RPC resolves only AFTER the
+    // foreground has already switched away (gateway settled on 'default'), so
+    // publishing the response would bind a runtime into the wrong profile.
+    setSessions([row({ id: 'stored-z', profile: 'ai-engineer' })])
+    const { $activeGatewayProfile, $gatewaySwapTarget } = await import('@/store/profile')
+
+    $activeGatewayProfile.set('default')
+    $gatewaySwapTarget.set(null)
+
+    const requestGateway = vi.fn(async (method: string) =>
+      method === 'session.resume' ? ({ session_id: 'runtime-3' } as never) : ({} as never)
+    )
+
+    renderTile(requestGateway)
+    await expect(sessionTileDelegate()!.resumeTile('stored-z', 'ai-engineer')).rejects.toThrow(
+      'profile changed during tile resume'
+    )
+  })
 })
 
 describe('useSessionTileDelegate interruptSession', () => {
