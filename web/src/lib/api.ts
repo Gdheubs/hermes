@@ -710,6 +710,61 @@ export const api = {
         body: JSON.stringify({ provider, model }),
       },
     ),
+  setProfileReasoning: (name: string, effort: string) =>
+    fetchJSON<{ ok: boolean; reasoning_effort: string }>(
+      `/api/profiles/${encodeURIComponent(name)}/reasoning`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ effort }),
+      },
+    ),
+  setProfileSettings: (
+    name: string,
+    provider: string | null,
+    model: string | null,
+    effort: string,
+  ) =>
+    fetchJSON<{
+      ok: boolean;
+      provider: string | null;
+      model: string | null;
+      reasoning_effort: string;
+    }>(
+      `/api/profiles/${encodeURIComponent(name)}/settings`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: provider ?? "", model: model ?? "", effort }),
+      },
+    ),
+  getProfileFallbacks: (name: string) =>
+    fetchJSON<{ fallbacks: ProfileFallbackInfo[] }>(
+      `/api/profiles/${encodeURIComponent(name)}/fallbacks`,
+    ),
+  updateProfileFallbacks: (
+    name: string,
+    fallbacks: Array<{
+      source_index?: number | null;
+      source_provider?: string | null;
+      source_model?: string | null;
+      source_base_url?: string | null;
+      source_api_mode?: string | null;
+      provider: string;
+      model: string;
+      reasoning_effort: string;
+      base_url?: string | null;
+      api_mode?: string | null;
+    }>,
+  ) =>
+    fetchJSON<{ ok: boolean; fallbacks: ProfileFallbackInfo[] }>(
+      `/api/profiles/${encodeURIComponent(name)}/fallbacks`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fallbacks }),
+      },
+    ),
   renameProfile: (name: string, newName: string) =>
     fetchJSON<{ ok: boolean; name: string; path: string }>(
       `/api/profiles/${encodeURIComponent(name)}`,
@@ -2175,6 +2230,7 @@ export interface ProfileInfo {
   is_default: boolean;
   model: string | null;
   provider: string | null;
+  reasoning_effort: string;
   has_env: boolean;
   skill_count: number;
   gateway_running: boolean;
@@ -2184,6 +2240,19 @@ export interface ProfileInfo {
   distribution_version: string | null;
   distribution_source: string | null;
   has_alias: boolean;
+}
+
+export interface ProfileFallbackInfo {
+  source_index: number;
+  source_provider?: string | null;
+  source_model?: string | null;
+  source_base_url?: string | null;
+  source_api_mode?: string | null;
+  provider: string;
+  model: string;
+  reasoning_effort: string;
+  base_url: string | null;
+  api_mode: string | null;
 }
 
 export interface ModelsAnalyticsModelEntry {
@@ -2398,6 +2467,9 @@ export interface ModelInfoResponse {
     context_window?: number;
     max_output_tokens?: number;
     model_family?: string;
+    /** Provider-known reasoning-effort dial values for this model.
+     *  Absent → full option list; empty array → no reasoning dial. */
+    reasoning_levels?: string[];
   };
 }
 
@@ -2413,6 +2485,16 @@ export interface ModelOptionProvider {
   source?: string;
   warning?: string;
   authenticated?: boolean;
+  /** Per-model capability map ({model: {fast, reasoning, reasoning_levels}})
+   *  when the picker requested it. */
+  capabilities?: Record<
+    string,
+    {
+      fast?: boolean;
+      reasoning?: boolean;
+      reasoning_levels?: string[] | null;
+    }
+  >;
 }
 
 export interface ModelOptionsResponse {
