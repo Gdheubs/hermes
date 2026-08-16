@@ -397,8 +397,14 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     surprise $4.63 run).
     """
     per_job = job.get("enabled_toolsets")
+    if isinstance(per_job, str):
+        per_job = [per_job.strip()] if per_job.strip() else []
+    elif isinstance(per_job, list):
+        per_job = [str(value).strip() for value in per_job if str(value).strip()]
+    else:
+        per_job = []
     if per_job:
-        return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
+        return _merge_mcp_into_per_job_toolsets(per_job, cfg or {})
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
         return sorted(_get_platform_tools(cfg or {}, "cron"))

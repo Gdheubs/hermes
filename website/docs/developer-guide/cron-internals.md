@@ -180,6 +180,54 @@ Each cron job runs in a completely fresh agent session:
 - The prompt must be self-contained — cron jobs cannot ask clarifying questions
 - The `cronjob` toolset is disabled (recursion guard)
 
+### Persisted configuration readback
+
+The model-facing `cronjob` tool treats create/update as a write followed by a
+separate read. After `create_job_with_scheduler_registration()` or
+`update_job()`, it calls `get_job()` and builds the response from that persisted
+record rather than the object returned by the write path. This catches stale or
+partially transformed return values before the agent claims configuration
+success.
+
+Successful create/update responses include `readback_verified: true` and a
+`readback` object produced by `_format_persisted_job_readback()`. It is the
+fresh-session execution contract and contains:
+
+- stored input: full prompt, script/monitor sources, `context_from`, and
+  `no_agent`,
+- normalized `workdir` and the profile-scoped local output directory,
+- the saved `enabled_toolsets` policy; runtime-effective tools remain explicitly
+  marked as resolved at fire time because global denials, MCP expansion, and
+  platform defaults may change,
+- delivery target and an `attach_to_session` policy that distinguishes an
+  explicit boolean from an unset value resolved through `cron.mirror_delivery`
+  at fire time,
+- model/provider/base URL pins plus write-time snapshots,
+- skills, schedule, state, and `next_run_at`.
+
+For `no_agent` records, `session.mode` is `none`; the script/stdout pair is the
+input/output contract. Stored model and toolset values are retained for audit,
+but their policies are `not_applicable`, effective tools are `none`, and both
+are marked as ignored at execution. Stored prompt and skills are also retained
+with `prompt_ignored` / `skills_ignored` flags.
+
+Legacy single-string `enabled_toolsets` values are normalized identically in
+readback and `_resolve_cron_enabled_toolsets()` so the displayed allowlist
+matches runtime behavior.
+
+Null/default values are retained so a detached reminder is as reviewable as a
+project job. If the post-write lookup returns no record, raises a storage error,
+or readback formatting fails, the tool logs the local diagnostic and returns
+`success: false` with
+`readback_verified: false` and a `job_saved` or `job_updated` marker; callers
+must not convert that partial outcome into a success message. If `update_job()`
+returns no record (for example, a concurrent removal), the response instead
+uses `job_updated: false` and skips provider notification/readback.
+
+This response contract is intentionally derived, not a second persisted schema.
+The persisted job record remains the single source of truth and existing jobs
+require no migration.
+
 ## Skill-Backed Jobs
 
 A cron job can attach one or more skills via the `skills` field. At execution time:

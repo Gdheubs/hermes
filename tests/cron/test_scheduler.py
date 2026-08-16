@@ -118,6 +118,14 @@ class TestPerJobToolsetMcpMerge:
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
 
+    def test_resolver_treats_legacy_string_as_one_toolset_name(self):
+        result = _resolve_cron_enabled_toolsets(
+            {"enabled_toolsets": "web"},
+            {},
+        )
+
+        assert result == ["web"]
+
 
 class TestResolveOrigin:
     def test_full_origin(self):

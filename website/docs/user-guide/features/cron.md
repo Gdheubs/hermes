@@ -67,6 +67,52 @@ Every morning at 9am, check Hacker News for AI news and send me a summary on Tel
 
 Hermes will use the unified `cronjob` tool internally.
 
+## Fresh-session contract and saved readback
+
+Every agent-backed job runs without the conversation that created it. Before
+Hermes creates or updates one through the `cronjob` tool, the stored task must
+therefore be a self-contained contract. For repository or file-based work, the
+contract should name:
+
+- the exact input or source,
+- the expected output or destination,
+- the ordering or acceptance rule,
+- the tool, network, and external-action boundary,
+- and any terminal success marker.
+
+Set an absolute `workdir` whenever the task depends on project-relative paths or
+repository instructions. If a required path, destination, or authority boundary
+is missing, Hermes stops instead of scheduling a guess. Simple reminders remain
+valid: their readback explicitly shows `workdir: null` and the inherited runtime
+policies.
+
+A successful write is not the confirmation. After `create` or `update`, the
+model-facing tool reads the job back from the persisted store and returns
+`readback_verified: true` plus a `readback` object containing:
+
+- fresh-session mode and the complete stored inputs (`prompt`, script/monitor
+  sources, and `context_from`),
+- `workdir` and the local cron output directory,
+- the saved per-job tool allowlist (effective tools are resolved again at fire
+  time),
+- delivery plus an `attach_to_session` policy: explicit overrides keep their
+  boolean value, while an absent override is marked `runtime_default` and
+  resolved against `cron.mirror_delivery` at fire time,
+- pinned or inherited model policy and write-time snapshots,
+- attached skills,
+- and the normalized schedule with `next_run_at`.
+
+For `no_agent: true`, the readback uses `session.mode: none`. The script path and
+stdout are the input/output contract; stored model and toolset values remain
+visible for audit but are marked `not_applicable` and ignored at execution.
+Stored prompt and skills are likewise retained with explicit `*_ignored` flags.
+Hermes does not require or invent a prompt for script-only jobs.
+
+If persistence succeeds but this readback fails, the response has
+`success: false`, `readback_verified: false`, and either `job_saved: true` or
+`job_updated: true`. Inspect the job with `cronjob(action="list")` before making
+another change; do not assume a retry is harmless.
+
 ## Pre-dispatch configuration validation
 
 Before constructing any agent machinery for a scheduled run, the scheduler

@@ -246,6 +246,351 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_create_returns_persisted_fresh_session_contract(self, tmp_path, monkeypatch):
+        """Creation must read the saved record back instead of trusting the
+        object returned by the write path."""
+        from cron import scheduler
+        from cron.jobs import get_cron_output_dir, get_job
+
+        workdir = tmp_path / "project"
+        workdir.mkdir()
+        real_create = scheduler.create_job_with_scheduler_registration
+
+        def create_with_stale_return(**kwargs):
+            saved = real_create(**kwargs)
+            stale = dict(saved)
+            stale.update(
+                prompt="stale prompt",
+                deliver="stale-delivery",
+                next_run_at="stale-next-run",
+                workdir=None,
+            )
+            return stale
+
+        monkeypatch.setattr(
+            scheduler,
+            "create_job_with_scheduler_registration",
+            create_with_stale_return,
+        )
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Read input.json and write report.md. End with COMPLETE.",
+                schedule="every 1h",
+                name="Queue report",
+                deliver="local",
+                skills=["search-first"],
+                model="pinned-model",
+                provider="pinned-provider",
+                enabled_toolsets=["file"],
+                workdir=str(workdir),
+                attach_to_session=True,
+            )
+        )
+
+        assert created["success"] is True
+        assert created["readback_verified"] is True
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        readback = created["readback"]
+        assert readback["job_id"] == stored["id"]
+        assert readback["name"] == stored["name"]
+        assert readback["schedule"] == stored["schedule_display"]
+        assert readback["workdir"] == stored["workdir"] == str(workdir.resolve())
+        assert readback["input"]["prompt"] == stored["prompt"]
+        assert readback["input"]["prompt_ignored"] is False
+        assert readback["input"]["no_agent"] is False
+        assert readback["session"] == {
+            "mode": "fresh",
+            "current_chat_context": False,
+        }
+        assert readback["output"]["local_output_dir"] == str(
+            get_cron_output_dir() / stored["id"]
+        )
+        assert readback["tool_boundary"] == {
+            "mode": "per_job_allowlist",
+            "enabled_toolsets": ["file"],
+            "effective_tools": "resolved_at_fire",
+        }
+        assert readback["delivery"] == stored["deliver"] == "local"
+        assert readback["attach_to_session"] == {
+            "policy": "explicit",
+            "value": True,
+            "effective": True,
+        }
+        assert readback["model"]["policy"] == "pinned"
+        assert readback["model"]["name"] == stored["model"] == "pinned-model"
+        assert readback["model"]["provider"] == stored["provider"] == "pinned-provider"
+        assert readback["model"]["base_url"] is None
+        assert readback["skills"] == stored["skills"] == ["search-first"]
+        assert readback["skills_ignored"] is False
+        assert readback["next_run_at"] == stored["next_run_at"]
+        assert created["job"]["next_run_at"] == stored["next_run_at"]
+
+    def test_create_readback_makes_default_boundaries_explicit(self):
+        """A simple reminder still has a complete, reviewable contract."""
+        from cron.jobs import get_job
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Remind me to stretch.",
+                schedule="every 1h",
+                name="Stretch reminder",
+            )
+        )
+
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        readback = created["readback"]
+        assert readback["session"] == {
+            "mode": "fresh",
+            "current_chat_context": False,
+        }
+        assert readback["workdir"] is None
+        assert readback["input"]["prompt"] == stored["prompt"]
+        assert readback["input"]["script"] is None
+        assert readback["input"]["context_from"] == []
+        assert readback["tool_boundary"] == {
+            "mode": "runtime_default",
+            "enabled_toolsets": [],
+            "effective_tools": "resolved_at_fire",
+        }
+        assert readback["delivery"] == stored["deliver"]
+        assert readback["attach_to_session"] == {
+            "policy": "runtime_default",
+            "value": None,
+            "effective": "resolved_at_fire",
+        }
+        assert readback["model"]["policy"] == "inherited"
+        assert readback["model"]["name"] is None
+        assert readback["model"]["provider"] is None
+        assert readback["skills"] == []
+        assert readback["next_run_at"] == stored["next_run_at"]
+
+    def test_create_readback_marks_single_model_override_pinned(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Summarize the local queue.",
+                schedule="every 1h",
+                model="pinned-model",
+            )
+        )
+
+        model = created["readback"]["model"]
+        assert model["policy"] == "pinned"
+        assert model["name"] == "pinned-model"
+        assert model["provider"] is None
+        assert model["base_url"] is None
+
+    def test_no_agent_readback_declares_no_agent_session(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                schedule="every 5m",
+                script="watchdog.py",
+                no_agent=True,
+                deliver="local",
+                prompt="ignored prompt",
+                skills=["ignored-skill"],
+                model="ignored-model",
+                enabled_toolsets=["web"],
+            )
+        )
+
+        assert created["success"] is True
+        readback = created["readback"]
+        assert readback["session"] == {
+            "mode": "none",
+            "current_chat_context": False,
+        }
+        assert readback["input"]["no_agent"] is True
+        assert readback["input"]["prompt"] == "ignored prompt"
+        assert readback["input"]["prompt_ignored"] is True
+        assert readback["input"]["script"] == "watchdog.py"
+        assert readback["tool_boundary"] == {
+            "mode": "not_applicable",
+            "enabled_toolsets": ["web"],
+            "effective_tools": "none",
+            "stored_policy_ignored": True,
+        }
+        assert readback["model"]["policy"] == "not_applicable"
+        assert readback["model"]["name"] == "ignored-model"
+        assert readback["model"]["stored_policy_ignored"] is True
+        assert readback["skills"] == ["ignored-skill"]
+        assert readback["skills_ignored"] is True
+
+    @pytest.mark.parametrize(
+        "readback_failure", ["missing", "get_error", "format_error"]
+    )
+    def test_create_does_not_claim_success_when_readback_fails(
+        self, monkeypatch, readback_failure
+    ):
+        """A completed write is not a verified schedule until readback succeeds."""
+        import tools.cronjob_tools as cronjob_tools
+
+        def fail_readback(_job_id):
+            if readback_failure == "get_error":
+                raise OSError("simulated readback failure")
+            return None
+
+        if readback_failure == "format_error":
+            def fail_format(_job):
+                raise ValueError("simulated readback formatting failure")
+
+            monkeypatch.setattr(
+                cronjob_tools, "_format_persisted_job_readback", fail_format
+            )
+        else:
+            monkeypatch.setattr(cronjob_tools, "get_job", fail_readback)
+
+        result = json.loads(
+            cronjob(
+                action="create",
+                prompt="Produce a local status report.",
+                schedule="every 1h",
+                name="Unreadable job",
+            )
+        )
+
+        assert result["success"] is False
+        assert result["job_saved"] is True
+        assert result["readback_verified"] is False
+        assert "read back" in result["error"]
+
+    def test_update_returns_persisted_fresh_session_contract(self, tmp_path, monkeypatch):
+        """An update response must reflect the stored record, including fields
+        that the write path did not mutate."""
+        from cron.jobs import get_job
+        import tools.cronjob_tools as cronjob_tools
+
+        workdir = tmp_path / "updated-project"
+        workdir.mkdir()
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Read old.json and write old.md.",
+                schedule="every 1h",
+                name="Original",
+                skills=["original-skill"],
+            )
+        )
+        real_update = cronjob_tools.update_job
+
+        def update_with_stale_return(job_id, updates):
+            saved = real_update(job_id, updates)
+            stale = dict(saved)
+            stale.update(
+                name="stale-name",
+                prompt="stale-prompt",
+                skills=["stale-skill"],
+                enabled_toolsets=["stale-toolset"],
+                next_run_at="stale-next-run",
+            )
+            return stale
+
+        monkeypatch.setattr(cronjob_tools, "update_job", update_with_stale_return)
+
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                name="Updated",
+                prompt="Read input.json and write report.md. End with COMPLETE.",
+                skills=["search-first"],
+                enabled_toolsets=["web"],
+                workdir=str(workdir),
+            )
+        )
+
+        assert updated["success"] is True
+        assert updated["readback_verified"] is True
+        stored = get_job(created["job_id"])
+        assert stored is not None
+        assert updated["job"]["name"] == stored["name"] == "Updated"
+        assert updated["readback"]["input"]["prompt"] == stored["prompt"]
+        assert updated["readback"]["workdir"] == stored["workdir"]
+        assert updated["readback"]["skills"] == stored["skills"] == ["search-first"]
+        assert updated["readback"]["tool_boundary"] == {
+            "mode": "per_job_allowlist",
+            "enabled_toolsets": ["web"],
+            "effective_tools": "resolved_at_fire",
+        }
+        assert updated["readback"]["next_run_at"] == stored["next_run_at"]
+
+    @pytest.mark.parametrize(
+        "readback_failure", ["missing", "get_error", "format_error"]
+    )
+    def test_update_does_not_claim_success_when_readback_fails(
+        self, monkeypatch, readback_failure
+    ):
+        """A saved edit without readback must be reported as unverified."""
+        import tools.cronjob_tools as cronjob_tools
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Produce a local status report.",
+                schedule="every 1h",
+                name="Before update",
+            )
+        )
+        def fail_readback(_job_id):
+            if readback_failure == "get_error":
+                raise OSError("simulated readback failure")
+            return None
+
+        if readback_failure == "format_error":
+            def fail_format(_job):
+                raise ValueError("simulated readback formatting failure")
+
+            monkeypatch.setattr(
+                cronjob_tools, "_format_persisted_job_readback", fail_format
+            )
+        else:
+            monkeypatch.setattr(cronjob_tools, "get_job", fail_readback)
+
+        result = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                name="After update",
+            )
+        )
+
+        assert result["success"] is False
+        assert result["job_updated"] is True
+        assert result["readback_verified"] is False
+        assert "read back" in result["error"]
+
+    def test_update_does_not_claim_write_when_job_disappears(self, monkeypatch):
+        import tools.cronjob_tools as cronjob_tools
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Produce a local status report.",
+                schedule="every 1h",
+                name="Soon removed",
+            )
+        )
+        monkeypatch.setattr(cronjob_tools, "update_job", lambda _job_id, _updates: None)
+
+        result = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                name="Never persisted",
+            )
+        )
+
+        assert result["success"] is False
+        assert result["job_updated"] is False
+        assert result["readback_verified"] is False
+        assert "not updated" in result["error"]
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 
@@ -267,6 +612,44 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "abc123deadbe"
         assert listing["jobs"][0]["prompt_preview"] == ""
         assert listing["jobs"][0]["schedule"] == "every 60m"
+
+    def test_update_readback_normalizes_legacy_optional_shapes(self):
+        from datetime import datetime, timedelta, timezone
+
+        from cron.jobs import save_jobs
+
+        next_run = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        save_jobs(
+            [
+                {
+                    "id": "legacy-job",
+                    "name": "legacy job",
+                    "prompt": "Read legacy input",
+                    "schedule": {"kind": "interval", "interval_seconds": 3600},
+                    "schedule_display": "every 1h",
+                    "repeat": {"times": None, "completed": 0},
+                    "enabled": True,
+                    "state": "scheduled",
+                    "next_run_at": next_run,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "enabled_toolsets": "web",
+                    "context_from": "upstream-job",
+                }
+            ]
+        )
+
+        updated = json.loads(
+            cronjob(action="update", job_id="legacy-job", name="legacy updated")
+        )
+
+        assert updated["success"] is True
+        assert updated["readback"]["tool_boundary"] == {
+            "mode": "per_job_allowlist",
+            "enabled_toolsets": ["web"],
+            "effective_tools": "resolved_at_fire",
+        }
+        assert updated["readback"]["input"]["context_from"] == ["upstream-job"]
+        assert updated["readback"]["skills"] == []
 
     def test_pause_and_resume(self):
         created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))

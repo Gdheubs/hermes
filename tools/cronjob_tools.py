@@ -41,6 +41,7 @@ from cron.jobs import (
     AmbiguousJobReference,
     claim_job_for_fire,
     effective_job_state,
+    get_cron_output_dir,
     get_job,
     is_job_runnable,
     list_jobs,
@@ -661,6 +662,131 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _read_persisted_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """Read one saved job without turning storage errors into false success."""
+    try:
+        return get_job(job_id)
+    except Exception as exc:
+        logger.warning("Failed to read back persisted cron job %s: %s", job_id, exc)
+        return None
+
+
+def _format_persisted_job_readback(job: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a complete fresh-session contract from one stored job record."""
+    prompt = str(job.get("prompt") or "")
+    skills = _canonical_skills(job.get("skill"), job.get("skills"))
+    job_id = str(job.get("id") or "unknown")
+    context_from = job.get("context_from")
+    if isinstance(context_from, str):
+        context_from = [context_from]
+    elif not isinstance(context_from, list):
+        context_from = []
+    raw_toolsets = job.get("enabled_toolsets")
+    if isinstance(raw_toolsets, str):
+        toolsets = [raw_toolsets.strip()] if raw_toolsets.strip() else []
+    elif isinstance(raw_toolsets, list):
+        toolsets = [str(value).strip() for value in raw_toolsets if str(value).strip()]
+    else:
+        toolsets = []
+    no_agent = bool(job.get("no_agent"))
+    if no_agent:
+        tool_boundary = {
+            "mode": "not_applicable",
+            "enabled_toolsets": toolsets,
+            "effective_tools": "none",
+            "stored_policy_ignored": True,
+        }
+        model_policy = "not_applicable"
+    else:
+        tool_boundary = {
+            "mode": "per_job_allowlist" if toolsets else "runtime_default",
+            "enabled_toolsets": toolsets,
+            "effective_tools": "resolved_at_fire",
+        }
+        model_policy = (
+            "pinned"
+            if any(
+                job.get(field) is not None
+                for field in ("model", "provider", "base_url")
+            )
+            else "inherited"
+        )
+    model_readback = {
+        "policy": model_policy,
+        "name": job.get("model"),
+        "provider": job.get("provider"),
+        "base_url": job.get("base_url"),
+        "model_snapshot": job.get("model_snapshot"),
+        "provider_snapshot": job.get("provider_snapshot"),
+    }
+    if no_agent:
+        model_readback["stored_policy_ignored"] = True
+    raw_attach_to_session = job.get("attach_to_session")
+    if isinstance(raw_attach_to_session, bool):
+        attach_to_session = {
+            "policy": "explicit",
+            "value": raw_attach_to_session,
+            "effective": raw_attach_to_session,
+        }
+    else:
+        attach_to_session = {
+            "policy": "runtime_default",
+            "value": None,
+            "effective": "resolved_at_fire",
+        }
+
+    return {
+        "source": "persisted",
+        "job_id": job_id,
+        "name": str(job.get("name") or job_id),
+        "schedule": job.get("schedule_display") or "?",
+        "enabled": job.get("enabled", True),
+        "state": effective_job_state(job),
+        "session": {
+            "mode": "none" if no_agent else "fresh",
+            "current_chat_context": False,
+        },
+        "workdir": job.get("workdir"),
+        "input": {
+            "prompt": prompt,
+            "prompt_ignored": no_agent,
+            "script": job.get("script"),
+            "monitor_script": job.get("monitor_script"),
+            "monitor_url": job.get("monitor_url"),
+            "context_from": context_from,
+            "no_agent": no_agent,
+        },
+        "output": {
+            "local_output_dir": str(get_cron_output_dir() / job_id),
+        },
+        "tool_boundary": tool_boundary,
+        "delivery": job.get("deliver", "local"),
+        "attach_to_session": attach_to_session,
+        "model": model_readback,
+        "skills": skills,
+        "skills_ignored": no_agent,
+        "next_run_at": job.get("next_run_at"),
+    }
+
+
+def _format_verified_job_readback(
+    job: Dict[str, Any],
+) -> Optional[Dict[str, Dict[str, Any]]]:
+    """Format a persisted job without turning formatter errors into success."""
+    try:
+        return {
+            "job": _format_job(job),
+            "readback": _format_persisted_job_readback(job),
+        }
+    except Exception as exc:
+        logger.warning(
+            "Failed to format persisted cron job readback %s: %s",
+            job.get("id", "unknown"),
+            exc,
+        )
+        return None
+
+
 def _execute_job_now(
     job: Dict[str, Any], extra_prompt: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -1258,6 +1384,29 @@ def cronjob(
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
                 return tool_error(_partial.pop("error"), success=False, **_partial)
+            persisted_job = _read_persisted_job(job["id"])
+            if persisted_job is None:
+                return tool_error(
+                    "Cron job was saved but its persisted configuration could "
+                    "not be read back. Inspect it with cronjob(action='list') "
+                    "before relying on the schedule.",
+                    success=False,
+                    job_id=job["id"],
+                    job_saved=True,
+                    readback_verified=False,
+                )
+            job = persisted_job
+            formatted_readback = _format_verified_job_readback(job)
+            if formatted_readback is None:
+                return tool_error(
+                    "Cron job was saved but its persisted configuration could "
+                    "not be read back and verified. Inspect it with "
+                    "cronjob(action='list') before relying on the schedule.",
+                    success=False,
+                    job_id=job["id"],
+                    job_saved=True,
+                    readback_verified=False,
+                )
             _create_message = f"Cron job '{job['name']}' created."
             _local_notice = _local_delivery_notice(job, _normalize_deliver_param(deliver))
             if _local_notice:
@@ -1273,7 +1422,9 @@ def cronjob(
                     "repeat": _repeat_display(job),
                     "deliver": job.get("deliver", "local"),
                     "next_run_at": job["next_run_at"],
-                    "job": _format_job(job),
+                    "job": formatted_readback["job"],
+                    "readback_verified": True,
+                    "readback": formatted_readback["readback"],
                     "message": _create_message,
                 },
                 indent=2,
@@ -1544,9 +1695,48 @@ def cronjob(
                     updates["enabled"] = True
             if not updates:
                 return tool_error("No updates provided.", success=False)
-            updated = update_job(job_id, updates)
+            updated_job = update_job(job_id, updates)
+            if updated_job is None:
+                return tool_error(
+                    "Cron job was not updated; it may have been removed before "
+                    "the change could be persisted.",
+                    success=False,
+                    job_id=job_id,
+                    job_updated=False,
+                    readback_verified=False,
+                )
             _notify_provider_jobs_changed_safe()
-            return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
+            persisted_job = _read_persisted_job(job_id)
+            if persisted_job is None:
+                return tool_error(
+                    "Cron job was updated but its persisted configuration could "
+                    "not be read back. Inspect it with cronjob(action='list') "
+                    "before relying on the change.",
+                    success=False,
+                    job_id=job_id,
+                    job_updated=True,
+                    readback_verified=False,
+                )
+            formatted_readback = _format_verified_job_readback(persisted_job)
+            if formatted_readback is None:
+                return tool_error(
+                    "Cron job was updated but its persisted configuration "
+                    "could not be read back and verified. Inspect it with "
+                    "cronjob(action='list') before relying on the change.",
+                    success=False,
+                    job_id=job_id,
+                    job_updated=True,
+                    readback_verified=False,
+                )
+            return json.dumps(
+                {
+                    "success": True,
+                    "job": formatted_readback["job"],
+                    "readback_verified": True,
+                    "readback": formatted_readback["readback"],
+                },
+                indent=2,
+            )
 
         return tool_error(f"Unknown cron action '{action}'", success=False)
 
@@ -1559,7 +1749,7 @@ CRONJOB_SCHEMA = {
     "name": "cronjob",
     "description": """Manage scheduled cron jobs with a single compressed tool.
 
-Use action='create' to schedule a new job from a prompt or one or more skills.
+Use action='create' to schedule a new job from a prompt, skills, or a no_agent script.
 Use action='list' to inspect jobs.
 Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing job.
 
@@ -1568,6 +1758,9 @@ action='run' fires the job immediately in the BACKGROUND (like delegate_task): t
 To stop a job the user no longer wants: first action='list' to find the job_id, then action='remove' with that job_id. Never guess job IDs — always list first.
 
 Jobs run in a fresh session with no current-chat context, so prompts must be self-contained.
+Before create or update, define a fresh-session contract. For tasks that consume files or data, produce artifacts, or perform actions, the prompt must state the exact input, expected output or destination, execution ordering or acceptance rule, tool boundary (including network and external-action limits), and terminal success marker. Set an absolute working directory whenever the task depends on project files or relative paths. If a required detail is missing, stop rather than schedule a guess.
+For no_agent=True, the script path and stdout are the input/output contract; prompt, skills, model, and toolset settings are ignored. Do not require or invent a prompt — verify workdir, delivery, and next_run_at from readback instead.
+After create or update, the tool must read back the persisted record. Verify the returned readback's working directory, exact input, expected output location, tool boundary, delivery, model policy, skills, and next_run_at before claiming success. A successful write without verified readback is not confirmation.
 If skills are provided on create, the future cron run loads those skills in order, then follows the prompt as the task instruction.
 On update, passing skills=[] clears attached skills.
 
@@ -1581,7 +1774,7 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
         "properties": {
             "action": {
                 "type": "string",
-                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
+                "description": "One of: create, list, update, pause, resume, remove, run. When action=create, schedule is REQUIRED; prompt is REQUIRED unless skills define the task. no_agent=True requires script and ignores prompt."
             },
             "job_id": {
                 "type": "string",
