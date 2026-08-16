@@ -98,6 +98,58 @@ class TestPlatformConfigRoundtrip:
         assert restored.gateway_restart_channel.platform == Platform.SLACK
         assert restored.gateway_restart_channel.chat_id == "C-ops"
 
+    def test_restart_channel_must_match_containing_platform(self, caplog):
+        config = GatewayConfig.from_dict(
+            {
+                "platforms": {
+                    "slack": {
+                        "enabled": True,
+                        "token": "test-token",
+                        "home_channel": {
+                            "platform": "slack",
+                            "chat_id": "C-home",
+                            "name": "Home",
+                        },
+                        "gateway_restart_channel": {
+                            "platform": "telegram",
+                            "chat_id": "C-ops",
+                            "name": "Operations",
+                        },
+                    }
+                }
+            }
+        )
+
+        slack = config.platforms[Platform.SLACK]
+        assert slack.enabled is True
+        assert slack.token == "test-token"
+        assert slack.home_channel is not None
+        assert slack.home_channel.chat_id == "C-home"
+        assert slack.gateway_restart_channel is None
+        assert "gateway_restart_channel platform mismatch" in caplog.text
+        assert "expected slack, got telegram" in caplog.text
+        assert "C-ops" not in caplog.text
+
+    def test_restart_channel_matching_containing_platform_roundtrips(self):
+        config = GatewayConfig.from_dict(
+            {
+                "platforms": {
+                    "slack": {
+                        "gateway_restart_channel": {
+                            "platform": "slack",
+                            "chat_id": "C-ops",
+                            "name": "Operations",
+                        }
+                    }
+                }
+            }
+        )
+
+        channel = config.platforms[Platform.SLACK].gateway_restart_channel
+        assert channel is not None
+        assert channel.platform == Platform.SLACK
+        assert channel.chat_id == "C-ops"
+
     @pytest.mark.parametrize(
         "malformed",
         [
@@ -346,6 +398,8 @@ class TestLoadGatewayConfig:
         assert lifecycle_channel is not None
         assert lifecycle_channel.chat_id == "C-ops"
         assert lifecycle_channel.name == "system-messages"
+        assert config.platforms[Platform.SLACK].enabled is False
+        assert Platform.SLACK not in config.get_connected_platforms()
 
     def test_nested_restart_channel_reaches_platform_config(
         self, tmp_path, monkeypatch
@@ -369,6 +423,8 @@ class TestLoadGatewayConfig:
         lifecycle_channel = config.platforms[Platform.SLACK].gateway_restart_channel
         assert lifecycle_channel is not None
         assert lifecycle_channel.chat_id == "C-ops"
+        assert config.platforms[Platform.SLACK].enabled is False
+        assert Platform.SLACK not in config.get_connected_platforms()
 
     def test_top_level_malformed_restart_channel_warns_and_falls_back(
         self, tmp_path, monkeypatch, caplog

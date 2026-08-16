@@ -368,6 +368,35 @@ async def test_relay_fronted_shutdown_uses_lifecycle_channel_with_provenance():
 
 
 @pytest.mark.asyncio
+async def test_failed_enabled_native_platform_does_not_relay_shutdown_notification():
+    from gateway.config import HomeChannel, Platform, PlatformConfig
+    from gateway.platforms.base import SendResult
+
+    runner, _native = make_restart_runner()
+    relay = MagicMock()
+    relay.fronts_platform.side_effect = lambda platform: platform == Platform.SLACK
+    relay.send_for_platform = AsyncMock(
+        return_value=SendResult(success=True, message_id="unexpected")
+    )
+    runner.adapters = {Platform.RELAY: relay}
+    runner.config.platforms = {
+        Platform.RELAY: PlatformConfig(enabled=True),
+        Platform.SLACK: PlatformConfig(
+            enabled=True,
+            gateway_restart_channel=HomeChannel(
+                platform=Platform.SLACK,
+                chat_id="COPS",
+                name="Operations",
+            ),
+        ),
+    }
+
+    await runner._notify_active_sessions_of_shutdown()
+
+    relay.send_for_platform.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_shutdown_notification_uses_persisted_origin_for_colon_ids():
     """Shutdown notifications should route from persisted origin, not reparsed keys."""
     runner, adapter = make_restart_runner()

@@ -708,7 +708,12 @@ class PlatformConfig:
         return result
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "PlatformConfig":
+    def from_dict(
+        cls,
+        data: Dict[str, Any],
+        *,
+        expected_platform: Optional[Platform] = None,
+    ) -> "PlatformConfig":
         data = _coerce_dict(data)
         home_channel = None
         if isinstance(data.get("home_channel"), dict):
@@ -734,6 +739,20 @@ class PlatformConfig:
                     "got %s",
                     type(raw_restart_channel).__name__,
                 )
+
+        if (
+            gateway_restart_channel is not None
+            and expected_platform is not None
+            and gateway_restart_channel.platform != expected_platform
+        ):
+            logger.warning(
+                "Ignoring gateway_restart_channel platform mismatch; "
+                "expected %s, got %s; lifecycle notices will fall back "
+                "to the home channel",
+                expected_platform.value,
+                gateway_restart_channel.platform.value,
+            )
+            gateway_restart_channel = None
 
         # gateway_restart_notification may be bridged into extra via the
         # shared-key loop in load_gateway_config(); check both top-level
@@ -1170,7 +1189,9 @@ class GatewayConfig:
                 continue
             try:
                 platform = Platform(platform_name)
-                platforms[platform] = PlatformConfig.from_dict(platform_data)
+                platforms[platform] = PlatformConfig.from_dict(
+                    platform_data, expected_platform=platform
+                )
             except ValueError:
                 pass  # Skip unknown platforms
         

@@ -2514,6 +2514,7 @@ from gateway.session import (
     neutralize_untrusted_inline_text,
 )
 from gateway.delivery import (
+    DeliveryTransport,
     DeliveryRouter,
     looks_like_telegram_private_chat_id,
     resolve_delivery_transport,
@@ -10348,6 +10349,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return len(notified)
 
+    def _resolve_lifecycle_transport(
+        self, platform: Platform, platform_cfg: PlatformConfig
+    ) -> Optional[DeliveryTransport]:
+        """Resolve delivery without masking a failed enabled native adapter.
+
+        Generic delivery may fall back to Relay when it fronts a logical
+        platform. Lifecycle broadcasts are stricter: an enabled native
+        platform must have connected successfully, while an intentionally
+        disabled logical platform may still be delivered through Relay.
+        """
+        if platform_cfg.enabled and (self.adapters or {}).get(platform) is None:
+            logger.debug(
+                "Skipping lifecycle notification for enabled platform without "
+                "a connected native adapter: %s",
+                platform.value,
+            )
+            return None
+        return resolve_delivery_transport(platform, self.config, self.adapters)
+
     async def _notify_active_sessions_of_shutdown(self) -> None:
         """Send shutdown/restart notifications to active chats and home channels.
 
@@ -10507,9 +10527,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not lifecycle_channel or not lifecycle_channel.chat_id:
                 continue
 
-            transport = resolve_delivery_transport(
-                platform, self.config, self.adapters
-            )
+            transport = self._resolve_lifecycle_transport(platform, platform_cfg)
             if transport is None:
                 continue
 
@@ -12793,7 +12811,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # chat/topic instead of also leaking it to the configured home channel.
         if planned_restart_notification_pending:
             try:
-                await self._send_home_channel_startup_notifications(
+                await self._send_lifecycle_channel_startup_notifications(
                     skip_targets=None,
                 )
             finally:
@@ -23739,7 +23757,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         finally:
             notify_path.unlink(missing_ok=True)
 
-    async def _send_home_channel_startup_notifications(
+    async def _send_lifecycle_channel_startup_notifications(
         self,
         *,
         skip_targets: Optional[set[tuple[str, str, Optional[str]]]] = None,
@@ -23756,7 +23774,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message = "♻️ Gateway online — Hermes is back and ready."
 
         for platform, platform_cfg in self.config.platforms.items():
-            transport = resolve_delivery_transport(platform, self.config, self.adapters)
+            transport = self._resolve_lifecycle_transport(platform, platform_cfg)
             if transport is None:
                 continue
 

@@ -710,6 +710,8 @@ gateway:
 
 Disable it on noisy or low-priority platforms while leaving it on for your primary chat. The notification is sent once per restart, regardless of how many sessions were in flight.
 
+`gateway_restart_channel.platform` must match the containing platform block (`slack` in the example). A mismatched target is ignored and lifecycle notices fall back to that platform's home channel. Configuring only `gateway_restart_channel` does not enable or connect the platform. Enabled native platforms receive lifecycle notices only through a successfully connected native adapter; an intentionally disabled logical platform can still receive them through a connected Relay adapter that explicitly fronts it.
+
 ### Typing indicators
 
 While the agent is processing a message, the gateway shows a live typing status on platforms that support it — a "typing…" bubble on Telegram/Discord/Signal, or the "is thinking…" assistant status on Slack. This is controlled per-platform by the `typing_indicator` flag in `gateway-config.yaml`, which defaults to `true`:

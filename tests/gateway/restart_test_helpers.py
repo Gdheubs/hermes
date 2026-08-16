@@ -106,8 +106,8 @@ def make_restart_runner(
     runner._send_restart_notification = GatewayRunner._send_restart_notification.__get__(
         runner, GatewayRunner
     )
-    runner._send_home_channel_startup_notifications = (
-        GatewayRunner._send_home_channel_startup_notifications.__get__(runner, GatewayRunner)
+    runner._send_lifecycle_channel_startup_notifications = (
+        GatewayRunner._send_lifecycle_channel_startup_notifications.__get__(runner, GatewayRunner)
     )
     runner._status_action_label = GatewayRunner._status_action_label.__get__(
         runner, GatewayRunner
