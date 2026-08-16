@@ -3,31 +3,16 @@
 Feature M4 of the Discord Omniscience campaign (EPIC #79564): a safe, typed
 outbound embed surface so an agent can attach rich embeds to Discord messages
 without hand-rolling discord.py objects or trusting untrusted JSON.
-
-Discord embed limits (REST v10, ``resources/message.mdx``) are enforced here so
-the REST call can never 400 on an oversized or malformed embed:
-
-    title            256 chars
-    description     4096 chars
-    field name       256 chars
-    field value     1024 chars
-    fields            25 max
-    footer text     2048 chars
-    author name      256 chars
-    total content   6000 chars (title + description + field names/values
-                    + footer + author)
-
-This module never executes arbitrary marker/JSON payloads; it is a pure typed
-builder that validates on construction and exposes a plain-text fallback for
-clients where embeds do not render.
 """
 
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence
+from urllib.parse import urlparse
 
 __all__ = [
     "EMBED_LIMITS",
@@ -42,7 +27,6 @@ __all__ = [
     "validate_embeds",
 ]
 
-# ── Discord-documented embed limits (REST v10) ───────────────────────────────
 EMBED_LIMITS = {
     "title": 256,
     "description": 4096,
@@ -55,22 +39,21 @@ EMBED_LIMITS = {
     "per_message": 10,
 }
 
-_HTTP_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 _ISO_TS_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})$"
 )
-# Control characters (C0 + DEL, excluding tab/newline/carriage-return) that have
-# no place in a Discord payload URL.
-_URL_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_BAD_PERCENT_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
 
 class EmbedValidationError(ValueError):
-    """Raised when an embed violates a Discord-documented limit."""
+    """Raised when an embed violates the typed Discord payload contract."""
 
 
 def _check_len(value: Optional[str], limit: int, what: str) -> Optional[str]:
     if value is None:
         return None
+    if not isinstance(value, str):
+        raise EmbedValidationError(f"embed {what} must be a string, got {value!r}")
     if len(value) > limit:
         raise EmbedValidationError(
             f"embed {what} is {len(value)} chars, exceeds Discord limit {limit}"
@@ -78,35 +61,68 @@ def _check_len(value: Optional[str], limit: int, what: str) -> Optional[str]:
     return value
 
 
-def _check_url(value: Optional[str], what: str) -> Optional[str]:
-    """Validate a URL: must use an http(s) scheme, have a non-empty hostname,
-    and contain no control characters. Preserves None handling and
-    EmbedValidationError behavior.
+def _has_forbidden_url_chars(value: str) -> bool:
+    return any(ch.isspace() or unicodedata.category(ch) == "Cc" for ch in value) or "\\" in value
+
+
+def _check_url(
+    value: Optional[str],
+    what: str,
+    *,
+    allow_attachment: bool = False,
+) -> Optional[str]:
+    """Validate an embed URL without allowing parser normalization to hide bad input.
+
+    Link targets must use HTTP(S). Media/icon targets may additionally use
+    Discord's ``attachment://filename`` reference form.
     """
     if value is None:
         return None
     if not isinstance(value, str):
+        raise EmbedValidationError(f"embed {what} must be a URL string, got {value!r}")
+    if _has_forbidden_url_chars(value):
         raise EmbedValidationError(
-            f"embed {what} must be an http(s) URL, got {value!r}"
+            f"embed {what} contains forbidden whitespace/control/backslash characters, "
+            f"got {value!r}"
         )
-    if _URL_CONTROL_RE.search(value):
+    if _BAD_PERCENT_RE.search(value):
         raise EmbedValidationError(
-            f"embed {what} contains control characters, got {value!r}"
+            f"embed {what} contains malformed percent encoding, got {value!r}"
         )
-    # Parse the URL for structural validation rather than relying on a
-    # prefix regex alone.
-    from urllib.parse import urlparse
 
-    parsed = urlparse(value)
-    if parsed.scheme.lower() not in ("http", "https"):
+    try:
+        parsed = urlparse(value)
+        scheme = parsed.scheme.lower()
+        hostname = parsed.hostname
+        # Accessing .port performs numeric/range validation and can raise.
+        parsed.port
+    except ValueError as exc:
         raise EmbedValidationError(
-            f"embed {what} must be an http(s) URL, got {value!r}"
-        )
-    if not parsed.hostname:
-        raise EmbedValidationError(
-            f"embed {what} must have a non-empty hostname, got {value!r}"
-        )
-    return value
+            f"embed {what} is not a structurally valid URL, got {value!r}"
+        ) from exc
+
+    if scheme in ("http", "https"):
+        if not hostname:
+            raise EmbedValidationError(
+                f"embed {what} must have a non-empty hostname, got {value!r}"
+            )
+        return value
+
+    if allow_attachment and scheme == "attachment":
+        if (
+            not parsed.netloc
+            or parsed.path
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise EmbedValidationError(
+                f"embed {what} must use attachment://filename, got {value!r}"
+            )
+        return value
+
+    allowed = "http(s) or attachment" if allow_attachment else "http(s)"
+    raise EmbedValidationError(f"embed {what} must use {allowed}, got {value!r}")
 
 
 @dataclass(frozen=True)
@@ -118,44 +134,67 @@ class EmbedField:
     inline: bool = False
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "name", _check_len(self.name, EMBED_LIMITS["field_name"], "field name"))
-        object.__setattr__(self, "value", _check_len(self.value, EMBED_LIMITS["field_value"], "field value"))
+        object.__setattr__(
+            self,
+            "name",
+            _check_len(self.name, EMBED_LIMITS["field_name"], "field name"),
+        )
+        object.__setattr__(
+            self,
+            "value",
+            _check_len(self.value, EMBED_LIMITS["field_value"], "field value"),
+        )
+        if type(self.inline) is not bool:
+            raise EmbedValidationError(
+                f"embed field inline must be a bool, got {self.inline!r}"
+            )
 
 
 @dataclass(frozen=True)
 class EmbedAuthor:
-    """Embed author line (name ≤256, optional url/icon)."""
+    """Embed author line (name <=256, optional url/icon)."""
 
     name: str
     url: Optional[str] = None
     icon_url: Optional[str] = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "name", _check_len(self.name, EMBED_LIMITS["author_name"], "author name"))
+        object.__setattr__(
+            self,
+            "name",
+            _check_len(self.name, EMBED_LIMITS["author_name"], "author name"),
+        )
         object.__setattr__(self, "url", _check_url(self.url, "author url"))
-        object.__setattr__(self, "icon_url", _check_url(self.icon_url, "author icon_url"))
+        object.__setattr__(
+            self,
+            "icon_url",
+            _check_url(self.icon_url, "author icon_url", allow_attachment=True),
+        )
 
 
 @dataclass(frozen=True)
 class EmbedFooter:
-    """Embed footer (text ≤2048, optional icon)."""
+    """Embed footer (text <=2048, optional icon)."""
 
     text: str
     icon_url: Optional[str] = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "text", _check_len(self.text, EMBED_LIMITS["footer_text"], "footer text"))
-        object.__setattr__(self, "icon_url", _check_url(self.icon_url, "footer icon_url"))
+        object.__setattr__(
+            self,
+            "text",
+            _check_len(self.text, EMBED_LIMITS["footer_text"], "footer text"),
+        )
+        object.__setattr__(
+            self,
+            "icon_url",
+            _check_url(self.icon_url, "footer icon_url", allow_attachment=True),
+        )
 
 
 @dataclass(frozen=True)
 class Embed:
-    """A validated Discord embed.
-
-    Enforces every documented limit at construction. ``fields`` are bounded to
-    25 and the total character budget across title/description/fields/footer/
-    author is capped at 6000.
-    """
+    """A validated Discord embed with an immutable external field surface."""
 
     title: Optional[str] = None
     description: Optional[str] = None
@@ -164,44 +203,73 @@ class Embed:
     timestamp: Optional[str] = None
     author: Optional[EmbedAuthor] = None
     footer: Optional[EmbedFooter] = None
-    fields: List[EmbedField] = field(default_factory=list)
+    fields: Sequence[EmbedField] = field(default_factory=tuple)
     image_url: Optional[str] = None
     thumbnail_url: Optional[str] = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "title", _check_len(self.title, EMBED_LIMITS["title"], "title"))
         object.__setattr__(
-            self, "description",
+            self,
+            "title",
+            _check_len(self.title, EMBED_LIMITS["title"], "title"),
+        )
+        object.__setattr__(
+            self,
+            "description",
             _check_len(self.description, EMBED_LIMITS["description"], "description"),
         )
         object.__setattr__(self, "url", _check_url(self.url, "url"))
-        object.__setattr__(self, "image_url", _check_url(self.image_url, "image url"))
-        object.__setattr__(self, "thumbnail_url", _check_url(self.thumbnail_url, "thumbnail url"))
+        object.__setattr__(
+            self,
+            "image_url",
+            _check_url(self.image_url, "image url", allow_attachment=True),
+        )
+        object.__setattr__(
+            self,
+            "thumbnail_url",
+            _check_url(self.thumbnail_url, "thumbnail url", allow_attachment=True),
+        )
+
+        if self.author is not None and not isinstance(self.author, EmbedAuthor):
+            raise EmbedValidationError(
+                f"embed author must be EmbedAuthor, got {self.author!r}"
+            )
+        if self.footer is not None and not isinstance(self.footer, EmbedFooter):
+            raise EmbedValidationError(
+                f"embed footer must be EmbedFooter, got {self.footer!r}"
+            )
+
         if self.timestamp is not None:
             if not isinstance(self.timestamp, str) or not _ISO_TS_RE.match(self.timestamp):
                 raise EmbedValidationError(
                     f"embed timestamp must be ISO-8601, got {self.timestamp!r}"
                 )
-            # Parse the validated timestamp to reject invalid calendar dates
-            # (e.g. 2026-02-30T00:00:00Z). Normalize trailing ``Z`` to ``+00:00``
-            # for fromisoformat compatibility on Python < 3.11.
             normalized = self.timestamp
             if normalized.endswith("Z"):
                 normalized = normalized[:-1] + "+00:00"
             try:
                 datetime.fromisoformat(normalized)
-            except ValueError:
+            except ValueError as exc:
                 raise EmbedValidationError(
                     f"embed timestamp is not a valid date/time, got {self.timestamp!r}"
-                )
+                ) from exc
+
         if self.color is not None:
-            if not isinstance(self.color, int) or not (0 <= self.color <= 0xFFFFFF):
+            if type(self.color) is not int or not (0 <= self.color <= 0xFFFFFF):
                 raise EmbedValidationError(
                     f"embed color must be a 24-bit int, got {self.color!r}"
                 )
-        # Convert the mutable list to an immutable tuple before validation so
-        # the frozen dataclass never exposes a mutable sequence externally.
-        object.__setattr__(self, "fields", tuple(self.fields))
+
+        try:
+            immutable_fields = tuple(self.fields)
+        except TypeError as exc:
+            raise EmbedValidationError(
+                f"embed fields must be a sequence of EmbedField, got {self.fields!r}"
+            ) from exc
+        if any(not isinstance(item, EmbedField) for item in immutable_fields):
+            raise EmbedValidationError("embed fields must contain only EmbedField values")
+        object.__setattr__(self, "fields", immutable_fields)
+
         if len(self.fields) > EMBED_LIMITS["fields"]:
             raise EmbedValidationError(
                 f"embed has {len(self.fields)} fields, exceeds Discord limit "
@@ -218,60 +286,57 @@ class Embed:
         total = len(self.title or "") + len(self.description or "")
         total += len(self.author.name) if self.author else 0
         total += len(self.footer.text) if self.footer else 0
-        total += sum(len(f.name) + len(f.value) for f in self.fields)
+        total += sum(len(item.name) + len(item.value) for item in self.fields)
         return total
 
     def to_payload(self) -> dict:
-        """Render to the Discord REST embed object (safe, no execution)."""
+        """Render to the Discord REST embed object."""
         payload: dict = {}
         for key in ("title", "description", "url", "color", "timestamp"):
-            val = getattr(self, key)
-            if val is not None:
-                payload[key] = val
+            value = getattr(self, key)
+            if value is not None:
+                payload[key] = value
+
         if self.author is not None:
-            a: dict = {"name": self.author.name}
+            author: dict = {"name": self.author.name}
             if self.author.url:
-                a["url"] = self.author.url
+                author["url"] = self.author.url
             if self.author.icon_url:
-                a["icon_url"] = self.author.icon_url
-            payload["author"] = a
+                author["icon_url"] = self.author.icon_url
+            payload["author"] = author
+
         if self.footer is not None:
-            f: dict = {"text": self.footer.text}
+            footer: dict = {"text": self.footer.text}
             if self.footer.icon_url:
-                f["icon_url"] = self.footer.icon_url
-            payload["footer"] = f
+                footer["icon_url"] = self.footer.icon_url
+            payload["footer"] = footer
+
         if self.image_url:
             payload["image"] = {"url": self.image_url}
         if self.thumbnail_url:
             payload["thumbnail"] = {"url": self.thumbnail_url}
         if self.fields:
             payload["fields"] = [
-                {"name": f.name, "value": f.value, "inline": f.inline}
-                for f in self.fields
+                {"name": item.name, "value": item.value, "inline": item.inline}
+                for item in self.fields
             ]
         return payload
 
 
-# ── Message-level batch validation ───────────────────────────────────────────
 def validate_embeds(embeds: Sequence[Embed]) -> None:
-    """Enforce Discord's per-message embed limits.
-
-    A single message may carry at most EMBED_LIMITS["per_message"] (10) embeds,
-    and the combined character budget across *all* embeds in that message is
-    capped at EMBED_LIMITS["total"] (6000). Individual embeds are already
-    validated at construction; this function adds the message-level count and
-    aggregate-budget constraints so callers have one entry point for the full
-    message.
-
-    Raises EmbedValidationError when the collection violates either limit.
-    """
-    embeds = list(embeds)
-    if len(embeds) > EMBED_LIMITS["per_message"]:
+    """Enforce Discord's per-message count and aggregate-character limits."""
+    try:
+        immutable_embeds = tuple(embeds)
+    except TypeError as exc:
+        raise EmbedValidationError("embeds must be a sequence of Embed values") from exc
+    if any(not isinstance(embed, Embed) for embed in immutable_embeds):
+        raise EmbedValidationError("embeds must contain only Embed values")
+    if len(immutable_embeds) > EMBED_LIMITS["per_message"]:
         raise EmbedValidationError(
-            f"message has {len(embeds)} embeds, exceeds Discord limit "
+            f"message has {len(immutable_embeds)} embeds, exceeds Discord limit "
             f"{EMBED_LIMITS['per_message']}"
         )
-    aggregate = sum(e._total_chars() for e in embeds)
+    aggregate = sum(embed._total_chars() for embed in immutable_embeds)
     if aggregate > EMBED_LIMITS["total"]:
         raise EmbedValidationError(
             f"message embed content is {aggregate} chars, exceeds Discord "
@@ -279,36 +344,52 @@ def validate_embeds(embeds: Sequence[Embed]) -> None:
         )
 
 
-# ── Mention policy ───────────────────────────────────────────────────────────
-# Discord mention forms: @everyone, @here, and <@id> / <@!id> user mentions.
 MENTION_PATTERNS = (
     re.compile(r"@everyone"),
     re.compile(r"@here"),
     re.compile(r"<@!?[0-9]+>"),
+    re.compile(r"<@&[0-9]+>"),
 )
 
 
 def contains_mention(text: str) -> bool:
     """Return True when ``text`` carries a Discord mention that can ping."""
-    return any(p.search(text or "") for p in MENTION_PATTERNS)
+    if not isinstance(text, str):
+        raise EmbedValidationError(f"mention text must be a string, got {text!r}")
+    return any(pattern.search(text) for pattern in MENTION_PATTERNS)
 
 
-# ── Plain-text fallback ──────────────────────────────────────────────────────
 def embed_to_plain_text(embed: Embed) -> str:
-    """Render an embed as plain markdown for clients where embeds are invisible.
+    """Render an embed's user-visible content as a plain Markdown fallback."""
+    if not isinstance(embed, Embed):
+        raise EmbedValidationError(f"fallback input must be Embed, got {embed!r}")
 
-    Preserves the full payload next to any buttons/typing so an interactive
-    prompt never loses its content on clients where embeds render separately.
-    """
     lines: List[str] = []
     if embed.author:
-        lines.append(f"**{embed.author.name}**")
+        if embed.author.url:
+            lines.append(f"**[{embed.author.name}]({embed.author.url})**")
+        else:
+            lines.append(f"**{embed.author.name}**")
+
     if embed.title:
-        lines.append(f"# {embed.title}")
+        if embed.url:
+            lines.append(f"# [{embed.title}]({embed.url})")
+        else:
+            lines.append(f"# {embed.title}")
+    elif embed.url:
+        lines.append(embed.url)
+
     if embed.description:
         lines.append(embed.description)
-    for f in embed.fields:
-        lines.append(f"**{f.name}:** {f.value}")
+    for item in embed.fields:
+        lines.append(f"**{item.name}:** {item.value}")
+    if embed.timestamp:
+        lines.append(f"`{embed.timestamp}`")
+    if embed.image_url:
+        lines.append(embed.image_url)
+    if embed.thumbnail_url:
+        lines.append(embed.thumbnail_url)
     if embed.footer:
         lines.append(f"_{embed.footer.text}_")
+
     return "\n".join(lines)
