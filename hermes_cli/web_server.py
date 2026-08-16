@@ -16849,9 +16849,9 @@ _IMMUTABLE_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 def mount_spa(application: FastAPI):
     """Mount the built SPA. Falls back to index.html for client-side routing.
 
-    The session token is injected into index.html via a ``<script>`` tag so
-    the SPA can authenticate against protected API endpoints without a
-    separate (unauthenticated) token-dispensing endpoint.
+    Runtime bootstrap values are injected into index.html via a ``<script>``
+    tag so the SPA can authenticate protected endpoints and inherit the
+    profile selected by the dashboard launcher.
 
     When served behind a path-prefix reverse proxy (e.g.
     ``mission-control.tilos.com/hermes/*`` -> local Caddy -> :9119), the
@@ -16906,12 +16906,17 @@ def mount_spa(application: FastAPI):
         chat_js = "true" if _DASHBOARD_EMBEDDED_CHAT_ENABLED else "false"
         gated = bool(getattr(app.state, "auth_required", False))
         gated_js = "true" if gated else "false"
+        initial_profile = str(
+            getattr(application.state, "initial_profile", "") or ""
+        )
+        initial_profile_js = json.dumps(initial_profile).replace("</", "<\\/")
         if gated:
             bootstrap_script = (
                 f"<script>"
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
+                f"window.__HERMES_INITIAL_PROFILE__={initial_profile_js};"
                 f"</script>"
             )
         else:
@@ -16920,6 +16925,7 @@ def mount_spa(application: FastAPI):
                 f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
                 f'window.__HERMES_BASE_PATH__="{prefix}";'
                 f"window.__HERMES_AUTH_REQUIRED__={gated_js};"
+                f"window.__HERMES_INITIAL_PROFILE__={initial_profile_js};"
                 f"</script>"
             )
         if prefix:
@@ -18378,10 +18384,9 @@ def start_server(
 ):
     """Start the web UI server.
 
-    ``initial_profile`` (when set) is appended to the auto-opened browser
-    URL as ``?profile=<name>`` so the SPA's profile switcher preselects it
-    — used when a profile alias (``<profile> dashboard``) routes to the
-    machine dashboard.
+    ``initial_profile`` preselects the SPA's profile switcher. It is appended
+    to the auto-opened browser URL and injected into the SPA bootstrap so
+    profile-less deep links inherit the same scope.
 
     ``headless`` is the ``serve`` path: the JSON-RPC/WS backend with no UI
     build and no SPA mount (mount_spa() honours ``HERMES_SERVE_HEADLESS``), so
@@ -18392,6 +18397,7 @@ def start_server(
     """
     _apply_ssh_session_token(ssh_session_token or "")
     _apply_ssh_owner_nonce(ssh_owner_nonce)
+    app.state.initial_profile = str(initial_profile or "")
 
     # Raise RLIMIT_NOFILE for dashboard-mode starts that don't route through
     # the `serve` path in main.py (which applies the same floor). Canonical
