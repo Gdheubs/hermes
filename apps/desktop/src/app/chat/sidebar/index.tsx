@@ -108,6 +108,7 @@ import {
 } from '@/store/pull-requests'
 import { openRouteTile } from '@/store/route-tiles'
 import {
+  $connection,
   $cronSessions,
   $currentCwd,
   $gatewayState,
@@ -122,6 +123,7 @@ import {
   sessionPinId,
   setCurrentCwd
 } from '@/store/session'
+import { resolveSessionDateGroupProfile, sessionDateGroupScope } from '@/store/session-date-group-collapse'
 import { $sessionDotStateById, sessionStatusBucket } from '@/store/session-dot-state'
 import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/store/session-states'
 import { ackAllSessionsRead } from '@/store/session-unread'
@@ -374,6 +376,7 @@ export function ChatSidebar({
   const profiles = useStore($profiles)
   const profileColors = useStore($profileColors)
   const profileScope = useStore($profileScope)
+  const connection = useStore($connection)
 
   // Toggle the persisted read-state watermark from a row menu. The row's own
   // `unread` prop mirrors what the dot paints; flip it and let the backend
@@ -395,6 +398,19 @@ export function ChatSidebar({
   // profile while scope is still ALL (persisted), the rail is hidden and they'd
   // otherwise be stuck in the grouped view with no way out.
   const showAllProfiles = multiProfile && profileScope === ALL_PROFILES
+
+  const recentsDateGroupScope = useMemo(
+    () =>
+      sessionDateGroupScope(
+        connection,
+        resolveSessionDateGroupProfile(connection, profileScope, {
+          allProfilesKey: ALL_PROFILES,
+          showAllProfiles
+        })
+      ),
+    [connection, profileScope, showAllProfiles]
+  )
+
   const agentOrderIds = useStore($sidebarSessionOrderIds)
   const agentOrderManual = useStore($sidebarSessionOrderManual)
   const workspaceOrderIds = useStore($sidebarWorkspaceOrderIds)
@@ -1626,6 +1642,7 @@ export function ChatSidebar({
                   // virtualized long list, which must keep its own scroller.
                   !recentsVirtualizes && COMPACT_FLAT
                 )}
+                dateGroupScope={recentsDateGroupScope}
                 dndSensors={dndSensors}
                 emptyState={
                   showSessionSkeletons ? (
