@@ -531,6 +531,12 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "north-mini-code-free",
         "nemotron-3-ultra-free",
     ],
+    "opencode-free": [
+        "big-pickle",
+        "deepseek-v4-flash-free",
+        "mimo-v2.5-free",
+        "nemotron-3-super-free",
+    ],
     "opencode-go": [
         "kimi-k3",
         "kimi-k2.7-code",
@@ -1243,7 +1249,7 @@ PROVIDER_GROUPS: dict[str, tuple[str, str, list[str]]] = {
     "google":   ("Google Gemini",   "Google AI Studio (API key)",                     ["gemini"]),
     "openai":   ("OpenAI",          "ChatGPT/Codex subscription or direct OpenAI API", ["openai-codex", "openai-api"]),
     "qwen":     ("Qwen",            "Qwen Cloud / DashScope, Coding Plan & Qwen CLI OAuth", ["alibaba", "alibaba-coding-plan", "qwen-oauth"]),
-    "opencode": ("OpenCode",        "Zen pay-as-you-go or Go subscription",            ["opencode-zen", "opencode-go"]),
+    "opencode": ("OpenCode",        "Zen pay-as-you-go, Go subscription, or free tier", ["opencode-zen", "opencode-go", "opencode-free"]),
     "copilot":  ("GitHub Copilot",  "GitHub token API or copilot --acp process",       ["copilot", "copilot-acp"]),
 }
 
@@ -3308,6 +3314,32 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                 return ids
         except Exception:
             pass
+
+    # OpenCode Free: match the exact same logic as opencode CLI.
+    # models.dev has cost+status metadata missing from /zen/v1/models.
+    # Filter: cost.input == 0 (free) AND status != "deprecated".
+    if normalized == "opencode-free":
+        try:
+            from agent.models_dev import fetch_models_dev
+            data = fetch_models_dev()
+            provider_data = data.get("opencode")
+            if isinstance(provider_data, dict):
+                mdev_models = provider_data.get("models", {})
+                if isinstance(mdev_models, dict):
+                    free_active = [
+                        mid for mid, m in mdev_models.items()
+                        if isinstance(m, dict)
+                        and isinstance(m.get("cost"), dict)
+                        and m["cost"].get("input") == 0
+                        and m.get("status") != "deprecated"
+                    ]
+                    if free_active:
+                        return sorted(free_active)
+        except Exception:
+            pass
+        curated_static = list(_PROVIDER_MODELS.get(normalized, []))
+        if curated_static:
+            return curated_static
 
     # ── Profile-based generic live fetch (all simple api-key providers) ──
     # Handles any provider registered in providers/ with auth_type="api_key".

@@ -3844,6 +3844,7 @@ def select_provider_and_model(args=None):
         "kilocode",
         "opencode-zen",
         "opencode-go",
+        "opencode-free",
         "alibaba",
         "huggingface",
         "xiaomi",
