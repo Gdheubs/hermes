@@ -162,6 +162,18 @@ VALID_HOOKS: Set[str] = {
     # Plugins return a string to replace the response text, or None/empty to leave unchanged.
     # First non-None string wins. Useful for vocabulary/personality transformation.
     "transform_llm_output",
+    # At-rest message content transforms. Fired on the sqlite boundary in
+    # hermes_state.HermesState, immediately before content is written and
+    # immediately after it is read. Callbacks receive ``content``, ``session_id``
+    # and ``role`` and return replacement content, or None to leave it unchanged.
+    # First non-None return wins.
+    #
+    # Unlike every other hook, callback exceptions PROPAGATE (invoked with
+    # strict=True): a store transform that silently no-ops writes untransformed
+    # content to disk, and a load transform that silently no-ops hands
+    # untransformed content to the model. Both are worse than a loud failure.
+    "transform_message_store",
+    "transform_message_load",
     "pre_llm_call",
     "post_llm_call",
     # Streaming LLM output observer hooks. Fired asynchronously off the token
@@ -5068,7 +5080,9 @@ class PluginManager:
         }
         return callback(**accepted_payload)
 
-    def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
+    def invoke_hook(
+        self, hook_name: str, *, strict: bool = False, **kwargs: Any
+    ) -> List[Any]:
         """Call all registered callbacks for *hook_name*.
 
         Hook payloads evolve additively. Callbacks that accept ``**kwargs``
@@ -5076,6 +5090,14 @@ class PluginManager:
         receive only the keyword arguments they declare. Each callback is
         wrapped in its own try/except so a misbehaving plugin cannot break the
         core agent loop.
+
+        Pass ``strict=True`` to propagate callback exceptions instead of
+        logging and continuing. This is for hooks where silently skipping a
+        callback is itself the failure — the at-rest content transforms
+        (``transform_message_store`` / ``transform_message_load``), where a
+        swallowed exception means untransformed content reaches disk or the
+        model. ``strict`` is keyword-only and is consumed here rather than
+        forwarded, so it cannot appear in a hook payload.
 
         Returns a list of non-``None`` return values from callbacks.
 
@@ -5105,6 +5127,8 @@ class PluginManager:
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
+                if strict:
+                    raise
                 logger.warning(
                     "Hook '%s' callback %s raised: %s",
                     hook_name,
@@ -5838,7 +5862,9 @@ def _delivery_manager() -> PluginManager:
     return manager
 
 
-def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+def invoke_hook(
+    hook_name: str, *, strict: bool = False, **kwargs: Any
+) -> List[Any]:
     """Invoke a lifecycle hook on loaded plugins.
 
     Ensures plugins are discovered on first invocation so callers in
@@ -5847,8 +5873,11 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
     callbacks registered by user plugins (tracking #64178).
 
     Returns a list of non-``None`` return values from plugin callbacks.
+
+    ``strict=True`` propagates callback exceptions rather than logging them;
+    see :meth:`PluginManager.invoke_hook`.
     """
-    return _delivery_manager().invoke_hook(hook_name, **kwargs)
+    return _delivery_manager().invoke_hook(hook_name, strict=strict, **kwargs)
 
 
 def render_system_prompt_sections(
