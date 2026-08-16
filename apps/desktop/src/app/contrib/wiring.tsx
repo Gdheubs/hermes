@@ -586,6 +586,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     activeSessionId,
     activeSessionIdRef,
     branchCurrentSession: branchInNewChat,
+    branchStoredSession,
     busyRef,
     createBackendSessionForSend,
     getRoutedStoredSessionId,
