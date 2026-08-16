@@ -17720,8 +17720,6 @@ def _merged_plugins_hub(force_refresh: bool = False) -> Dict[str, Any]:
         dir_path = Path(dir_str)
         if aliases & disabled_set:
             runtime_status = "disabled"
-        elif aliases & enabled_set:
-            runtime_status = "enabled"
         elif _same_dir(dir_path, active_provider_dir):
             # Selected through `memory.provider`, which never populates
             # `plugins.enabled` — it is loaded and running, so "inactive" is
@@ -17730,7 +17728,14 @@ def _merged_plugins_hub(force_refresh: bool = False) -> Dict[str, Any]:
             # membership in `plugins.enabled`, which does not govern the
             # provider, so the Plugins page must not offer Disable here — it
             # points at the memory-provider selector instead.
+            #
+            # Checked before `plugins.enabled` to match the CLI's
+            # `_plugin_status`. A plugin can be in both sets, and the provider
+            # is the stronger fact: it is what is actually serving memory, and
+            # it is the state whose lifecycle the toggle cannot govern.
             runtime_status = "active"
+        elif aliases & enabled_set:
+            runtime_status = "enabled"
         else:
             runtime_status = "inactive"
 

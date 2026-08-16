@@ -152,3 +152,41 @@ def test_no_configured_provider_leaves_rows_inactive(monkeypatch, tmp_path):
     payload = web_server._merged_plugins_hub(force_refresh=True)
 
     assert _row_for(payload)["unrelated"]["runtime_status"] == "inactive"
+
+
+def test_provider_also_in_enabled_set_agrees_with_the_cli(monkeypatch, tmp_path):
+    """The hub and the CLI must not disagree when a provider is *also* enabled.
+
+    A plugin can be listed in `plugins.enabled` and selected through
+    `memory.provider` at once. The CLI's `_plugin_status` checks the provider
+    directory before `plugins.enabled`, so it reports "active"; the hub checked
+    `plugins.enabled` first, so it reported "enabled" and the Plugins page put
+    the Disable button back — the exact control this change removes, since
+    disabling only edits `plugins.enabled` and would not stop the provider.
+    """
+    provider_dir = tmp_path / "plugins" / "mnemosyne"
+    provider_dir.mkdir(parents=True)
+    rows = [
+        ("mnemosyne-hermes", "0.5.0", "Memory", "user", str(provider_dir), "mnemosyne-hermes"),
+    ]
+    _patch_hub(
+        monkeypatch,
+        rows=rows,
+        active_provider_dir=provider_dir,
+        enabled={"mnemosyne-hermes"},
+    )
+
+    payload = web_server._merged_plugins_hub(force_refresh=True)
+    hub_status = _row_for(payload)["mnemosyne-hermes"]["runtime_status"]
+
+    cli_status = plugins_cmd._plugin_status(
+        "mnemosyne-hermes",
+        {"mnemosyne-hermes"},
+        set(),
+        key="mnemosyne-hermes",
+        dir_path=provider_dir,
+        active_provider_dir=provider_dir,
+    )
+
+    assert cli_status == plugins_cmd.PLUGIN_STATUS_ACTIVE
+    assert hub_status == cli_status
