@@ -25,6 +25,40 @@ const remoteTarget = {
   url: 'file:///srv/report.html'
 }
 
+describe('strict normalization', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('returns null when the IPC refuses the target', async () => {
+    window.hermesDesktop = {
+      normalizePreviewTarget: vi.fn(async () => null)
+    } as never
+
+    await expect(
+      normalizeOrLocalPreviewTarget('/backend/only/evidence.png', undefined, { strict: true })
+    ).resolves.toBeNull()
+  })
+
+  it('still classifies locally without strict when the IPC refuses', async () => {
+    window.hermesDesktop = {
+      normalizePreviewTarget: vi.fn(async () => null)
+    } as never
+
+    await expect(normalizeOrLocalPreviewTarget('/backend/only/evidence.png')).resolves.toMatchObject({
+      kind: 'file'
+    })
+  })
+
+  it('falls back to local classification when the IPC is missing, even in strict mode', async () => {
+    window.hermesDesktop = {} as never
+
+    await expect(
+      normalizeOrLocalPreviewTarget('/srv/evidence.png', undefined, { strict: true })
+    ).resolves.toMatchObject({ kind: 'file' })
+  })
+})
+
 describe('remote HTML previews', () => {
   beforeEach(() => {
     vi.clearAllMocks()

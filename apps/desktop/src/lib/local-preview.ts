@@ -259,13 +259,26 @@ async function enrichPreviewTarget(target: PreviewTarget | null): Promise<Previe
 
 export async function normalizeOrLocalPreviewTarget(
   rawTarget: string,
-  cwd?: string | null
+  cwd?: string | null,
+  options?: { strict?: boolean }
 ): Promise<PreviewTarget | null> {
   try {
-    const normalized = await window.hermesDesktop?.normalizePreviewTarget?.(rawTarget, cwd || undefined)
+    const normalize = window.hermesDesktop?.normalizePreviewTarget
 
-    if (normalized) {
-      return enrichPreviewTarget(normalized)
+    if (normalize) {
+      const normalized = await normalize(rawTarget, cwd || undefined)
+
+      if (normalized) {
+        return enrichPreviewTarget(normalized)
+      }
+
+      // The IPC probed the target and refused it — a missing/unreadable path
+      // (e.g. a backend-host path that does not exist on this machine). In
+      // strict mode that verdict is final: extension-based classification
+      // would fabricate a target for a file we know is not readable here.
+      if (options?.strict) {
+        return null
+      }
     }
   } catch {
     // Running Electron may still have the old HTML-only preview IPC. Fall

@@ -26,8 +26,10 @@ import type { ClientSessionState } from '@/app/types'
 import { $narrowViewport } from '@/components/pane-shell/tree/store'
 import { onGatewayEvent } from '@/contrib/events'
 import { deleteProfile, getLogs, getStatus, type HermesGateway } from '@/hermes'
+import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { $gateway, openGatewayForAgent, openGatewayForProfile } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
+import { openPreview } from '@/store/preview'
 import {
   $activeGatewayProfile,
   ensureGatewayAgent,
@@ -315,6 +317,20 @@ export const host = {
 
   /** Restart the backend gateway (progress surfaces in the core statusbar). */
   restartGateway: async () => runGatewayRestart(),
+
+  /** Open a machine-readable file in the shared preview rail. Plugins hand
+   *  over a path; the host owns local/remote resolution and presentation. */
+  previewFile: async (path: string, label?: string): Promise<boolean> => {
+    const target = await normalizeOrLocalPreviewTarget(path, $currentCwd.get() || undefined, { strict: true })
+
+    if (!target) {
+      return false
+    }
+
+    openPreview(label ? { ...target, label } : target, 'manual')
+
+    return true
+  },
 
   /** One-shot system status snapshot (platforms, versions, …). */
   status: async () => getStatus(),
