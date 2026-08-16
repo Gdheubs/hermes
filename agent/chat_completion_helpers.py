@@ -2811,7 +2811,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         rewrite_prompt_model_identity(agent, fb_model, fb_provider)
 
         agent._buffer_status(
-            f"🔄 Primary model failed — switching to fallback: "
+            f"🔄 Primary model unavailable — switching to fallback: "
             f"{fb_model} via {fb_provider}"
         )
         # The buffered line above is dropped on successful recovery, but a
@@ -2821,8 +2821,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # (see run_agent.py); it is discarded on terminal failure since the
         # buffered line is flushed instead.  See fallback-observability fix.
         agent._pending_fallback_notice = (
-            f"🔄 Switched to fallback model: {old_model} via {old_provider} "
-            f"→ {fb_model} via {fb_provider}"
+            f"🔄 Falling back to {fb_model} via {fb_provider} "
+            f"({old_model} via {old_provider} unavailable) — continuing work"
         )
         logger.info(
             "Fallback activated: %s → %s (%s)",

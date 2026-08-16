@@ -133,8 +133,8 @@ def test_pending_fallback_notice_emitted_once_on_success():
 
     # Simulate try_activate_fallback: buffer the noisy switch line AND record
     # the durable one-shot notice.
-    agent._buffer_status("🔄 Primary model failed — switching to fallback: m2 via p2")
-    agent._pending_fallback_notice = "🔄 Switched to fallback model: m1 via p1 → m2 via p2"
+    agent._buffer_status("🔄 Primary model unavailable — switching to fallback: m2 via p2")
+    agent._pending_fallback_notice = "🔄 Falling back to m2 via p2 (m1 via p1 unavailable) — continuing work"
 
     # Success path order: emit pending notice, then drop the buffer.
     agent._emit_pending_fallback_notice()
@@ -142,14 +142,14 @@ def test_pending_fallback_notice_emitted_once_on_success():
 
     # The durable notice was shown exactly once; the buffered retry noise was
     # silently dropped.
-    assert emitted == ["🔄 Switched to fallback model: m1 via p1 → m2 via p2"]
+    assert emitted == ["🔄 Falling back to m2 via p2 (m1 via p1 unavailable) — continuing work"]
     assert agent._retry_status_buffer == []
     # Notice is cleared so it cannot re-emit on a later turn.
     assert agent._pending_fallback_notice is None
 
     # A second success path with no new fallback emits nothing.
     agent._emit_pending_fallback_notice()
-    assert emitted == ["🔄 Switched to fallback model: m1 via p1 → m2 via p2"]
+    assert emitted == ["🔄 Falling back to m2 via p2 (m1 via p1 unavailable) — continuing work"]
 
 
 def test_pending_fallback_notice_noop_when_unset():
@@ -170,12 +170,12 @@ def test_flush_discards_pending_fallback_notice():
     emitted = []
     agent._emit_status = lambda msg: emitted.append(msg)
 
-    agent._buffer_status("🔄 Primary model failed — switching to fallback: m2 via p2")
-    agent._pending_fallback_notice = "🔄 Switched to fallback model: m1 via p1 → m2 via p2"
+    agent._buffer_status("🔄 Primary model unavailable — switching to fallback: m2 via p2")
+    agent._pending_fallback_notice = "🔄 Falling back to m2 via p2 (m1 via p1 unavailable) — continuing work"
 
     # Terminal failure flushes the buffered trace...
     agent._flush_status_buffer()
-    assert emitted == ["🔄 Primary model failed — switching to fallback: m2 via p2"]
+    assert emitted == ["🔄 Primary model unavailable — switching to fallback: m2 via p2"]
     # ...and discards the pending notice so it won't re-emit on a later turn.
     assert agent._pending_fallback_notice is None
 
