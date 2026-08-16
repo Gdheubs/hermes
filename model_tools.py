@@ -414,6 +414,24 @@ def get_tool_definitions(
     return result
 
 
+def _builtin_memory_tools_disabled() -> bool:
+    """True when the user has explicitly disabled BOTH built-in memory stores.
+
+    Delegates to :func:`tools.memory_tool.check_memory_requirements` as the
+    single source of truth for the config gate.
+
+    ``model_tools._compute_tool_definitions`` applies this gate synchronously
+    on config fingerprint changes to bypass the 30 s TTL / 60 s flap-grace
+    window in :meth:`tools.registry.ToolRegistry.get_definitions` on a disable
+    flip.
+    """
+    try:
+        from tools.memory_tool import check_memory_requirements
+        return not check_memory_requirements()
+    except Exception:
+        return False
+
+
 def _compute_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
@@ -456,6 +474,12 @@ def _compute_tool_definitions(
         from toolsets import get_all_toolsets
         for ts_name in get_all_toolsets():
             tools_to_include.update(resolve_toolset(ts_name))
+
+    # Honcho-primary memory mode: when both built-in memory stores are
+    # disabled, drop the dead built-in `memory` schema. External provider
+    # tools (honcho_*) are injected later and unaffected.
+    if "memory" in tools_to_include and _builtin_memory_tools_disabled():
+        tools_to_include.discard("memory")
 
     # Always apply disabled toolsets as a subtraction step at the end.
     # This ensures that even if a composite toolset (like hermes-cli)
