@@ -25,6 +25,7 @@ import hermes_cli.auth as auth_mod
 from hermes_cli.auth import (
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
     PROVIDER_REGISTRY,
+    TOOL_CREDENTIAL_PROVIDERS,
     _auth_store_lock,
     _codex_access_token_is_expiring,
     _decode_jwt_claims,
@@ -729,6 +730,21 @@ class CredentialPool:
     def entries(self) -> List[PooledCredential]:
         with self._lock:
             return list(self._entries)
+
+    def available_entries(self) -> List[PooledCredential]:
+        """Return entries not currently in exhaustion cooldown (read-only).
+
+        Public sibling of ``peek()`` for callers that need the whole
+        candidate list up front (e.g. tool key rotation deciding whether a
+        failed key has any untried alternative before marking it exhausted).
+        Read-only: expired-cooldown pruning and OAuth refresh are skipped,
+        matching ``peek()``'s non-mutating read.
+        """
+        with self._lock:
+            available, _pending = self._available_entries(
+                clear_expired=False, refresh=False
+            )
+            return list(available)
 
     def _current_unlocked(self) -> Optional[PooledCredential]:
         if not self._current_id:
@@ -2979,7 +2995,13 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
 
     pconfig = PROVIDER_REGISTRY.get(provider)
     if not pconfig or pconfig.auth_type != AUTH_TYPE_API_KEY:
-        return changed, active_sources
+        # Tool-provider pools (firecrawl, tavily, exa, parallel) are API-key
+        # credential identities only — they live in a separate registry and
+        # seed identically so their env keys participate in rotation and
+        # cooldowns.
+        pconfig = TOOL_CREDENTIAL_PROVIDERS.get(provider)
+        if not pconfig:
+            return changed, active_sources
 
     env_url = ""
     if pconfig.base_url_env_var:

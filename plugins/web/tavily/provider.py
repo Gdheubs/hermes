@@ -6,7 +6,11 @@ capabilities advertised:
 - ``supports_search()``  -> True (Tavily ``/search``)
 - ``supports_extract()`` -> True (Tavily ``/extract``)
 
-Both are sync — the underlying call is ``httpx.post(...)``.
+Both are sync — the underlying call is ``httpx.post(...)``. Each public
+call is wrapped in :func:`agent.tool_credentials.run_with_key_rotation`:
+when the resolved key fails with an auth/billing/rate-limit error, the call
+is retried with the next credential for the same provider (``hermes auth
+add tavily`` keys or env-seeded pool entries).
 
 Config keys this provider responds to::
 
@@ -27,23 +31,42 @@ import logging
 import os
 from typing import Any, Dict, List
 
-from agent.web_search_provider import WebSearchProvider
+from agent.tool_credentials import ToolCredentialError, run_with_key_rotation
+from agent.web_search_provider import WebSearchProvider, get_provider_env
 
 logger = logging.getLogger(__name__)
 
 
-def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def _resolve_tavily_api_key() -> str:
+    """Resolve the Tavily API key for this provider.
+
+    Routes through :func:`tools.tool_backend_helpers.resolve_provider_secret`
+    (config → scoped env → ``.env`` → credential pool) so keys added via
+    ``hermes auth add tavily`` and env-seeded pool entries are visible, not
+    just ``TAVILY_API_KEY``. Never raises; returns ``""`` on a miss.
+    """
+    from tools.tool_backend_helpers import resolve_provider_secret
+
+    return resolve_provider_secret("TAVILY_API_KEY", "tavily")
+
+
+def _tavily_request(
+    endpoint: str, payload: Dict[str, Any], api_key: str = ""
+) -> Dict[str, Any]:
     """POST to the Tavily API and return the parsed JSON response.
 
-    Mirrors :func:`tools.web_tools._tavily_request`. Raises ``ValueError``
-    when ``TAVILY_API_KEY`` is unset; the caller catches and surfaces as
-    a typed error response.
+    Performs ONE attempt with the given ``api_key`` (resolved via
+    :func:`_resolve_tavily_api_key` when empty). Raises ``ValueError`` when
+    no key is available anywhere. Non-2xx responses raise
+    :class:`ToolCredentialError` carrying the REAL HTTP status code and
+    body — the rotation wrapper classifies those for auth/billing/rate-limit
+    rotation with the best fidelity of the three web providers (direct
+    httpx access).
     """
     import httpx
 
-    from agent.web_search_provider import get_provider_env
-
-    api_key = get_provider_env("TAVILY_API_KEY")
+    if not api_key:
+        api_key = _resolve_tavily_api_key()
     if not api_key:
         raise ValueError(
             "TAVILY_API_KEY environment variable not set. "
@@ -57,7 +80,17 @@ def _tavily_request(endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     logger.info("Tavily %s request to %s", endpoint, url)
 
     response = httpx.post(url, json=payload, timeout=60)
-    response.raise_for_status()
+    if response.status_code >= 400:
+        try:
+            body = response.json()
+        except Exception:  # noqa: BLE001 — body may be non-JSON text
+            body = response.text or None
+        raise ToolCredentialError(
+            f"Tavily API error {response.status_code}: {body}",
+            status_code=response.status_code,
+            body=body,
+            provider_id="tavily",
+        )
     return response.json()
 
 
@@ -139,10 +172,13 @@ class TavilyWebSearchProvider(WebSearchProvider):
         return "Tavily"
 
     def is_available(self) -> bool:
-        """Return True when ``TAVILY_API_KEY`` is set to a non-empty value."""
-        from agent.web_search_provider import get_provider_env
+        """Return True when a Tavily API key is configured.
 
-        return bool(get_provider_env("TAVILY_API_KEY"))
+        Resolves through config → scoped env → ``.env`` → credential pool
+        (network-free), so keys added via ``hermes auth add tavily`` count
+        even when no env var is set.
+        """
+        return bool(_resolve_tavily_api_key())
 
     def supports_search(self) -> bool:
         return True
@@ -159,19 +195,23 @@ class TavilyWebSearchProvider(WebSearchProvider):
                 return {"success": False, "error": "Interrupted"}
 
             logger.info("Tavily search: '%s' (limit=%d)", query, limit)
-            raw = _tavily_request(
-                "search",
-                {
-                    "query": query,
-                    "max_results": min(limit, 20),
-                    "include_raw_content": False,
-                    "include_images": False,
-                },
+            payload = {
+                "query": query,
+                "max_results": min(limit, 20),
+                "include_raw_content": False,
+                "include_images": False,
+            }
+            raw = run_with_key_rotation(
+                "tavily",
+                lambda attempt_key: _tavily_request(
+                    "search", payload, api_key=attempt_key
+                ),
+                current_key=_resolve_tavily_api_key(),
             )
             return _normalize_tavily_search_results(raw)
         except ValueError as exc:
             return {"success": False, "error": str(exc)}
-        except Exception as exc:  # noqa: BLE001 — including httpx errors
+        except Exception as exc:  # noqa: BLE001 — incl. ToolCredentialError
             logger.warning("Tavily search error: %s", exc)
             return {"success": False, "error": f"Tavily search failed: {exc}"}
 
@@ -190,12 +230,16 @@ class TavilyWebSearchProvider(WebSearchProvider):
                 ]
 
             logger.info("Tavily extract: %d URL(s)", len(urls))
-            raw = _tavily_request(
-                "extract",
-                {
-                    "urls": urls,
-                    "include_images": False,
-                },
+            payload = {
+                "urls": urls,
+                "include_images": False,
+            }
+            raw = run_with_key_rotation(
+                "tavily",
+                lambda attempt_key: _tavily_request(
+                    "extract", payload, api_key=attempt_key
+                ),
+                current_key=_resolve_tavily_api_key(),
             )
             return _normalize_tavily_documents(
                 raw, fallback_url=urls[0] if urls else ""

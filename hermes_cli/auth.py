@@ -588,6 +588,44 @@ except Exception:
     pass
 
 
+# Tool-provider credential identities (Firecrawl, Tavily, Exa, Parallel).
+# These are credential-pool identities ONLY — they are NOT inference
+# providers and must never leak into model-provider listings, model pickers,
+# or inference auth flows (every one of those keys off PROVIDER_REGISTRY).
+# The pool uses them solely to seed/rotate API keys for managed tool calls
+# (e.g. FIRECRAWL_API_KEY rotation on billing/rate-limit failures).
+TOOL_CREDENTIAL_PROVIDERS: Dict[str, ProviderConfig] = {
+    "firecrawl": ProviderConfig(
+        id="firecrawl",
+        name="Firecrawl",
+        auth_type="api_key",
+        inference_base_url="https://api.firecrawl.dev",
+        api_key_env_vars=("FIRECRAWL_API_KEY",),
+    ),
+    "tavily": ProviderConfig(
+        id="tavily",
+        name="Tavily",
+        auth_type="api_key",
+        inference_base_url="https://api.tavily.com",
+        api_key_env_vars=("TAVILY_API_KEY",),
+    ),
+    "exa": ProviderConfig(
+        id="exa",
+        name="Exa",
+        auth_type="api_key",
+        inference_base_url="https://api.exa.ai",
+        api_key_env_vars=("EXA_API_KEY",),
+    ),
+    "parallel": ProviderConfig(
+        id="parallel",
+        name="Parallel",
+        auth_type="api_key",
+        inference_base_url="https://api.parallel.ai",
+        api_key_env_vars=("PARALLEL_API_KEY",),
+    ),
+}
+
+
 # =============================================================================
 # Anthropic Key Helper
 # =============================================================================

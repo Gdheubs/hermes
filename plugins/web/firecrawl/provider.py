@@ -120,11 +120,23 @@ Firecrawl = _FirecrawlProxy()
 # :func:`_get_firecrawl_client` below.
 
 
-def _get_direct_firecrawl_config() -> Optional[tuple]:
-    """Return explicit direct Firecrawl kwargs + cache key, or None when unset."""
-    from hermes_cli.config import get_env_value
+def _get_direct_firecrawl_config(api_key_override: str = "") -> Optional[tuple]:
+    """Return explicit direct Firecrawl kwargs + cache key, or None when unset.
 
-    api_key = (get_env_value("FIRECRAWL_API_KEY") or "").strip()
+    ``api_key_override`` (used by pool-backed key rotation) pins the key
+    when given. Otherwise the key resolves via
+    :func:`tools.tool_backend_helpers.resolve_provider_secret`, which
+    checks scoped env / ``.env`` and then the credential pool
+    (``hermes auth add firecrawl``) — so pool keys participate in presence
+    checks (``check_firecrawl_api_key``) and rotation. The Firecrawl API URL
+    read stays a plain ``get_env_value`` lookup.
+    """
+    from hermes_cli.config import get_env_value
+    from tools.tool_backend_helpers import resolve_provider_secret
+
+    api_key = (api_key_override or "").strip()
+    if not api_key:
+        api_key = resolve_provider_secret("FIRECRAWL_API_KEY", "firecrawl")
     api_url = (get_env_value("FIRECRAWL_API_URL") or "").strip().rstrip("/")
 
     if not api_key and not api_url:
@@ -163,15 +175,22 @@ def _is_tool_gateway_ready() -> bool:
 
 
 def _has_direct_firecrawl_config() -> bool:
-    """Return True when direct Firecrawl config is explicitly configured."""
+    """Return True when direct Firecrawl config is explicitly configured.
+
+    Via :func:`_get_direct_firecrawl_config` this also covers keys resolved
+    from the credential pool (``hermes auth add firecrawl``).
+    """
     return _get_direct_firecrawl_config() is not None
 
 
 def check_firecrawl_api_key() -> bool:
     """Return True when Firecrawl backend (direct or gateway) is usable.
 
-    Re-exported by :mod:`tools.web_tools` for backward compatibility with
-    existing tests and the ``hermes tools`` setup flow.
+    Direct presence includes env / ``.env`` keys as well as credential-pool
+    keys (resolved via :func:`_get_direct_firecrawl_config`); the check is
+    network-free (config/env/.env/pool reads only). Re-exported by
+    :mod:`tools.web_tools` for backward compatibility with existing tests
+    and the ``hermes tools`` setup flow.
     """
     return _has_direct_firecrawl_config() or _is_tool_gateway_ready()
 
@@ -209,12 +228,18 @@ def _raise_web_backend_configuration_error() -> None:
     raise ValueError(message)
 
 
-def _get_firecrawl_client() -> Any:
+def _get_firecrawl_client(api_key_override: str = "") -> Any:
     """Get or create the cached Firecrawl client.
 
     When ``web.use_gateway`` is set in config, the managed Tool Gateway is
     preferred even if direct Firecrawl credentials are present. Otherwise
     direct Firecrawl takes precedence when explicitly configured.
+
+    ``api_key_override`` (pool-backed key rotation) pins the direct API key
+    for this construction. The cache key tuple already includes the key
+    value, so a rotated key rebuilds the client automatically. The override
+    only matters on the direct path — when the managed gateway is preferred
+    (or required) it is used regardless.
 
     Raises ValueError when neither path is usable.
 
@@ -229,7 +254,7 @@ def _get_firecrawl_client() -> Any:
     """
     import tools.web_tools as _wt
 
-    direct_config = _get_direct_firecrawl_config()
+    direct_config = _get_direct_firecrawl_config(api_key_override=api_key_override)
     if direct_config is not None and not _wt.prefers_gateway("web"):
         kwargs, client_config = direct_config
     else:
@@ -275,6 +300,78 @@ def _reset_client_for_tests() -> None:
 
     _wt._firecrawl_client = None
     _wt._firecrawl_client_config = None
+
+
+# ---------------------------------------------------------------------------
+# Pool-backed key rotation (direct cloud auth only)
+# ---------------------------------------------------------------------------
+# Credentials registered via ``hermes auth add firecrawl`` (or seeded from
+# env) form a per-provider credential pool. When a direct-cloud key fails
+# with a billing / auth / rate-limit error (402 / 401 / 403 / 429), the call
+# is retried with the next pool key for the SAME provider — never a
+# different provider, and never in managed-gateway mode (a gateway 402 is
+# the Nous subscription's billing state, not a user key) or self-hosted
+# mode (pool keys are cloud keys and must not be aimed at a self-hosted
+# instance).
+#
+# The helpers below are sync — the underlying firecrawl SDK is sync — and
+# wrap each call in ``run_with_key_rotation``, which owns candidate
+# ordering (current key first, then pool entries, deduped), single-shot
+# passthrough (no pool / multiplex-active), and best-effort
+# ``mark_exhausted_and_rotate`` bookkeeping. SDK exceptions are re-raised
+# as ``ToolCredentialError`` so HTTP status codes reach the classifier.
+
+def _search_firecrawl_with_rotation(
+    query: str, limit: int, *, current_key: str = ""
+) -> Any:
+    """Search Firecrawl with pool-backed key rotation (direct cloud auth).
+
+    ``fn`` builds the client per candidate key via
+    :func:`_get_firecrawl_client` (the cache key tuple includes the key
+    value, so rotation rebuilds the client automatically) and wraps SDK
+    exceptions with :func:`agent.tool_credentials.tool_error_from_exception`
+    so the HTTP status (402 billing, 429 rate-limit, 401/403 auth) reaches
+    :func:`agent.error_classifier.classify_api_error` inside the rotation
+    wrapper.
+    """
+    from agent.tool_credentials import run_with_key_rotation
+    from agent.tool_credentials import tool_error_from_exception
+
+    def _attempt(api_key: str) -> Any:
+        client = _get_firecrawl_client(api_key_override=api_key)
+        try:
+            return client.search(query=query, limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            raise tool_error_from_exception(exc, "firecrawl") from exc
+
+    return run_with_key_rotation("firecrawl", _attempt, current_key=current_key)
+
+
+def _scrape_firecrawl_with_rotation(
+    url: str, formats: List[str], *, current_key: str = ""
+) -> Any:
+    """Scrape ONE URL with pool-backed key rotation (sync; run in a thread).
+
+    Same rotation semantics as :func:`_search_firecrawl_with_rotation`, but
+    scoped per URL: a billing/auth/rate-limit failure on URL ``i`` rotates
+    to the next pool key and retries ONLY URL ``i`` — already-scraped URLs
+    are never re-fetched. This is the async adaptation: the rotation
+    wrapper is sync and the SDK is sync, so ``extract()`` runs this helper
+    via ``asyncio.to_thread`` with its existing per-URL
+    ``asyncio.wait_for(timeout=60)`` guard, which bounds the whole attempt
+    for a URL including any key retries.
+    """
+    from agent.tool_credentials import run_with_key_rotation
+    from agent.tool_credentials import tool_error_from_exception
+
+    def _attempt(api_key: str) -> Any:
+        client = _get_firecrawl_client(api_key_override=api_key)
+        try:
+            return client.scrape(url=url, formats=formats)
+        except Exception as exc:  # noqa: BLE001
+            raise tool_error_from_exception(exc, "firecrawl") from exc
+
+    return run_with_key_rotation("firecrawl", _attempt, current_key=current_key)
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +492,13 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
         call directly. Normalizes the response across SDK/direct/gateway
         shapes via :func:`_extract_web_search_results`.
 
+        Direct cloud auth is pool-backed: when the resolved key fails with a
+        billing/auth/rate-limit error, the call is retried once per remaining
+        pool key via :func:`_search_firecrawl_with_rotation`. Managed-gateway
+        and self-hosted (URL-only) paths stay single-shot — a gateway 402 is
+        the Nous subscription's billing state (never a user key), and pool
+        keys are cloud keys that must not be aimed at a self-hosted instance.
+
         Pre-flight errors (``ValueError`` from configuration check,
         ``ImportError`` from missing SDK) propagate to the dispatcher's
         top-level handler, which wraps them as ``tool_error(...)`` —
@@ -408,17 +512,52 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
             return {"success": False, "error": "Interrupted"}
 
         logger.info("Firecrawl search: '%s' (limit=%d)", query, limit)
-        # _get_firecrawl_client() raises ValueError on unconfigured systems —
-        # let it propagate so the dispatcher emits the legacy envelope shape.
-        client = _get_firecrawl_client()
-        try:
-            response = client.search(query=query, limit=limit)
-            web_results = _extract_web_search_results(response)
-            logger.info("Firecrawl: found %d search results", len(web_results))
-            return {"success": True, "data": {"web": web_results}}
-        except Exception as exc:  # noqa: BLE001
+
+        import tools.web_tools as _wt
+
+        # Mode gate, mirroring _get_firecrawl_client's own selection: when
+        # the managed gateway is preferred — or there is no direct config at
+        # all — the gateway path runs single-shot, exactly as before.
+        direct_config = _get_direct_firecrawl_config()
+        gateway_active = direct_config is None or _wt.prefers_gateway("web")
+        direct_key = ""
+        self_hosted = False
+        if direct_config is not None:
+            direct_kwargs, _ = direct_config
+            direct_key = direct_kwargs.get("api_key") or ""
+            # Self-hosted direct mode (URL set, no key): single shot, no
+            # rotation — pool keys would be cloud keys against a self-hosted
+            # URL.
+            self_hosted = bool(direct_kwargs.get("api_url")) and not direct_key
+
+        def _fail(exc: Exception) -> Dict[str, Any]:
             logger.warning("Firecrawl search error: %s", exc)
             return {"success": False, "error": f"Firecrawl search failed: {exc}"}
+
+        if gateway_active or self_hosted:
+            # Single attempt, exactly as today. _get_firecrawl_client()
+            # raises ValueError on unconfigured systems — let it propagate so
+            # the dispatcher emits the legacy envelope shape.
+            client = _get_firecrawl_client()
+            try:
+                response = client.search(query=query, limit=limit)
+            except Exception as exc:  # noqa: BLE001
+                return _fail(exc)
+        else:
+            # Direct cloud auth — pool-backed key rotation.
+            try:
+                response = _search_firecrawl_with_rotation(
+                    query, limit, current_key=direct_key
+                )
+            except Exception as exc:  # noqa: BLE001
+                return _fail(exc)
+
+        try:
+            web_results = _extract_web_search_results(response)
+        except Exception as exc:  # noqa: BLE001
+            return _fail(exc)
+        logger.info("Firecrawl: found %d search results", len(web_results))
+        return {"success": True, "data": {"web": web_results}}
 
     async def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
         """Extract content from one or more URLs via Firecrawl.
@@ -453,6 +592,22 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
         # module level (lazy-friendly because the website_policy import is
         # cheap) so monkeypatching it in tests works as expected.
 
+        # Pool-backed key rotation applies only to direct cloud auth —
+        # single-shot exclusions mirror search(): managed gateway (a gateway
+        # 402 is Nous subscription billing, never a user key) and
+        # self-hosted URL-only mode (pool keys are cloud keys aimed at the
+        # wrong endpoint).
+        import tools.web_tools as _wt
+
+        direct_config = _get_direct_firecrawl_config()
+        use_rotation = False
+        direct_key = ""
+        if direct_config is not None and not _wt.prefers_gateway("web"):
+            direct_kwargs, _ = direct_config
+            direct_key = direct_kwargs.get("api_key") or ""
+            self_hosted = bool(direct_kwargs.get("api_url")) and not direct_key
+            use_rotation = not self_hosted
+
         results: List[Dict[str, Any]] = []
 
         for url in urls:
@@ -486,14 +641,33 @@ class FirecrawlWebSearchProvider(WebSearchProvider):
             try:
                 logger.info("Firecrawl scraping: %s", url)
                 try:
-                    scrape_result = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            _get_firecrawl_client().scrape,
-                            url=url,
-                            formats=formats,
-                        ),
-                        timeout=60,
-                    )
+                    if use_rotation:
+                        # Per-URL rotation: a billing/auth/rate-limit failure
+                        # on THIS url rotates to the next pool key and
+                        # retries only it; already-scraped URLs are never
+                        # re-fetched. The rotation wrapper is sync (SDK is
+                        # sync), so it runs inside the same to_thread as the
+                        # scrape, keeping run_with_key_rotation semantics
+                        # identical; the wait_for(60) guard still bounds the
+                        # whole per-URL attempt including key retries.
+                        scrape_result = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                _scrape_firecrawl_with_rotation,
+                                url,
+                                formats,
+                                current_key=direct_key,
+                            ),
+                            timeout=60,
+                        )
+                    else:
+                        scrape_result = await asyncio.wait_for(
+                            asyncio.to_thread(
+                                _get_firecrawl_client().scrape,
+                                url=url,
+                                formats=formats,
+                            ),
+                            timeout=60,
+                        )
                 except asyncio.TimeoutError:
                     logger.warning("Firecrawl scrape timed out for %s", url)
                     results.append(

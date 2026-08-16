@@ -149,6 +149,31 @@ Provider-supplied `reset_at` timestamps override these default cooldowns.
 
 The `has_retried_429` flag resets on every successful API call, so a single transient 429 doesn't trigger rotation.
 
+## Tool Provider Keys (Web Search & Extract)
+
+Pools also cover the API keys behind the `web_search` / `web_extract` tools — Firecrawl, Tavily, Exa, and Parallel. When a tool call fails with a credential-level error (402 billing, 401/403 auth, 429 rate limit), Hermes retries the call with the next pool key for the **same** provider instead of failing the tool call.
+
+```bash
+# Add a backup Firecrawl key — rotation is automatic from here
+hermes auth add firecrawl --api-key fc-your-second-key
+
+# Same for the other web backends
+hermes auth add tavily --api-key tvly-your-second-key
+hermes auth add exa --api-key your-second-exa-key
+hermes auth add parallel --api-key your-second-parallel-key
+```
+
+Your `FIRECRAWL_API_KEY` (etc.) from `.env` is auto-seeded into the pool, so an env key plus one `hermes auth add` key already gives you two-key rotation.
+
+Differences from model-provider rotation:
+
+- **Request errors never rotate.** A 400/404/5xx/timeout is not a key problem — the call fails normally and no key is marked.
+- **A lone key is never cooled down.** Marking your only key exhausted would make the tool disappear until the cooldown expires, so the final available key's failure just surfaces the error.
+- **`web_extract` rotates per URL.** If a batch extract hits a billing error on URL 5, only URL 5 is retried with the next key — already-scraped URLs are not re-fetched.
+- **Managed Tool Gateway and self-hosted Firecrawl never rotate.** A gateway 402 reflects your Nous subscription's billing state, not a user key, and pool keys are cloud keys that must not be sent to a self-hosted instance.
+
+Cross-provider failover (Firecrawl → Tavily) is a separate mechanism: set `web.search_backend` / `web.extract_backend` in config.yaml, or let the automatic backend selection walk the available providers. Pools rotate *within* one provider's keys; backend selection picks *which* provider serves the call.
+
 ## Custom Endpoint Pools
 
 Custom OpenAI-compatible endpoints (Together.ai, RunPod, local servers) get their own pools, keyed by the endpoint name from the `providers:` dict in config.yaml (or the legacy `custom_providers` list, which is auto-migrated).
@@ -218,6 +243,7 @@ The credential pool integrates at the provider resolution layer:
 2. **`hermes_cli/auth_commands.py`** — CLI commands and interactive wizard
 3. **`hermes_cli/runtime_provider.py`** — Pool-aware credential resolution
 4. **`run_agent.py`** — Error recovery: 429/402/401 → pool rotation → fallback
+5. **`agent/tool_credentials.py`** — Same-provider key rotation for tool API keys (Firecrawl, Tavily, Exa, Parallel)
 
 ## Storage
 

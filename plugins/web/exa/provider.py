@@ -16,10 +16,16 @@ Env var::
 
     EXA_API_KEY=...    # https://exa.ai (paid tier; free trial available)
 
+Each public call is wrapped in :func:`agent.tool_credentials.run_with_key_rotation`:
+when the resolved key fails with an auth/billing/rate-limit error, the call
+is retried with the next credential for the same provider (``hermes auth
+add exa`` keys or env-seeded pool entries). The SDK client is built per
+attempt key and cached keyed by key value.
+
 The previous in-tree implementation lived at
 ``tools.web_tools._exa_search`` / ``_exa_extract``; this file is the
 canonical replacement. Behavior is bit-for-bit identical aside from the
-ABC method-name change.
+ABC method-name change and key rotation.
 """
 
 from __future__ import annotations
@@ -28,37 +34,57 @@ import logging
 import os
 from typing import Any, Dict, List
 
+from agent.tool_credentials import run_with_key_rotation, tool_error_from_exception
 from agent.web_search_provider import WebSearchProvider
 
 logger = logging.getLogger(__name__)
 
-# Module-level note: the canonical ``_exa_client`` cache slot lives on
-# :mod:`tools.web_tools` so tests that do ``tools.web_tools._exa_client =
-# None`` between cases see fresh state. The plugin reads/writes through
-# that public module (see :func:`_get_exa_client`).
+# Key-keyed Exa client cache: ``{api_key: client}``. Rotation hands each
+# attempt a different key, so caching per key value reuses the SDK client
+# for the common single-key case while never serving a client bound to a
+# stale key. The canonical ``tools.web_tools._exa_client`` slot is kept in
+# sync so tests that reset it (``tools.web_tools._exa_client = None``
+# between cases) still see fresh state.
+_exa_client_cache: Dict[str, Any] = {}
 
 
-def _get_exa_client() -> Any:
-    """Lazy-import and cache an Exa SDK client.
+def _resolve_exa_api_key() -> str:
+    """Resolve the Exa API key for this provider.
 
-    Cache lives on :mod:`tools.web_tools` (as ``_exa_client``) so unit
-    tests that reset that name between cases keep working. Raises
-    ``ValueError`` when ``EXA_API_KEY`` is unset.
+    Routes through :func:`tools.tool_backend_helpers.resolve_provider_secret`
+    (config → scoped env → ``.env`` → credential pool) so keys added via
+    ``hermes auth add exa`` and env-seeded pool entries are visible, not
+    just ``EXA_API_KEY``. Never raises; returns ``""`` on a miss.
+    """
+    from tools.tool_backend_helpers import resolve_provider_secret
+
+    return resolve_provider_secret("EXA_API_KEY", "exa")
+
+
+def _get_exa_client(api_key: str = "") -> Any:
+    """Lazy-import and cache an Exa SDK client keyed by API key.
+
+    When ``api_key`` is empty it is resolved like the legacy env read
+    (via :func:`_resolve_exa_api_key`). Raises ``ValueError`` when no key
+    is available anywhere; ``ImportError`` when the SDK is missing.
     """
     import tools.web_tools as _wt
 
-    cached = getattr(_wt, "_exa_client", None)
-    if cached is not None:
-        return cached
+    if getattr(_wt, "_exa_client", None) is None:
+        # Tests reset the canonical slot between cases; honor that by
+        # dropping the key-keyed cache so a stale client never survives.
+        _exa_client_cache.clear()
 
-    from agent.web_search_provider import get_provider_env
-
-    api_key = get_provider_env("EXA_API_KEY")
+    api_key = api_key or _resolve_exa_api_key()
     if not api_key:
         raise ValueError(
             "EXA_API_KEY environment variable not set. "
             "Get your API key at https://exa.ai"
         )
+
+    cached = _exa_client_cache.get(api_key)
+    if cached is not None:
+        return cached
 
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
@@ -73,15 +99,17 @@ def _get_exa_client() -> Any:
 
     client = Exa(api_key=api_key)
     client.headers["x-exa-integration"] = "hermes-agent"
+    _exa_client_cache[api_key] = client
     _wt._exa_client = client
     return client
 
 
 def _reset_client_for_tests() -> None:
-    """Drop the cached Exa client so tests can re-instantiate cleanly."""
+    """Drop the cached Exa clients so tests can re-instantiate cleanly."""
     import tools.web_tools as _wt
 
     _wt._exa_client = None
+    _exa_client_cache.clear()
 
 
 class ExaWebSearchProvider(WebSearchProvider):
@@ -101,10 +129,13 @@ class ExaWebSearchProvider(WebSearchProvider):
         return "Exa"
 
     def is_available(self) -> bool:
-        """Return True when ``EXA_API_KEY`` is set to a non-empty value."""
-        from agent.web_search_provider import get_provider_env
+        """Return True when an Exa API key is configured.
 
-        return bool(get_provider_env("EXA_API_KEY"))
+        Resolves through config → scoped env → ``.env`` → credential pool
+        (network-free), so keys added via ``hermes auth add exa`` count
+        even when no env var is set.
+        """
+        return bool(_resolve_exa_api_key())
 
     def supports_search(self) -> bool:
         return True
@@ -126,10 +157,22 @@ class ExaWebSearchProvider(WebSearchProvider):
                 return {"success": False, "error": "Interrupted"}
 
             logger.info("Exa search: '%s' (limit=%d)", query, limit)
-            response = _get_exa_client().search(
-                query,
-                num_results=limit,
-                contents={"highlights": True},
+
+            def _run(attempt_key: str) -> Any:
+                client = _get_exa_client(attempt_key)
+                try:
+                    return client.search(
+                        query,
+                        num_results=limit,
+                        contents={"highlights": True},
+                    )
+                except Exception as exc:  # noqa: BLE001 — SDK failure
+                    # Wrap SDK errors so run_with_key_rotation can classify
+                    # auth/billing/rate-limit from the SDK payload.
+                    raise tool_error_from_exception(exc, "exa") from exc
+
+            response = run_with_key_rotation(
+                "exa", _run, current_key=_resolve_exa_api_key()
             )
 
             web_results = []
@@ -170,7 +213,17 @@ class ExaWebSearchProvider(WebSearchProvider):
                 ]
 
             logger.info("Exa extract: %d URL(s)", len(urls))
-            response = _get_exa_client().get_contents(urls, text=True)
+
+            def _run(attempt_key: str) -> Any:
+                client = _get_exa_client(attempt_key)
+                try:
+                    return client.get_contents(urls, text=True)
+                except Exception as exc:  # noqa: BLE001 — SDK failure
+                    raise tool_error_from_exception(exc, "exa") from exc
+
+            response = run_with_key_rotation(
+                "exa", _run, current_key=_resolve_exa_api_key()
+            )
 
             results: List[Dict[str, Any]] = []
             for result in response.results or []:
