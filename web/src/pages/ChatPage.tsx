@@ -824,6 +824,47 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       }
     };
     host.addEventListener("keydown", _imeCompositionGuard, true);
+    // ── Touch scrolling (Android / touch devices) ──────────────────────
+    // In @xterm/xterm 6.0.0 the ONLY touch handler is the document-level
+    // listener inside the vendored Gesture class, and Gesture.addTarget has
+    // no callers — the gesture path is dead code. Nothing is bound on
+    // .xterm-viewport, and content touches bubble through .xterm-screen →
+    // .xterm-scrollable-element → .xterm, never through the viewport, so a
+    // listener there would never fire. We therefore attach to the host
+    // element (the container wrapping the screen path) and translate
+    // one-finger vertical drags into term.scrollLines ourselves, since
+    // 6.0.0 wires no native touch scroll (#81119).
+    host.style.touchAction = "pan-y";
+    let touchDragLastY: number | null = null;
+    let touchScrollCleanup: (() => void) | null = null;
+    const swallowTouchMove = (ev: TouchEvent) => {
+      // One-finger drag is a scroll gesture; multi-touch (pinch-zoom) and
+      // taps are left alone.
+      if (ev.touches.length !== 1) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      const y = ev.touches[0].clientY;
+      if (touchDragLastY !== null && touchDragLastY !== y) {
+        term.scrollLines(touchDragLastY > y ? 1 : -1);
+      }
+      touchDragLastY = y;
+    };
+    const resetTouchDrag = () => {
+      touchDragLastY = null;
+    };
+    host.addEventListener("touchmove", swallowTouchMove, {
+      capture: true,
+      passive: false,
+    });
+    // Reset the drag baseline between gestures (multi-touch, tap, new
+    // touch after a pointer lift).
+    host.addEventListener("touchstart", resetTouchDrag, { capture: true });
+    host.addEventListener("touchcancel", resetTouchDrag, { capture: true });
+    touchScrollCleanup = () => {
+      host.removeEventListener("touchmove", swallowTouchMove, true);
+      host.removeEventListener("touchstart", resetTouchDrag, true);
+      host.removeEventListener("touchcancel", resetTouchDrag, true);
+    };
 
     const textarea = term.textarea;
     if (textarea) {
@@ -923,12 +964,19 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         term.options.fontSize = nextSize;
         term.options.lineHeight = nextLh;
       }
+      const prevCols = term.cols;
+      const prevRows = term.rows;
       try {
         fit.fit();
       } catch {
         return;
       }
-      if (fontChanged && term.rows > 0) {
+      // Force a repaint when the grid or font metrics actually changed.
+      // On touch devices, fit() alone can leave the canvas showing stale
+      // or blank text after a rotation/resize — especially with the WebGL
+      // renderer — so we issue an explicit refresh in either case (#81119).
+      const gridChanged = term.cols !== prevCols || term.rows !== prevRows;
+      if ((fontChanged || gridChanged) && term.rows > 0) {
         try {
           term.refresh(0, term.rows - 1);
         } catch {
@@ -1398,6 +1446,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       host.removeEventListener("paste", handleBrowserPaste, true);
       host.removeEventListener("dragover", handleBrowserDragOver, true);
       host.removeEventListener("drop", handleBrowserDrop, true);
+      touchScrollCleanup?.();
       if (metricsDebounce) clearTimeout(metricsDebounce);
       window.removeEventListener("resize", scheduleSyncTerminalMetrics);
       window.visualViewport?.removeEventListener(

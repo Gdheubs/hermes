@@ -7,7 +7,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PTY_TICKET_TIMEOUT_MS } from "@/lib/pty-reconnect";
 
 class FakeFitAddon {
-  fit() {}
+  static instances: FakeFitAddon[] = [];
+  fit = vi.fn();
+
+  constructor() {
+    FakeFitAddon.instances.push(this);
+  }
 }
 
 class FakeWebglAddon {
@@ -17,6 +22,7 @@ class FakeWebglAddon {
 }
 
 class FakeTerminal {
+  static instances: FakeTerminal[] = [];
   options: Record<string, unknown>;
   rows = 24;
   cols = 80;
@@ -24,9 +30,12 @@ class FakeTerminal {
     registerOscHandler: vi.fn(),
   };
   unicode = { activeVersion: "" };
+  refresh = vi.fn();
+  scrollLines = vi.fn();
 
   constructor(options: Record<string, unknown>) {
     this.options = options;
+    FakeTerminal.instances.push(this);
   }
 
   attachCustomKeyEventHandler() {
@@ -69,11 +78,19 @@ class FakeTerminal {
 
   scrollToBottom() {}
 
-  open() {}
+  open(host: HTMLElement) {
+    // Mimic xterm.js's DOM: the .xterm-viewport (overlay scrollbar) is a
+    // sibling of .xterm-screen inside the host, and content touches bubble
+    // through the screen path, never the viewport (#81119).
+    const viewport = document.createElement("div");
+    viewport.className = "xterm-viewport";
+    host.appendChild(viewport);
+    const screen = document.createElement("div");
+    screen.className = "xterm-screen";
+    host.appendChild(screen);
+  }
 
   paste() {}
-
-  refresh() {}
 
   write() {}
 }
@@ -186,6 +203,8 @@ async function render(ui: ReactNode) {
 
 beforeEach(() => {
   FakeWebSocket.instances = [];
+  FakeFitAddon.instances = [];
+  FakeTerminal.instances = [];
   maybeReloadForLoopbackWsAuthFailure.mockClear();
   apiMocks.buildWsUrl.mockReset();
   apiMocks.buildWsUrl.mockResolvedValue("ws://localhost/api/pty?channel=chat-1");
@@ -268,6 +287,111 @@ describe("ChatPage", () => {
     });
 
     expect(maybeReloadForLoopbackWsAuthFailure).toHaveBeenCalledWith(4401);
+  });
+
+  it("lets touch swipes scroll the xterm scrollback (#81119)", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+
+    const host = document.querySelector(
+      ".hermes-chat-xterm-host",
+    ) as HTMLElement | null;
+    expect(host).not.toBeNull();
+
+    // The fix binds touch handling on the host (the element wrapping the
+    // terminal's screen path): xterm 6.0.0 attaches no touch handlers to
+    // .xterm-viewport — its only touch listener is on the document inside
+    // the unused Gesture class — and content touches bubble through
+    // .xterm-screen, never through the viewport.
+    expect(host!.style.touchAction).toBe("pan-y");
+
+    const terminal = FakeTerminal.instances[FakeTerminal.instances.length - 1];
+    const screen = host!.querySelector<HTMLElement>(".xterm-screen");
+    expect(screen).not.toBeNull();
+
+    const makeTouchMove = (clientY: number) => {
+      const ev = new Event("touchmove", { bubbles: true, cancelable: true });
+      Object.defineProperty(ev, "touches", {
+        configurable: true,
+        value: [{ clientY }],
+      });
+      return ev;
+    };
+
+    // A one-finger upward drag on the screen element must be intercepted by
+    // the host's capture-phase handler: default prevented (so nothing else
+    // can swallow the gesture) and translated into a scroll down.
+    const ev1 = makeTouchMove(200);
+    screen!.dispatchEvent(ev1);
+    expect(ev1.defaultPrevented).toBe(true);
+
+    const ev2 = makeTouchMove(150);
+    screen!.dispatchEvent(ev2);
+    expect(ev2.defaultPrevented).toBe(true);
+    expect(terminal.scrollLines).toHaveBeenLastCalledWith(1);
+
+    // The delta is relative to the previous move, not to the screen origin.
+    const ev3 = makeTouchMove(120);
+    screen!.dispatchEvent(ev3);
+    expect(terminal.scrollLines).toHaveBeenLastCalledWith(1);
+
+    // Fingers moving apart (pinch-zoom) must be left alone.
+    const pinch = new Event("touchmove", { bubbles: true, cancelable: true });
+    Object.defineProperty(pinch, "touches", {
+      configurable: true,
+      value: [{ clientY: 100 }, { clientY: 300 }],
+    });
+    screen!.dispatchEvent(pinch);
+    expect(pinch.defaultPrevented).toBe(false);
+  });
+
+  it("refits and repaints the terminal after a viewport resize (#81119)", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+
+    const host = document.querySelector(
+      ".hermes-chat-xterm-host",
+    ) as HTMLElement | null;
+    expect(host).not.toBeNull();
+
+    // jsdom doesn't lay out elements, so clientWidth/Height are 0 by
+    // default — the metrics sync early-returns while hidden.  Mock the
+    // layout to simulate a mobile viewport and trigger a real refit.
+    Object.defineProperty(host!, "clientWidth", {
+      configurable: true,
+      value: 800,
+    });
+    Object.defineProperty(host!, "clientHeight", {
+      configurable: true,
+      value: 600,
+    });
+
+    const terminal = FakeTerminal.instances[FakeTerminal.instances.length - 1];
+    const fitAddon = FakeFitAddon.instances[FakeFitAddon.instances.length - 1];
+    fitAddon.fit.mockClear();
+    terminal.refresh.mockClear();
+
+    act(() => {
+      window.dispatchEvent(new Event("resize"));
+    });
+
+    // scheduleSyncTerminalMetrics debounces 60ms before calling fit.
+    await vi.waitFor(() => expect(fitAddon.fit).toHaveBeenCalled());
+
+    // The width changed enough to cross a font tier, so the explicit
+    // refresh must fire as well — otherwise the canvas can stay stale on
+    // touch devices until something else forces a repaint.
+    expect(terminal.refresh).toHaveBeenCalledWith(0, terminal.rows - 1);
   });
 });
 
