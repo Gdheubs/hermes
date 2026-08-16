@@ -17134,34 +17134,59 @@ def test_emit_approval_request_uses_session_transport_when_live():
         server._sessions.pop("live-approval-sid", None)
 
 
-def test_approval_notify_registration_failure_logs_loudly(caplog):
+def test_approval_notify_registration_failure_logs_loudly(caplog, monkeypatch):
     """A failed register_gateway_notify must not be swallowed silently.
 
     #83443 / #84395 silent-approval-timeout family: a session whose notify
     callback failed to register would block the agent for the full timeout
     with nothing rendered. The build path must log the failure loudly.
+
+    Drives the REAL _start_agent_build → _build path with register_gateway_notify
+    failing, so the test fails if the guarded block ever regresses to a silent
+    `except: pass` (review #85967: previously the test called
+    server.logger.exception directly and passed regardless).
     """
+    import threading
 
     import tools.approval as _approval
 
-    original = _approval.register_gateway_notify
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda *args, **kwargs: type("Agent", (), {"model": "test"})(),
+    )
+    monkeypatch.setattr(
+        "tui_gateway.entry.ensure_mcp_discovery_started", lambda: None
+    )
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
+    monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(
+        _approval, "register_gateway_notify", lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("injected registration failure")
+        )
+    )
+    monkeypatch.setattr(_approval, "load_permanent_allowlist", lambda: None)
 
-    def _boom(*a, **k):
-        raise RuntimeError("injected registration failure")
+    ready = threading.Event()
+    sid = "fail-reg-sid"
+    session = {
+        "agent_ready": ready,
+        "session_key": "fail-reg-key",
+    }
 
+    server._sessions[sid] = session
     try:
-        _approval.register_gateway_notify = _boom
-        _approval.load_permanent_allowlist = lambda: None
         with caplog.at_level("ERROR", logger="tui_gateway.server"):
-            # Directly exercise the guarded block's failure path via the build
-            # helper is heavy; assert the exception is surfaced by the same
-            # logging helper the code path uses.
-            server.logger.exception(
-                "Failed to register gateway approval notify for session %s (key=%s) — "
-                "approval prompts for this session may not reach the client",
-                "sid-x",
-                "key-x",
-            )
-        assert "Failed to register gateway approval notify" in caplog.text
+            server._start_agent_build(sid, session)
+            # Wait for the FULL build thread to finish (ready is set in
+            # _build's finally, AFTER the approval-registration block ran),
+            # not just for _make_agent — otherwise caplog exits its capture
+            # scope before the background thread logs the failure.
+            assert ready.wait(timeout=5), "agent build should still complete"
     finally:
-        _approval.register_gateway_notify = original
+        server._sessions.pop(sid, None)
+
+    assert "Failed to register gateway approval notify" in caplog.text
+    assert "injected registration failure" in caplog.text

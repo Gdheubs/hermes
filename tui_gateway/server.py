@@ -1855,12 +1855,22 @@ def _emit_approval_request(sid: str, data: dict | None) -> None:
         session = _sessions.get(sid)
         transport = (session or {}).get("transport") if session else None
     if transport is not None and not _transport_is_dead(transport):
-        transport.write(frame)
-        return
-    # No live session transport (disconnected / parked on the drop sentinel, or
-    # the session record is gone): broadcast to every connected client so the
-    # approval is not silently lost. The frame keeps its session_id, so the
-    # frontend routes it to the right session even on a broadcast path.
+        # Check the write() result, not just _closed (review #85967): a WS
+        # transport mid-close (disconnect received, teardown not yet run) can
+        # still look alive here but silently drop the frame — the exact
+        # silent-loss class this fan-out targets, in a narrower window. A
+        # False return is the drop-sentinel contract; fall through to the
+        # broadcast so the approval is not lost.
+        if transport.write(frame):
+            return
+    # No live session transport (disconnected / parked on the drop sentinel,
+    # mid-close write dropped, or the session record is gone): broadcast to
+    # every connected client so the approval is not silently lost. The frame
+    # keeps its session_id, so the frontend routes it to the right session
+    # even on a broadcast path. NOTE: this intentionally crosses session
+    # boundaries (a second connected peer renders another session's approval
+    # prompt); that is safe only because approval.respond is
+    # session/ownership-scoped server-side — keep that invariant.
     logger.warning(
         "approval.request for session %s has no live transport; broadcasting to connected clients",
         sid,
