@@ -84,3 +84,61 @@ class TestDoUninstallSkipConfirm:
             mock_uninstall.assert_called_once_with("test-skill")
 
 
+class TestUninstallYesFlag:
+    """Issue #84662: `hermes skills uninstall` must accept --yes (Desktop skill
+    hub passes it). Without --yes the confirmation prompt must be preserved."""
+
+    @staticmethod
+    def _build_parser():
+        import argparse
+
+        from hermes_cli.subcommands.skills import build_skills_parser
+
+        parser = argparse.ArgumentParser(prog="hermes")
+        sub = parser.add_subparsers(dest="command")
+        build_skills_parser(sub, cmd_skills=lambda args: None)
+        return parser
+
+    def test_uninstall_accepts_yes_flag(self):
+        """--yes parses instead of failing with 'unrecognized arguments'."""
+        ns = self._build_parser().parse_args(
+            ["skills", "uninstall", "my-skill", "--yes"]
+        )
+        assert ns.skills_action == "uninstall"
+        assert ns.name == "my-skill"
+        assert ns.yes is True
+
+    def test_uninstall_accepts_short_y_flag(self):
+        ns = self._build_parser().parse_args(
+            ["skills", "uninstall", "my-skill", "-y"]
+        )
+        assert ns.yes is True
+
+    def test_uninstall_without_yes_keeps_prompt_default(self):
+        """Without --yes, skip_confirm stays False (fail-closed: prompt kept)."""
+        ns = self._build_parser().parse_args(
+            ["skills", "uninstall", "my-skill"]
+        )
+        assert ns.yes is False
+
+    @patch("hermes_cli.skills_hub.do_uninstall")
+    def test_skills_command_yes_forwards_skip_confirm(self, mock_uninstall):
+        """--yes on the CLI must reach do_uninstall as skip_confirm=True."""
+        from hermes_cli.skills_hub import skills_command
+
+        ns = self._build_parser().parse_args(
+            ["skills", "uninstall", "my-skill", "--yes"]
+        )
+        skills_command(ns)
+        mock_uninstall.assert_called_once_with("my-skill", skip_confirm=True)
+
+    @patch("hermes_cli.skills_hub.do_uninstall")
+    def test_skills_command_without_yes_keeps_confirm_prompt(self, mock_uninstall):
+        """No --yes → skip_confirm=False, so do_uninstall still prompts."""
+        from hermes_cli.skills_hub import skills_command
+
+        ns = self._build_parser().parse_args(
+            ["skills", "uninstall", "my-skill"]
+        )
+        skills_command(ns)
+        mock_uninstall.assert_called_once_with("my-skill", skip_confirm=False)
