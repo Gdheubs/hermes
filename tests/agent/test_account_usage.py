@@ -262,11 +262,16 @@ def kimi_usage_payload():
     }
 
 
-def _patch_kimi_runtime(monkeypatch, base_url="https://api.kimi.com/coding"):
+def _patch_kimi_runtime(monkeypatch, base_url="https://api.kimi.com/coding", resolutions=None):
+    def _fake_resolve(**kwargs):
+        if resolutions is not None:
+            resolutions.append(kwargs)
+        return {"api_key": "kimi-test-key", "base_url": base_url}
+
     monkeypatch.setattr(
         account_usage,
         "resolve_runtime_provider",
-        lambda **kwargs: {"api_key": "kimi-test-key", "base_url": base_url},
+        _fake_resolve,
     )
 
 
@@ -325,7 +330,8 @@ def test_kimi_aliases_route_to_confirmed_coding_plan(monkeypatch, kimi_usage_pay
         "Client",
         lambda timeout: _FakeClient(calls, kimi_usage_payload),
     )
-    _patch_kimi_runtime(monkeypatch)
+    resolutions = []
+    _patch_kimi_runtime(monkeypatch, resolutions=resolutions)
 
     for alias in ("kimi", "moonshot", "kimi-coding-cn", "kimi-cn", "moonshot-cn"):
         snapshot = account_usage.fetch_account_usage(alias)
@@ -337,6 +343,11 @@ def test_kimi_aliases_route_to_confirmed_coding_plan(monkeypatch, kimi_usage_pay
         )
         assert snapshot.provider == expected_provider
         assert [w.label for w in snapshot.windows] == ["Weekly", "5-hour"]
+        # Runtime credentials must be resolved under the caller's own alias —
+        # legacy `moonshot`/`moonshot-cn` credential records are keyed on that
+        # name, and resolving under a substituted `kimi-coding` would silently
+        # miss them and return None.
+        assert resolutions[-1]["requested"] == alias
 
 
 @pytest.mark.parametrize(
@@ -384,6 +395,84 @@ def test_kimi_usage_skips_effective_legacy_resolution(monkeypatch):
 
     assert account_usage.fetch_account_usage("kimi-coding") is None
     assert calls == []
+
+
+def test_kimi_legacy_alias_resolves_real_coding_plan_credentials(monkeypatch, kimi_usage_payload):
+    """Real resolution path (no resolve_runtime_provider patch): a user whose
+    provider is still spelled `moonshot` but who holds an sk-kimi- Coding Plan
+    key must get a quota snapshot — resolution happens under the original
+    alias, and the Coding Plan gate is the resolved base URL."""
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, kimi_usage_payload),
+    )
+    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi-unit-test-key-000")
+    monkeypatch.delenv("KIMI_BASE_URL", raising=False)
+
+    snapshot = account_usage.fetch_account_usage("moonshot")
+
+    assert snapshot is not None
+    assert snapshot.provider == "kimi-coding"
+    assert calls[0]["url"] == "https://api.kimi.com/coding/v1/usages"
+
+
+def test_kimi_legacy_alias_with_legacy_key_yields_no_snapshot(monkeypatch):
+    """Real resolution path: legacy `moonshot` alias + non-Coding-Plan key
+    resolves to api.moonshot.ai/v1 and must NOT be probed for quota."""
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, {}),
+    )
+    monkeypatch.setenv("KIMI_API_KEY", "legacy-moonshot-key")
+    monkeypatch.delenv("KIMI_BASE_URL", raising=False)
+
+    assert account_usage.fetch_account_usage("moonshot") is None
+    assert calls == []
+
+
+def test_kimi_coding_base_url_helper_is_shared():
+    """The endpoint gate is one function used by both the quota and billing
+    paths (utils.is_kimi_coding_base_url) so the check cannot drift."""
+    from agent import usage_pricing
+    from utils import is_kimi_coding_base_url
+
+    assert account_usage.is_kimi_coding_base_url is is_kimi_coding_base_url
+    assert usage_pricing.is_kimi_coding_base_url is is_kimi_coding_base_url
+    assert is_kimi_coding_base_url("https://api.kimi.com/coding")
+    assert is_kimi_coding_base_url("https://api.kimi.com/coding/v1")
+    assert not is_kimi_coding_base_url("https://api.moonshot.ai/v1")
+    assert not is_kimi_coding_base_url("https://proxy.example.com/coding")
+    assert not is_kimi_coding_base_url("http://api.kimi.com/coding")
+    assert not is_kimi_coding_base_url(None)
+
+
+def test_kimi_percent_from_counts_clamps_out_of_range():
+    assert account_usage._percent_from_counts({"limit": "100", "used": "250"}) == 100.0
+    assert account_usage._percent_from_counts({"limit": "100", "used": "-5"}) == 0.0
+    assert account_usage._percent_from_counts({"limit": "100", "used": "40"}) == pytest.approx(40.0)
+
+
+def test_kimi_over_quota_window_renders_zero_remaining(monkeypatch):
+    """An over-quota period (used > limit) surfaces as 100% used / 0%
+    remaining rather than a >100% figure in the rendered lines."""
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, {"usage": {"limit": "100", "used": "130"}}),
+    )
+    _patch_kimi_runtime(monkeypatch)
+
+    snapshot = account_usage.fetch_account_usage("kimi-coding")
+
+    assert snapshot is not None
+    assert snapshot.windows[0].used_percent == 100.0
+    rendered = account_usage.render_account_usage_lines(snapshot)
+    assert any("0% remaining (100% used)" in line for line in rendered)
 
 
 def test_kimi_window_labels():

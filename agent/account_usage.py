@@ -5,13 +5,13 @@ import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
-from urllib.parse import urlparse
 
 import httpx
 
 from agent.anthropic_adapter import _is_oauth_token, resolve_anthropic_token
 from hermes_cli.auth import AuthError, _read_codex_tokens, resolve_codex_runtime_credentials
 from hermes_cli.runtime_provider import resolve_runtime_provider
+from utils import is_kimi_coding_base_url
 
 if TYPE_CHECKING:
     from typing import TypeGuard
@@ -813,23 +813,17 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
 _KIMI_USAGE_DEFAULT_BASE_URL = "https://api.kimi.com/coding"
 
 
-def _is_kimi_coding_base_url(base_url: Optional[str]) -> bool:
-    """Return whether *base_url* is the confirmed Kimi Coding Plan runtime."""
-    try:
-        parsed = urlparse((base_url or "").strip())
-        port = parsed.port
-    except ValueError:
-        return False
-    return (
-        parsed.scheme.lower() == "https"
-        and (parsed.hostname or "").lower() == "api.kimi.com"
-        and port in (None, 443)
-        and parsed.username is None
-        and parsed.password is None
-        and parsed.path.rstrip("/") in {"/coding", "/coding/v1"}
-        and not parsed.query
-        and not parsed.fragment
-    )
+# All provider spellings that may resolve to a Kimi runtime. The CN set keeps
+# its own snapshot label; the actual Coding Plan gate is the resolved base URL
+# (utils.is_kimi_coding_base_url), not the alias.
+_KIMI_PROVIDER_ALIASES = frozenset(
+    {"kimi", "kimi-coding", "kimi-coding-cn", "moonshot", "kimi-cn", "moonshot-cn"}
+)
+_KIMI_CN_PROVIDER_ALIASES = frozenset({"kimi-coding-cn", "kimi-cn", "moonshot-cn"})
+
+
+def _kimi_provider_label(alias: str) -> str:
+    return "kimi-coding-cn" if alias in _KIMI_CN_PROVIDER_ALIASES else "kimi-coding"
 
 
 def _kimi_usages_url(base_url: Optional[str]) -> str:
@@ -872,7 +866,11 @@ def _kimi_window_label(window: Any) -> str:
 
 
 def _percent_from_counts(detail: Any) -> Optional[float]:
-    """Compute used_percent from a {limit, used, remaining} quota object."""
+    """Compute used_percent from a {limit, used, remaining} quota object.
+
+    Clamped to [0, 100]: an over-quota period (used > limit) reads as 100%
+    used / 0% remaining in the rendered lines rather than a >100% figure.
+    """
     if not isinstance(detail, dict):
         return None
     limit_raw = detail.get("limit")
@@ -888,7 +886,7 @@ def _percent_from_counts(detail: Any) -> Optional[float]:
         return None
     if limit <= 0:
         return None
-    return used / limit * 100.0
+    return max(0.0, min(100.0, used / limit * 100.0))
 
 
 def _fetch_kimi_account_usage(
@@ -897,6 +895,12 @@ def _fetch_kimi_account_usage(
     api_key: Optional[str] = None,
 ) -> Optional[AccountUsageSnapshot]:
     """Fetch Kimi Code (Coding Plan) quota from ``/coding/v1/usages``.
+
+    ``provider`` is the caller's original alias (``kimi``, ``moonshot``,
+    ``kimi-coding-cn``, …). Resolution happens under that alias — the same
+    name the runtime credential records are keyed on — and the Coding Plan
+    gate is the *resolved* base URL, mirroring ``resolve_billing_route``.
+    Legacy ``api.moonshot.ai/v1`` and custom routes return no snapshot.
 
     Response schema (verified against the live endpoint 2026-07)::
 
@@ -917,7 +921,7 @@ def _fetch_kimi_account_usage(
     )
     token = str(runtime.get("api_key", "") or "").strip()
     runtime_base_url = str(runtime.get("base_url", "") or "").strip()
-    if not token or not _is_kimi_coding_base_url(runtime_base_url):
+    if not token or not is_kimi_coding_base_url(runtime_base_url):
         return None
     headers = {
         "Authorization": f"Bearer {token}",
@@ -968,7 +972,7 @@ def _fetch_kimi_account_usage(
         ((payload.get("user") or {}).get("membership") or {}).get("level")
     )
     return AccountUsageSnapshot(
-        provider=provider,
+        provider=_kimi_provider_label(provider),
         source="usage_api",
         fetched_at=_utc_now(),
         plan=plan,
@@ -1063,9 +1067,13 @@ def fetch_account_usage(
             return _fetch_codex_account_usage(base_url=base_url, api_key=api_key)
         if normalized == "anthropic":
             return _fetch_anthropic_account_usage()
-        if normalized in {"kimi", "kimi-coding", "kimi-coding-cn", "moonshot", "kimi-cn", "moonshot-cn"}:
-            kimi_provider = "kimi-coding-cn" if normalized in {"kimi-coding-cn", "kimi-cn", "moonshot-cn"} else "kimi-coding"
-            return _fetch_kimi_account_usage(kimi_provider, base_url=base_url, api_key=api_key)
+        if normalized in _KIMI_PROVIDER_ALIASES:
+            # Resolve under the caller's own alias — runtime credential
+            # records for legacy `moonshot`/`moonshot-cn` users are keyed on
+            # that name, and resolving under a substituted `kimi-coding`
+            # would silently miss them. The Coding Plan gate is the resolved
+            # base URL inside _fetch_kimi_account_usage.
+            return _fetch_kimi_account_usage(normalized, base_url=base_url, api_key=api_key)
         if normalized == "openrouter":
             return _fetch_openrouter_account_usage(base_url, api_key)
     except Exception:

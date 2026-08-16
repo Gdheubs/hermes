@@ -6,10 +6,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Dict, Literal, Optional
-from urllib.parse import urlparse
 
 from agent.model_metadata import fetch_endpoint_model_metadata, fetch_model_metadata
-from utils import base_url_host_matches, base_url_hostname
+from utils import base_url_host_matches, base_url_hostname, is_kimi_coding_base_url
 
 logger = logging.getLogger(__name__)
 
@@ -1053,24 +1052,6 @@ def _usage_count(value: Any) -> int:
     return max(0, _to_int(value))
 
 
-def _is_kimi_coding_base_url(base_url: Optional[str]) -> bool:
-    """Return whether billing is confirmed to use the Kimi Coding Plan."""
-    try:
-        parsed = urlparse((base_url or "").strip())
-        port = parsed.port
-    except ValueError:
-        return False
-    return (
-        parsed.scheme.lower() == "https"
-        and (parsed.hostname or "").lower() == "api.kimi.com"
-        and port in (None, 443)
-        and parsed.username is None
-        and parsed.password is None
-        and parsed.path.rstrip("/") in {"/coding", "/coding/v1"}
-        and not parsed.query
-        and not parsed.fragment
-    )
-
 
 def resolve_billing_route(
     model_name: str,
@@ -1090,7 +1071,7 @@ def resolve_billing_route(
         return BillingRoute(provider="openai-codex", model=model, base_url=base_url or "", billing_mode="subscription_included")
     # Only the confirmed api.kimi.com/coding runtime is a flat weekly-quota
     # subscription. Legacy Moonshot and custom routes retain unknown billing.
-    if provider_name in {"kimi-coding", "kimi-coding-cn", "kimi", "moonshot", "kimi-cn", "moonshot-cn"} and _is_kimi_coding_base_url(base_url):
+    if provider_name in {"kimi-coding", "kimi-coding-cn", "kimi", "moonshot", "kimi-cn", "moonshot-cn"} and is_kimi_coding_base_url(base_url):
         kimi_provider = "kimi-coding-cn" if provider_name in {"kimi-coding-cn", "kimi-cn", "moonshot-cn"} else "kimi-coding"
         return BillingRoute(provider=kimi_provider, model=model.split("/")[-1], base_url=base_url or "", billing_mode="subscription_included")
     if provider_name == "openrouter" or base_url_host_matches(base_url or "", "openrouter.ai"):
