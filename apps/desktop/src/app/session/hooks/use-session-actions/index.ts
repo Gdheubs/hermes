@@ -57,6 +57,7 @@ import {
   setFreshDraftReady,
   setIntroSeed,
   setMessages,
+  setMessagingSessions,
   setNewChatWorkspaceTarget,
   setResumeExhaustedSessionId,
   setResumeFailedSessionId,
@@ -92,6 +93,7 @@ import {
   type BranchMessage,
   chatMessageArraysEquivalent,
   dedupeInflightUserAgainstTranscript,
+  findSidebarSession,
   goneSessionVerdict,
   isSessionGoneError,
   overlayConcurrentMessageChanges,
@@ -102,6 +104,7 @@ import {
   resolveResumedBusy,
   resolveSessionProfile,
   resolveStoredSession,
+  restoreSidebarSession,
   selectBranchMessages,
   sessionMatchesStoredId,
   sessionShouldHaveTranscript,
@@ -1637,7 +1640,7 @@ export function useSessionActions({
     async (storedSessionId: string) => {
       clearNotifications()
 
-      const removed = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+      const removed = findSidebarSession(storedSessionId)
       const wasSelected = selectedStoredSessionId === storedSessionId
       const closingRuntimeId = wasSelected ? activeSessionId : null
       const previousMessages = $messages.get()
@@ -1648,6 +1651,7 @@ export function useSessionActions({
       const removedIds = [storedSessionId, removed?.id, removed?._lineage_root_id]
 
       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
+      setMessagingSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
       // Evict from the project tree's optimistic layer too (the backend snapshot
       // still lists it until its next refresh), so grouped + flat views drop the
       // row in lockstep. Pin the tombstone against the projects.tree prune while
@@ -1690,7 +1694,7 @@ export function useSessionActions({
         }
       } catch (err) {
         if (removed) {
-          setSessions(prev => [removed, ...prev])
+          restoreSidebarSession(removed)
         }
 
         untombstoneSessions(removedIds)
@@ -1700,7 +1704,7 @@ export function useSessionActions({
           setFreshDraftReady(false)
           setSelectedStoredSessionId(storedSessionId)
           selectedStoredSessionIdRef.current = storedSessionId
-          const stored = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+          const stored = findSidebarSession(storedSessionId)
 
           if (stored) {
             applyStoredUsage(stored)
@@ -1741,7 +1745,7 @@ export function useSessionActions({
     async (storedSessionId: string) => {
       clearNotifications()
 
-      const archived = $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+      const archived = findSidebarSession(storedSessionId)
       const wasSelected = selectedStoredSessionId === storedSessionId
       const previousPinned = $pinnedSessionIds.get()
       // Pins are keyed on the durable lineage-root id; the stored id may be the
@@ -1751,6 +1755,7 @@ export function useSessionActions({
 
       // Soft-hide: drop from the sidebar immediately, keep the data.
       setSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
+      setMessagingSessions(prev => prev.filter(session => !sessionMatchesStoredId(session, storedSessionId)))
       tombstoneSessions(archivedIds)
       beginSessionMutation(archivedIds)
       $pinnedSessionIds.set(previousPinned.filter(id => id !== storedSessionId && id !== archivedPinId))
@@ -1777,7 +1782,7 @@ export function useSessionActions({
         notify({ durationMs: 2_000, kind: 'success', message: copy.archived })
       } catch (err) {
         if (archived) {
-          setSessions(prev => [archived, ...prev.filter(session => !sessionMatchesStoredId(session, storedSessionId))])
+          restoreSidebarSession(archived)
         }
 
         untombstoneSessions(archivedIds)

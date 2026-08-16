@@ -3,6 +3,7 @@ import { getSession } from '@/hermes'
 import { assistantTextPart, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
+import { isMessagingSource } from '@/lib/session-source'
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { requestDesktopOnboardingForCredentialWarning } from '@/store/onboarding'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
@@ -23,6 +24,7 @@ import {
   setCurrentReasoningEffort,
   setCurrentServiceTier,
   setCurrentUsage,
+  setMessagingSessions,
   setSessions,
   setWorkspaceCwdOwner,
   setYoloActive
@@ -1290,6 +1292,41 @@ function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
       return (existing._lineage_root_id ?? existing.id) !== lineage
     })
   ])
+}
+
+/** The sidebar row for a stored id, from whichever slice actually holds it.
+ *
+ * The sidebar is two disjoint atoms, not one: `refreshSessions` fetches recents
+ * with `SIDEBAR_EXCLUDED_SOURCES` (which spreads in every messaging source), and
+ * `refreshMessagingSessions` fetches the inverse into `$messagingSessions`. So a
+ * Feishu/Discord/Telegram row is NEVER in `$sessions`, and a lookup that reads
+ * only `$sessions` does not return undefined by accident for those rows — it
+ * returns undefined always.
+ *
+ * That matters beyond the row itself: callers derive the session's `profile`
+ * (which routes the RPC), its `_lineage_root_id` (which the tombstone needs to
+ * match a compressed row) and their own rollback snapshot from this lookup.
+ * `resolveStoredSession` below already reads all three slices for exactly this
+ * reason — see its multi-profile note.
+ */
+export function findSidebarSession(storedSessionId: string): SessionInfo | undefined {
+  return (
+    $sessions.get().find(session => sessionMatchesStoredId(session, storedSessionId)) ??
+    $messagingSessions.get().find(session => sessionMatchesStoredId(session, storedSessionId))
+  )
+}
+
+/** Put a row back in the slice it came from, after a failed archive/delete.
+ *
+ * Restoring into `$sessions` unconditionally would move a messaging row into
+ * the recents list, where it does not belong and where the next
+ * `refreshSessions` would drop it again — a rollback that looks like it worked
+ * and then silently loses the row a second time.
+ */
+export function restoreSidebarSession(session: SessionInfo): void {
+  const setSlice = isMessagingSource(session.source) ? setMessagingSessions : setSessions
+
+  setSlice(prev => [session, ...prev.filter(existing => existing.id !== session.id)])
 }
 
 export async function resolveStoredSession(storedSessionId: string): Promise<SessionInfo | undefined> {
