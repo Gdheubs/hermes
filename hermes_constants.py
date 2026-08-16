@@ -227,6 +227,16 @@ def get_default_hermes_root() -> Path:
     return result
 
 
+def get_ares_state_root() -> Path:
+    """Return the installation-scoped Ares state root.
+
+    Ares candidate custody deliberately lives outside a selected profile. A
+    profile may change ``get_hermes_home()``, while a sealed candidate must be
+    discoverable by the installer/updater regardless of that runtime profile.
+    """
+    return get_default_hermes_root() / "ares"
+
+
 def get_optional_skills_dir(default: Path | None = None) -> Path:
     """Return the optional-skills directory, honoring package-manager wrappers.
 

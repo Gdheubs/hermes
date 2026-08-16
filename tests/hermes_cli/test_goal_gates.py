@@ -180,7 +180,9 @@ def test_passing_gates_fall_through_to_judge():
     ) as mock_judge:
         decision = mgr.evaluate_after_turn("finished")
     mock_judge.assert_called_once()
-    assert decision["verdict"] == "done"
+    # Ares keeps an explicit-completion authority gate: a model verdict alone
+    # may not close a goal, even after its deterministic quality gates pass.
+    assert decision["verdict"] == "waiting_for_authority"
     # Passing run resets attempt bookkeeping.
     assert mgr.state.gates[0].attempts == 0
     assert mgr.state.gates[0].last_exit_code == 0

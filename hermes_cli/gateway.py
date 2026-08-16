@@ -5605,7 +5605,10 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     # that ships new unit settings won't take effect until the next manual
     # `hermes gateway start/restart` — leaving the gateway vulnerable to
     # the exact failure mode the new settings were meant to prevent.
-    if supports_systemd_services():
+    # Ares owns its isolated release-pointer unit and promotes it atomically.
+    # Letting Hermes regenerate a generic unit from inside that supervised
+    # process replaces the Ares launcher mid-start and causes a restart loop.
+    if supports_systemd_services() and os.environ.get("ARES_MANAGED_RUNTIME") != "1":
         try:
             refresh_systemd_unit_if_needed(system=False)
         except Exception:
