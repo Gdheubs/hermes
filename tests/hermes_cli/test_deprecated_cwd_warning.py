@@ -15,6 +15,8 @@ class TestDeprecatedCwdWarning:
         assert "MESSAGING_CWD" in captured.err
         assert "deprecated" in captured.err.lower()
         assert "config.yaml" in captured.err
+        assert "\033[" not in captured.err
+        assert "    terminal:\n      cwd: /some/path" in captured.err
 
 
     def test_both_deprecated_vars_warn(self, monkeypatch, capsys):
@@ -27,3 +29,5 @@ class TestDeprecatedCwdWarning:
         captured = capsys.readouterr()
         assert "MESSAGING_CWD" in captured.err
         assert "TERMINAL_CWD" in captured.err
+        assert "\033[" not in captured.err
+        assert "    terminal:\n      cwd: /term/path" in captured.err
