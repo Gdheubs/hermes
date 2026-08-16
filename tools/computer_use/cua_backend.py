@@ -445,11 +445,13 @@ def _select_capture_target(
     """
     candidates = [w for w in windows if not w["off_screen"]]
     pool = candidates
-    if not exact_target and not app_requested and sys.platform == "linux":
+    # Desktop/shell helper exclusion is cross-platform. The optional X11
+    # active-window tie-break remains Linux-only.
+    if not exact_target and not app_requested:
         real_apps = [w for w in candidates if _is_real_app_window(w)]
         if real_apps:
             pool = real_apps
-        if pool and _z_index_uninformative(pool):
+        if sys.platform == "linux" and pool and _z_index_uninformative(pool):
             active_id = _linux_x11_active_window_id()
             if active_id is not None:
                 for w in pool:
@@ -1679,7 +1681,14 @@ class _CuaDriverSession:
         self._start_lifecycle_locked()
         self._started = True
 
-    def _call_tool_via_cli(self, name: str, args: Dict[str, Any], timeout: float) -> Dict[str, Any]:
+    def _call_tool_via_cli(
+        self,
+        name: str,
+        args: Dict[str, Any],
+        timeout: float,
+        *,
+        shared_daemon: bool = False,
+    ) -> Dict[str, Any]:
         """Fallback transport: invoke ``cua-driver call <tool> <json>`` as a
         subprocess instead of going through the stdio MCP bridge.
 
@@ -1717,7 +1726,7 @@ class _CuaDriverSession:
         child_env = cua_driver_child_env()
         socket_args: List[str] = []
         embedded_daemon = getattr(self, "_embedded_daemon", None)
-        if embedded_daemon is not None:
+        if embedded_daemon is not None and not shared_daemon:
             driver_command = embedded_daemon.proxy_invocation()[0]
             child_env = embedded_daemon.child_env()
             socket_args = ["--socket", embedded_daemon.socket_path]
@@ -1731,6 +1740,7 @@ class _CuaDriverSession:
         attempts = 4
         backoff = 0.5
         parsed: Any = None
+        parsed_returncode = 0
         last_err = ""
         try:
             for attempt in range(attempts):
@@ -1769,6 +1779,7 @@ class _CuaDriverSession:
                         candidate = None
                     if candidate is not None:
                         parsed = candidate
+                        parsed_returncode = int(proc.returncode or 0)
                         break
                 # No JSON (EAGAIN warning / empty) — retry with backoff.
                 if attempt < attempts - 1:
@@ -1790,12 +1801,16 @@ class _CuaDriverSession:
             images: List[str] = []
             data: Any = None
             structured: Optional[Dict] = parsed if isinstance(parsed, dict) else None
-            is_error = False
+            is_error = parsed_returncode != 0
             if isinstance(parsed, dict):
                 # Current cua-driver CLI responses may report logical failures
                 # in-band even when the subprocess itself exits successfully.
                 # Preserve that bit so stateful callers can fail closed.
-                is_error = parsed.get("isError") is True or parsed.get("is_error") is True
+                is_error = (
+                    is_error
+                    or parsed.get("isError") is True
+                    or parsed.get("is_error") is True
+                )
                 shot = parsed.get("screenshot_png_b64")
                 if not shot:
                     # Screenshot was routed to a file (ours or the daemon's choice).
@@ -2271,7 +2286,10 @@ class CuaDriverBackend(ComputerUseBackend):
         self._last_target = None
         self._snapshot_tokens = {}
 
-    def _failed_capture(self, mode: str, message: str = "") -> CaptureResult:
+    def _failed_capture(
+        self, mode: str, message: str = "", *, error: Optional[str] = None,
+        available_windows: Optional[List[Dict[str, Any]]] = None,
+    ) -> CaptureResult:
         """Return an empty capture after disarming any prior target context."""
         self._clear_active_target()
         return CaptureResult(
@@ -2283,7 +2301,108 @@ class CuaDriverBackend(ComputerUseBackend):
             app="",
             window_title=message,
             png_bytes_len=0,
+            error=error,
+            available_windows=available_windows or [],
         )
+
+    @staticmethod
+    def _visible_window(window: Dict[str, Any]) -> bool:
+        """Exclude hidden and zero-area helper windows from app ambiguity."""
+        if window.get("is_on_screen") is False or window.get("off_screen") is True:
+            return False
+        bounds = window.get("bounds") or {}
+        width = bounds.get("width")
+        height = bounds.get("height")
+        return not (width is not None and height is not None
+                    and (float(width) <= 0 or float(height) <= 0))
+
+    def _resolve_exact_target(
+        self, *, pid: Optional[int], window_id: Optional[int], action: str,
+    ) -> Tuple[
+        Optional[Dict[str, Any]],
+        List[Dict[str, Any]],
+        Optional[str],
+    ]:
+        """Validate native IDs and refuse a PID that still names >1 window."""
+        del action  # retained in the signature for diagnostics/call-site clarity
+        # Exact IDs are allowed to name an off-screen/background window. App
+        # and PID-only resolution still filter to visible top-level windows.
+        windows = self._load_windows(on_screen_only=False)
+        visible = [window for window in windows if self._visible_window(window)]
+        wanted_pid = _positive_int(pid) if pid is not None else None
+        wanted_window = _positive_int(window_id) if window_id is not None else None
+        if ((pid is not None and wanted_pid is None)
+                or (window_id is not None and wanted_window is None)):
+            return None, visible, "stale_window_target"
+
+        # A native window ID is the strongest identity. If a PID accompanies
+        # it, both values must still describe the same live window. This is the
+        # strongest identity macOS exposes here: CGWindowID can theoretically
+        # be recycled quickly to a new window owned by the same PID, and
+        # list_windows provides no generation token to distinguish that case.
+        # We therefore guarantee current pair existence, but cannot detect
+        # same-PID/same-CGWindowID recycling without an OS-provided generation.
+        if wanted_window is not None:
+            matches = [
+                window for window in windows
+                if window["window_id"] == wanted_window
+                and (wanted_pid is None or window["pid"] == wanted_pid)
+            ]
+            return (
+                matches[0] if matches else None,
+                visible,
+                None if matches else "stale_window_target",
+            )
+
+        # PID-only targeting is safe only when exactly one visible window is
+        # owned by that process. Hidden helper windows do not create ambiguity.
+        matches = [window for window in visible if window["pid"] == wanted_pid]
+        if len(matches) > 1:
+            return None, matches, "ambiguous_window_target"
+        return (
+            matches[0] if matches else None,
+            visible,
+            None if matches else "stale_window_target",
+        )
+
+    def _action_target(
+        self, action: str, pid: Optional[int], window_id: Optional[int],
+    ) -> Tuple[Optional[int], Optional[int], Optional[ActionResult]]:
+        explicit = pid is not None or window_id is not None
+        if explicit:
+            target, windows, target_error = self._resolve_exact_target(
+                pid=pid, window_id=window_id, action=action,
+            )
+        else:
+            if self._active_pid is None or self._active_window_id is None:
+                return None, None, ActionResult(
+                    ok=False, action=action,
+                    message="No active window — call capture() first.",
+                )
+            # Revalidate the exact sticky pair immediately before every native
+            # mutation. This detects a closed ID and cross-process ID recycling
+            # without ever resolving by PID to a sibling window.
+            target, windows, target_error = self._resolve_exact_target(
+                pid=self._active_pid,
+                window_id=self._active_window_id,
+                action=action,
+            )
+            if target is None:
+                self._clear_active_target()
+
+        if target is None:
+            code = target_error or "stale_window_target"
+            message = (
+                "The process owns more than one visible top-level window; "
+                "provide window_id."
+                if code == "ambiguous_window_target"
+                else "The exact native window target is no longer available."
+            )
+            return None, None, ActionResult(
+                ok=False, action=action, code=code, message=message,
+                meta={"available_windows": windows},
+            )
+        return target["pid"], target["window_id"], None
 
     def _call_capture_tool(self, name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         """Call a capture-stage tool and disarm state on transport or logical failure."""
@@ -2301,7 +2420,7 @@ class CuaDriverBackend(ComputerUseBackend):
             )
         return out
 
-    def _load_windows(self) -> List[Dict[str, Any]]:
+    def _load_windows(self, *, on_screen_only: bool = True) -> List[Dict[str, Any]]:
         """Load normalized visible windows, with the shared CLI recovery path.
 
         Windows are sorted by ``z_index`` **descending**: CUA Driver
@@ -2313,7 +2432,7 @@ class CuaDriverBackend(ComputerUseBackend):
         """
         out = self._call_capture_tool(
             "list_windows",
-            {"on_screen_only": True, "session": self._session_id},
+            {"on_screen_only": on_screen_only, "session": self._session_id},
         )
         windows = _ingest_windows(_windows_from_tool_result(out))
         windows.sort(key=lambda w: w["z_index"], reverse=True)
@@ -2327,7 +2446,7 @@ class CuaDriverBackend(ComputerUseBackend):
         try:
             cli_out = self._session._call_tool_via_cli(
                 "list_windows",
-                {"on_screen_only": True, "session": self._session_id},
+                {"on_screen_only": on_screen_only, "session": self._session_id},
                 20.0,
             )
         except Exception as exc:
@@ -2451,24 +2570,21 @@ class CuaDriverBackend(ComputerUseBackend):
         # An exact pid/window pair is both the stable capture_after target and
         # the escape hatch when app/window discovery is unavailable on X11.
         if pid is not None or window_id is not None:
-            if pid is None or window_id is None:
+            target, available, target_error = self._resolve_exact_target(
+                pid=pid, window_id=window_id, action="capture",
+            )
+            if target is None:
                 return self._failed_capture(
-                    mode, "<capture targeting requires both pid and window_id>",
+                    mode,
+                    (
+                        "<process owns multiple visible windows; pass window_id>"
+                        if target_error == "ambiguous_window_target"
+                        else "<explicit native window target is stale>"
+                    ),
+                    error=target_error or "stale_window_target",
+                    available_windows=available,
                 )
-            target_pid = _positive_int(pid)
-            target_window_id = _positive_int(window_id)
-            if target_pid is None or target_window_id is None:
-                return self._failed_capture(
-                    mode, "<capture targeting requires positive integer pid and window_id>",
-                )
-            windows = [{
-                "app_name": app or "",
-                "pid": target_pid,
-                "window_id": target_window_id,
-                "off_screen": False,
-                "title": "",
-                "z_index": 0,
-            }]
+            windows = [target]
         else:
             try:
                 windows = self._load_windows()
@@ -2522,6 +2638,7 @@ class CuaDriverBackend(ComputerUseBackend):
             )
         elif pid is None and window_id is None and app:
             filtered = self._match_windows_for_app(windows, app)
+            filtered = [w for w in filtered if self._visible_window(w)]
             if not filtered:
                 return self._failed_capture(
                     mode,
@@ -2532,6 +2649,11 @@ class CuaDriverBackend(ComputerUseBackend):
                         f"instead of 'Calculator'; some Linux/Qt apps only "
                         f"resolve via list_apps metadata)>"
                     ),
+                )
+            if len(filtered) > 1:
+                return self._failed_capture(
+                    mode, "<multiple visible windows matched app; pass window_id>",
+                    error="ambiguous_window_target", available_windows=filtered,
                 )
             windows = filtered
 
@@ -2763,6 +2885,8 @@ class CuaDriverBackend(ComputerUseBackend):
             window_title=window_title,
             png_bytes_len=png_bytes_len,
             image_mime_type=image_mime_type,
+            pid=self._active_pid,
+            window_id=self._active_window_id,
         )
 
     # ── Pointer ────────────────────────────────────────────────────
@@ -2836,7 +2960,9 @@ class CuaDriverBackend(ComputerUseBackend):
                     delivery_mode="foreground",
                     message="The connected cua-driver does not advertise the standalone bring_to_front tool.",
                 )
-            if self._active_pid is None or self._active_window_id is None:
+            target_pid = _positive_int(args.get("pid"))
+            target_window_id = _positive_int(args.get("window_id"))
+            if target_pid is None or target_window_id is None:
                 return ActionResult(
                     ok=False,
                     action=action,
@@ -2845,12 +2971,27 @@ class CuaDriverBackend(ComputerUseBackend):
                     message="Capture an exact target before requesting persistent foreground focus.",
                 )
             focused = self.bring_to_front(
-                pid=self._active_pid,
-                window_id=self._active_window_id,
+                pid=target_pid,
+                window_id=target_window_id,
             )
             if not focused.ok:
                 return focused
-        result = self._action(action, args)
+        # Foreground input is an explicit escalation for native apps that do
+        # not accept background delivery. Route that one rung over the
+        # driver's direct CLI/socket transport: the persistent stdio MCP
+        # bridge can acknowledge macOS global-input delivery without the
+        # event reaching the target, while `cua-driver call` uses the daemon's
+        # native socket and delivers the same exact pid/window-bound payload.
+        # Background input remains on MCP and retains the no-focus contract.
+        result = self._action(
+            action,
+            args,
+            cli_transport=delivery_mode == "foreground",
+        )
+        if args.get("pid") is not None:
+            result.meta.setdefault("pid", args["pid"])
+        if args.get("window_id") is not None:
+            result.meta.setdefault("window_id", args["window_id"])
         if bring_to_front:
             result.meta["foreground_focus"] = {
                 "invoked": True,
@@ -2869,11 +3010,12 @@ class CuaDriverBackend(ComputerUseBackend):
         modifiers: Optional[List[str]] = None,
         delivery_mode: Optional[str] = None,
         bring_to_front: bool = False,
+        pid: Optional[int] = None,
+        window_id: Optional[int] = None,
     ) -> ActionResult:
-        pid = self._active_pid
-        if pid is None:
-            return ActionResult(ok=False, action="click",
-                                message="No active window — call capture() first.")
+        pid, target_window_id, target_error = self._action_target("click", pid, window_id)
+        if target_error:
+            return target_error
 
         # Choose tool by click_count only — single-vs-double — and pass the
         # button through to `click`'s `button` enum (Surface 5 of
@@ -2891,18 +3033,18 @@ class CuaDriverBackend(ComputerUseBackend):
 
         args: Dict[str, Any] = {"pid": pid, "button": button_norm}
         if element is not None:
-            if self._active_window_id is None:
+            if target_window_id is None:
                 return ActionResult(ok=False, action=tool,
                                     message="No active window_id for element_index click.")
             args["element_index"] = element
-            args["window_id"] = self._active_window_id
+            args["window_id"] = target_window_id
         elif x is not None and y is not None:
-            if self._active_window_id is None:
+            if target_window_id is None:
                 return ActionResult(ok=False, action=tool,
                                     message="No active window_id for coordinate click.")
             args["x"] = x
             args["y"] = y
-            args["window_id"] = self._active_window_id
+            args["window_id"] = target_window_id
         else:
             return ActionResult(ok=False, action=tool,
                                 message="click requires element= or x/y.")
@@ -2922,26 +3064,27 @@ class CuaDriverBackend(ComputerUseBackend):
         modifiers: Optional[List[str]] = None,
         delivery_mode: Optional[str] = None,
         bring_to_front: bool = False,
+        pid: Optional[int] = None,
+        window_id: Optional[int] = None,
     ) -> ActionResult:
-        pid = self._active_pid
-        if pid is None:
-            return ActionResult(ok=False, action="drag",
-                                message="No active window — call capture() first.")
+        pid, target_window_id, target_error = self._action_target("drag", pid, window_id)
+        if target_error:
+            return target_error
         args: Dict[str, Any] = {"pid": pid}
         if from_element is not None and to_element is not None:
-            if self._active_window_id is None:
+            if target_window_id is None:
                 return ActionResult(ok=False, action="drag",
                                     message="No active window_id for element-based drag.")
             args["from_element"] = from_element
             args["to_element"] = to_element
-            args["window_id"] = self._active_window_id
+            args["window_id"] = target_window_id
         elif from_xy is not None and to_xy is not None:
-            if self._active_window_id is None:
+            if target_window_id is None:
                 return ActionResult(ok=False, action="drag",
                                     message="No active window_id for coordinate drag.")
             args["from_x"], args["from_y"] = int(from_xy[0]), int(from_xy[1])
             args["to_x"], args["to_y"] = int(to_xy[0]), int(to_xy[1])
-            args["window_id"] = self._active_window_id
+            args["window_id"] = target_window_id
         else:
             return ActionResult(ok=False, action="drag",
                                 message="drag requires from_element/to_element or from_coordinate/to_coordinate.")
@@ -2958,21 +3101,22 @@ class CuaDriverBackend(ComputerUseBackend):
         modifiers: Optional[List[str]] = None,
         delivery_mode: Optional[str] = None,
         bring_to_front: bool = False,
+        pid: Optional[int] = None,
+        window_id: Optional[int] = None,
     ) -> ActionResult:
-        pid = self._active_pid
-        if pid is None:
-            return ActionResult(ok=False, action="scroll",
-                                message="No active window — call capture() first.")
+        pid, target_window_id, target_error = self._action_target("scroll", pid, window_id)
+        if target_error:
+            return target_error
         args: Dict[str, Any] = {
             "pid": pid,
             "direction": direction,
             "amount": max(1, min(50, amount)),
         }
-        if element is not None and self._active_window_id is not None:
+        if element is not None and target_window_id is not None:
             args["element_index"] = element
-            args["window_id"] = self._active_window_id
+            args["window_id"] = target_window_id
         elif x is not None and y is not None:
-            if self._active_window_id is None:
+            if target_window_id is None:
                 return ActionResult(ok=False, action="scroll",
                                     message="No active window_id for coordinate scroll.")
             # CUA Driver 0.7.1 Linux schema rejects x/y on scroll. Only
@@ -2986,27 +3130,27 @@ class CuaDriverBackend(ComputerUseBackend):
             ):
                 args["x"] = x
                 args["y"] = y
-            args["window_id"] = self._active_window_id
+            args["window_id"] = target_window_id
+        elif target_window_id is not None:
+            args["window_id"] = target_window_id
         return self._run_input_action("scroll", args, delivery_mode, bring_to_front)
 
     # ── Keyboard ───────────────────────────────────────────────────
     def type_text(self, text: str, *, delivery_mode: Optional[str] = None,
-                  bring_to_front: bool = False) -> ActionResult:
-        pid = self._active_pid
-        window_id = self._active_window_id
-        if pid is None or window_id is None:
-            return ActionResult(ok=False, action="type_text",
-                                message="No active window — call capture() first.")
+                  bring_to_front: bool = False, pid: Optional[int] = None,
+                  window_id: Optional[int] = None) -> ActionResult:
+        pid, window_id, target_error = self._action_target("type_text", pid, window_id)
+        if target_error:
+            return target_error
         args: Dict[str, Any] = {"pid": pid, "window_id": window_id, "text": text}
         return self._run_input_action("type_text", args, delivery_mode, bring_to_front)
 
     def key(self, keys: str, *, delivery_mode: Optional[str] = None,
-            bring_to_front: bool = False) -> ActionResult:
-        pid = self._active_pid
-        window_id = self._active_window_id
-        if pid is None or window_id is None:
-            return ActionResult(ok=False, action="key",
-                                message="No active window — call capture() first.")
+            bring_to_front: bool = False, pid: Optional[int] = None,
+            window_id: Optional[int] = None) -> ActionResult:
+        pid, window_id, target_error = self._action_target("key", pid, window_id)
+        if target_error:
+            return target_error
 
         key_name, modifiers = _parse_key_combo(keys)
         if not key_name:
@@ -3023,13 +3167,13 @@ class CuaDriverBackend(ComputerUseBackend):
             return self._run_input_action("press_key", args, delivery_mode, bring_to_front)
 
     # ── Value setter ────────────────────────────────────────────────
-    def set_value(self, value: str, element: Optional[int] = None) -> ActionResult:
+    def set_value(self, value: str, element: Optional[int] = None, *,
+                  pid: Optional[int] = None,
+                  window_id: Optional[int] = None) -> ActionResult:
         """Set a value on an element. Handles AXPopUpButton selects natively."""
-        pid = self._active_pid
-        window_id = self._active_window_id
-        if pid is None or window_id is None:
-            return ActionResult(ok=False, action="set_value",
-                                message="No active window — call capture() first.")
+        pid, window_id, target_error = self._action_target("set_value", pid, window_id)
+        if target_error:
+            return target_error
         if element is None:
             return ActionResult(ok=False, action="set_value",
                                 message="set_value requires element= (element index).")
@@ -3039,7 +3183,10 @@ class CuaDriverBackend(ComputerUseBackend):
             "element_index": element,
             "value": value,
         }
-        return self._action("set_value", args)
+        result = self._action("set_value", args)
+        result.meta.setdefault("pid", pid)
+        result.meta.setdefault("window_id", window_id)
+        return result
 
     # ── Introspection ──────────────────────────────────────────────
     def list_apps(self) -> List[Dict[str, Any]]:
@@ -3081,7 +3228,9 @@ class CuaDriverBackend(ComputerUseBackend):
     def list_windows(self) -> List[Dict[str, Any]]:
         return self._load_windows()
 
-    def focus_app(self, app: str, raise_window: bool = False) -> ActionResult:
+    def focus_app(self, app: Optional[str] = None, raise_window: bool = False, *,
+                  pid: Optional[int] = None,
+                  window_id: Optional[int] = None) -> ActionResult:
         """Target an app, optionally invoking standalone foreground focus.
 
         cua-driver background-automation never needs to bring a window to the
@@ -3095,13 +3244,49 @@ class CuaDriverBackend(ComputerUseBackend):
         separately approved by the Hermes adapter, and uses cua-driver's
         standalone ``bring_to_front`` tool rather than an action property.
         """
-        try:
-            windows = self._load_windows()
-        except Exception:
-            self._clear_active_target()
-            raise
-
-        matched = self._match_windows_for_app(windows, app)
+        explicit_target = pid is not None or window_id is not None
+        if explicit_target:
+            target, available, target_error = self._resolve_exact_target(
+                pid=pid, window_id=window_id, action="focus_app",
+            )
+            if target is None:
+                self._clear_active_target()
+                code = target_error or "stale_window_target"
+                return ActionResult(
+                    ok=False,
+                    action="focus_app",
+                    code=code,
+                    message=(
+                        "The process owns more than one visible top-level window; "
+                        "provide window_id."
+                        if code == "ambiguous_window_target"
+                        else "The explicit native window target is no longer available."
+                    ),
+                    meta={"available_windows": available},
+                )
+            matched = [target]
+        else:
+            try:
+                windows = self._load_windows()
+            except Exception:
+                self._clear_active_target()
+                raise
+            matched = [
+                window for window in self._match_windows_for_app(windows, app or "")
+                if self._visible_window(window)
+            ]
+            if len(matched) > 1:
+                self._clear_active_target()
+                return ActionResult(
+                    ok=False,
+                    action="focus_app",
+                    code="ambiguous_window_target",
+                    message=(
+                        "The app owns more than one visible top-level window; "
+                        "provide window_id."
+                    ),
+                    meta={"available_windows": matched},
+                )
         # Don't silently fall back to the frontmost window when the filter
         # matches nothing — that hides the real failure (often a localized
         # macOS app name mismatch, e.g. caller passed "Calculator" but
@@ -3111,7 +3296,7 @@ class CuaDriverBackend(ComputerUseBackend):
             self._active_pid = target["pid"]
             self._active_window_id = target["window_id"]
             self._snapshot_tokens = {}
-            self._last_app = target["app_name"] or app  # retained for back-compat diagnostics
+            self._last_app = target["app_name"] or app or ""  # retained for back-compat diagnostics
             self._last_target = {
                 "pid": self._active_pid,
                 "window_id": self._active_window_id,
@@ -3137,6 +3322,7 @@ class CuaDriverBackend(ComputerUseBackend):
                 ok=True, action="focus_app",
                 message=f"Targeted {target['app_name']} (pid {self._active_pid}, "
                         f"window {self._active_window_id}) without raising window.",
+                meta={"pid": self._active_pid, "window_id": self._active_window_id},
             )
         self._clear_active_target()
         return ActionResult(ok=False, action="focus_app",
@@ -3472,6 +3658,7 @@ class CuaDriverBackend(ComputerUseBackend):
         args: Dict[str, Any],
         *,
         inject_session: bool = True,
+        cli_transport: bool = False,
     ) -> ActionResult:
         # Attach the snapshot's element_token whenever the call carries
         # an element_index and the target tool advertises support.
@@ -3483,7 +3670,12 @@ class CuaDriverBackend(ComputerUseBackend):
         if inject_session:
             args.setdefault("session", self._session_id)
         try:
-            out = self._session.call_tool(name, args)
+            if cli_transport:
+                out = self._session._call_tool_via_cli(
+                    name, args, 30.0, shared_daemon=True,
+                )
+            else:
+                out = self._session.call_tool(name, args)
         except Exception as e:
             logger.exception("cua-driver %s call failed", name)
             return ActionResult(ok=False, action=name, message=f"cua-driver error: {e}")

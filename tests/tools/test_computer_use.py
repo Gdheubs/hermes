@@ -1455,6 +1455,43 @@ class TestCuaCliFallbackResolution:
             "/Users/example/.local/bin/cua-driver", "call", "click"
         ]
 
+    def test_cli_fallback_nonzero_exit_with_json_fails_closed(self):
+        from tools.computer_use.cua_backend import _AsyncBridge, _CuaDriverSession
+
+        proc = MagicMock(
+            stdout='{"error":"stale target"}',
+            stderr="",
+            returncode=1,
+        )
+        session = _CuaDriverSession(_AsyncBridge())
+        with patch(
+            "tools.computer_use.cua_backend.resolve_cua_driver_cmd",
+            return_value="/Users/example/.local/bin/cua-driver",
+        ), patch("subprocess.run", return_value=proc):
+            out = session._call_tool_via_cli(
+                "hotkey", {"pid": 42, "window_id": 7}, timeout=0.1,
+            )
+
+        assert out["isError"] is True
+        assert out["structuredContent"]["error"] == "stale target"
+
+    def test_shared_daemon_cli_transport_does_not_append_embedded_socket(self):
+        from tools.computer_use.cua_backend import _AsyncBridge, _CuaDriverSession
+
+        proc = MagicMock(stdout="{}", stderr="", returncode=0)
+        session = _CuaDriverSession(_AsyncBridge())
+        session._embedded_daemon = MagicMock()
+        with patch(
+            "tools.computer_use.cua_backend.resolve_cua_driver_cmd",
+            return_value="/Users/example/.local/bin/cua-driver",
+        ), patch("subprocess.run", return_value=proc) as run:
+            session._call_tool_via_cli(
+                "hotkey", {"pid": 42, "window_id": 7}, timeout=0.1,
+                shared_daemon=True,
+            )
+
+        assert "--socket" not in run.call_args.args[0]
+
 
 class TestClickButtonPassthrough:
     """Surface 5 (NousResearch/hermes-agent#47072) — `middle_click` must
@@ -1473,12 +1510,31 @@ class TestClickButtonPassthrough:
         from tools.computer_use.cua_backend import CuaDriverBackend
         backend = CuaDriverBackend()
         backend._session = MagicMock()
-        backend._session.call_tool.return_value = {
+        action_result = {
             "data": "ok",
             "images": [],
             "structuredContent": None,
             "isError": False,
         }
+
+        def call_tool(name, _args):
+            if name == "list_windows":
+                return {
+                    "data": "",
+                    "images": [],
+                    "structuredContent": {"windows": [{
+                        "app_name": "Test App",
+                        "pid": 111,
+                        "window_id": 222,
+                        "is_on_screen": True,
+                        "title": "Test Window",
+                        "z_index": 1,
+                    }]},
+                    "isError": False,
+                }
+            return action_result
+
+        backend._session.call_tool.side_effect = call_tool
         # Pretend capture() ran and resolved a target.
         backend._active_pid = 111
         backend._active_window_id = 222
@@ -1559,12 +1615,31 @@ class TestKeyboardWindowIdRouting:
         from tools.computer_use.cua_backend import CuaDriverBackend
         backend = CuaDriverBackend()
         backend._session = MagicMock()
-        backend._session.call_tool.return_value = {
+        action_result = {
             "data": "ok",
             "images": [],
             "structuredContent": None,
             "isError": False,
         }
+
+        def call_tool(name, _args):
+            if name == "list_windows":
+                return {
+                    "data": "",
+                    "images": [],
+                    "structuredContent": {"windows": [{
+                        "app_name": "Test App",
+                        "pid": 111,
+                        "window_id": 222,
+                        "is_on_screen": True,
+                        "title": "Test Window",
+                        "z_index": 1,
+                    }]},
+                    "isError": False,
+                }
+            return action_result
+
+        backend._session.call_tool.side_effect = call_tool
         backend._active_pid = 111
         backend._active_window_id = 222
         return backend
@@ -1890,10 +1965,29 @@ class TestElementTokenAttachment:
 
         backend = CuaDriverBackend()
         backend._session = MagicMock()
-        backend._session.call_tool.return_value = {
+        action_result = {
             "data": "ok", "images": [], "image_mime_types": [],
             "structuredContent": None, "isError": False,
         }
+
+        def call_tool(name, _args):
+            if name == "list_windows":
+                return {
+                    "data": "",
+                    "images": [],
+                    "structuredContent": {"windows": [{
+                        "app_name": "Test App",
+                        "pid": 111,
+                        "window_id": 222,
+                        "is_on_screen": True,
+                        "title": "Test Window",
+                        "z_index": 1,
+                    }]},
+                    "isError": False,
+                }
+            return action_result
+
+        backend._session.call_tool.side_effect = call_tool
         # `supports_capability(cap, tool=None)` honors the supplied map.
         def _supports(cap, tool=None):
             if tool is not None:

@@ -65,6 +65,14 @@ class CaptureResult:
     # When None, downstream consumers fall back to base64-prefix
     # sniffing for back-compat with older drivers.
     image_mime_type: Optional[str] = None
+    # Exact native target resolved for this capture. Additive for backward
+    # compatibility: non-window backends leave both fields unset.
+    pid: Optional[int] = None
+    window_id: Optional[int] = None
+    # Structured target-resolution failure. Failed captures carry no active
+    # target and may include safe window metadata so callers can choose one.
+    error: Optional[str] = None
+    available_windows: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -147,6 +155,8 @@ class ComputerUseBackend(ABC):
         modifiers: Optional[List[str]] = None,
         delivery_mode: Optional[str] = None,   # background (default) | foreground
         bring_to_front: bool = False,
+        pid: Optional[int] = None,
+        window_id: Optional[int] = None,
     ) -> ActionResult: ...
 
     @abstractmethod
@@ -161,6 +171,8 @@ class ComputerUseBackend(ABC):
         modifiers: Optional[List[str]] = None,
         delivery_mode: Optional[str] = None,
         bring_to_front: bool = False,
+        pid: Optional[int] = None,
+        window_id: Optional[int] = None,
     ) -> ActionResult: ...
 
     @abstractmethod
@@ -175,16 +187,20 @@ class ComputerUseBackend(ABC):
         modifiers: Optional[List[str]] = None,
         delivery_mode: Optional[str] = None,
         bring_to_front: bool = False,
+        pid: Optional[int] = None,
+        window_id: Optional[int] = None,
     ) -> ActionResult: ...
 
     # ── Keyboard ────────────────────────────────────────────────────
     @abstractmethod
     def type_text(self, text: str, *, delivery_mode: Optional[str] = None,
-                  bring_to_front: bool = False) -> ActionResult: ...
+                  bring_to_front: bool = False, pid: Optional[int] = None,
+                  window_id: Optional[int] = None) -> ActionResult: ...
 
     @abstractmethod
     def key(self, keys: str, *, delivery_mode: Optional[str] = None,
-            bring_to_front: bool = False) -> ActionResult:
+            bring_to_front: bool = False, pid: Optional[int] = None,
+            window_id: Optional[int] = None) -> ActionResult:
         """Send a key combo, e.g. 'cmd+s', 'ctrl+alt+t', 'return'."""
 
     # ── Introspection ───────────────────────────────────────────────
@@ -201,12 +217,16 @@ class ComputerUseBackend(ABC):
         return []
 
     @abstractmethod
-    def focus_app(self, app: str, raise_window: bool = False) -> ActionResult:
+    def focus_app(self, app: Optional[str] = None, raise_window: bool = False, *,
+                  pid: Optional[int] = None,
+                  window_id: Optional[int] = None) -> ActionResult:
         """Route input to `app` (by name or bundle ID). Default: focus without raise."""
 
     # ── Native-value mutation ────────────────────────────────────────
     @abstractmethod
-    def set_value(self, value: str, element: Optional[int] = None) -> ActionResult:
+    def set_value(self, value: str, element: Optional[int] = None, *,
+                  pid: Optional[int] = None,
+                  window_id: Optional[int] = None) -> ActionResult:
         """Set a native value on an element (e.g. AXPopUpButton selection).
 
         `element` is the 1-based SOM index returned by a prior capture call.

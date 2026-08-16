@@ -50,10 +50,31 @@ class _FakeSession:
         self._input_properties = input_properties or {}
         self.last_args: Dict[str, Any] = {}
         self.calls = []
+        self.cli_calls = []
 
     def call_tool(self, name: str, args: Dict[str, Any], timeout: float = 30.0):
+        if name == "list_windows":
+            return {
+                "isError": False,
+                "data": {},
+                "structuredContent": {"windows": [{
+                    "app_name": "Test App",
+                    "pid": 4242,
+                    "window_id": 7,
+                    "is_on_screen": True,
+                    "title": "Test Window",
+                    "z_index": 1,
+                }]},
+            }
         self.last_args = args
         self.calls.append((name, dict(args)))
+        return self._out
+
+    def _call_tool_via_cli(
+        self, name: str, args: Dict[str, Any], timeout: float, **kwargs: Any,
+    ):
+        self.last_args = args
+        self.cli_calls.append((name, dict(args), timeout))
         return self._out
 
     def supports_capability(self, capability: str, tool: Optional[str] = None) -> bool:
@@ -191,7 +212,8 @@ def test_foreground_sent_when_schema_property_present():
     sess = _FakeSession(out, input_properties={"click": {"delivery_mode"}})
     be = _make_backend(sess)
     res = be.click(element=1, delivery_mode="foreground", bring_to_front=True)
-    assert [name for name, _ in sess.calls] == ["bring_to_front", "click"]
+    assert [name for name, _ in sess.calls] == ["bring_to_front"]
+    assert [name for name, _, _ in sess.cli_calls] == ["click"]
     assert sess.calls[0][1] == {"pid": 4242, "window_id": 7}
     assert sess.last_args.get("delivery_mode") == "foreground"
     assert "bring_to_front" not in sess.last_args

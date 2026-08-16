@@ -94,16 +94,19 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
             "pid": {
                 "type": "integer",
                 "description": (
-                    "Optional exact process target for action='capture'. Pair "
-                    "with window_id when discovery cannot resolve an X11 app."
+                    "Optional exact process target for capture and native "
+                    "window actions. Pair with window_id when known; window_id "
+                    "alone can resolve its owning pid through list_windows."
                 ),
             },
             "window_id": {
                 "type": "integer",
                 "description": (
-                    "Optional exact native window target for action='capture'. "
-                    "Pair with pid when an external cua-driver list_windows "
-                    "lookup has already identified the window."
+                    "Optional exact native window target for capture, click, "
+                    "double/right/middle click, drag, scroll, type, key, "
+                    "set_value, and focus_app. Explicit window_id always wins. "
+                    "Capture responses expose pid/window_id for reuse. A stale "
+                    "or closed id fails without selecting another window."
                 ),
             },
             "max_elements": {

@@ -46,9 +46,29 @@ class _FakeSession:
         self.input_properties = input_properties or {}
         self.tools = tools or {"bring_to_front", *self.input_properties}
         self.calls: list[tuple[str, Dict[str, Any]]] = []
+        self.cli_calls: list[tuple[str, Dict[str, Any], float]] = []
 
     def call_tool(self, name: str, args: Dict[str, Any], timeout: float = 30.0):
+        if name == "list_windows":
+            return {
+                "isError": False,
+                "data": {},
+                "structuredContent": {"windows": [{
+                    "app_name": "Test App",
+                    "pid": 42,
+                    "window_id": 7,
+                    "is_on_screen": True,
+                    "title": "Test Window",
+                    "z_index": 1,
+                }]},
+            }
         self.calls.append((name, dict(args)))
+        return self.out
+
+    def _call_tool_via_cli(
+        self, name: str, args: Dict[str, Any], timeout: float, **kwargs: Any,
+    ):
+        self.cli_calls.append((name, dict(args), timeout))
         return self.out
 
     def supports_capability(self, capability: str, tool: Optional[str] = None) -> bool:
@@ -160,12 +180,28 @@ def test_foreground_focus_is_a_separate_call_before_action():
     )
 
     assert result.ok is True
-    assert [name for name, _ in session.calls] == ["bring_to_front", "click"]
+    assert [name for name, _ in session.calls] == ["bring_to_front"]
+    assert [name for name, _, _ in session.cli_calls] == ["click"]
     focus_args = session.calls[0][1]
-    action_args = session.calls[1][1]
+    action_args = session.cli_calls[0][1]
     assert focus_args == {"pid": 42, "window_id": 7}
     assert action_args["delivery_mode"] == "foreground"
     assert "bring_to_front" not in action_args
+
+
+def test_foreground_input_uses_cli_socket_transport_but_background_stays_on_mcp():
+    session = _FakeSession(input_properties={"hotkey": {"delivery_mode"}})
+    backend = _make_backend(session)
+
+    foreground = backend.key("cmd+t", delivery_mode="foreground")
+    background = backend.key("cmd+t", delivery_mode="background")
+
+    assert foreground.ok is True
+    assert background.ok is True
+    assert [name for name, _, _ in session.cli_calls] == ["hotkey"]
+    assert session.cli_calls[0][1]["delivery_mode"] == "foreground"
+    assert [name for name, _ in session.calls] == ["hotkey"]
+    assert "delivery_mode" not in session.calls[0][1]
 
 
 def test_foreground_refuses_only_when_schema_lacks_delivery_property():

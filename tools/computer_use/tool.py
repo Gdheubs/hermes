@@ -460,12 +460,13 @@ class _NoopBackend(ComputerUseBackend):  # pragma: no cover
         self.calls.append(("list_windows", {}))
         return []
 
-    def focus_app(self, app: str, raise_window: bool = False) -> ActionResult:
-        self.calls.append(("focus_app", {"app": app, "raise": raise_window}))
+    def focus_app(self, app: Optional[str] = None, raise_window: bool = False,
+                  **kw) -> ActionResult:
+        self.calls.append(("focus_app", {"app": app, "raise": raise_window, **kw}))
         return ActionResult(ok=True, action="focus_app")
 
-    def set_value(self, value: str, element: Optional[int] = None) -> ActionResult:
-        self.calls.append(("set_value", {"value": value, "element": element}))
+    def set_value(self, value: str, element: Optional[int] = None, **kw) -> ActionResult:
+        self.calls.append(("set_value", {"value": value, "element": element, **kw}))
         return ActionResult(ok=True, action="set_value")
 
 
@@ -600,42 +601,56 @@ def _request_approval(action: str, args: Dict[str, Any],
 def _summarize_action(action: str, args: Dict[str, Any]) -> str:
     fg = " [FOREGROUND — briefly raises the window / changes focus]" \
         if args.get("delivery_mode") == "foreground" else ""
+    target_parts = [
+        f"{key}={args[key]}"
+        for key in ("pid", "window_id")
+        if args.get(key) is not None
+    ]
+    target = f" [target {' '.join(target_parts)}]" if target_parts else ""
     if action in {"click", "double_click", "right_click", "middle_click"}:
         if args.get("element") is not None:
-            return f"{action} element #{args['element']}{fg}"
-        coord = args.get("coordinate")
-        if coord:
-            return f"{action} at {tuple(coord)}{fg}"
-        return action + fg
-    if action == "drag":
+            summary = f"{action} element #{args['element']}"
+        elif coord := args.get("coordinate"):
+            summary = f"{action} at {tuple(coord)}"
+        else:
+            summary = action
+    elif action == "drag":
         src = args.get("from_element") or args.get("from_coordinate")
         dst = args.get("to_element") or args.get("to_coordinate")
-        return f"drag {src} → {dst}{fg}"
-    if action == "scroll":
-        return f"scroll {args.get('direction', '?')} x{args.get('amount', 3)}{fg}"
-    if action == "type":
+        summary = f"drag {src} → {dst}"
+    elif action == "scroll":
+        summary = f"scroll {args.get('direction', '?')} x{args.get('amount', 3)}"
+    elif action == "type":
         text = args.get("text", "")
-        return f"type {text[:60]!r}" + ("..." if len(text) > 60 else "") + fg
-    if action == "key":
-        return f"key {args.get('keys', '')!r}{fg}"
-    if action == "focus_app":
-        return f"focus {args.get('app', '')!r}" + (" (raise)" if args.get("raise_window") else "")
-    return action + fg
+        summary = f"type {text[:60]!r}" + ("..." if len(text) > 60 else "")
+    elif action == "key":
+        summary = f"key {args.get('keys', '')!r}"
+    elif action == "focus_app":
+        summary = f"focus {args.get('app', '')!r}" + (
+            " (raise)" if args.get("raise_window") else ""
+        )
+    else:
+        summary = action
+    return summary + target + fg
 
 
 def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) -> Any:
     capture_after = bool(args.get("capture_after"))
+    target_kwargs = {
+        key: args[key]
+        for key in ("pid", "window_id")
+        if args.get(key) is not None
+    }
 
     if action == "capture":
         mode = str(args.get("mode", "som"))
         if mode not in {"som", "vision", "ax"}:
             return json.dumps({"error": f"bad mode {mode!r}; use som|vision|ax"})
-        capture_kwargs: Dict[str, Any] = {"mode": mode, "app": args.get("app")}
-        if args.get("pid") is not None or args.get("window_id") is not None:
-            capture_kwargs.update({
-                "pid": args.get("pid"),
-                "window_id": args.get("window_id"),
-            })
+        capture_kwargs: Dict[str, Any] = {
+            "mode": mode,
+            "app": args.get("app"),
+            **target_kwargs,
+        }
         cap = backend.capture(**capture_kwargs)
         return _capture_response(cap, max_elements=_coerce_max_elements(args.get("max_elements")))
 
@@ -654,9 +669,11 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
 
     if action == "focus_app":
         app = args.get("app")
-        if not app:
+        if not app and args.get("pid") is None and args.get("window_id") is None:
             return json.dumps({"error": "focus_app requires `app`"})
-        res = backend.focus_app(app, raise_window=bool(args.get("raise_window")))
+        res = backend.focus_app(
+            app, raise_window=bool(args.get("raise_window")), **target_kwargs,
+        )
         return _maybe_follow_capture(backend, res, capture_after)
 
     # cua-driver's typed browser surface is namespaced inside the existing
@@ -796,6 +813,7 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
             x=x, y=y, button=button or "left", click_count=click_count,
             modifiers=args.get("modifiers"),
             delivery_mode=delivery_mode, bring_to_front=bring_to_front,
+            **target_kwargs,
         )
         return _maybe_follow_capture(backend, res, capture_after)
 
@@ -814,6 +832,7 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
             button=args.get("button", "left"),
             modifiers=args.get("modifiers"),
             delivery_mode=delivery_mode, bring_to_front=bring_to_front,
+            **target_kwargs,
         )
         return _maybe_follow_capture(backend, res, capture_after)
 
@@ -827,24 +846,35 @@ def _dispatch(backend: ComputerUseBackend, action: str, args: Dict[str, Any]) ->
             y=coord[1] if coord and coord[1] is not None else None,
             modifiers=args.get("modifiers"),
             delivery_mode=delivery_mode, bring_to_front=bring_to_front,
+            **target_kwargs,
         )
         return _maybe_follow_capture(backend, res, capture_after)
 
     if action == "type":
-        res = backend.type_text(args.get("text", ""),
-                                delivery_mode=delivery_mode, bring_to_front=bring_to_front)
+        res = backend.type_text(
+            args.get("text", ""),
+            delivery_mode=delivery_mode,
+            bring_to_front=bring_to_front,
+            **target_kwargs,
+        )
         return _maybe_follow_capture(backend, res, capture_after)
 
     if action == "key":
-        res = backend.key(args.get("keys", ""),
-                          delivery_mode=delivery_mode, bring_to_front=bring_to_front)
+        res = backend.key(
+            args.get("keys", ""),
+            delivery_mode=delivery_mode,
+            bring_to_front=bring_to_front,
+            **target_kwargs,
+        )
         return _maybe_follow_capture(backend, res, capture_after)
 
     if action == "set_value":
         value = args.get("value")
         if value is None:
             return json.dumps({"error": "set_value requires `value`"})
-        res = backend.set_value(value=str(value), element=args.get("element"))
+        res = backend.set_value(
+            value=str(value), element=args.get("element"), **target_kwargs,
+        )
         return _maybe_follow_capture(backend, res, capture_after)
 
     # Do NOT alias unknown actions (we never repair bad model output), but
@@ -1098,7 +1128,9 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
     summary_lines = [
         f"capture mode={cap.mode} {response_width}x{response_height}"
         + (f" app={cap.app}" if cap.app else "")
-        + (f" window={cap.window_title!r}" if cap.window_title else ""),
+        + (f" window={cap.window_title!r}" if cap.window_title else "")
+        + (f" pid={cap.pid} window_id={cap.window_id}"
+           if cap.pid is not None or cap.window_id is not None else ""),
         f"{total_elements} interactable element(s):",
     ]
     if bounds_note:
@@ -1168,6 +1200,10 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
                 "summary": "\n".join(summary_lines),
                 "vision_unavailable": True,
             }
+            if cap.pid is not None:
+                payload["pid"] = cap.pid
+            if cap.window_id is not None:
+                payload["window_id"] = cap.window_id
             if truncated_elements:
                 payload["truncated_elements"] = truncated_elements
             if elements_file:
@@ -1198,6 +1234,8 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
             "text_summary": summary,
             "meta": {"mode": cap.mode, "width": response_width, "height": response_height,
                      "elements": total_elements, "png_bytes": cap.png_bytes_len,
+                     **({"pid": cap.pid} if cap.pid is not None else {}),
+                     **({"window_id": cap.window_id} if cap.window_id is not None else {}),
                      **({"elements_file": elements_file} if elements_file else {}),
                      **({"bounds_scale": bounds_scale} if bounds_scale else {})},
         }
@@ -1219,6 +1257,14 @@ def _capture_response(cap: CaptureResult, max_elements: int = _DEFAULT_MAX_ELEME
         "total_elements": total_elements,
         "summary": summary,
     }
+    if cap.pid is not None:
+        payload["pid"] = cap.pid
+    if cap.window_id is not None:
+        payload["window_id"] = cap.window_id
+    if cap.error is not None:
+        payload["error"] = cap.error
+    if cap.available_windows:
+        payload["available_windows"] = cap.available_windows
     if truncated_elements:
         payload["truncated_elements"] = truncated_elements
     if elements_file:
@@ -1449,6 +1495,10 @@ def _route_capture_through_aux_vision(
         "vision_analysis": analysis_text,
         "vision_analysis_routed_via": "auxiliary.vision",
     }
+    if cap.pid is not None:
+        payload["pid"] = cap.pid
+    if cap.window_id is not None:
+        payload["window_id"] = cap.window_id
     if truncated_elements:
         payload["truncated_elements"] = truncated_elements
     if elements_file:
@@ -1467,12 +1517,16 @@ def _maybe_follow_capture(
     if not res.ok:
         return _text_response(res)
     try:
-        # Preserve the exact selected window when possible. Linux may expose a
-        # generic app name for several unrelated windows, so app-only recapture
-        # can silently switch targets after a successful action.
-        target = getattr(backend, "_last_target", None) or {}
-        pid = target.get("pid")
-        window_id = target.get("window_id")
+        # Prefer the exact target confirmed by the successful action. An
+        # explicit action may override the backend's prior sticky capture
+        # target, so consulting only ``_last_target`` can recapture a sibling.
+        action_meta = res.meta if isinstance(res.meta, dict) else {}
+        pid = action_meta.get("pid")
+        window_id = action_meta.get("window_id")
+        if pid is None or window_id is None:
+            target = getattr(backend, "_last_target", None) or {}
+            pid = target.get("pid")
+            window_id = target.get("window_id")
         mode = _capture_after_mode()
         if pid is not None and window_id is not None:
             cap = backend.capture(mode=mode, pid=pid, window_id=window_id)
