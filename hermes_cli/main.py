@@ -223,6 +223,16 @@ def _run_and_exit_oneshot(
         _exit_after_oneshot(rc)
 
 
+def _oneshot_ignore_rules(args) -> bool:
+    """Map CLI flags onto one-shot isolation.
+
+    ``--safe-mode`` implies ``--ignore-rules`` (it skips context files and
+    memory injection too), so both flags feed the same skip contract and are
+    resolved here once instead of at each dispatch site.
+    """
+    return bool(getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False))
+
+
 def _project_root_str_fast() -> str:
     return _startup_fast.project_root_str()
 
@@ -11386,8 +11396,7 @@ def _try_termux_fast_cli_launch() -> bool:
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
-            ignore_rules=getattr(args, "ignore_rules", False)
-            or getattr(args, "safe_mode", False),
+            ignore_rules=_oneshot_ignore_rules(args),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -13092,8 +13101,7 @@ def main():
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
-            ignore_rules=getattr(args, "ignore_rules", False)
-            or getattr(args, "safe_mode", False),
+            ignore_rules=_oneshot_ignore_rules(args),
         )
 
     # Handle top-level --resume / --continue as shortcut to chat

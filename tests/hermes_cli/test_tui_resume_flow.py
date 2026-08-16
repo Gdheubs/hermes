@@ -37,7 +37,13 @@ def main_mod(monkeypatch):
     return mod
 
 
-def test_termux_fast_cli_launch_forwards_oneshot_isolation(monkeypatch, main_mod):
+@pytest.mark.parametrize(
+    ("flag", "expected"),
+    [("--ignore-rules", True), ("--safe-mode", True), (None, False)],
+)
+def test_termux_fast_cli_launch_forwards_oneshot_isolation(
+    monkeypatch, main_mod, flag, expected
+):
     captured = {}
 
     monkeypatch.setenv("TERMUX_VERSION", "1")
@@ -45,7 +51,7 @@ def test_termux_fast_cli_launch_forwards_oneshot_isolation(monkeypatch, main_mod
     monkeypatch.setattr(
         sys,
         "argv",
-        ["hermes", "-z", "hello", "--ignore-rules"],
+        ["hermes", "-z", "hello"] + ([flag] if flag else []),
     )
     monkeypatch.setattr(main_mod, "_prepare_agent_startup", lambda _args: None)
     monkeypatch.setattr(
@@ -56,7 +62,40 @@ def test_termux_fast_cli_launch_forwards_oneshot_isolation(monkeypatch, main_mod
 
     assert main_mod._try_termux_fast_cli_launch() is True
     assert captured["prompt"] == "hello"
-    assert captured["ignore_rules"] is True
+    assert captured["ignore_rules"] is expected
+
+
+def test_oneshot_parser_registers_isolation_flags():
+    """--ignore-rules / --safe-mode must be real parser flags, not just
+    getattr fallbacks, so the oneshot dispatch can never silently no-op."""
+    from hermes_cli._parser import build_top_level_parser
+
+    parser, _, _ = build_top_level_parser()
+    for flag, attr in (("--ignore-rules", "ignore_rules"), ("--safe-mode", "safe_mode")):
+        parsed = parser.parse_args(["-z", "hello", flag])
+        assert getattr(parsed, attr) is True
+
+
+@pytest.mark.parametrize(
+    ("ignore_rules", "env", "expected"),
+    [
+        (False, {}, False),
+        (True, {}, True),
+        (False, {"HERMES_IGNORE_RULES": "1"}, True),
+        (False, {"HERMES_SAFE_MODE": "1"}, True),
+        (False, {"HERMES_IGNORE_RULES": "0"}, False),
+        (True, {"HERMES_SAFE_MODE": "0"}, True),
+        (False, {"HERMES_IGNORE_RULES": "0", "HERMES_SAFE_MODE": "0"}, False),
+    ],
+)
+def test_effective_ignore_rules_helper(monkeypatch, ignore_rules, env, expected):
+    from hermes_cli.oneshot import _effective_ignore_rules
+
+    monkeypatch.delenv("HERMES_IGNORE_RULES", raising=False)
+    monkeypatch.delenv("HERMES_SAFE_MODE", raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    assert _effective_ignore_rules(ignore_rules) is expected
 
 
 def test_run_and_exit_oneshot_forwards_isolation(monkeypatch, main_mod):

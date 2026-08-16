@@ -218,11 +218,7 @@ def run_oneshot(
         sys.stderr.write(toolsets_error)
         return 2
     use_config_toolsets = _normalize_toolsets(toolsets) is None
-    effective_ignore_rules = (
-        ignore_rules
-        or os.environ.get("HERMES_IGNORE_RULES") == "1"
-        or os.environ.get("HERMES_SAFE_MODE") == "1"
-    )
+    effective_ignore_rules = _effective_ignore_rules(ignore_rules)
 
     # Auto-approve any shell / tool approvals.  Non-interactive by
     # definition — a prompt would hang forever.
@@ -326,6 +322,22 @@ def _create_session_db_for_oneshot():
     except Exception as exc:
         logging.debug("SQLite session store not available for oneshot mode: %s", exc)
         return None
+
+
+def _effective_ignore_rules(ignore_rules: bool) -> bool:
+    """Resolve one-shot isolation from the explicit flag or env equivalents.
+
+    ``--ignore-rules`` (or ``HERMES_IGNORE_RULES=1``) and safe mode
+    (``--safe-mode`` / ``HERMES_SAFE_MODE=1``) all skip rules and memory
+    injection.  The env forms are honored so one-shot workers launched by
+    cron/Termux keep the same contract as the interactive CLI, which maps
+    both flags onto the same skip flags before construction.
+    """
+    return bool(
+        ignore_rules
+        or os.environ.get("HERMES_IGNORE_RULES") == "1"
+        or os.environ.get("HERMES_SAFE_MODE") == "1"
+    )
 
 
 def _run_agent(
@@ -434,11 +446,7 @@ def _run_agent(
     )
 
     session_db = _create_session_db_for_oneshot()
-    effective_ignore_rules = (
-        ignore_rules
-        or os.environ.get("HERMES_IGNORE_RULES") == "1"
-        or os.environ.get("HERMES_SAFE_MODE") == "1"
-    )
+    effective_ignore_rules = _effective_ignore_rules(ignore_rules)
     # The try spans agent construction (not just ``chat``) so the SQLite store
     # opened above is always closed — including when ``AIAgent(...)`` itself
     # raises on a provider/config error. The one-shot exit path hard-exits via
