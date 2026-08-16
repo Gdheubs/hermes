@@ -33,3 +33,29 @@ export function forceLoneHeaderForPanes(
 
   return shown.length === 1 && isCollapsePane(shown[0])
 }
+
+/** Header visibility for a zone, in precedence order:
+ *  1. a full-page view (headerVeto) always suppresses the strip;
+ *  2. a LONE closeable tile always keeps its strip — even over a persisted
+ *     `headerHidden: true` (a double-tap hide or an older build's leftover).
+ *     Without the strip the tile has no tab to grab and no close gesture
+ *     reachable over a webview/iframe body: an unclosable dead zone whose
+ *     only escape was a layout reset;
+ *  3. otherwise the user's persisted choice stands (normalize deliberately
+ *     keeps it), defaulting to headerless for lone side chrome. */
+export function resolveZoneHeaderHidden(input: {
+  headerVeto?: boolean
+  persisted?: boolean
+  shownCount: number
+  forceLoneHeader: boolean
+}): boolean {
+  if (input.headerVeto) {
+    return true
+  }
+
+  if (input.shownCount <= 1 && input.forceLoneHeader) {
+    return false
+  }
+
+  return input.persisted ?? input.shownCount <= 1
+}

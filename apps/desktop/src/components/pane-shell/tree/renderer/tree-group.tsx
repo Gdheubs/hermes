@@ -71,7 +71,10 @@ import {
 } from '../tab-selection'
 
 import { type DoubleTapContext, startPaneDrag } from './drag-session'
-import { forceLoneHeaderForPanes } from './lone-header'
+import {
+  forceLoneHeaderForPanes,
+  resolveZoneHeaderHidden
+} from './lone-header'
 import { useActiveTabVisible } from './tab-strip-scroll'
 import { paneChrome } from './track-model'
 
@@ -250,7 +253,14 @@ export function TreeGroup({
 
   // A full-page view (headerVeto) suppresses the strip while it's the active
   // pane — a page is not a tab-able surface; the bar returns with the chat.
-  const headerHidden = paneChrome(active).headerVeto || (node.headerHidden ?? (shown.length <= 1 && !forceLoneHeader))
+  // resolveZoneHeaderHidden also makes a lone closeable tile's strip beat a
+  // persisted headerHidden — that state was an unclosable dead zone.
+  const headerHidden = resolveZoneHeaderHidden({
+    headerVeto: paneChrome(active).headerVeto,
+    persisted: node.headerHidden,
+    shownCount: shown.length,
+    forceLoneHeader
+  })
 
   // A group collapses ALONG its parent split's axis. In a row that means the
   // WIDTH collapses — a full-width horizontal header would strand a tall
