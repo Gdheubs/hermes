@@ -427,6 +427,69 @@ class _TitlingAgent:
         self._session_db_created = True
 
 
+# ── Runtime routing gate (deterministic model routing) ────────────────────────
+#
+# A ``pre_llm_call`` plugin may return an opaque ``routing_gate`` that the loop
+# enforces as a hard prerequisite (run required workers, then gate the parent
+# model). The prologue must (1) surface the gate, (2) fail closed when a hook
+# declared ``routing_required`` but produced no gate, and (3) fail closed on a
+# two-gate conflict rather than silently keeping the first one.
+
+
+def _fake_routing_hook(*results):
+    def _invoke(hook_name, **kwargs):
+        if hook_name == "pre_llm_call":
+            return list(results)
+        return []
+    return _invoke
+
+
+def test_routing_gate_is_captured_from_pre_llm_hook():
+    agent = _FakeAgent()
+    gate = {
+        "action": "allow",
+        "state_key": "turn-key",
+        "required_model": "gpt-5.6-sol",
+        "required_provider": "openai-codex",
+        "disable_fallback": True,
+        "disable_tools": True,
+    }
+    with patch(
+        "hermes_cli.lifecycle.invoke_hook",
+        side_effect=_fake_routing_hook(
+            {"routing_required": True, "context": "PLAN", "routing_gate": gate}
+        ),
+    ):
+        ctx = _build(agent)
+    assert ctx.routing_gate == gate
+
+
+def test_routing_required_without_gate_fails_closed():
+    agent = _FakeAgent()
+    with patch(
+        "hermes_cli.lifecycle.invoke_hook",
+        side_effect=_fake_routing_hook({"routing_required": True, "context": "PLAN"}),
+    ):
+        ctx = _build(agent)
+    assert ctx.routing_gate is not None
+    assert ctx.routing_gate["action"] == "block"
+    assert ctx.routing_gate["disable_fallback"] is True
+
+
+def test_multiple_routing_gates_fail_closed():
+    agent = _FakeAgent()
+    with patch(
+        "hermes_cli.lifecycle.invoke_hook",
+        side_effect=_fake_routing_hook(
+            {"routing_gate": {"action": "allow", "state_key": "a"}},
+            {"routing_gate": {"action": "allow", "state_key": "b"}},
+        ),
+    ):
+        ctx = _build(agent)
+    assert ctx.routing_gate["action"] == "block"
+    assert "multiple" in ctx.routing_gate["reason"]
+
+
 def _title_turn(platform, message="Fix the login button"):
     """Run the prologue's titling step and return the maybe_auto_title mock."""
     from agent import turn_context

@@ -812,6 +812,38 @@ def env_bool(key: str, default: bool = False) -> bool:
     return is_truthy_value(os.getenv(key, ""), default=default)
 
 
+# ─── Integer List Parsing ─────────────────────────────────────────────────────
+
+
+def parse_integer_list(value: str) -> "list[int]":
+    """Parse a comma-separated string of integers into a de-duplicated list.
+
+    Strips whitespace around each field, raises ``ValueError`` with a
+    1-based field position on empty or non-integer fields, and raises
+    ``TypeError`` for non-string input. Duplicates are removed while
+    preserving first-occurrence order.
+    """
+    if not isinstance(value, str):
+        raise TypeError(f"parse_integer_list: expected str, got {type(value).__name__}")
+    text = value.strip()
+    if not text:
+        raise ValueError("parse_integer_list: input is empty")
+    result: "list[int]" = []
+    for index, token in enumerate(text.split(","), start=1):
+        field = token.strip()
+        if not field:
+            raise ValueError(f"parse_integer_list: empty value at position {index}")
+        try:
+            number = int(field)
+        except ValueError:
+            raise ValueError(
+                f"parse_integer_list: invalid integer at position {index}: '{field}'"
+            ) from None
+        if number not in result:
+            result.append(number)
+    return result
+
+
 # ─── Proxy Helpers ────────────────────────────────────────────────────────────
 
 

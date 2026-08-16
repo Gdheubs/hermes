@@ -25,6 +25,7 @@ move-and-name refactor with no semantic change.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import uuid
@@ -426,6 +427,8 @@ class TurnContext:
     ext_prefetch_cache: str = ""
     # Turn-start preflight already proved an immediate retry ineffective.
     preflight_compression_blocked: bool = False
+    # Opaque runtime-enforced model routing gate from pre_llm_call plugins.
+    routing_gate: Optional[Dict[str, Any]] = None
 
 
 def build_turn_context(
@@ -1170,6 +1173,8 @@ def build_turn_context(
 
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
+    routing_gate: Optional[Dict[str, Any]] = None
+    routing_required = False
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
@@ -1184,6 +1189,7 @@ def build_turn_context(
             platform=getattr(agent, "platform", None) or "",
             parent_session_id=getattr(agent, "_parent_session_id", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
+            workdir=str(getattr(agent, "cwd", None) or os.getcwd()),
         )
         _ctx_parts: list[str] = []
         # Spill oversized per-hook context to disk so a runaway plugin
@@ -1199,6 +1205,21 @@ def build_turn_context(
             _spill_if_oversized = None  # type: ignore[assignment]
             _spill_config_cached = None
         for r in _pre_results:
+            if isinstance(r, dict) and r.get("routing_required") is True:
+                routing_required = True
+            if isinstance(r, dict) and isinstance(r.get("routing_gate"), dict):
+                if routing_gate is not None:
+                    # A second routing gate is a policy conflict. Raising here
+                    # would be swallowed by the outer try/except and leave the
+                    # first gate in place (fail-open), so fail closed instead.
+                    routing_gate = {
+                        "action": "block",
+                        "reason": "multiple runtime routing gates for one turn",
+                        "disable_fallback": True,
+                    }
+                    routing_required = True
+                    break
+                routing_gate = dict(r["routing_gate"])
             _piece: str = ""
             if isinstance(r, dict) and r.get("context"):
                 _piece = str(r["context"])
@@ -1217,6 +1238,12 @@ def build_turn_context(
                 except Exception as _spill_exc:
                     logger.warning("hook context spill failed: %s", _spill_exc)
             _ctx_parts.append(_piece)
+        if routing_required and routing_gate is None:
+            routing_gate = {
+                "action": "block",
+                "reason": "required deterministic routing hook did not produce a gate",
+                "disable_fallback": True,
+            }
         if _ctx_parts:
             plugin_user_context = "\n\n".join(_ctx_parts)
     except Exception as exc:
@@ -1405,4 +1432,5 @@ def build_turn_context(
         plugin_user_context=plugin_user_context,
         ext_prefetch_cache=ext_prefetch_cache,
         preflight_compression_blocked=_preflight_compression_blocked,
+        routing_gate=routing_gate,
     )

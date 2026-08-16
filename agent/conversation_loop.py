@@ -1744,6 +1744,22 @@ def run_conversation(
     _should_review_memory = _ctx.should_review_memory
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
+    _routing_gate = _ctx.routing_gate
+    _routing_no_fallback = bool(
+        isinstance(_routing_gate, dict) and _routing_gate.get("disable_fallback")
+    )
+
+    # Runtime routing is a hard prerequisite, not prompt context. If an
+    # isolated required worker failed, terminate before any parent-model call.
+    if isinstance(_routing_gate, dict) and _routing_gate.get("action") == "block":
+        _reason = str(_routing_gate.get("reason") or "required model routing failed")
+        return {
+            "messages": messages, "completed": False, "failed": True,
+            "api_calls": 0, "error": f"model_routing_blocked: {_reason}",
+        }
+    if isinstance(_routing_gate, dict) and _routing_gate.get("disable_fallback"):
+        agent._fallback_chain = []
+        agent._fallback_index = 0
 
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
@@ -1852,6 +1868,32 @@ def run_conversation(
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")
+
+        if isinstance(_routing_gate, dict):
+            try:
+                from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+                _gate_results = _invoke_hook(
+                    "pre_api_request", routing_gate=_routing_gate,
+                    session_id=agent.session_id or "", task_id=effective_task_id,
+                    turn_id=turn_id, model=agent.model, provider=agent.provider,
+                    api_call_count=api_call_count,
+                )
+                _blocked = next(
+                    (r for r in _gate_results if isinstance(r, dict) and r.get("action") == "block"),
+                    None,
+                )
+                if _blocked:
+                    return {
+                        "messages": messages, "completed": False, "failed": True,
+                        "api_calls": api_call_count - 1,
+                        "error": f"model_routing_blocked: {_blocked.get('reason', 'gate rejected call')}",
+                    }
+            except Exception as exc:
+                return {
+                    "messages": messages, "completed": False, "failed": True,
+                    "api_calls": api_call_count - 1,
+                    "error": f"model_routing_blocked: gate failure: {exc}",
+                }
 
         # Grace call: the budget is exhausted but we gave the model one
         # more chance.  Consume the grace flag so the loop exits after
@@ -2304,6 +2346,8 @@ def run_conversation(
         # last also keeps breakpoints off messages that the orphan sweep or
         # the thinking-only drop is about to remove or merge away.
         tools_for_api = agent.tools
+        if isinstance(_routing_gate, dict) and _routing_gate.get("disable_tools"):
+            tools_for_api = []
         if agent._use_prompt_caching and agent.provider != "moa":
             _static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
             _initial_cache_plan = build_prompt_cache_plan(
@@ -2617,7 +2661,7 @@ def run_conversation(
         
         api_start_time = time.time()
         retry_count = 0
-        max_retries = agent._api_max_retries
+        max_retries = 1 if _routing_no_fallback else agent._api_max_retries
         _retry = TurnRetryState()
 
         finish_reason = "stop"
@@ -2679,6 +2723,15 @@ def run_conversation(
                     pass  # Never let rate guard break the agent loop
 
             try:
+                if _routing_no_fallback and (
+                    agent.model != str(_routing_gate.get("required_model") or "")
+                    or agent.provider != str(_routing_gate.get("required_provider") or "")
+                ):
+                    return {
+                        "messages": messages, "completed": False, "failed": True,
+                        "api_calls": api_call_count - 1,
+                        "error": "model_routing_blocked: provider/model changed before review request",
+                    }
                 agent._reset_stream_delivery_tracking()
                 # api_messages is built once, before this retry loop, while the
                 # primary provider is active.  A mid-conversation fallback can
@@ -6463,14 +6516,19 @@ def run_conversation(
                     has_hook,
                     invoke_hook as _invoke_hook,
                 )
-                if has_hook("post_api_request"):
+                # A routing gate makes the post-API review provenance a hard
+                # requirement, so the hook must run even if no observer is
+                # registered (an empty result list is itself a failure below).
+                _gate_requires_review = isinstance(_routing_gate, dict)
+                if has_hook("post_api_request") or _gate_requires_review:
                     _assistant_tool_calls = (
                         getattr(assistant_message, "tool_calls", None) or []
                     )
                     _assistant_text = assistant_message.content or ""
                     _api_ended_at = api_start_time + api_duration
-                    _invoke_hook(
+                    _post_results = _invoke_hook(
                         "post_api_request",
+                        routing_gate=_routing_gate,
                         task_id=effective_task_id,
                         turn_id=turn_id,
                         api_request_id=api_request_id,
@@ -6498,8 +6556,36 @@ def run_conversation(
                         assistant_tool_call_count=len(_assistant_tool_calls),
                         moa_references=_moa_reference_metrics_for_hook(agent),
                     )
-            except Exception:
-                pass
+                    # An explicit rejection (worker provenance vanished, tool
+                    # use attempted, duplicate review, provider mismatch) is
+                    # more actionable than the generic "not recorded" fallback,
+                    # so it must win. Fail closed on either.
+                    _post_block = next(
+                        (r for r in _post_results if isinstance(r, dict) and r.get("action") == "block"),
+                        None,
+                    )
+                    if _post_block and _gate_requires_review:
+                        return {
+                            "messages": messages, "completed": False, "failed": True,
+                            "api_calls": api_call_count,
+                            "error": f"model_routing_blocked: {_post_block.get('reason', 'review provenance rejected')}",
+                        }
+                    if _gate_requires_review and not any(
+                        isinstance(r, dict) and r.get("routing_review_recorded") is True
+                        for r in _post_results
+                    ):
+                        return {
+                            "messages": messages, "completed": False, "failed": True,
+                            "api_calls": api_call_count,
+                            "error": "model_routing_blocked: required SOL review provenance was not recorded",
+                        }
+            except Exception as exc:
+                if isinstance(_routing_gate, dict):
+                    return {
+                        "messages": messages, "completed": False, "failed": True,
+                        "api_calls": api_call_count,
+                        "error": f"model_routing_blocked: review provenance hook failure: {exc}",
+                    }
 
             # Handle assistant response
             if assistant_message.content and not agent.quiet_mode:

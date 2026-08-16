@@ -418,8 +418,27 @@ def ensure_mcp_discovery_started() -> None:
         )
 
 
+def _discover_plugins() -> None:
+    """Discover lifecycle plugins at startup.
+
+    The CLI and gateway entry points discover plugins eagerly; the TUI gateway
+    previously only did so lazily for unresolved toolsets, which left
+    fail-closed lifecycle hooks (e.g. intent-router's ``pre_llm_call`` routing
+    gate) unregistered and let the parent model run unconstrained on coding
+    tasks. ``discover_plugins()`` is idempotent.
+    """
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+    except Exception:
+        logger.warning("plugin discovery failed at TUI gateway startup", exc_info=True)
+
+
 def main():
     _install_sidecar_publisher()
+
+    _discover_plugins()
 
     # MCP tool discovery — backgrounded so a slow or unreachable MCP server
     # can't freeze TUI startup (a dead stdio/http server burns 1+2+4s of
