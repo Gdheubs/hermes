@@ -382,6 +382,74 @@ def test_oneshot_explicit_cwd_resolves_backend_before_chdir(monkeypatch, tmp_pat
     assert HERMES_EXPLICIT_CWD_PIN not in os.environ
 
 
+def test_oneshot_explicit_cwd_restores_process_cwd_and_terminal_cwd(monkeypatch, tmp_path):
+    import os
+
+    from hermes_cli.oneshot import _oneshot_explicit_cwd
+    from tools import terminal_tool
+
+    target = tmp_path / "requested"
+    previous_terminal_cwd = tmp_path / "previous"
+    target.mkdir()
+    previous_terminal_cwd.mkdir()
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "terminal:\n  backend: local\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("TERMINAL_CWD", str(previous_terminal_cwd))
+    monkeypatch.delenv(HERMES_EXPLICIT_CWD_PIN, raising=False)
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", False)
+    start = os.getcwd()
+
+    try:
+        with _oneshot_explicit_cwd(str(target), "oneshot:test"):
+            assert os.getcwd() == str(target.resolve())
+            assert os.environ["TERMINAL_CWD"] == str(target.resolve())
+
+        assert os.getcwd() == start
+        assert os.environ["TERMINAL_CWD"] == str(previous_terminal_cwd)
+    finally:
+        os.chdir(start)
+
+
+def test_oneshot_explicit_cwd_recovers_from_deleted_launch_cwd(monkeypatch, tmp_path):
+    import os
+
+    from hermes_cli.oneshot import _oneshot_explicit_cwd
+    from tools import terminal_tool
+
+    target = tmp_path / "requested"
+    fallback = tmp_path / "fallback"
+    launch = tmp_path / "deleted-launch"
+    target.mkdir()
+    fallback.mkdir()
+    launch.mkdir()
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "terminal:\n  backend: local\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("TERMINAL_CWD", str(fallback))
+    monkeypatch.setattr(terminal_tool, "_terminal_config_bridge_attempted", False)
+    start = os.getcwd()
+
+    try:
+        os.chdir(launch)
+        launch.rmdir()
+
+        with _oneshot_explicit_cwd(str(target), "oneshot:test"):
+            assert os.getcwd() == str(target.resolve())
+
+        assert os.getcwd() == str(fallback)
+    finally:
+        os.chdir(start)
+
+
 def test_oneshot_explicit_cwd_preserves_config_error(monkeypatch, tmp_path):
     import os
 
