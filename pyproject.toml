@@ -5,14 +5,12 @@ name = "hermes-agent"
 version = "0.20.1"
 description = "The self-improving AI agent — creates skills from experience, improves them during use, and runs anywhere"
 readme = "README.md"
-# Upper bound is load-bearing, not cosmetic. uv resolves the project's
-# Python from `requires-python`, and an inherited `UV_PYTHON` env var (or a
-# fresh distro whose newest interpreter uv auto-picks) will otherwise select
-# 3.14, where Rust-backed transitives (e.g. pydantic-core) have no cp314
-# wheel yet and fall back to a maturin source build that fails. Capping at
-# <3.14 makes uv refuse 3.14 with a clear error instead of attempting that
-# build. Raise the ceiling once our Rust transitives ship cp314 wheels.
-requires-python = ">=3.11,<3.14"
+# Upper bound raised from <3.14 to <3.15: the original cap existed because
+# "Rust-backed transitives (e.g. pydantic-core) have no cp314 wheel yet" —
+# now stale: pydantic-core, numpy, uvloop, watchfiles all ship cp314 wheels
+# and the full CI-shaped install succeeds on 3.14.4. One code fix
+# (tools/daemon_pool.py WorkerContext) completes 3.14 support.
+requires-python = ">=3.11,<3.15"
 authors = [{ name = "Nous Research" }]
 license = "MIT"
 license-files = ["LICENSE"]
@@ -216,8 +214,13 @@ wake = [
   # openWakeWord's onnx embedding model scores near-zero on macOS ARM64
   # (dscripka/openWakeWord#336), so the wake word runs on tflite there.
   # Upstream declares tflite-runtime for Linux only; ai-edge-litert is the
-  # macOS equivalent, bridged in tools/wake_word.py.
-  "ai-edge-litert==2.1.6; platform_system == 'Darwin'",
+  # cross-platform successor with cp314 wheels (tflite-runtime has cp311-only
+  # wheels and cannot install on Python 3.12+). tools/wake_word.py bridges
+  # tflite_runtime -> ai_edge_litert when the former is absent, so litert
+  # covers BOTH Linux and macOS. The marker-gated override in [tool.uv]
+  # excludes tflite-runtime on 3.12+ so the resolver does not try the
+  # cp311-only wheel.
+  "ai-edge-litert==2.1.6",
 ]
 honcho = ["honcho-ai==2.2.0"]
 # Cloud memory providers — opt-in, lazy-installed via tools/lazy_deps.py
@@ -380,6 +383,14 @@ override-dependencies = [
   # requests with RSA and AES, and that API did not break in 49 or 50.
   # Remove this line when alibabacloud-tea-openapi lifts the cap.
   "cryptography>=50,<51",
+  # tflite-runtime ships only cp38-cp311 wheels (no cp312/cp314) — it cannot
+  # install on Python 3.12+. The wake-word path uses ai-edge-litert (the
+  # cross-platform successor, now in the [wake] extra for ALL platforms) via
+  # the bridge in tools/wake_word.py, so on 3.12+ this override excludes
+  # tflite-runtime from resolution entirely (openwakeword declares it for
+  # Linux). Keep it available on <3.12 for the legacy path. Remove when
+  # tflite-runtime publishes newer wheels.
+  "tflite-runtime==2.14.0; python_version < '3.12'",
 ]
 exclude-newer = "14 days"
 # h2: temporary exclude-newer exception for the CVE-2026-71554 (GHSA-6hr6-w5qg-qmwg,

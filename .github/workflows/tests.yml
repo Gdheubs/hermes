@@ -146,6 +146,102 @@ jobs:
           path: test_durations.json
           retention-days: 1
 
+  # Python 3.14 compatibility lane.
+  #
+  # The project's historical CI interpreter is 3.11; the 3.14 support
+  # surface (daemon_pool WorkerContext, requires-python ceiling) is only
+  # exercised by this lane. Runs the same per-file-isolation slices as the
+  # 3.11 lane (no xdist, no shared workers), on a subset of the files to
+  # bound CI time — the 3.14-specific surface lives in
+  # tests/tools/test_daemon_pool.py plus the delegate/async clusters that
+  # depend on the daemon pool.
+  test-py314:
+    needs: generate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.14
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.14
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.14 --extra all --extra dev
+
+      - name: Minimize uv cache
+        run: uv cache prune --ci
+
+      - name: Run 3.14 compatibility tests
+        run: |
+          source .venv/bin/activate
+          python -m pytest \
+            tests/tools/test_daemon_pool.py \
+            tests/tools/test_delegate.py \
+            tests/tools/test_async_delegation.py \
+            tests/agent/test_compression_concurrent_fork.py \
+            -q --no-header -p no:cacheprovider
+        env:
+          # Ensure tests don't accidentally call real APIs
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
+      # R46 (AI-review point 3): the 3.14 lane previously ran only the four
+      # daemon-pool-adjacent test files, leaving runtime import regressions in
+      # the rest of the tree (gateway, TUI, plugins) uncovered on 3.14. This
+      # smoke imports the major runtime modules so a 3.14 import break surfaces
+      # in CI even if the narrow test files stay green. `uv sync --extra all`
+      # already validated the install surface above; this validates the runtime
+      # import surface.
+      - name: 3.14 runtime import smoke
+        run: |
+          source .venv/bin/activate
+          python - <<'PY'
+          import importlib
+          # Core runtime modules that must import cleanly on 3.14. (Some
+          # interactive surfaces like `cli`/`tui` require prompt_toolkit from
+          # the dev extra and are exercised by the main lanes; this smoke
+          # covers the persistent/agent/gateway/tool runtime that 3.11->3.14
+          # is most likely to break.)
+          mods = [
+              "gateway.run",
+              "gateway.authz_mixin",
+              "gateway.pairing",
+              "run_agent",
+              "hermes_cli.config",
+              "hermes_state",
+              "model_tools",
+              "tools.terminal_tool",
+              "tools.daemon_pool",
+              "tools.skills_tool",
+          ]
+          failed = []
+          for m in mods:
+              try:
+                  importlib.import_module(m)
+              except Exception as exc:  # noqa: BLE001 - surface every failure
+                  failed.append(f"{m}: {type(exc).__name__}: {exc}")
+          if failed:
+              print("3.14 import smoke FAILED:")
+              print("\n".join(failed))
+              raise SystemExit(1)
+          print(f"3.14 import smoke OK ({len(mods)} modules)")
+          PY
+
   # Merge per-slice duration data into a single cache, so future runs
   # (including PRs) get balanced slicing.
   save-durations:
