@@ -9,6 +9,8 @@ default off) makes that denial opt-out-able:
   - gate on: ``cronjob`` dropped from the base denylist; ``messaging`` and
     ``clarify`` (interactivity constraints) and ``memory`` (cron agents run
     with skip_memory=True) are ALWAYS denied regardless of the gate.
+  - ``desktop_ui`` and ``kanban`` are session/worker-only surfaces and are
+    likewise always denied; the gate governs ``cronjob`` only.
   - user-level ``agent.disabled_toolsets`` still layers on top, so a user who
     denies ``cronjob`` globally keeps it denied even with the gate on
     (per-job enabled_toolsets can never widen past the config denylist).
@@ -29,17 +31,20 @@ class TestGateOffDefault:
     def test_empty_config_denies_cronjob(self):
         assert _resolve_cron_disabled_toolsets({}) == [
             "cronjob", "messaging", "clarify", "memory",
+            "desktop_ui", "kanban",
         ]
 
     def test_none_config_denies_cronjob(self):
         assert _resolve_cron_disabled_toolsets(None) == [
             "cronjob", "messaging", "clarify", "memory",
+            "desktop_ui", "kanban",
         ]
 
     def test_cron_section_present_but_gate_absent(self):
         cfg = {"cron": {"preflight": True}}
         assert _resolve_cron_disabled_toolsets(cfg) == [
             "cronjob", "messaging", "clarify", "memory",
+            "desktop_ui", "kanban",
         ]
 
     def test_explicit_false_matches_default(self):

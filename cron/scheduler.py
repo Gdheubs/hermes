@@ -312,6 +312,22 @@ class CronPromptInjectionBlocked(Exception):
     """
 
 
+# These toolsets describe a client/session surface rather than capabilities a
+# scheduled job can use.  They must be removed before schema assembly: the
+# registry evaluates every registered check_fn for every requested toolset, so
+# merely relying on the checks to return False still emits irrelevant warnings
+# on every cron run.  The desktop gateway adds ``desktop_ui`` for desktop-sourced
+# sessions, while Kanban dispatcher workers get ``kanban`` through their worker
+# context.  Neither surface belongs to a cron agent, and keeping this policy
+# scheduler-local leaves those interactive/worker paths unchanged.
+_CRON_SESSION_ONLY_TOOLSETS = frozenset({"desktop_ui", "kanban"})
+
+
+def _filter_cron_session_toolsets(toolsets: list[str]) -> list[str]:
+    """Remove client/worker-only toolsets from a cron toolset allowlist."""
+    return [name for name in toolsets if str(name) not in _CRON_SESSION_ONLY_TOOLSETS]
+
+
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
@@ -320,6 +336,10 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
       - ``clarify`` — interactive, blocks waiting for user input
       - ``memory`` — cron agents are constructed with ``skip_memory=True``, so
         exposing this tool only gives the model an unbacked tool that fails
+
+    ``desktop_ui`` and ``kanban`` are likewise always disabled: they are a
+    session/client surface and a dispatcher-worker surface respectively, and
+    neither is part of a scheduled run. See ``_CRON_SESSION_ONLY_TOOLSETS``.
 
     ``cronjob`` is policy-denied by default (loop prevention, not a security
     boundary) and config-gated: setting ``cron.allow_agent_scheduling: true``
@@ -337,6 +357,9 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
         disabled = ["messaging", "clarify", "memory"]
     else:
         disabled = ["cronjob", "messaging", "clarify", "memory"]
+    # Appended after the gate so both branches inherit them: the
+    # allow_agent_scheduling gate governs ``cronjob`` only.
+    disabled.extend(sorted(_CRON_SESSION_ONLY_TOOLSETS))
     agent_cfg = (cfg or {}).get("agent") or {}
     user_disabled = agent_cfg.get("disabled_toolsets") or []
     for name in user_disabled:
@@ -361,7 +384,11 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
         add nothing further (the user named exactly the servers they want)
       * otherwise -> union in every globally-enabled MCP server
     """
-    result = [t for t in per_job if t != "no_mcp"]
+    result = [
+        t
+        for t in per_job
+        if t != "no_mcp" and str(t) not in _CRON_SESSION_ONLY_TOOLSETS
+    ]
     if "no_mcp" in per_job:
         return result
     # lazy import: avoid heavy hermes_cli import at cron module load (matches
@@ -401,7 +428,9 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
-        return sorted(_get_platform_tools(cfg or {}, "cron"))
+        return _filter_cron_session_toolsets(
+            sorted(_get_platform_tools(cfg or {}, "cron"))
+        )
     except Exception as exc:
         logger.warning(
             "Cron toolset resolution failed, falling back to full default toolset: %s",

@@ -14,6 +14,7 @@ from cron.scheduler import (
     _build_job_prompt,
     _deliver_result,
     _merge_mcp_into_per_job_toolsets,
+    _resolve_cron_disabled_toolsets,
     _resolve_cron_enabled_toolsets,
     _resolve_delivery_target,
     _resolve_origin,
@@ -117,6 +118,98 @@ class TestPerJobToolsetMcpMerge:
         # _get_platform_tools args: (cfg, "cron")
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
+
+
+class TestCronToolsetAvailability:
+    """Cron must not request client/session-only toolset gates."""
+
+    def test_resolver_filters_desktop_and_kanban_toolsets(self):
+        cfg = {"platform_toolsets": {"cron": ["file", "skills", "terminal"]}}
+        with patch(
+            "hermes_cli.tools_config._get_platform_tools",
+            return_value={"file", "skills", "terminal", "desktop_ui", "kanban"},
+        ):
+            result = _resolve_cron_enabled_toolsets({}, cfg)
+
+        assert set(result) == {"file", "skills", "terminal"}
+
+    def test_per_job_override_cannot_reenable_session_toolsets(self):
+        result = _resolve_cron_enabled_toolsets(
+            {"enabled_toolsets": ["file", "desktop_ui", "kanban"]},
+            {},
+        )
+
+        assert result == ["file"]
+
+    def test_cron_policy_disables_session_toolsets_even_on_fallback(self):
+        disabled = _resolve_cron_disabled_toolsets({})
+
+        assert {"desktop_ui", "kanban"} <= set(disabled)
+
+    def test_session_toolsets_stay_disabled_under_agent_scheduling_gate(self):
+        """The allow_agent_scheduling gate governs ``cronjob`` only."""
+        disabled = _resolve_cron_disabled_toolsets(
+            {"cron": {"allow_agent_scheduling": True}}
+        )
+
+        assert {"desktop_ui", "kanban"} <= set(disabled)
+        assert "cronjob" not in disabled
+
+    def test_schema_assembly_keeps_core_tools_without_session_gate_probes(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        """A cron schema build must not evaluate GUI/Kanban check_fn gates."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        (tmp_path / ".hermes").mkdir()
+
+        from model_tools import _clear_tool_defs_cache, get_tool_definitions
+        from tools.registry import invalidate_check_fn_cache
+
+        _clear_tool_defs_cache()
+        invalidate_check_fn_cache()
+        caplog.set_level(logging.WARNING, logger="tools.registry")
+
+        enabled = _resolve_cron_enabled_toolsets(
+            {}, {"platform_toolsets": {"cron": ["file", "skills", "terminal"]}}
+        )
+        schema = get_tool_definitions(
+            enabled_toolsets=enabled,
+            disabled_toolsets=_resolve_cron_disabled_toolsets({}),
+            quiet_mode=True,
+        )
+        names = {item["function"]["name"] for item in schema}
+
+        assert {"terminal", "process", "read_file", "write_file"} <= names
+        assert not {name for name in names if name.startswith("kanban_")}
+        assert not {
+            name
+            for name in names
+            if name
+            in {
+                "read_terminal",
+                "close_terminal",
+                "open_preview",
+                "read_preview",
+                "read_window_below",
+                "focus_pane",
+                "react_to_message",
+            }
+        }
+
+        irrelevant_check_names = {
+            "check_close_terminal_requirements",
+            "check_focus_pane_requirements",
+            "check_open_preview_requirements",
+            "check_react_requirements",
+            "check_read_preview_requirements",
+            "check_read_terminal_requirements",
+            "_check_kanban_mode",
+            "_check_kanban_orchestrator_mode",
+        }
+        assert not any(
+            any(name in record.getMessage() for name in irrelevant_check_names)
+            for record in caplog.records
+        )
 
 
 class TestResolveOrigin:
