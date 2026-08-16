@@ -515,6 +515,10 @@ _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES = 3
 # A micro pass costs a prompt-cache break + one aux LLM call; skip the pass
 # when the oldest exchange has too little mass to justify it.
 _MICRO_COMPACT_MIN_EXCHANGE_TOKENS = 1024
+# A provider-learned context limit expires after this many successful turns,
+# restoring the catalog window — sessions can run for days, so a wrong-low
+# learn must not pin premature compression for the whole session.
+_LEARNED_CONTEXT_LIMIT_TURNS = 200
 
 # Aggregate cap on the serialized turn block fed to the summarizer prompt
 # (chars). Per-message truncation (_CONTENT_MAX / _TOOL_ARGS_MAX) alone is
@@ -2941,6 +2945,15 @@ class ContextCompressor(ContextEngine):
         self._micro_compact_every_n_turns: int = 1
         self._micro_compact_min_exchange_tokens: int = _MICRO_COMPACT_MIN_EXCHANGE_TOKENS
         self._micro_compact_turns_since_pass: int = 0
+        # Learned provider context limit: adopted from a 413 (lower-only), it
+        # expires after a bounded turn count and the catalog window is
+        # restored — a wrong-low learn must not stick for a days-long session.
+        self._learned_context_limit_turns_left: int = 0
+        self._pre_learn_context_length: int | None = None
+        # Confirmation: a re-learn of a previously-expired value proves the
+        # limit is real (the provider consistently rejects there) -> sticky.
+        self._learned_context_limit_confirmed_value: int | None = None
+        self._learned_context_limit_sticky: bool = False
 
         # Defer context-length resolution to first access (#32221):
         # get_model_context_length() can issue a synchronous /models HTTP
@@ -3059,8 +3072,35 @@ class ContextCompressor(ContextEngine):
         self._active_compression_telemetry: Optional[Dict[str, Any]] = None
         self._compression_telemetry_seed: Optional[Dict[str, Any]] = None
 
+    def mark_learned_context_limit(self) -> None:
+        """Capture the pre-learn window + arm the expiry (call BEFORE the
+        learned update_model). A wrong-low learn heals within the session."""
+        self._pre_learn_context_length = getattr(self, "context_length", None)
+        self._learned_context_limit_turns_left = _LEARNED_CONTEXT_LIMIT_TURNS
+
+    def _expire_learned_context_limit(self) -> None:
+        pre = self._pre_learn_context_length
+        # Remember the value that just expired: a re-learn of the same value
+        # proves the provider really rejects there -> sticky (no re-expiry).
+        self._learned_context_limit_confirmed_value = getattr(self, "context_length", None)
+        self._pre_learn_context_length = None
+        self._learned_context_limit_turns_left = 0
+        if pre and pre > getattr(self, "context_length", 0):
+            self.context_length = pre
+            try:
+                self.threshold_tokens = self._compute_threshold_tokens(
+                    pre, getattr(self, "threshold_percent", 0.5),
+                    getattr(self, "_max_output_tokens", None),
+                )
+            except Exception:
+                pass
+
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
+        if not self._learned_context_limit_sticky and self._learned_context_limit_turns_left > 0:
+            self._learned_context_limit_turns_left -= 1
+            if self._learned_context_limit_turns_left == 0:
+                self._expire_learned_context_limit()
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
         self.last_completion_tokens = usage.get("completion_tokens", 0)
         self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)

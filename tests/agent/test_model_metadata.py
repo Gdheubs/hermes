@@ -1760,3 +1760,51 @@ def test_context_limit_from_error_decision_paths():
     # window is adopted (a real small model) but never persisted (sub-64K).
     assert get_context_length_from_provider_error("max_model_len 100", 131072) is None
     assert get_context_length_from_provider_error("max_model_len 8000", 131072) == 8000
+
+
+def test_learned_context_limit_expires_and_restores_catalog_window():
+    """A provider-learned limit heals within the session: after a bounded
+    turn count the catalog window is restored (wrong-low must not pin a
+    days-long session)."""
+    from agent.context_compressor import ContextCompressor, _LEARNED_CONTEXT_LIMIT_TURNS
+
+    cc = ContextCompressor(
+        model="deepseek-v4-pro", config_context_length=1_000_000,
+        quiet_mode=True, provider="deepseek",
+    )
+    cc.update_model(model="deepseek-v4-pro", context_length=1_000_000)
+    pre = cc.context_length
+    # Learn a wrong-low limit (as the 413 handler does: mark first, then update).
+    cc.mark_learned_context_limit()
+    cc.update_model(model="deepseek-v4-pro", context_length=8_000)
+    assert cc.context_length == 8_000 and pre == 1_000_000
+    # N successful turns: the expiry restores the catalog window.
+    for _ in range(_LEARNED_CONTEXT_LIMIT_TURNS + 1):
+        cc.update_from_response({"prompt_tokens": 100, "completion_tokens": 10})
+    assert cc.context_length == pre, "catalog window must be restored within the session"
+
+
+def test_confirmed_learned_limit_is_sticky():
+    """A re-learn of a previously-expired value proves the provider really
+    rejects there -> sticky (no re-expiry / no recurring-413 oscillation)."""
+    from agent.context_compressor import ContextCompressor, _LEARNED_CONTEXT_LIMIT_TURNS
+
+    cc = ContextCompressor(
+        model="deepseek-v4-pro", config_context_length=1_000_000,
+        quiet_mode=True, provider="deepseek",
+    )
+    cc.update_model(model="deepseek-v4-pro", context_length=1_000_000)
+    # Learn a low limit, let it expire.
+    cc.mark_learned_context_limit()
+    cc.update_model(model="deepseek-v4-pro", context_length=8_000)
+    for _ in range(_LEARNED_CONTEXT_LIMIT_TURNS + 1):
+        cc.update_from_response({"prompt_tokens": 100, "completion_tokens": 10})
+    assert cc.context_length == 1_000_000  # expired -> catalog restored
+    # The provider 413s at the same 8000 again -> confirm -> sticky.
+    assert cc._learned_context_limit_confirmed_value == 8_000
+    cc._learned_context_limit_sticky = True
+    cc.mark_learned_context_limit()
+    cc.update_model(model="deepseek-v4-pro", context_length=8_000)
+    for _ in range(_LEARNED_CONTEXT_LIMIT_TURNS * 2 + 1):
+        cc.update_from_response({"prompt_tokens": 100, "completion_tokens": 10})
+    assert cc.context_length == 8_000, "confirmed limit must stick (no re-expiry)"

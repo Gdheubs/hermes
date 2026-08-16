@@ -5732,6 +5732,16 @@ def run_conversation(
 
                     if new_ctx is not None:
                         agent._buffer_vprint(f"Context limit detected from API: {new_ctx:,} tokens (was {old_ctx:,})")
+                        # Confirmation: a re-learn of a previously-expired value
+                        # proves the provider really rejects there -> sticky.
+                        if getattr(compressor, "_learned_context_limit_confirmed_value", None) == new_ctx:
+                            compressor._learned_context_limit_sticky = True
+                        # Otherwise arm the same-session expiry FIRST: the learned
+                        # limit restores the catalog window after a bounded turn
+                        # count (a wrong-low learn must not pin a days-long session).
+                        _mark_learned = getattr(compressor, "mark_learned_context_limit", None)
+                        if callable(_mark_learned):
+                            _mark_learned()
                         compressor.update_model(
                             model=agent.model,
                             context_length=new_ctx,
