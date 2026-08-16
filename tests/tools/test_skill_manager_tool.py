@@ -18,6 +18,7 @@ from tools.skill_manager_tool import (
     _delete_skill,
     _write_file,
     _remove_file,
+    _skill_owner_routing_policy,
     skill_manage,
 )
 from agent.skill_utils import (
@@ -56,6 +57,20 @@ description: Updated description.
 # Test Skill v2
 
 Step 1: Do the new thing.
+"""
+
+OWNER_ROUTED_SKILL_CONTENT = """\
+---
+name: routed-skill
+description: A routed test skill.
+metadata:
+  hermes:
+    owner_profile: trt
+---
+
+# Routed Skill
+
+Step 1: Verify ownership routing.
 """
 
 LONG_DESC_CONTENT = """\
@@ -187,6 +202,309 @@ class TestCreateSkill:
         assert "System prompt will show" in result["system_prompt_preview"]
         fm, _ = parse_frontmatter(LONG_DESC_CONTENT)
         assert extract_skill_description(fm) in result["system_prompt_preview"]
+
+
+class TestSkillOwnerRouting:
+    def _policy(self):
+        return {
+            "enabled": True,
+            "require_owner_metadata": True,
+            "route_from_default": True,
+        }
+
+    def test_policy_is_read_from_default_home(self, tmp_path):
+        default_home = tmp_path / "hermes"
+        observed = {}
+
+        def fake_load_config():
+            from hermes_constants import get_hermes_home
+
+            observed["home"] = get_hermes_home()
+            return {
+                "skills": {
+                    "owner_routing": {
+                        "enabled": True,
+                        "require_owner_metadata": False,
+                        "route_from_default": False,
+                    }
+                }
+            }
+
+        with patch(
+            "tools.skill_manager_tool._fleet_default_home", return_value=default_home
+        ), patch("hermes_cli.config.load_config", side_effect=fake_load_config):
+            policy = _skill_owner_routing_policy()
+
+        assert observed["home"] == default_home
+        assert policy == {
+            "enabled": True,
+            "require_owner_metadata": False,
+            "route_from_default": False,
+        }
+
+    def test_create_requires_owner_metadata_when_enabled(self):
+        with patch(
+            "tools.skill_manager_tool._skill_owner_routing_policy",
+            return_value=self._policy(),
+        ):
+            result = json.loads(
+                skill_manage(action="create", name="test-skill", content=VALID_SKILL_CONTENT)
+            )
+        assert result["success"] is False
+        assert "owner_profile" in result["error"]
+
+    def test_default_routes_create_to_declared_owner(self, tmp_path):
+        target_home = tmp_path / "profiles" / "trt"
+        target_home.mkdir(parents=True)
+        observed = {}
+
+        def fake_create(name, content, category=None):
+            from hermes_constants import get_hermes_home
+
+            observed["home"] = get_hermes_home()
+            return {"success": True, "message": "created", "skill_md": "SKILL.md"}
+
+        def fake_record_created(*args, **kwargs):
+            from hermes_constants import get_hermes_home
+
+            observed["telemetry_home"] = get_hermes_home()
+
+        with patch(
+            "tools.skill_manager_tool._skill_owner_routing_policy",
+            return_value=self._policy(),
+        ), patch(
+            "hermes_cli.profiles.get_active_profile_name", return_value="default"
+        ), patch(
+            "hermes_cli.profiles.profile_exists", return_value=True
+        ), patch(
+            "hermes_cli.profiles.get_profile_dir", return_value=target_home
+        ), patch(
+            "tools.skill_manager_tool._create_skill", side_effect=fake_create
+        ), patch(
+            "tools.skill_usage.record_created", side_effect=fake_record_created
+        ), patch(
+            "tools.skill_manager_tool._maybe_debounced_sync_push"
+        ):
+            result = json.loads(
+                skill_manage(
+                    action="create",
+                    name="routed-skill",
+                    content=OWNER_ROUTED_SKILL_CONTENT,
+                )
+            )
+
+        assert result["success"] is True
+        assert result["owner_profile"] == "trt"
+        assert result["routed_from_profile"] == "default"
+        assert "hand those mutations" in result["hint"]
+        assert observed["home"] == target_home
+        assert observed["telemetry_home"] == target_home
+
+    def test_named_profile_cannot_write_sideways(self):
+        with patch(
+            "tools.skill_manager_tool._skill_owner_routing_policy",
+            return_value=self._policy(),
+        ), patch(
+            "hermes_cli.profiles.get_active_profile_name", return_value="growth"
+        ), patch(
+            "hermes_cli.profiles.profile_exists", return_value=True
+        ):
+            result = json.loads(
+                skill_manage(
+                    action="create",
+                    name="routed-skill",
+                    content=OWNER_ROUTED_SKILL_CONTENT,
+                )
+            )
+
+        assert result["success"] is False
+        assert result["owner_profile"] == "trt"
+        assert result["active_profile"] == "growth"
+        assert "may not write skills sideways" in result["error"]
+
+    def test_owner_matching_active_profile_creates_locally(self):
+        with patch(
+            "tools.skill_manager_tool._skill_owner_routing_policy",
+            return_value=self._policy(),
+        ), patch(
+            "hermes_cli.profiles.get_active_profile_name", return_value="trt"
+        ), patch(
+            "hermes_cli.profiles.profile_exists", return_value=True
+        ), patch(
+            "tools.skill_manager_tool._create_skill",
+            return_value={"success": True, "message": "created"},
+        ) as create:
+            result = json.loads(
+                skill_manage(
+                    action="create",
+                    name="routed-skill",
+                    content=OWNER_ROUTED_SKILL_CONTENT,
+                )
+            )
+
+        assert result["success"] is True
+        assert result["owner_profile"] == "trt"
+        assert "routed_from_profile" not in result
+        create.assert_called_once()
+
+    def test_default_owned_skill_stays_on_default(self):
+        content = OWNER_ROUTED_SKILL_CONTENT.replace(
+            "owner_profile: trt", "owner_profile: default"
+        )
+        with patch(
+            "tools.skill_manager_tool._skill_owner_routing_policy",
+            return_value=self._policy(),
+        ), patch(
+            "hermes_cli.profiles.get_active_profile_name", return_value="default"
+        ), patch(
+            "hermes_cli.profiles.profile_exists", return_value=True
+        ), patch(
+            "tools.skill_manager_tool._create_skill",
+            return_value={"success": True, "message": "created"},
+        ) as create:
+            result = json.loads(
+                skill_manage(action="create", name="routed-skill", content=content)
+            )
+
+        assert result["success"] is True
+        assert result["owner_profile"] == "default"
+        assert "routed_from_profile" not in result
+        create.assert_called_once()
+
+    def test_unknown_owner_is_rejected(self):
+        content = OWNER_ROUTED_SKILL_CONTENT.replace(
+            "owner_profile: trt", "owner_profile: missing-profile"
+        )
+        with patch(
+            "tools.skill_manager_tool._skill_owner_routing_policy",
+            return_value=self._policy(),
+        ), patch(
+            "hermes_cli.profiles.get_active_profile_name", return_value="default"
+        ), patch(
+            "hermes_cli.profiles.profile_exists", return_value=False
+        ):
+            result = json.loads(
+                skill_manage(action="create", name="routed-skill", content=content)
+            )
+
+        assert result["success"] is False
+        assert "not registered" in result["error"]
+
+    @pytest.mark.parametrize("bad_owner", ["../../tmp", "root", "bad/profile"])
+    def test_invalid_owner_id_is_rejected_before_profile_lookup(self, bad_owner):
+        content = OWNER_ROUTED_SKILL_CONTENT.replace(
+            "owner_profile: trt", f"owner_profile: {bad_owner}"
+        )
+        with patch(
+            "tools.skill_manager_tool._skill_owner_routing_policy",
+            return_value=self._policy(),
+        ), patch(
+            "hermes_cli.profiles.get_active_profile_name", return_value="default"
+        ), patch(
+            "hermes_cli.profiles.profile_exists",
+            side_effect=AssertionError("invalid owner reached profile lookup"),
+        ):
+            result = json.loads(
+                skill_manage(action="create", name="routed-skill", content=content)
+            )
+
+        assert result["success"] is False
+        assert "Could not resolve skill owner profile" in result["error"]
+
+    def test_default_can_be_configured_to_refuse_cross_profile_routing(self):
+        policy = self._policy()
+        policy["route_from_default"] = False
+        with patch(
+            "tools.skill_manager_tool._skill_owner_routing_policy",
+            return_value=policy,
+        ), patch(
+            "hermes_cli.profiles.get_active_profile_name", return_value="default"
+        ), patch(
+            "hermes_cli.profiles.profile_exists", return_value=True
+        ), patch("tools.skill_manager_tool._create_skill") as create:
+            result = json.loads(
+                skill_manage(
+                    action="create",
+                    name="routed-skill",
+                    content=OWNER_ROUTED_SKILL_CONTENT,
+                )
+            )
+
+        assert result["success"] is False
+        assert "configured to refuse cross-profile creation" in result["error"]
+        create.assert_not_called()
+
+    def test_disabled_owner_routing_preserves_existing_create_behavior(self):
+        with patch(
+            "tools.skill_manager_tool._skill_owner_routing_policy",
+            return_value={"enabled": False},
+        ), patch(
+            "tools.skill_manager_tool._create_skill",
+            return_value={"success": True, "message": "created"},
+        ) as create:
+            result = json.loads(
+                skill_manage(action="create", name="test-skill", content=VALID_SKILL_CONTENT)
+            )
+
+        assert result["success"] is True
+        create.assert_called_once_with("test-skill", VALID_SKILL_CONTENT, None)
+
+    def test_owner_metadata_can_be_optional_when_configured(self):
+        policy = self._policy()
+        policy["require_owner_metadata"] = False
+        with patch(
+            "tools.skill_manager_tool._skill_owner_routing_policy",
+            return_value=policy,
+        ), patch(
+            "tools.skill_manager_tool._create_skill",
+            return_value={"success": True, "message": "created"},
+        ) as create:
+            result = json.loads(
+                skill_manage(action="create", name="test-skill", content=VALID_SKILL_CONTENT)
+            )
+
+        assert result["success"] is True
+        create.assert_called_once_with("test-skill", VALID_SKILL_CONTENT, None)
+
+    def test_real_routed_create_places_skill_and_usage_in_owner_home(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / "hermes"
+        target_home = root / "profiles" / "trt"
+        target_home.mkdir(parents=True)
+        (root / "config.yaml").write_text(
+            "skills:\n"
+            "  owner_routing:\n"
+            "    enabled: true\n"
+            "    require_owner_metadata: true\n"
+            "    route_from_default: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(root))
+
+        result = json.loads(
+            skill_manage(
+                action="create",
+                name="routed-skill",
+                content=OWNER_ROUTED_SKILL_CONTENT,
+            )
+        )
+
+        target_skill = target_home / "skills" / "routed-skill" / "SKILL.md"
+        default_skill = root / "skills" / "routed-skill" / "SKILL.md"
+        target_usage = target_home / "skills" / ".usage.json"
+        default_usage = root / "skills" / ".usage.json"
+
+        assert result["success"] is True
+        assert result["owner_profile"] == "trt"
+        assert result["routed_from_profile"] == "default"
+        assert target_skill.is_file()
+        assert not default_skill.exists()
+        assert target_usage.is_file()
+        assert "routed-skill" in target_usage.read_text(encoding="utf-8")
+        assert not default_usage.exists() or "routed-skill" not in default_usage.read_text(
+            encoding="utf-8"
+        )
 
 
 class TestEditSkill:
