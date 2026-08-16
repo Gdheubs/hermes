@@ -838,11 +838,14 @@ def _print_update_completion(message: str) -> None:
         print(f"=== hermes-update completed {action_id} ===")
 
 
-def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
+def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> bool:
     """Update Hermes Agent by downloading a ZIP archive.
 
     Used on Windows when git file I/O is broken (antivirus, NTFS filter
     drivers causing 'Invalid argument' errors on file creation).
+
+    Returns ``False`` when the desktop rebuild ran and failed (#86443);
+    ``True`` otherwise.
     """
     active_tool_dependencies = _m()._capture_active_tool_dependencies()
 
@@ -1091,7 +1094,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
 
     node_failures = _update_node_dependencies()
     _m()._build_web_ui(_m().PROJECT_ROOT / "web")
-    _rebuild_desktop_after_update(
+    desktop_build_ok = _rebuild_desktop_after_update(
         _m().PROJECT_ROOT / "apps" / "desktop",
         had_desktop_app_before_update=had_desktop_app_before_update,
     )
@@ -1217,6 +1220,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
     # Don't stop a working dashboard when the Node refresh failed — see the
     # git-update path for rationale (#30271).
     _finish_dashboard_update_cleanup(node_failures)
+    return desktop_build_ok
 
 def _stash_local_changes_if_needed(git_cmd: list[str], cwd: Path) -> Optional[str]:
     status = subprocess.run(
@@ -4331,8 +4335,14 @@ def _desktop_app_present(desktop_dir: Path) -> bool:
 
 def _rebuild_desktop_after_update(
     desktop_dir: Path, *, had_desktop_app_before_update: bool
-) -> None:
-    """Rebuild an installed Desktop app when its source or artifact changed."""
+) -> bool:
+    """Rebuild an installed Desktop app when its source or artifact changed.
+
+    Returns ``False`` only when a rebuild was attempted and the build itself
+    failed — callers propagate this into ``hermes update``'s exit status so
+    a broken desktop rebuild is no longer reported as a successful update
+    (#86443). ``True`` covers both "nothing to rebuild" and "rebuilt fine".
+    """
     # The release tree is ignored by git and can disappear during an update.
     # Its pre-update presence is enough to restore it; do not make people who
     # have never used Desktop pay for an Electron build.
@@ -4342,7 +4352,7 @@ def _rebuild_desktop_after_update(
         and _m()._resolve_node_runtime_npm()
         and has_desktop_app
     ):
-        return
+        return True
 
     print("→ Checking if desktop app needs rebuilding...")
     # Consult the content-hash stamp IN-PROCESS first. The spawned
@@ -4361,7 +4371,7 @@ def _rebuild_desktop_after_update(
         skip_desktop_build = False
     if skip_desktop_build:
         print("  ✓ Desktop app up to date")
-        return
+        return True
 
     desktop_build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
     # Capture the (very loud) Electron/vite build output into update.log
@@ -4386,15 +4396,17 @@ def _rebuild_desktop_after_update(
             desktop_build_cmd, cwd=_m().PROJECT_ROOT, env=build_env
         )
     if build_result.returncode != 0:
-        print("  ⚠ Desktop build failed (non-fatal; run `hermes desktop` to retry)")
+        print("  ⚠ Desktop build failed — this update will report as failed")
+        print("    (run `hermes desktop` to retry the desktop rebuild)")
         tail = "\n".join((build_result.stdout or "").strip().splitlines()[-15:])
         if tail:
             print(tail)
         from hermes_constants import display_hermes_home as _dhh
 
         print(f"  Full build log: {_dhh()}/logs/update.log")
-    else:
-        print("  ✓ Desktop app up to date")
+        return False
+    print("  ✓ Desktop app up to date")
+    return True
 
 
 def _cmd_update_impl(args, gateway_mode: bool):
@@ -4608,12 +4620,20 @@ def _cmd_update_impl(args, gateway_mode: bool):
     if use_zip_update:
         # ZIP-based update for Windows when git is broken
         try:
-            _update_via_zip(
+            desktop_build_ok = _update_via_zip(
                 args,
                 had_desktop_app_before_update=had_desktop_app_before_update,
             )
         finally:
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
+        if gateway_mode:
+            _exit_code_path = get_hermes_home() / ".update_exit_code"
+            try:
+                _exit_code_path.write_text(
+                    "0" if desktop_build_ok else "1", encoding="utf-8"
+                )
+            except OSError:
+                pass
         return
 
     # Fetch and pull
@@ -5196,7 +5216,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         node_failures = _update_node_dependencies()
         _m()._build_web_ui(_m().PROJECT_ROOT / "web")
 
-        _rebuild_desktop_after_update(
+        desktop_build_ok = _rebuild_desktop_after_update(
             desktop_dir,
             had_desktop_app_before_update=had_desktop_app_before_update,
         )
@@ -5687,11 +5707,16 @@ def _cmd_update_impl(args, gateway_mode: bool):
         #
         # Writing the marker here — after git pull + pip install succeed but
         # before we attempt the restart — ensures the new gateway sees it
-        # regardless of how we die.
+        # regardless of how we die. Gated on desktop_build_ok (#86443): a
+        # desktop rebuild failure here must not be reported as "0" — the
+        # gateway's own /update watcher (gateway/run.py) polls this exact
+        # file to tell the chat platform whether the update succeeded.
         if gateway_mode:
             _exit_code_path = get_hermes_home() / ".update_exit_code"
             try:
-                _exit_code_path.write_text("0", encoding="utf-8")
+                _exit_code_path.write_text(
+                    "0" if desktop_build_ok else "1", encoding="utf-8"
+                )
             except OSError:
                 pass
 
@@ -6518,10 +6543,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(f"⚠ Git update failed: {e}")
             print("→ Falling back to ZIP download...")
             print()
-            _update_via_zip(
+            desktop_build_ok = _update_via_zip(
                 args,
                 had_desktop_app_before_update=had_desktop_app_before_update,
             )
+            if gateway_mode:
+                _exit_code_path = get_hermes_home() / ".update_exit_code"
+                try:
+                    _exit_code_path.write_text(
+                        "0" if desktop_build_ok else "1", encoding="utf-8"
+                    )
+                except OSError:
+                    pass
         else:
             print(f"✗ Update failed: {e}")
             sys.exit(1)

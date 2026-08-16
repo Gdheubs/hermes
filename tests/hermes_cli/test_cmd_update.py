@@ -884,6 +884,50 @@ class TestNodeRuntimeNpmResolution:
             env=ANY,
         )
 
+    def test_rebuild_desktop_after_update_returns_true_on_success(self):
+        """A successful rebuild must report ok=True."""
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        desktop_dir = PROJECT_ROOT / "apps" / "desktop"
+        build_ok = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+        with (
+            patch.object(update_cmd, "_desktop_app_present", return_value=True),
+            patch.object(hm, "_resolve_node_runtime_npm", return_value="npm.cmd"),
+            patch.object(hm, "_desktop_build_needed", return_value=True),
+            patch.object(hm, "_run_logged_subprocess", return_value=build_ok),
+        ):
+            ok = update_cmd._rebuild_desktop_after_update(
+                desktop_dir, had_desktop_app_before_update=True
+            )
+
+        assert ok is True
+
+    def test_rebuild_desktop_after_update_returns_false_on_build_failure(self):
+        """A failed desktop rebuild (#86443) must report ok=False so ``hermes update``'s
+        exit status — and the ``.update_exit_code`` marker gateway watchers poll — stops
+        claiming success while the packaged app is broken or missing."""
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd
+
+        desktop_dir = PROJECT_ROOT / "apps" / "desktop"
+        build_failed = subprocess.CompletedProcess(
+            [], 1, stdout="npm ERR! missing dep", stderr=""
+        )
+
+        with (
+            patch.object(update_cmd, "_desktop_app_present", return_value=True),
+            patch.object(hm, "_resolve_node_runtime_npm", return_value="npm.cmd"),
+            patch.object(hm, "_desktop_build_needed", return_value=True),
+            patch.object(hm, "_run_logged_subprocess", return_value=build_failed),
+        ):
+            ok = update_cmd._rebuild_desktop_after_update(
+                desktop_dir, had_desktop_app_before_update=True
+            )
+
+        assert ok is False
+
     def test_git_failure_zip_fallback_rebuilds_missing_desktop(self, tmp_path, monkeypatch):
         """The Windows ZIP fallback restores Desktop after replacing ``apps/``."""
         import zipfile
