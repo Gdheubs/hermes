@@ -512,6 +512,9 @@ _SUMMARY_TOKENS_CEILING = 10_000
 # same cursor position, skip the stuck exchange and advance the cursor so the
 # system doesn't busy-loop on an unsummarizable exchange every turn.
 _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES = 3
+# A micro pass costs a prompt-cache break + one aux LLM call; skip the pass
+# when the oldest exchange has too little mass to justify it.
+_MICRO_COMPACT_MIN_EXCHANGE_TOKENS = 1024
 
 # Aggregate cap on the serialized turn block fed to the summarizer prompt
 # (chars). Per-message truncation (_CONTENT_MAX / _TOOL_ARGS_MAX) alone is
@@ -2936,6 +2939,7 @@ class ContextCompressor(ContextEngine):
         # makes this the dial that sets how often that break is paid. 1 =
         # every turn (most aggressive reclaim, one break per turn).
         self._micro_compact_every_n_turns: int = 1
+        self._micro_compact_min_exchange_tokens: int = _MICRO_COMPACT_MIN_EXCHANGE_TOKENS
         self._micro_compact_turns_since_pass: int = 0
 
         # Defer context-length resolution to first access (#32221):
@@ -6540,8 +6544,39 @@ This compaction should PRIORITISE preserving all information related to the focu
         # subsumes any earlier marker. Captured before summarizing.
         _cumulative = bool(self._micro_compact_rolling_summary.strip())
 
-        # Micro-summarize one exchange
-        exchange_text = self._serialize_one_exchange(messages, exchange_start, exchange_end)
+        # Reclaim gate on the RAW exchange mass: a pass costs a cache break
+        # + an aux LLM call, so skip it when the exchange itself is tiny (the
+        # cadence still advanced, so this cannot wedge the cursor). The gate
+        # must NOT see the compacted size — a tool-heavy exchange would
+        # otherwise compact below the floor and never absorb.
+        # estimate_messages_tokens_rough on the raw span: a cheap gate that
+        # does not pay a full serialize (the compacted serialize below is the
+        # only one the summary needs).
+        _raw_exchange_tokens = estimate_messages_tokens_rough(
+            messages[exchange_start:exchange_end]
+        )
+        if _raw_exchange_tokens < self._micro_compact_min_exchange_tokens:
+            return messages
+
+        # Prune-first: deterministically compact the exchange's oversized
+        # tool results (head+tail, no LLM) before serializing, so the summary
+        # call reads a smaller input — same Phase-1 tradeoff as full
+        # compression. Operates on a COPY: the stored messages are never
+        # mutated, so a failed summary cannot leak compacted bodies into the
+        # persisted history (the raw stays until the splice replaces it).
+        _serialize_span = [dict(m) for m in messages[exchange_start:exchange_end]]  # per-dict copy: never mutate the stored messages
+        try:
+            from agent.deepseek_replay import tool_result_replay_content
+            for _m in _serialize_span:
+                if _m.get("role") == "tool" and isinstance(_m.get("content"), str):
+                    _replayed = tool_result_replay_content(_m["content"], limits=None)
+                    if _replayed != _m["content"]:
+                        _m["content"] = _replayed
+        except Exception:
+            pass
+        exchange_text = self._serialize_one_exchange(
+            _serialize_span, 0, len(_serialize_span)
+        )
         _exchange_tokens = estimate_tokens_rough(exchange_text)
         updated_summary = self._micro_summarize_one(exchange_text)
         if updated_summary is None:
