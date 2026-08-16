@@ -8332,8 +8332,27 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        session_turn_lease_holder: Optional[str] = None,
+        session_turn_lease_ttl_seconds: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        """Forwarder — see ``agent.conversation_loop.run_conversation``.
+
+        ``session_turn_lease_holder`` is for a caller that has already acquired
+        this conversation's durable turn lease and made its own admission
+        decision. The turn arms the transcript-write fence with that holder and
+        does not acquire, refresh, or release the lease: admission, refresh,
+        and release stay with the caller for the whole life of the lease,
+        including on every path out of this method. So does re-synchronizing
+        the conversation history: a caller whose acquisition waited on another
+        holder must refresh its own snapshot before calling, because the
+        reload this method runs after a contended acquire of its own does not
+        run on this path.
+        ``session_turn_lease_ttl_seconds`` is the TTL the write fence uses when
+        it renews a lapsed row that is still the caller's own (default 300.0,
+        matching the internally acquired lease). Both are ignored when there is
+        no session id or no session store, in which case the turn behaves
+        exactly as it does without them.
+        """
         from agent.aux_accounting import (
             reset_accounting_context,
             set_accounting_context,
@@ -8368,6 +8387,7 @@ class AIAgent:
         relay_lease = None
         relay_turn = None
         durable_turn_lease = None
+        external_turn_lease = None
         durable_turn_lease_stop = None
         durable_turn_lease_thread = None
         durable_turn_lease_activity_lock = threading.Lock()
@@ -8433,7 +8453,35 @@ class AIAgent:
                         exc_info=True,
                     )
                     _durable_session_exists = True
-            if (
+            _external_holder = str(session_turn_lease_holder or "").strip() or None
+            if _external_holder is not None and not session_id:
+                # Every fence below is keyed on the session id, so a holder
+                # supplied without one is inert: nothing arms, and the turn
+                # runs unfenced while the caller believes its lease covers it.
+                # Say so rather than dropping it silently.
+                logger.warning(
+                    "session turn lease holder supplied without a session id; "
+                    "ignoring it and running this turn unfenced: %s",
+                    _external_holder,
+                )
+            if _external_holder is not None and _turn_db is not None and session_id:
+                # The caller already holds this conversation's lease and made
+                # its own admission decision. Arm the write fence with its
+                # holder and skip acquisition: acquiring again under a
+                # different holder string would block on the caller's own row
+                # for the full wait, then reclaim it once the TTL lapses and
+                # leave the caller's later release matching nothing. Refresh
+                # and release stay with the caller.
+                if _durable_session_exists:
+                    # Same proof the internal path below relies on: the row is
+                    # there, so suppress the redundant create attempt.
+                    self._session_db_created = True
+                external_turn_lease = _external_holder
+                self._active_session_turn_lease_holder = _external_holder
+                self._active_session_turn_lease_ttl_seconds = float(
+                    session_turn_lease_ttl_seconds or 300.0
+                )
+            elif (
                 _turn_db is not None
                 and session_id
                 and not getattr(self, "_persist_disabled", False)
@@ -8778,6 +8826,15 @@ class AIAgent:
                         ):
                             self._active_session_turn_lease_holder = None
                             self._active_session_turn_lease_ttl_seconds = None
+                    if external_turn_lease is not None and (
+                        getattr(self, "_active_session_turn_lease_holder", None)
+                        == external_turn_lease
+                    ):
+                        # Clear the fence input without releasing: the row is
+                        # the caller's and only the caller may release it. A
+                        # cached agent must not fence its next turn with it.
+                        self._active_session_turn_lease_holder = None
+                        self._active_session_turn_lease_ttl_seconds = None
                     # Always clear mid-turn labels when the turn exits — including
                     # interrupted early returns that skip finalize_turn. Keep ts.
                     try:
