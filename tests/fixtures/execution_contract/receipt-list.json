@@ -1,0 +1,37 @@
+{
+  "contract_version": "hermes.execution.read.v1",
+  "authority": {
+    "profile_id": "hermes-profile-instance:0123456789ab0123456789ab",
+    "profile_name": "synthetic",
+    "authority_id": "hermes-execution-authority:0123456789ab0123456789ab",
+    "executor_id": "hermes-agent-executor:0123456789ab0123456789ab"
+  },
+  "receipts": [
+    {
+      "contract_version": "hermes.execution.read.v1",
+      "receipt_id": "rcp_0123456789ab_00000000000000000000000000000004",
+      "execution_id": "exe_0123456789ab_00000000000000000000000000000001",
+      "effect_id": "effect:synthetic-1",
+      "profile_id": "hermes-profile-instance:0123456789ab0123456789ab",
+      "authority_id": "hermes-execution-authority:0123456789ab0123456789ab",
+      "executor_id": "hermes-agent-executor:0123456789ab0123456789ab",
+      "outcome": "partial",
+      "subject_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "evidence_digest": "4444444444444444444444444444444444444444444444444444444444444444",
+      "result_digest": "5555555555555555555555555555555555555555555555555555555555555555",
+      "terminal_at": "2026-08-15T12:02:00.000000Z",
+      "decision_id": "dec_0123456789ab_00000000000000000000000000000002",
+      "recovery_ref": null,
+      "reconciliation_ref": "reconcile:synthetic-1",
+      "revision": 1
+    }
+  ],
+  "page": {
+    "cursor": 1,
+    "high_water": 1,
+    "snapshot_high_water": 1,
+    "minimum_available": 1,
+    "has_more": false,
+    "completeness": "complete"
+  }
+}

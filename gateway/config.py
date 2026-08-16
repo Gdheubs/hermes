@@ -1540,8 +1540,8 @@ def load_gateway_config() -> GatewayConfig:
                 if _nested_platforms:
                     _merge_platform_map(_nested_platforms)
 
-            # Bridge api_server-specific keys (port, key, host, cors_origins,
-            # model_name) into extra so PlatformConfig.from_dict preserves
+            # Bridge api_server-specific keys (port, key, read_key, host,
+            # cors_origins, model_name) into extra so PlatformConfig.from_dict preserves
             # them — adapting what _apply_env_overrides does for env vars to
             # the YAML path.  Users writing ``gateway.api_server.port: 8642``
             # expect these to end up in the platform's extra dict.
@@ -1551,7 +1551,14 @@ def load_gateway_config() -> GatewayConfig:
                 if not isinstance(_api_extra, dict):
                     _api_extra = {}
                     _api_plat["extra"] = _api_extra
-                for _bridge_key in ("port", "key", "host", "cors_origins", "model_name"):
+                for _bridge_key in (
+                    "port",
+                    "key",
+                    "read_key",
+                    "host",
+                    "cors_origins",
+                    "model_name",
+                ):
                     if _bridge_key in _api_plat and _bridge_key not in _api_extra:
                         _api_extra[_bridge_key] = _api_plat.pop(_bridge_key)
 
@@ -2201,6 +2208,7 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
 
     # API Server
     api_server_key = getenv("API_SERVER_KEY", "")
+    api_server_read_key = getenv("API_SERVER_READ_KEY", "")
     api_server_cors_origins = getenv("API_SERVER_CORS_ORIGINS", "")
     api_server_port = getenv("API_SERVER_PORT")
     api_server_host = getenv("API_SERVER_HOST")
@@ -2227,6 +2235,8 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             config.platforms[Platform.API_SERVER].enabled = True
         if api_server_key:
             config.platforms[Platform.API_SERVER].extra["key"] = api_server_key
+        if api_server_read_key:
+            config.platforms[Platform.API_SERVER].extra["read_key"] = api_server_read_key
         if api_server_cors_origins:
             origins = [origin.strip() for origin in api_server_cors_origins.split(",") if origin.strip()]
             if origins:

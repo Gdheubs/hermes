@@ -497,6 +497,7 @@ class TestLoadGatewayConfig:
         for key in (
             "API_SERVER_ENABLED",
             "API_SERVER_KEY",
+            "API_SERVER_READ_KEY",
             "API_SERVER_PORT",
             "API_SERVER_HOST",
             "API_SERVER_CORS_ORIGINS",
@@ -529,7 +530,7 @@ class TestLoadGatewayConfig:
 
     def test_api_server_port_bridged_into_extra(self, tmp_path, monkeypatch):
         """``gateway.api_server.port`` must land in PlatformConfig.extra —
-        the adapter reads port/key/host/cors_origins/model_name from extra
+        the adapter reads port/key/read_key/host/cors_origins/model_name from extra
         (gateway/platforms/api_server.py), and from_dict discards unknown
         top-level keys, so without the bridge the port is silently lost."""
         self._clear_api_server_env(monkeypatch)
@@ -542,6 +543,7 @@ class TestLoadGatewayConfig:
             "    port: 8642\n"
             "    host: 0.0.0.0\n"
             "    key: sekrit\n"
+            "    read_key: read-sekrit\n"
             "    model_name: my-hermes\n",
             encoding="utf-8",
         )
@@ -553,6 +555,7 @@ class TestLoadGatewayConfig:
         assert extra["port"] == 8642
         assert extra["host"] == "0.0.0.0"
         assert extra["key"] == "sekrit"
+        assert extra["read_key"] == "read-sekrit"
         assert extra["model_name"] == "my-hermes"
 
 

@@ -8248,6 +8248,7 @@ _PLATFORM_OVERRIDES: dict[str, dict[str, Any]] = {
         "env_vars": (
             "API_SERVER_ENABLED",
             "API_SERVER_KEY",
+            "API_SERVER_READ_KEY",
             "API_SERVER_PORT",
             "API_SERVER_HOST",
             "API_SERVER_MODEL_NAME",

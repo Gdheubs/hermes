@@ -1,5 +1,6 @@
 """Behavioral regression coverage for the wheel/sdist distribution guard."""
 
+import json
 import os
 import subprocess
 import sys
@@ -79,18 +80,33 @@ def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_
         for pattern in ("plugin.yaml", "plugin.yml")
         for path in (PROJECT_ROOT / "plugins").rglob(pattern)
     }
+    contract_schema_path = (
+        "hermes_cli/execution_contract_schemas/"
+        "hermes.execution.read.v1.schema.json"
+    )
+    expected.add(contract_schema_path)
     assert expected, "expected bundled plugin manifests under plugins/"
 
     if kind == "wheel":
         with zipfile.ZipFile(artifacts[0]) as wheel:
             shipped = set(wheel.namelist())
+            packaged_contract = json.loads(wheel.read(contract_schema_path))
     else:
         with tarfile.open(artifacts[0]) as sdist:
+            root = sdist.getnames()[0].split("/", 1)[0]
             shipped = {
                 name.split("/", 1)[1]
                 for name in sdist.getnames()
                 if "/" in name
             }
+            member = sdist.extractfile(f"{root}/{contract_schema_path}")
+            assert member is not None
+            packaged_contract = json.loads(member.read())
 
     missing = sorted(expected - shipped)
-    assert not missing, f"{kind} omits bundled plugin manifests: {missing}"
+    assert not missing, f"{kind} omits required packaged data: {missing}"
+    assert packaged_contract["$id"] == (
+        "https://hermes-agent.nousresearch.com/contracts/"
+        "hermes.execution.read.v1.schema.json"
+    )
+    assert packaged_contract["$defs"]["errorDetail"]["additionalProperties"] is False

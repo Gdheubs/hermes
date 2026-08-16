@@ -1,0 +1,40 @@
+{
+  "contract_version": "hermes.execution.read.v1",
+  "authority": {
+    "profile_id": "hermes-profile-instance:0123456789ab0123456789ab",
+    "profile_name": "synthetic",
+    "authority_id": "hermes-execution-authority:0123456789ab0123456789ab",
+    "executor_id": "hermes-agent-executor:0123456789ab0123456789ab"
+  },
+  "decisions": [
+    {
+      "contract_version": "hermes.execution.read.v1",
+      "decision_id": "dec_0123456789ab_00000000000000000000000000000002",
+      "execution_id": "exe_0123456789ab_00000000000000000000000000000001",
+      "profile_id": "hermes-profile-instance:0123456789ab0123456789ab",
+      "authority_id": "hermes-execution-authority:0123456789ab0123456789ab",
+      "effect_id": "effect:synthetic-1",
+      "proposal_ref": "proposal:synthetic-1",
+      "request_digest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "candidate_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "policy_digest": null,
+      "allowed_choices": ["once", "deny"],
+      "expires_at": "2026-08-15T12:05:00.000000Z",
+      "state": "pending",
+      "choice": null,
+      "resolution_evidence_digest": null,
+      "created_at": "2026-08-15T12:01:00.000000Z",
+      "updated_at": "2026-08-15T12:01:00.000000Z",
+      "resolved_at": null,
+      "revision": 1
+    }
+  ],
+  "page": {
+    "cursor": 1,
+    "high_water": 1,
+    "snapshot_high_water": 1,
+    "minimum_available": 1,
+    "has_more": false,
+    "completeness": "complete"
+  }
+}

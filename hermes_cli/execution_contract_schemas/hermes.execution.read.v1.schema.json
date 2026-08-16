@@ -1,0 +1,394 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hermes-agent.nousresearch.com/contracts/hermes.execution.read.v1.schema.json",
+  "title": "Hermes Execution Read Contract v1",
+  "description": "Closed public schemas for profile-scoped executions, decisions, ordered events, and evidence-backed terminal receipts.",
+  "$defs": {
+    "nullableString": {
+      "type": ["string", "null"]
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "nullableDigest": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "nullableTimestamp": {
+      "type": ["string", "null"],
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "nullableDecisionId": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "string", "pattern": "^dec_[0-9a-f]{12}_[0-9a-f]{32}$"}
+      ]
+    },
+    "nullableReceiptId": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "string", "pattern": "^rcp_[0-9a-f]{12}_[0-9a-f]{32}$"}
+      ]
+    },
+    "profileId": {
+      "type": "string",
+      "pattern": "^hermes-profile-instance:[0-9a-f]{24}$"
+    },
+    "authorityId": {
+      "type": "string",
+      "pattern": "^hermes-execution-authority:[0-9a-f]{24}$"
+    },
+    "executorId": {
+      "type": "string",
+      "pattern": "^hermes-agent-executor:[0-9a-f]{24}$"
+    },
+    "authority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_id", "profile_name", "authority_id", "executor_id"],
+      "properties": {
+        "profile_id": {"$ref": "#/$defs/profileId"},
+        "profile_name": {"type": "string", "minLength": 1},
+        "authority_id": {"$ref": "#/$defs/authorityId"},
+        "executor_id": {"$ref": "#/$defs/executorId"}
+      }
+    },
+    "page": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cursor", "high_water", "snapshot_high_water", "minimum_available", "has_more", "completeness"],
+      "properties": {
+        "cursor": {"type": "integer", "minimum": 0},
+        "high_water": {"type": "integer", "minimum": 0},
+        "snapshot_high_water": {"type": "integer", "minimum": 0},
+        "minimum_available": {"type": "integer", "minimum": 0},
+        "has_more": {"type": "boolean"},
+        "completeness": {"const": "complete"}
+      }
+    },
+    "eventPage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cursor", "high_water", "snapshot_high_water", "minimum_available", "has_more", "completeness", "pruned_through", "retention_seconds"],
+      "properties": {
+        "cursor": {"type": "integer", "minimum": 0},
+        "high_water": {"type": "integer", "minimum": 0},
+        "snapshot_high_water": {"type": "integer", "minimum": 0},
+        "minimum_available": {"type": "integer", "minimum": 0},
+        "has_more": {"type": "boolean"},
+        "completeness": {"const": "complete"},
+        "pruned_through": {"type": "integer", "minimum": 0},
+        "retention_seconds": {"type": "integer", "minimum": 1}
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version", "execution_id", "profile_id", "authority_id",
+        "executor_id", "source_run_id", "work_ref", "proposal_ref", "effect_id",
+        "lifecycle", "freshness", "receipt_state", "receipt_id", "created_at",
+        "started_at", "updated_at", "terminal_at", "recovery_ref", "revision"
+      ],
+      "properties": {
+        "contract_version": {"const": "hermes.execution.read.v1"},
+        "execution_id": {"type": "string", "pattern": "^exe_[0-9a-f]{12}_[0-9a-f]{32}$"},
+        "profile_id": {"$ref": "#/$defs/profileId"},
+        "authority_id": {"$ref": "#/$defs/authorityId"},
+        "executor_id": {"$ref": "#/$defs/executorId"},
+        "source_run_id": {"$ref": "#/$defs/nullableString"},
+        "work_ref": {"$ref": "#/$defs/nullableString"},
+        "proposal_ref": {"$ref": "#/$defs/nullableString"},
+        "effect_id": {"$ref": "#/$defs/nullableString"},
+        "lifecycle": {
+          "enum": [
+            "accepted", "queued", "running", "awaiting_decision",
+            "cancellation_requested", "terminal_succeeded", "terminal_failed",
+            "terminal_cancelled", "terminal_partial", "terminal_ambiguous"
+          ]
+        },
+        "freshness": {"enum": ["live", "stale", "terminal"]},
+        "receipt_state": {"enum": ["not_applicable", "pending_evidence", "unproven", "published"]},
+        "receipt_id": {"$ref": "#/$defs/nullableReceiptId"},
+        "created_at": {"$ref": "#/$defs/timestamp"},
+        "started_at": {"$ref": "#/$defs/nullableTimestamp"},
+        "updated_at": {"$ref": "#/$defs/timestamp"},
+        "terminal_at": {"$ref": "#/$defs/nullableTimestamp"},
+        "recovery_ref": {"$ref": "#/$defs/nullableString"},
+        "revision": {"type": "integer", "minimum": 1}
+      }
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version", "decision_id", "execution_id", "profile_id",
+        "authority_id", "effect_id", "proposal_ref", "request_digest",
+        "candidate_digest", "policy_digest", "allowed_choices", "expires_at",
+        "state", "choice", "resolution_evidence_digest", "created_at", "updated_at",
+        "resolved_at", "revision"
+      ],
+      "properties": {
+        "contract_version": {"const": "hermes.execution.read.v1"},
+        "decision_id": {"type": "string", "pattern": "^dec_[0-9a-f]{12}_[0-9a-f]{32}$"},
+        "execution_id": {"type": "string", "pattern": "^exe_[0-9a-f]{12}_[0-9a-f]{32}$"},
+        "profile_id": {"$ref": "#/$defs/profileId"},
+        "authority_id": {"$ref": "#/$defs/authorityId"},
+        "effect_id": {"type": "string", "minLength": 1},
+        "proposal_ref": {"type": "string", "minLength": 1},
+        "request_digest": {"$ref": "#/$defs/digest"},
+        "candidate_digest": {"$ref": "#/$defs/nullableDigest"},
+        "policy_digest": {"$ref": "#/$defs/nullableDigest"},
+        "allowed_choices": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1, "maxLength": 64}
+        },
+        "expires_at": {"$ref": "#/$defs/timestamp"},
+        "state": {"enum": ["pending", "resolved", "expired", "superseded"]},
+        "choice": {"$ref": "#/$defs/nullableString"},
+        "resolution_evidence_digest": {"$ref": "#/$defs/nullableDigest"},
+        "created_at": {"$ref": "#/$defs/timestamp"},
+        "updated_at": {"$ref": "#/$defs/timestamp"},
+        "resolved_at": {"$ref": "#/$defs/nullableTimestamp"},
+        "revision": {"type": "integer", "minimum": 1}
+      }
+    },
+    "receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version", "receipt_id", "execution_id", "effect_id", "profile_id",
+        "authority_id", "executor_id", "outcome", "subject_digest", "evidence_digest",
+        "result_digest", "terminal_at", "decision_id", "recovery_ref",
+        "reconciliation_ref", "revision"
+      ],
+      "properties": {
+        "contract_version": {"const": "hermes.execution.read.v1"},
+        "receipt_id": {"type": "string", "pattern": "^rcp_[0-9a-f]{12}_[0-9a-f]{32}$"},
+        "execution_id": {"type": "string", "pattern": "^exe_[0-9a-f]{12}_[0-9a-f]{32}$"},
+        "effect_id": {"type": "string", "minLength": 1},
+        "profile_id": {"$ref": "#/$defs/profileId"},
+        "authority_id": {"$ref": "#/$defs/authorityId"},
+        "executor_id": {"$ref": "#/$defs/executorId"},
+        "outcome": {"enum": ["succeeded", "failed", "cancelled", "partial", "ambiguous"]},
+        "subject_digest": {"$ref": "#/$defs/digest"},
+        "evidence_digest": {"$ref": "#/$defs/digest"},
+        "result_digest": {"$ref": "#/$defs/digest"},
+        "terminal_at": {"$ref": "#/$defs/timestamp"},
+        "decision_id": {"$ref": "#/$defs/nullableDecisionId"},
+        "recovery_ref": {"$ref": "#/$defs/nullableString"},
+        "reconciliation_ref": {"$ref": "#/$defs/nullableString"},
+        "revision": {"const": 1}
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version", "sequence", "event_id", "execution_id", "profile_id",
+        "authority_id", "event_type", "from_lifecycle", "to_lifecycle", "decision_id",
+        "receipt_id", "reason_code", "occurred_at", "revision"
+      ],
+      "properties": {
+        "contract_version": {"const": "hermes.execution.read.v1"},
+        "sequence": {"type": "integer", "minimum": 1},
+        "event_id": {"type": "string", "pattern": "^evt_[0-9a-f]{12}_[0-9a-f]{32}$"},
+        "execution_id": {"type": "string", "pattern": "^exe_[0-9a-f]{12}_[0-9a-f]{32}$"},
+        "profile_id": {"$ref": "#/$defs/profileId"},
+        "authority_id": {"$ref": "#/$defs/authorityId"},
+        "event_type": {
+          "enum": [
+            "execution.created", "execution.transitioned", "execution.recovered",
+            "decision.requested", "decision.resolved", "decision.expired",
+            "decision.superseded", "effect.evidence_recorded", "receipt.published"
+          ]
+        },
+        "from_lifecycle": {"$ref": "#/$defs/nullableString"},
+        "to_lifecycle": {"$ref": "#/$defs/nullableString"},
+        "decision_id": {"$ref": "#/$defs/nullableDecisionId"},
+        "receipt_id": {"$ref": "#/$defs/nullableReceiptId"},
+        "reason_code": {"$ref": "#/$defs/nullableString"},
+        "occurred_at": {"$ref": "#/$defs/timestamp"},
+        "revision": {"type": "integer", "minimum": 1}
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_version", "api_version", "authority", "read_scope",
+        "mutation_scopes", "event_retention_seconds", "max_page_size", "features"
+      ],
+      "properties": {
+        "contract_version": {"const": "hermes.execution.read.v1"},
+        "api_version": {"const": "v1"},
+        "authority": {"$ref": "#/$defs/authority"},
+        "read_scope": {"const": "execution:read"},
+        "mutation_scopes": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {
+            "enum": [
+              "execution:start",
+              "decision:resolve",
+              "execution:steer",
+              "execution:stop"
+            ]
+          },
+          "uniqueItems": true
+        },
+        "event_retention_seconds": {"type": "integer", "minimum": 1},
+        "max_page_size": {"type": "integer", "minimum": 1},
+        "features": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "durable_executions", "durable_pending_decisions",
+            "ordered_restart_safe_events", "evidence_gated_terminal_receipts",
+            "transactional_event_outbox", "profile_scoped_authority",
+            "webauthn_decisions", "action_dispatch"
+          ],
+          "properties": {
+            "durable_executions": {"const": true},
+            "durable_pending_decisions": {"const": true},
+            "ordered_restart_safe_events": {"const": true},
+            "evidence_gated_terminal_receipts": {"const": true},
+            "transactional_event_outbox": {"const": true},
+            "profile_scoped_authority": {"const": true},
+            "webauthn_decisions": {"const": false},
+            "action_dispatch": {"const": false}
+          }
+        }
+      }
+    },
+    "executionList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "authority", "executions", "page"],
+      "properties": {
+        "contract_version": {"const": "hermes.execution.read.v1"},
+        "authority": {"$ref": "#/$defs/authority"},
+        "executions": {"type": "array", "items": {"$ref": "#/$defs/execution"}},
+        "page": {"$ref": "#/$defs/page"}
+      }
+    },
+    "decisionList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "authority", "decisions", "page"],
+      "properties": {
+        "contract_version": {"const": "hermes.execution.read.v1"},
+        "authority": {"$ref": "#/$defs/authority"},
+        "decisions": {"type": "array", "items": {"$ref": "#/$defs/decision"}},
+        "page": {"$ref": "#/$defs/page"}
+      }
+    },
+    "receiptList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "authority", "receipts", "page"],
+      "properties": {
+        "contract_version": {"const": "hermes.execution.read.v1"},
+        "authority": {"$ref": "#/$defs/authority"},
+        "receipts": {"type": "array", "items": {"$ref": "#/$defs/receipt"}},
+        "page": {"$ref": "#/$defs/page"}
+      }
+    },
+    "eventList": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "authority", "events", "page"],
+      "properties": {
+        "contract_version": {"const": "hermes.execution.read.v1"},
+        "authority": {"$ref": "#/$defs/authority"},
+        "events": {"type": "array", "items": {"$ref": "#/$defs/event"}},
+        "page": {"$ref": "#/$defs/eventPage"}
+      }
+    },
+    "executionDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "authority", "execution"],
+      "properties": {
+        "contract_version": {"const": "hermes.execution.read.v1"},
+        "authority": {"$ref": "#/$defs/authority"},
+        "execution": {"$ref": "#/$defs/execution"}
+      }
+    },
+    "decisionDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "authority", "decision"],
+      "properties": {
+        "contract_version": {"const": "hermes.execution.read.v1"},
+        "authority": {"$ref": "#/$defs/authority"},
+        "decision": {"$ref": "#/$defs/decision"}
+      }
+    },
+    "receiptDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_version", "authority", "receipt"],
+      "properties": {
+        "contract_version": {"const": "hermes.execution.read.v1"},
+        "authority": {"$ref": "#/$defs/authority"},
+        "receipt": {"$ref": "#/$defs/receipt"}
+      }
+    },
+    "errorDetail": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error"],
+      "properties": {
+        "error": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["message", "type", "code"],
+          "properties": {
+            "message": {"type": "string", "minLength": 1},
+            "type": {"const": "execution_contract_error"},
+            "code": {
+              "enum": [
+                "execution_contract_unauthorized",
+                "execution_contract_invalid_request",
+                "execution_contract_profile_forbidden",
+                "execution_contract_not_found",
+                "execution_contract_method_not_allowed",
+                "execution_contract_conflict",
+                "execution_contract_cursor_gone",
+                "execution_contract_rate_limited",
+                "execution_contract_unavailable",
+                "execution_contract_corrupt",
+                "execution_contract_internal_error"
+              ]
+            },
+            "minimum_available": {"type": "integer", "minimum": 1},
+            "high_water": {"type": "integer", "minimum": 0}
+          }
+        }
+      }
+    }
+  },
+  "oneOf": [
+    {"$ref": "#/$defs/capabilities"},
+    {"$ref": "#/$defs/executionList"},
+    {"$ref": "#/$defs/decisionList"},
+    {"$ref": "#/$defs/receiptList"},
+    {"$ref": "#/$defs/eventList"},
+    {"$ref": "#/$defs/executionDetail"},
+    {"$ref": "#/$defs/decisionDetail"},
+    {"$ref": "#/$defs/receiptDetail"},
+    {"$ref": "#/$defs/errorDetail"}
+  ]
+}

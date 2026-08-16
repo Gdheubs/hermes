@@ -1,0 +1,40 @@
+{
+  "contract_version": "hermes.execution.read.v1",
+  "authority": {
+    "profile_id": "hermes-profile-instance:0123456789ab0123456789ab",
+    "profile_name": "synthetic",
+    "authority_id": "hermes-execution-authority:0123456789ab0123456789ab",
+    "executor_id": "hermes-agent-executor:0123456789ab0123456789ab"
+  },
+  "executions": [
+    {
+      "contract_version": "hermes.execution.read.v1",
+      "execution_id": "exe_0123456789ab_00000000000000000000000000000001",
+      "profile_id": "hermes-profile-instance:0123456789ab0123456789ab",
+      "authority_id": "hermes-execution-authority:0123456789ab0123456789ab",
+      "executor_id": "hermes-agent-executor:0123456789ab0123456789ab",
+      "source_run_id": "run-synthetic-1",
+      "work_ref": "work:synthetic-1",
+      "proposal_ref": "proposal:synthetic-1",
+      "effect_id": "effect:synthetic-1",
+      "lifecycle": "running",
+      "freshness": "live",
+      "receipt_state": "pending_evidence",
+      "receipt_id": null,
+      "created_at": "2026-08-15T12:00:00.000000Z",
+      "started_at": "2026-08-15T12:00:01.000000Z",
+      "updated_at": "2026-08-15T12:00:01.000000Z",
+      "terminal_at": null,
+      "recovery_ref": null,
+      "revision": 2
+    }
+  ],
+  "page": {
+    "cursor": 1,
+    "high_water": 1,
+    "snapshot_high_water": 1,
+    "minimum_available": 1,
+    "has_more": false,
+    "completeness": "complete"
+  }
+}

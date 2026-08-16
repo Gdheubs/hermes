@@ -1,0 +1,29 @@
+{
+  "contract_version": "hermes.execution.read.v1",
+  "api_version": "v1",
+  "authority": {
+    "profile_id": "hermes-profile-instance:0123456789ab0123456789ab",
+    "profile_name": "synthetic",
+    "authority_id": "hermes-execution-authority:0123456789ab0123456789ab",
+    "executor_id": "hermes-agent-executor:0123456789ab0123456789ab"
+  },
+  "read_scope": "execution:read",
+  "mutation_scopes": [
+    "execution:start",
+    "decision:resolve",
+    "execution:steer",
+    "execution:stop"
+  ],
+  "event_retention_seconds": 2592000,
+  "max_page_size": 200,
+  "features": {
+    "durable_executions": true,
+    "durable_pending_decisions": true,
+    "ordered_restart_safe_events": true,
+    "evidence_gated_terminal_receipts": true,
+    "transactional_event_outbox": true,
+    "profile_scoped_authority": true,
+    "webauthn_decisions": false,
+    "action_dispatch": false
+  }
+}

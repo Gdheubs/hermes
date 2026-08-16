@@ -525,6 +525,7 @@ These are set automatically by the Docker terminal backend when `proxy.enabled: 
 | `WEBHOOK_SECRET` | Global HMAC secret for webhook signature validation (used as fallback when routes don't specify their own) |
 | `API_SERVER_ENABLED` | Enable the OpenAI-compatible API server (`true`/`false`). Runs alongside other platforms. |
 | `API_SERVER_KEY` | Bearer token for API server authentication. Required whenever the API server is enabled. |
+| `API_SERVER_READ_KEY` | Optional profile-scoped bearer token limited to capability discovery and the versioned execution read contract. It cannot submit, approve, steer, stop, or access unrelated API resources. |
 | `API_SERVER_CORS_ORIGINS` | Comma-separated browser origins allowed to call the API server directly (for example `http://localhost:3000,http://127.0.0.1:3000`). Default: disabled. |
 | `API_SERVER_PORT` | Port for the API server (default: `8642`) |
 | `API_SERVER_HOST` | Host/bind address for the API server (default: `127.0.0.1`). `API_SERVER_KEY` is still required on loopback; use a narrow `API_SERVER_CORS_ORIGINS` allowlist for browser access. |

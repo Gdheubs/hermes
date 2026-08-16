@@ -4575,6 +4575,14 @@ OPTIONAL_ENV_VARS = {
         "category": "messaging",
         "advanced": True,
     },
+    "API_SERVER_READ_KEY": {
+        "description": "Optional bearer token limited to the versioned execution read contract and capability discovery. It cannot submit, approve, steer, stop, or access other API resources.",
+        "prompt": "API server execution read-only key",
+        "url": None,
+        "password": True,
+        "category": "messaging",
+        "advanced": True,
+    },
     "API_SERVER_PORT": {
         "description": "Port for the API server (default: 8642).",
         "prompt": "API server port",

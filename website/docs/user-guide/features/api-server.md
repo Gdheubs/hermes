@@ -23,6 +23,8 @@ Add to `~/.hermes/.env`:
 ```bash
 API_SERVER_ENABLED=true
 API_SERVER_KEY=change-me-local-dev
+# Optional: a separate key for execution/capability GETs only
+# API_SERVER_READ_KEY=change-me-read-only
 # Optional: only if a browser must call Hermes directly
 # API_SERVER_CORS_ORIGINS=http://localhost:3000
 ```
@@ -405,6 +407,59 @@ running.
 
 Resolve a pending approval for a run that is waiting on a human decision (for example, a tool call gated behind an approval policy). The body carries the approval decision; the run resumes once the decision is recorded. This endpoint is advertised in `/v1/capabilities` as the `run_approval` feature so external UIs can detect support before surfacing an approval prompt.
 
+## Execution read contract (Release 1)
+
+Hermes exposes a durable, provider-neutral execution read contract at
+`/v1/execution-contract`. It is separate from the process-local Runs API:
+chat output, session history, a Kanban row, or `status=completed` does not prove
+an external effect. An effect-bearing execution publishes a terminal receipt
+only after its executor supplies exact evidence digests; otherwise it closes
+as `terminal_ambiguous` with no receipt.
+
+Contract version: `hermes.execution.read.v1`
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/v1/execution-contract/capabilities` | Negotiate version, authority, scopes, retention, and features |
+| `GET` | `/v1/execution-contract/schema` | Fetch the closed packaged JSON Schema |
+| `GET` | `/v1/execution-contract/executions` | Read durable execution lifecycle |
+| `GET` | `/v1/execution-contract/executions/{execution_id}` | Read one execution |
+| `GET` | `/v1/execution-contract/decisions` | Read pending or historical decisions |
+| `GET` | `/v1/execution-contract/decisions/{decision_id}` | Read one decision |
+| `GET` | `/v1/execution-contract/events` | Replay ordered, restart-safe events |
+| `GET` | `/v1/execution-contract/receipts` | Read authoritative terminal effect receipts |
+| `GET` | `/v1/execution-contract/receipts/{receipt_id}` | Read one receipt |
+
+Collections accept `after`, `limit` (maximum 200), and
+`snapshot_high_water`. The first page pins a high-water mark in the same read
+transaction as row selection; carry that value to subsequent pages so
+concurrent inserts cannot skip or duplicate data. Events also include a
+monotonic sequence, minimum available cursor, completeness, and explicit
+retention watermark. A pruned cursor returns `410`, so consumers can detect a
+replay gap instead of silently treating missing history as empty.
+
+Use `API_SERVER_READ_KEY` when a service needs these GETs without run, approval,
+steer, stop, chat, or other mutation authority:
+
+```bash
+curl http://localhost:8642/v1/execution-contract/capabilities \
+  -H "Authorization: Bearer $API_SERVER_READ_KEY" \
+  -H "Hermes-Execution-Contract-Version: hermes.execution.read.v1"
+```
+
+The server derives and asserts the profile-instance, authority, and executor
+identity from the active scoped Hermes home in every response; URL labels do
+not create authority. Under multiplexing,
+`/p/<profile>/v1/execution-contract/...` uses that profile's home, ledger, and
+keys. Late authoritative ambiguous evidence has a dedicated atomic
+reconciliation path, while generic chat/process state remains non-authoritative.
+Release 1 does not expose proposal/action
+dispatch, public decision mutation, or WebAuthn step-up; capability discovery
+reports those features as disabled.
+
+See `docs/execution-read-contract-v1.md` in the source repository for complete
+lifecycle, receipt, pagination, and error semantics.
+
 ## Jobs API (background scheduled work)
 
 The server exposes a lightweight jobs CRUD surface for managing scheduled / background agent runs from a remote client. All endpoints are gated behind the same bearer auth.
@@ -519,6 +574,12 @@ Authorization: Bearer ***
 
 Configure the key via `API_SERVER_KEY` env var. If you need a browser to call Hermes directly, also set `API_SERVER_CORS_ORIGINS` to an explicit allowlist.
 
+For read-only execution consumers, configure a distinct
+`API_SERVER_READ_KEY`. It is accepted only by `/v1/capabilities` and
+`GET /v1/execution-contract/*`; presenting it to any other route returns
+`403`. Hermes refuses to start if it equals `API_SERVER_KEY` for the default
+or any served named profile.
+
 ### Multi-profile routing (`/p/<profile>/…`)
 
 When [multi-profile gateway routing](/user-guide/multi-profile-gateways) is
@@ -554,6 +615,7 @@ The API server gives full access to hermes-agent's toolset, **including terminal
 | `API_SERVER_PORT` | `8642` | HTTP server port |
 | `API_SERVER_HOST` | `127.0.0.1` | Bind address (localhost only by default) |
 | `API_SERVER_KEY` | _(required)_ | Bearer token for auth |
+| `API_SERVER_READ_KEY` | _(none)_ | Optional profile-scoped bearer token limited to execution/capability GETs |
 | `API_SERVER_CORS_ORIGINS` | _(none)_ | Comma-separated allowed browser origins |
 | `API_SERVER_MODEL_NAME` | _(profile name)_ | Model name on `/v1/models`. Defaults to profile name, or `hermes-agent` for default profile. |
 
@@ -568,6 +630,7 @@ gateway:
     port: 8642
     host: 127.0.0.1
     key: your-secret-key
+    read_key: your-read-only-secret
     cors_origins: http://localhost:3000
     model_name: my-hermes
     max_concurrent_runs: 10   # concurrent-run cap; 0 disables the limit

@@ -20,13 +20,21 @@ Exposes an HTTP server with endpoints:
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/steer      — inject guidance into a running agent
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
+- GET  /v1/execution-contract/capabilities — version and authority negotiation
+- GET  /v1/execution-contract/schema — closed Release 1 JSON Schema
+- GET  /v1/execution-contract/executions[/<id>] — durable execution reads
+- GET  /v1/execution-contract/decisions[/<id>] — durable decision reads
+- GET  /v1/execution-contract/events — ordered restart-safe event feed
+- GET  /v1/execution-contract/receipts[/<id>] — authoritative receipt reads
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
 Any OpenAI-compatible frontend (Open WebUI, LobeChat, LibreChat,
 AnythingLLM, NextChat, ChatBox, etc.) can connect to hermes-agent
 through this adapter by pointing at http://localhost:8642/v1 and
-authenticating with API_SERVER_KEY.
+authenticating with API_SERVER_KEY. Read-only execution consumers may instead
+use API_SERVER_READ_KEY, which is accepted only for capability discovery and
+the versioned execution-contract GET routes.
 
 When ``gateway.multiplex_profiles`` is on, the default profile owns this
 listener and secondary profiles are reached via a URL prefix — same contract
@@ -57,6 +65,7 @@ import sys
 import threading
 import time
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -1381,6 +1390,10 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", _get_scoped_secret("API_SERVER_KEY", ""))
+        self._read_api_key: str = extra.get(
+            "read_key",
+            _get_scoped_secret("API_SERVER_READ_KEY", ""),
+        )
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -1436,6 +1449,13 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
+        # Release 1 durable execution contract.  Runtime maps only correlate
+        # legacy /v1/runs handles with durable IDs; the SQLite ledger remains
+        # authoritative and survives restart.
+        self._execution_contract_runtime_id = uuid.uuid4().hex
+        self._run_execution_ids: Dict[str, str] = {}
+        self._run_decision_ids: Dict[str, Dict[str, str]] = {}
+        self._execution_contract_degraded_profiles: set[str] = set()
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
         self._session_dbs: Dict[str, Any] = {}
         self._session_db_cache_lock = threading.Lock()
@@ -1779,6 +1799,81 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             return ""
 
+    def _expected_read_api_key(self) -> str:
+        """Return the profile-scoped execution:read bearer key, if configured."""
+        profile = _api_request_profile.get()
+        try:
+            from hermes_cli.auth import has_usable_secret
+
+            if not profile or profile == "default":
+                key = self._read_api_key or ""
+            else:
+                from agent.secret_scope import get_secret
+
+                key = get_secret("API_SERVER_READ_KEY", "") or ""
+            return key if has_usable_secret(key, min_length=16) else ""
+        except Exception as exc:
+            logger.warning(
+                "Failed to resolve a usable profile-scoped API_SERVER_READ_KEY "
+                "for %r: %s",
+                profile,
+                type(exc).__name__,
+            )
+            return ""
+
+    @staticmethod
+    def _request_path(request: "web.Request") -> str:
+        """Return the request path for aiohttp and narrow auth-test doubles."""
+        path = getattr(request, "path", None)
+        if not isinstance(path, str):
+            path_qs = getattr(request, "path_qs", "")
+            path = path_qs.split("?", 1)[0] if isinstance(path_qs, str) else ""
+        if path.startswith("/p/"):
+            parts = path.split("/", 3)
+            path = f"/{parts[3]}" if len(parts) == 4 else "/"
+        return path
+
+    @staticmethod
+    def _is_execution_contract_namespace_path(path: str) -> bool:
+        return path == "/v1/execution-contract" or path.startswith(
+            "/v1/execution-contract/"
+        )
+
+    @staticmethod
+    def _read_key_path_allowed(request: "web.Request") -> bool:
+        """True only for Release 1 contract reads and capability negotiation."""
+        if request.method != "GET":
+            return False
+        path = APIServerAdapter._request_path(request)
+        return path == "/v1/capabilities" or (
+            APIServerAdapter._is_execution_contract_namespace_path(path)
+        )
+
+    @staticmethod
+    def _is_execution_contract_public_request(request: "web.Request") -> bool:
+        path = APIServerAdapter._request_path(request)
+        return path == "/v1/capabilities" or (
+            APIServerAdapter._is_execution_contract_namespace_path(path)
+        )
+
+    def _execution_contract_auth_response(
+        self,
+        *,
+        status: int,
+        message: str,
+    ) -> "web.Response":
+        from hermes_cli.execution_contract import (
+            ContractForbiddenError,
+            ContractUnauthorizedError,
+        )
+
+        error = (
+            ContractUnauthorizedError(message)
+            if status == 401
+            else ContractForbiddenError(message)
+        )
+        return self._execution_contract_error_response(error)
+
     def _check_auth(self, request: "web.Request") -> Optional["web.Response"]:
         """
         Validate Bearer token from Authorization header.
@@ -1790,7 +1885,31 @@ class APIServerAdapter(BasePlatformAdapter):
         profile = _api_request_profile.get()
         is_named_profile = bool(profile and profile != "default")
         expected_key = self._expected_api_key()
-        if not expected_key:
+        expected_read_key = self._expected_read_api_key()
+        contract_request = self._is_execution_contract_public_request(request)
+        if expected_key and expected_read_key and hmac.compare_digest(
+            expected_key.encode(),
+            expected_read_key.encode(),
+        ):
+            if contract_request:
+                from hermes_cli.execution_contract import ContractUnavailableError
+
+                return self._execution_contract_error_response(
+                    ContractUnavailableError(
+                        "execution contract credentials are misconfigured"
+                    )
+                )
+            return web.json_response(
+                {
+                    "error": {
+                        "message": "Gateway API credentials are misconfigured",
+                        "type": "gateway_auth_error",
+                        "code": "gateway_auth_misconfigured",
+                    }
+                },
+                status=503,
+            )
+        if not expected_key and not expected_read_key:
             # Preserve the historical no-key test/manual-wiring behavior only
             # for the default listener. Named profiles must fail closed rather
             # than inherit the listener owner's key.
@@ -1802,6 +1921,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 profile,
                 self._request_audit_log_suffix(request),
             )
+            if contract_request:
+                return self._execution_contract_auth_response(
+                    status=401,
+                    message="Execution contract bearer token is invalid",
+                )
             return web.json_response(
                 {
                     "error": {
@@ -1822,13 +1946,44 @@ class APIServerAdapter(BasePlatformAdapter):
             # otherwise crash this handler (500) instead of returning a clean
             # 401. Encoding both sides keeps the timing-safe comparison and
             # matches web_server.py's dashboard-token check.
-            if hmac.compare_digest(token.encode(), expected_key.encode()):
+            if expected_key and hmac.compare_digest(
+                token.encode(),
+                expected_key.encode(),
+            ):
                 return None  # Auth OK
+            if expected_read_key and hmac.compare_digest(
+                token.encode(),
+                expected_read_key.encode(),
+            ):
+                if self._read_key_path_allowed(request):
+                    return None
+                if contract_request:
+                    return self._execution_contract_auth_response(
+                        status=403,
+                        message="Bearer token lacks the required contract scope",
+                    )
+                return web.json_response(
+                    {
+                        "error": {
+                            "message": "Bearer token lacks the required mutation scope",
+                            "type": "gateway_authorization_error",
+                            "code": "gateway_scope_forbidden",
+                            "required_scope": "mutation",
+                            "granted_scope": "execution:read",
+                        }
+                    },
+                    status=403,
+                )
 
         logger.warning(
             "API server rejected invalid API key: %s",
             self._request_audit_log_suffix(request),
         )
+        if contract_request:
+            return self._execution_contract_auth_response(
+                status=401,
+                message="Execution contract bearer token is invalid",
+            )
         return web.json_response(
             {"error": {"message": "Invalid gateway API key (API_SERVER_KEY)", "type": "gateway_auth_error", "code": "gateway_auth_failed"}},
             status=401,
@@ -1976,6 +2131,14 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         profile = (request.match_info.get("profile") or "").strip()
         if not profile:
+            raw_path = getattr(request, "path", "")
+            if isinstance(raw_path, str) and raw_path.startswith("/p/"):
+                parts = raw_path.split("/", 3)
+                if len(parts) == 4:
+                    profile = parts[2].strip()
+                if not profile and self._is_execution_contract_public_request(request):
+                    return _PROFILE_REJECTED
+        if not profile:
             return None
         runner = getattr(self, "gateway_runner", None)
         cfg = getattr(runner, "config", None)
@@ -2037,6 +2200,15 @@ class APIServerAdapter(BasePlatformAdapter):
         async def profile_prefix_middleware(request: "web.Request", handler):
             profile = self._resolve_request_profile(request)
             if profile is _PROFILE_REJECTED:
+                if self._is_execution_contract_public_request(request):
+                    from hermes_cli.execution_contract import ContractNotFoundError
+
+                    auth_err = self._check_auth(request)
+                    if auth_err:
+                        return auth_err
+                    return self._execution_contract_error_response(
+                        ContractNotFoundError("profile is unknown or unconfigured")
+                    )
                 return web.json_response(
                     {"error": "Unknown or unconfigured profile"},
                     status=404,
@@ -2049,6 +2221,42 @@ class APIServerAdapter(BasePlatformAdapter):
                 _api_request_profile.reset(token)
 
         return profile_prefix_middleware
+
+    def _make_execution_contract_router_error_middleware(self):
+        """Close authenticated 404/405 responses inside the contract namespace."""
+
+        @web.middleware
+        async def execution_contract_router_error_middleware(
+            request: "web.Request",
+            handler,
+        ):
+            try:
+                return await handler(request)
+            except (web.HTTPNotFound, web.HTTPMethodNotAllowed) as exc:
+                if not self._is_execution_contract_namespace_path(
+                    self._request_path(request)
+                ):
+                    raise
+                auth_err = self._check_auth(request)
+                if auth_err:
+                    return auth_err
+                if isinstance(exc, web.HTTPMethodNotAllowed):
+                    from hermes_cli.execution_contract import (
+                        ContractMethodNotAllowedError,
+                    )
+
+                    return self._execution_contract_error_response(
+                        ContractMethodNotAllowedError(
+                            "method is not allowed in the execution contract namespace"
+                        )
+                    )
+                from hermes_cli.execution_contract import ContractNotFoundError
+
+                return self._execution_contract_error_response(
+                    ContractNotFoundError("execution contract route not found")
+                )
+
+        return execution_contract_router_error_middleware
 
     def _http_route_table(self) -> List[tuple]:
         """Return (method, path, handler) rows registered by ``connect()``.
@@ -2097,6 +2305,51 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/v1/runs/{run_id}/approval", self._handle_run_approval),
             ("POST", "/v1/runs/{run_id}/steer", self._handle_steer_run),
             ("POST", "/v1/runs/{run_id}/stop", self._handle_stop_run),
+            (
+                "GET",
+                "/v1/execution-contract/capabilities",
+                self._handle_execution_contract_capabilities,
+            ),
+            (
+                "GET",
+                "/v1/execution-contract/schema",
+                self._handle_execution_contract_schema,
+            ),
+            (
+                "GET",
+                "/v1/execution-contract/executions",
+                self._handle_execution_contract_executions,
+            ),
+            (
+                "GET",
+                "/v1/execution-contract/executions/{execution_id}",
+                self._handle_execution_contract_execution,
+            ),
+            (
+                "GET",
+                "/v1/execution-contract/decisions",
+                self._handle_execution_contract_decisions,
+            ),
+            (
+                "GET",
+                "/v1/execution-contract/decisions/{decision_id}",
+                self._handle_execution_contract_decision,
+            ),
+            (
+                "GET",
+                "/v1/execution-contract/events",
+                self._handle_execution_contract_events,
+            ),
+            (
+                "GET",
+                "/v1/execution-contract/receipts",
+                self._handle_execution_contract_receipts,
+            ),
+            (
+                "GET",
+                "/v1/execution-contract/receipts/{receipt_id}",
+                self._handle_execution_contract_receipt,
+            ),
         ]
         if _CRON_AVAILABLE:
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
@@ -3110,6 +3363,347 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=500,
             )
 
+    # ------------------------------------------------------------------
+    # Durable execution read contract (Release 1)
+    # ------------------------------------------------------------------
+
+    def _execution_contract_profile_name(self) -> str:
+        return _api_request_profile.get() or "default"
+
+    def _execution_contract_store(self):
+        from hermes_cli.execution_contract import ExecutionContractStore
+        from hermes_constants import get_hermes_home
+
+        return ExecutionContractStore(
+            profile_home=get_hermes_home(),
+            runtime_instance_id=self._execution_contract_runtime_id,
+        )
+
+    def _execution_contract_is_degraded(self) -> bool:
+        return (
+            self._execution_contract_profile_name()
+            in self._execution_contract_degraded_profiles
+        )
+
+    def _mark_execution_contract_degraded(self) -> None:
+        self._execution_contract_degraded_profiles.add(
+            self._execution_contract_profile_name()
+        )
+
+    @staticmethod
+    def _requested_execution_contract_version(request: "web.Request") -> Optional[str]:
+        header_version = request.headers.get("Hermes-Execution-Contract-Version")
+        query_version = request.query.get("contract_version")
+        if header_version and query_version and header_version != query_version:
+            from hermes_cli.execution_contract import ContractValidationError
+
+            raise ContractValidationError(
+                "header and query contract versions disagree"
+            )
+        return header_version or query_version
+
+    def _execution_contract_error_response(self, exc: Exception) -> "web.Response":
+        from hermes_cli.execution_contract import (
+            CONTRACT_VERSION,
+            ContractConflictError,
+            ContractCursorGoneError,
+            ContractDataError,
+            ContractForbiddenError,
+            ContractMethodNotAllowedError,
+            ContractNotFoundError,
+            ContractRateLimitedError,
+            ContractUnauthorizedError,
+            ContractUnavailableError,
+            ContractValidationError,
+            UnsupportedContractVersionError,
+        )
+
+        status = 500
+        code = "execution_contract_internal_error"
+        details: dict[str, Any] = {}
+        headers = {"Hermes-Execution-Contract-Version": CONTRACT_VERSION}
+        headers["Cache-Control"] = "no-store"
+        if isinstance(exc, ContractUnauthorizedError):
+            status, code = 401, "execution_contract_unauthorized"
+        elif isinstance(exc, ContractValidationError):
+            status, code = 400, "execution_contract_invalid_request"
+        elif isinstance(exc, ContractForbiddenError):
+            status, code = 403, "execution_contract_profile_forbidden"
+        elif isinstance(exc, ContractNotFoundError):
+            status, code = 404, "execution_contract_not_found"
+        elif isinstance(exc, ContractMethodNotAllowedError):
+            status, code = 405, "execution_contract_method_not_allowed"
+        elif isinstance(exc, (ContractConflictError, UnsupportedContractVersionError)):
+            status, code = 409, "execution_contract_conflict"
+        elif isinstance(exc, ContractCursorGoneError):
+            status, code = 410, "execution_contract_cursor_gone"
+            details = {
+                "minimum_available": exc.minimum_available,
+                "high_water": exc.high_water,
+            }
+        elif isinstance(exc, ContractRateLimitedError):
+            status, code = 429, "execution_contract_rate_limited"
+            headers["Retry-After"] = "1"
+        elif isinstance(exc, ContractUnavailableError):
+            status, code = 503, "execution_contract_unavailable"
+        elif isinstance(exc, ContractDataError):
+            status, code = 500, "execution_contract_corrupt"
+        message = str(exc) if status < 500 else "Execution contract unavailable"
+        return web.json_response(
+            {
+                "error": {
+                    "message": message,
+                    "type": "execution_contract_error",
+                    "code": code,
+                    **details,
+                }
+            },
+            status=status,
+            headers=headers,
+        )
+
+    def _execution_contract_read_guard(
+        self,
+        request: "web.Request",
+    ) -> Optional["web.Response"]:
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        if self._execution_contract_is_degraded():
+            from hermes_cli.execution_contract import ContractUnavailableError
+
+            return self._execution_contract_error_response(
+                ContractUnavailableError(
+                    "execution contract is degraded after a failed durable write"
+                )
+            )
+        try:
+            from hermes_cli.execution_contract import validate_contract_version
+
+            validate_contract_version(
+                self._requested_execution_contract_version(request)
+            )
+        except Exception as exc:
+            return self._execution_contract_error_response(exc)
+        return None
+
+    @staticmethod
+    def _execution_contract_headers() -> dict[str, str]:
+        from hermes_cli.execution_contract import CONTRACT_VERSION
+
+        return {
+            "Hermes-Execution-Contract-Version": CONTRACT_VERSION,
+            "Cache-Control": "no-store",
+        }
+
+    async def _handle_execution_contract_capabilities(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        guard = self._execution_contract_read_guard(request)
+        if guard:
+            return guard
+        from hermes_cli.execution_contract import contract_capabilities
+
+        store = self._execution_contract_store()
+
+        return web.json_response(
+            contract_capabilities(
+                store.profile_home,
+                store.authority.profile_name,
+            ),
+            headers=self._execution_contract_headers(),
+        )
+
+    async def _handle_execution_contract_schema(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        guard = self._execution_contract_read_guard(request)
+        if guard:
+            return guard
+        try:
+            from hermes_cli.execution_contract import contract_schema
+
+            return web.json_response(
+                contract_schema(),
+                headers=self._execution_contract_headers(),
+            )
+        except Exception as exc:
+            return self._execution_contract_error_response(exc)
+
+    def _execution_contract_envelope(
+        self,
+        key: str,
+        value: Any,
+        *,
+        page: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        from hermes_cli.execution_contract import CONTRACT_VERSION
+
+        payload = {
+            "contract_version": CONTRACT_VERSION,
+            "authority": self._execution_contract_store().authority.public(),
+            key: value,
+        }
+        if page is not None:
+            payload["page"] = page
+        return payload
+
+    async def _handle_execution_contract_executions(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        guard = self._execution_contract_read_guard(request)
+        if guard:
+            return guard
+        try:
+            page = self._execution_contract_store().list_executions(
+                after=request.query.get("after", 0),
+                limit=request.query.get("limit", 50),
+                lifecycle=request.query.get("lifecycle"),
+                snapshot_high_water=request.query.get("snapshot_high_water"),
+            )
+            return web.json_response(
+                self._execution_contract_envelope(
+                    "executions",
+                    page["items"],
+                    page=page["page"],
+                ),
+                headers=self._execution_contract_headers(),
+            )
+        except Exception as exc:
+            return self._execution_contract_error_response(exc)
+
+    async def _handle_execution_contract_execution(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        guard = self._execution_contract_read_guard(request)
+        if guard:
+            return guard
+        try:
+            execution = self._execution_contract_store().get_execution(
+                request.match_info["execution_id"]
+            )
+            return web.json_response(
+                self._execution_contract_envelope("execution", execution),
+                headers=self._execution_contract_headers(),
+            )
+        except Exception as exc:
+            return self._execution_contract_error_response(exc)
+
+    async def _handle_execution_contract_decisions(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        guard = self._execution_contract_read_guard(request)
+        if guard:
+            return guard
+        try:
+            page = self._execution_contract_store().list_decisions(
+                after=request.query.get("after", 0),
+                limit=request.query.get("limit", 50),
+                state=request.query.get("state"),
+                snapshot_high_water=request.query.get("snapshot_high_water"),
+            )
+            return web.json_response(
+                self._execution_contract_envelope(
+                    "decisions",
+                    page["items"],
+                    page=page["page"],
+                ),
+                headers=self._execution_contract_headers(),
+            )
+        except Exception as exc:
+            return self._execution_contract_error_response(exc)
+
+    async def _handle_execution_contract_decision(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        guard = self._execution_contract_read_guard(request)
+        if guard:
+            return guard
+        try:
+            decision = self._execution_contract_store().get_decision(
+                request.match_info["decision_id"]
+            )
+            return web.json_response(
+                self._execution_contract_envelope("decision", decision),
+                headers=self._execution_contract_headers(),
+            )
+        except Exception as exc:
+            return self._execution_contract_error_response(exc)
+
+    async def _handle_execution_contract_events(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        guard = self._execution_contract_read_guard(request)
+        if guard:
+            return guard
+        try:
+            page = self._execution_contract_store().list_events(
+                after=request.query.get("after", 0),
+                limit=request.query.get("limit", 50),
+                execution_id=request.query.get("execution_id"),
+                snapshot_high_water=request.query.get("snapshot_high_water"),
+            )
+            return web.json_response(
+                self._execution_contract_envelope(
+                    "events",
+                    page["items"],
+                    page=page["page"],
+                ),
+                headers=self._execution_contract_headers(),
+            )
+        except Exception as exc:
+            return self._execution_contract_error_response(exc)
+
+    async def _handle_execution_contract_receipts(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        guard = self._execution_contract_read_guard(request)
+        if guard:
+            return guard
+        try:
+            page = self._execution_contract_store().list_receipts(
+                after=request.query.get("after", 0),
+                limit=request.query.get("limit", 50),
+                outcome=request.query.get("outcome"),
+                snapshot_high_water=request.query.get("snapshot_high_water"),
+            )
+            return web.json_response(
+                self._execution_contract_envelope(
+                    "receipts",
+                    page["items"],
+                    page=page["page"],
+                ),
+                headers=self._execution_contract_headers(),
+            )
+        except Exception as exc:
+            return self._execution_contract_error_response(exc)
+
+    async def _handle_execution_contract_receipt(
+        self,
+        request: "web.Request",
+    ) -> "web.Response":
+        guard = self._execution_contract_read_guard(request)
+        if guard:
+            return guard
+        try:
+            receipt = self._execution_contract_store().get_receipt(
+                request.match_info["receipt_id"]
+            )
+            return web.json_response(
+                self._execution_contract_envelope("receipt", receipt),
+                headers=self._execution_contract_headers(),
+            )
+        except Exception as exc:
+            return self._execution_contract_error_response(exc)
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """GET /v1/capabilities — advertise the stable API surface.
 
@@ -3128,6 +3722,8 @@ class APIServerAdapter(BasePlatformAdapter):
             "auth": {
                 "type": "bearer",
                 "required": bool(self._api_key),
+                "read_only_key_configured": bool(self._expected_read_api_key()),
+                "read_only_scope": "execution:read",
             },
             "runtime": {
                 "mode": "server_agent",
@@ -3152,6 +3748,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval_response": True,
                 "tool_progress_events": True,
                 "approval_events": True,
+                "execution_read_contract": True,
+                "execution_read_contract_version": "hermes.execution.read.v1",
+                "authoritative_effect_receipts_require_evidence": True,
                 "session_resources": True,
                 "model_options": True,
                 "session_chat": True,
@@ -3181,6 +3780,42 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_steer": {"method": "POST", "path": "/v1/runs/{run_id}/steer"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "execution_contract_capabilities": {
+                    "method": "GET",
+                    "path": "/v1/execution-contract/capabilities",
+                },
+                "execution_contract_schema": {
+                    "method": "GET",
+                    "path": "/v1/execution-contract/schema",
+                },
+                "executions": {
+                    "method": "GET",
+                    "path": "/v1/execution-contract/executions",
+                },
+                "execution": {
+                    "method": "GET",
+                    "path": "/v1/execution-contract/executions/{execution_id}",
+                },
+                "decisions": {
+                    "method": "GET",
+                    "path": "/v1/execution-contract/decisions",
+                },
+                "decision": {
+                    "method": "GET",
+                    "path": "/v1/execution-contract/decisions/{decision_id}",
+                },
+                "execution_events": {
+                    "method": "GET",
+                    "path": "/v1/execution-contract/events",
+                },
+                "receipts": {
+                    "method": "GET",
+                    "path": "/v1/execution-contract/receipts",
+                },
+                "receipt": {
+                    "method": "GET",
+                    "path": "/v1/execution-contract/receipts/{receipt_id}",
+                },
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -6633,6 +7268,234 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return _callback
 
+    @staticmethod
+    def _parse_execution_contract_context(body: dict[str, Any]) -> dict[str, Optional[str]]:
+        """Validate the optional immutable bindings accepted by legacy /v1/runs."""
+        raw = body.get("execution_context")
+        if raw is None:
+            return {"work_ref": None, "proposal_ref": None, "effect_id": None}
+        if not isinstance(raw, dict):
+            raise ValueError("execution_context must be an object")
+        allowed = {"work_ref", "proposal_ref", "effect_id"}
+        extras = sorted(set(raw) - allowed)
+        if extras:
+            raise ValueError(
+                f"execution_context contains unsupported fields: {', '.join(extras)}"
+            )
+        values = {
+            key: (str(raw[key]).strip() if raw.get(key) is not None else None)
+            for key in allowed
+        }
+        if values["effect_id"] and not (
+            values["work_ref"] and values["proposal_ref"]
+        ):
+            raise ValueError(
+                "effect_id requires exact work_ref and proposal_ref bindings"
+            )
+        return values
+
+    def _create_execution_contract_run(
+        self,
+        run_id: str,
+        context: dict[str, Optional[str]],
+    ) -> dict[str, Any]:
+        execution = self._execution_contract_store().create_execution(
+            lifecycle="queued",
+            source_run_id=run_id,
+            work_ref=context.get("work_ref"),
+            proposal_ref=context.get("proposal_ref"),
+            effect_id=context.get("effect_id"),
+        )
+        self._run_execution_ids[run_id] = execution["execution_id"]
+        return execution
+
+    def _transition_execution_contract_run(
+        self,
+        run_id: str,
+        lifecycle: str,
+        *,
+        reason_code: Optional[str] = None,
+        recovery_ref: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        execution_id = self._run_execution_ids.get(run_id)
+        if not execution_id:
+            return None
+        try:
+            return self._execution_contract_store().transition_execution(
+                execution_id,
+                lifecycle,
+                reason_code=reason_code,
+                recovery_ref=recovery_ref,
+            )
+        except Exception:
+            self._mark_execution_contract_degraded()
+            logger.exception(
+                "Durable execution contract transition failed for run=%s",
+                run_id,
+            )
+            return None
+
+    def _terminalize_execution_contract_run(
+        self,
+        run_id: str,
+        terminal_status: str,
+        *,
+        reason_code: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        lifecycle = {
+            "completed": "terminal_succeeded",
+            "failed": "terminal_failed",
+            "cancelled": "terminal_cancelled",
+            "partial": "terminal_partial",
+            "ambiguous": "terminal_ambiguous",
+        }.get(terminal_status)
+        if lifecycle is None:
+            raise ValueError(f"unknown terminal execution status: {terminal_status}")
+        return self._transition_execution_contract_run(
+            run_id,
+            lifecycle,
+            reason_code=reason_code,
+        )
+
+    def _create_execution_contract_decision(
+        self,
+        run_id: str,
+        approval_data: dict[str, Any],
+        allowed_choices: list[str],
+    ) -> Optional[dict[str, Any]]:
+        execution_id = self._run_execution_ids.get(run_id)
+        if not execution_id:
+            return None
+        store = self._execution_contract_store()
+        execution = store.get_execution(execution_id)
+        if not execution["effect_id"] or not execution["proposal_ref"]:
+            return None
+        from hermes_cli.execution_contract import canonical_digest
+        from tools.approval import _get_approval_timeout
+
+        request_payload = {
+            "request_id": approval_data.get("request_id"),
+            "execution_id": execution_id,
+            "effect_id": execution["effect_id"],
+            "proposal_ref": execution["proposal_ref"],
+            "command": approval_data.get("command"),
+            "description": approval_data.get("description"),
+            "pattern_keys": approval_data.get("pattern_keys") or [],
+            "allowed_choices": allowed_choices,
+        }
+        decision = store.create_decision(
+            execution_id=execution_id,
+            effect_id=execution["effect_id"],
+            proposal_ref=execution["proposal_ref"],
+            request_digest=canonical_digest(request_payload),
+            candidate_digest=canonical_digest(
+                {
+                    "command": approval_data.get("command"),
+                    "pattern_keys": approval_data.get("pattern_keys") or [],
+                }
+            ),
+            allowed_choices=allowed_choices,
+            expires_at=datetime.now(timezone.utc)
+            + timedelta(seconds=max(float(_get_approval_timeout()), 0.0)),
+        )
+        request_id = str(approval_data.get("request_id") or "")
+        if not request_id:
+            raise RuntimeError("approval request is missing its host request_id")
+        self._run_decision_ids.setdefault(run_id, {})[request_id] = decision[
+            "decision_id"
+        ]
+        return decision
+
+    def _resolve_execution_contract_decision(
+        self,
+        run_id: str,
+        choice: str,
+        *,
+        request_id: Optional[str] = None,
+        decision_id: Optional[str] = None,
+    ) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+        mappings = self._run_decision_ids.get(run_id, {})
+        if not mappings:
+            return None, None
+        if request_id is None:
+            from tools.approval import list_gateway_approvals
+
+            pending = list_gateway_approvals(run_id)
+            request_id = str(pending[0].get("request_id")) if pending else None
+        expected_decision_id = mappings.get(str(request_id or ""))
+        if expected_decision_id is None:
+            raise RuntimeError("durable decision binding is unavailable")
+        if decision_id and decision_id != expected_decision_id:
+            from hermes_cli.execution_contract import ContractConflictError
+
+            raise ContractConflictError("decision_id does not match the pending request")
+        from hermes_cli.execution_contract import canonical_digest
+
+        resolved = self._execution_contract_store().resolve_decision(
+            expected_decision_id,
+            choice=choice,
+            resolution_evidence_digest=canonical_digest(
+                {
+                    "decision_id": expected_decision_id,
+                    "request_id": request_id,
+                    "run_id": run_id,
+                    "choice": choice,
+                    "transport": "api_server_bearer",
+                }
+            ),
+        )
+        return resolved, request_id
+
+    def record_execution_effect_evidence(
+        self,
+        *,
+        run_id: str,
+        effect_id: str,
+        outcome: str,
+        subject_digest: str,
+        evidence_digest: str,
+        result_digest: str,
+        decision_id: Optional[str] = None,
+        recovery_ref: Optional[str] = None,
+        reconciliation_ref: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Closed executor hook required before an authoritative receipt exists.
+
+        Tool/executor integrations call this with their own exact effect
+        evidence. Generic chat output, session history, Kanban summaries, and
+        the process-local run status are intentionally not accepted here.
+        """
+        execution_id = self._run_execution_ids.get(run_id)
+        if not execution_id:
+            execution = self._execution_contract_store().get_execution_by_source_run_id(
+                run_id
+            )
+            execution_id = execution["execution_id"]
+        store = self._execution_contract_store()
+        if reconciliation_ref is not None:
+            return store.reconcile_ambiguous_evidence(
+                execution_id=execution_id,
+                effect_id=effect_id,
+                outcome=outcome,
+                subject_digest=subject_digest,
+                evidence_digest=evidence_digest,
+                result_digest=result_digest,
+                decision_id=decision_id,
+                recovery_ref=recovery_ref,
+                reconciliation_ref=reconciliation_ref,
+            )
+        return store.record_effect_evidence(
+            execution_id=execution_id,
+            effect_id=effect_id,
+            outcome=outcome,
+            subject_digest=subject_digest,
+            evidence_digest=evidence_digest,
+            result_digest=result_digest,
+            decision_id=decision_id,
+            recovery_ref=recovery_ref,
+            reconciliation_ref=reconciliation_ref,
+        )
+
     @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
@@ -6651,6 +7514,14 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
+
+        try:
+            execution_context = self._parse_execution_contract_context(body)
+        except ValueError as exc:
+            return web.json_response(
+                _openai_error(str(exc), code="invalid_execution_context"),
+                status=400,
+            )
 
         raw_input = body.get("input")
         if not raw_input:
@@ -6722,6 +7593,13 @@ class APIServerAdapter(BasePlatformAdapter):
 
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = session_id or run_id
+        try:
+            durable_execution = self._create_execution_contract_run(
+                run_id,
+                execution_context,
+            )
+        except Exception as exc:
+            return self._execution_contract_error_response(exc)
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
@@ -6765,6 +7643,7 @@ class APIServerAdapter(BasePlatformAdapter):
             created_at=created_at,
             session_id=session_id,
             model=body.get("model", self._model_name),
+            execution_id=durable_execution["execution_id"],
         )
 
         # Background task outlives the HTTP response (and thus the middleware
@@ -6774,6 +7653,8 @@ class APIServerAdapter(BasePlatformAdapter):
         async def _run_and_close():
             try:
                 self._set_run_status(run_id, "running")
+                with self._profile_scope(request_profile):
+                    self._transition_execution_contract_run(run_id, "running")
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
@@ -6785,6 +7666,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         "cancelled",
                         last_event="run.cancelled",
                     )
+                    with self._profile_scope(request_profile):
+                        self._terminalize_execution_contract_run(
+                            run_id,
+                            "cancelled",
+                            reason_code="stopped_before_agent_start",
+                        )
                     return
                 with self._profile_scope(request_profile):
                     agent = self._create_agent(
@@ -6810,14 +7697,44 @@ class APIServerAdapter(BasePlatformAdapter):
                         from gateway.run import _redact_approval_command
 
                         event["command"] = _redact_approval_command(event.get("command"))
+                    choices = _approval_event_choices(
+                        smart_denied=bool(event.get("smart_denied")),
+                        allow_permanent=event.get("allow_permanent") is not False,
+                    )
+                    try:
+                        decision = self._create_execution_contract_decision(
+                            run_id,
+                            event,
+                            choices,
+                        )
+                        if decision is None:
+                            self._transition_execution_contract_run(
+                                run_id,
+                                "awaiting_decision",
+                            )
+                        else:
+                            event.update(
+                                {
+                                    "decision_id": decision["decision_id"],
+                                    "request_digest": decision["request_digest"],
+                                    "candidate_digest": decision["candidate_digest"],
+                                    "expires_at": decision["expires_at"],
+                                }
+                            )
+                    except Exception as exc:
+                        self._mark_execution_contract_degraded()
+                        logger.exception(
+                            "Durable approval publication failed for run=%s",
+                            run_id,
+                        )
+                        raise RuntimeError(
+                            "durable approval publication failed closed"
+                        ) from exc
                     event.update({
                         "event": "approval.request",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
-                            allow_permanent=event.get("allow_permanent") is not False,
-                        ),
+                        "choices": choices,
                     })
                     self._set_run_status(
                         run_id,
@@ -6910,6 +7827,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         "cancelled",
                         last_event="run.cancelled",
                     )
+                    with self._profile_scope(request_profile):
+                        self._terminalize_execution_contract_run(
+                            run_id,
+                            "cancelled",
+                            reason_code="stop_requested",
+                        )
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
@@ -6927,6 +7850,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         error=error_msg,
                         last_event="run.failed",
                     )
+                    with self._profile_scope(request_profile):
+                        self._terminalize_execution_contract_run(
+                            run_id,
+                            "failed",
+                            reason_code="agent_reported_failure",
+                        )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                     # Undelivered steer text (accepted after the final response;
@@ -6951,6 +7880,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.completed",
                         **({"pending_steer": pending_steer} if pending_steer else {}),
                     )
+                    with self._profile_scope(request_profile):
+                        self._terminalize_execution_contract_run(run_id, "completed")
             except asyncio.CancelledError:
                 self._set_run_status(
                     run_id,
@@ -6965,6 +7896,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     })
                 except Exception:
                     pass
+                with self._profile_scope(request_profile):
+                    self._terminalize_execution_contract_run(
+                        run_id,
+                        "cancelled",
+                        reason_code="task_cancelled",
+                    )
                 raise
             except _ProviderAuthResolutionError as exc:
                 # /v1/runs builds its own agent via _create_agent() and does
@@ -6991,6 +7928,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     })
                 except Exception:
                     pass
+                with self._profile_scope(request_profile):
+                    self._terminalize_execution_contract_run(
+                        run_id,
+                        "failed",
+                        reason_code="provider_authentication_failed",
+                    )
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
                 self._set_run_status(
@@ -7008,6 +7951,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     })
                 except Exception:
                     pass
+                with self._profile_scope(request_profile):
+                    self._terminalize_execution_contract_run(
+                        run_id,
+                        "failed",
+                        reason_code="agent_exception",
+                    )
             finally:
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
@@ -7044,7 +7993,11 @@ class APIServerAdapter(BasePlatformAdapter):
             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
         )
         return web.json_response(
-            {"run_id": run_id, "status": "started"},
+            {
+                "run_id": run_id,
+                "execution_id": durable_execution["execution_id"],
+                "status": "started",
+            },
             status=202,
             headers=response_headers,
         )
@@ -7162,6 +8115,28 @@ class APIServerAdapter(BasePlatformAdapter):
             _coerce_request_bool(body.get("all"), default=False)
             or _coerce_request_bool(body.get("resolve_all"), default=False)
         )
+        durable_decision = None
+        durable_request_id = str(body.get("request_id") or "").strip() or None
+        requested_decision_id = str(body.get("decision_id") or "").strip() or None
+        if self._run_decision_ids.get(run_id) and resolve_all:
+            return web.json_response(
+                _openai_error(
+                    "resolve_all is not supported for durable decisions; resolve one exact decision_id",
+                    code="durable_decision_requires_exact_binding",
+                ),
+                status=409,
+            )
+        try:
+            durable_decision, durable_request_id = (
+                self._resolve_execution_contract_decision(
+                    run_id,
+                    choice,
+                    request_id=durable_request_id,
+                    decision_id=requested_decision_id,
+                )
+            )
+        except Exception as exc:
+            return self._execution_contract_error_response(exc)
         try:
             from tools.approval import resolve_gateway_approval
 
@@ -7169,12 +8144,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 approval_session_key,
                 choice,
                 resolve_all=resolve_all,
+                request_id=durable_request_id,
             )
         except Exception as exc:
             logger.exception("[api_server] approval resolution failed for run %s", run_id)
+            if durable_decision is not None:
+                self._terminalize_execution_contract_run(
+                    run_id,
+                    "ambiguous",
+                    reason_code="approval_delivery_failed",
+                )
             return web.json_response(_openai_error(str(exc)), status=500)
 
         if resolved <= 0:
+            if durable_decision is not None:
+                self._terminalize_execution_contract_run(
+                    run_id,
+                    "ambiguous",
+                    reason_code="approval_target_missing",
+                )
             return web.json_response(
                 _openai_error(
                     f"Run has no pending approval: {run_id}",
@@ -7193,6 +8181,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     "timestamp": time.time(),
                     "choice": choice,
                     "resolved": resolved,
+                    **(
+                        {"decision_id": durable_decision["decision_id"]}
+                        if durable_decision is not None
+                        else {}
+                    ),
                 })
             except Exception:
                 pass
@@ -7202,6 +8195,14 @@ class APIServerAdapter(BasePlatformAdapter):
             "run_id": run_id,
             "choice": choice,
             "resolved": resolved,
+            **(
+                {
+                    "decision_id": durable_decision["decision_id"],
+                    "request_id": durable_request_id,
+                }
+                if durable_decision is not None
+                else {}
+            ),
         })
 
     async def _handle_steer_run(self, request: "web.Request") -> "web.Response":
@@ -7278,6 +8279,11 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
         self._set_run_status(run_id, "stopping", last_event="run.stopping")
+        self._transition_execution_contract_run(
+            run_id,
+            "cancellation_requested",
+            reason_code="stop_requested",
+        )
         self._stopping_run_ids.add(run_id)
 
         if agent is not None:
@@ -7301,6 +8307,10 @@ class APIServerAdapter(BasePlatformAdapter):
         while True:
             await asyncio.sleep(60)
             self._sweep_orphaned_runs_once(time.time())
+            try:
+                self._maintain_execution_contract_state(recover=False)
+            except Exception:
+                logger.exception("Execution contract maintenance failed")
 
     def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
         """Expire old SSE buffers without treating transport age as run age."""
@@ -7343,6 +8353,8 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            self._run_execution_ids.pop(run_id, None)
+            self._run_decision_ids.pop(run_id, None)
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface
@@ -7388,6 +8400,112 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
         return True
 
+    def _read_api_key_passes_startup_guard(self) -> bool:
+        """Validate read keys and reject equality for every served profile."""
+        try:
+            from hermes_cli.auth import has_usable_secret
+        except Exception as exc:
+            logger.error(
+                "[%s] Refusing to start: API_SERVER_READ_KEY strength could not "
+                "be verified (%s)",
+                self.name,
+                type(exc).__name__,
+            )
+            return False
+        for profile in self._execution_contract_profiles():
+            token = _api_request_profile.set(profile)
+            try:
+                with self._profile_scope(profile):
+                    if not profile or profile == "default":
+                        full_key = self._api_key or ""
+                        read_key = self._read_api_key or ""
+                    else:
+                        from agent.secret_scope import get_secret
+
+                        full_key = get_secret("API_SERVER_KEY", "") or ""
+                        read_key = get_secret("API_SERVER_READ_KEY", "") or ""
+            except Exception as exc:
+                logger.error(
+                    "[%s] Refusing to start: profile-scoped API keys could not "
+                    "be resolved for %r (%s)",
+                    self.name,
+                    profile or "default",
+                    type(exc).__name__,
+                )
+                return False
+            finally:
+                _api_request_profile.reset(token)
+            if not read_key:
+                continue
+            if not has_usable_secret(read_key, min_length=16):
+                logger.error(
+                    "[%s] Refusing to start: API_SERVER_READ_KEY is a placeholder "
+                    "or too short (<16 chars) for profile %r",
+                    self.name,
+                    profile or "default",
+                )
+                return False
+            if full_key and hmac.compare_digest(
+                full_key.encode(),
+                read_key.encode(),
+            ):
+                logger.error(
+                    "[%s] Refusing to start: API_SERVER_READ_KEY must differ "
+                    "from API_SERVER_KEY for profile %r",
+                    self.name,
+                    profile or "default",
+                )
+                return False
+        return True
+
+    def _execution_contract_profiles(self) -> list[Optional[str]]:
+        profiles: list[Optional[str]] = [None]
+        runner = getattr(self, "gateway_runner", None)
+        cfg = getattr(runner, "config", None)
+        if getattr(cfg, "multiplex_profiles", False):
+            from hermes_cli.profiles import profiles_to_serve
+
+            profiles = []
+            for name, _home in profiles_to_serve(
+                multiplex=True,
+                profile_allowlist=getattr(
+                    cfg,
+                    "multiplex_profile_allowlist",
+                    None,
+                ),
+            ):
+                profiles.append(None if name == "default" else name)
+        return profiles
+
+    def _maintain_execution_contract_state(self, *, recover: bool) -> None:
+        """Migrate, expire, prune, and optionally recover every served profile."""
+        profiles = self._execution_contract_profiles()
+        for profile in profiles:
+            token = _api_request_profile.set(profile)
+            try:
+                with self._profile_scope(profile):
+                    store = self._execution_contract_store()
+                    store.initialize()
+                    if recover:
+                        store.recover_orphaned_executions(
+                            recovery_ref=(
+                                f"api-server-restart:{self._execution_contract_runtime_id}"
+                            )
+                        )
+                    store.expire_decisions()
+                    store.prune_events()
+            except Exception:
+                self._execution_contract_degraded_profiles.add(
+                    profile or "default"
+                )
+                raise
+            finally:
+                _api_request_profile.reset(token)
+
+    def _initialize_execution_contract_state(self) -> None:
+        """Migrate and recover every profile before the listener accepts reads."""
+        self._maintain_execution_contract_state(recover=True)
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Start the aiohttp web server."""
         if not AIOHTTP_AVAILABLE:
@@ -7420,11 +8538,36 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             return False
 
+        if not self._read_api_key_passes_startup_guard():
+            self._set_fatal_error(
+                "api_server_read_key_invalid",
+                "API_SERVER_READ_KEY was rejected by the startup guard. Generate "
+                "a strong secret or remove it to disable read-only access.",
+                retryable=False,
+            )
+            return False
+
+        try:
+            self._initialize_execution_contract_state()
+        except Exception as exc:
+            logger.error(
+                "[%s] Refusing to start: execution contract initialization failed (%s)",
+                self.name,
+                type(exc).__name__,
+            )
+            self._set_fatal_error(
+                "execution_contract_unavailable",
+                "The durable execution contract could not be initialized or recovered.",
+                retryable=False,
+            )
+            return False
+
         try:
             mws = [
                 mw
                 for mw in (
                     self._make_profile_prefix_middleware(),
+                    self._make_execution_contract_router_error_middleware(),
                     cors_middleware,
                     body_limit_middleware,
                     security_headers_middleware,

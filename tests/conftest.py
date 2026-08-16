@@ -224,6 +224,7 @@ _CREDENTIAL_NAMES = frozenset({
     "SUDO_PASSWORD",
     "GATEWAY_PROXY_KEY",
     "API_SERVER_KEY",
+    "API_SERVER_READ_KEY",
     "TOOL_GATEWAY_USER_TOKEN",
     "TELEGRAM_WEBHOOK_SECRET",
     "WEBHOOK_SECRET",
@@ -414,6 +415,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "API_SERVER_HOST",
     "API_SERVER_PORT",
     "API_SERVER_KEY",
+    "API_SERVER_READ_KEY",
     "API_SERVER_CORS_ORIGINS",
     "API_SERVER_MODEL_NAME",
     # Platform gating — set by load_gateway_config() as a side effect when
