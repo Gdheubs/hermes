@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import queue
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -38,6 +39,7 @@ from agent.replay_cleanup import sanitize_replay_history
 from agent.skill_commands import describe_skill_invocation
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe
+from tui_gateway.prompt_intents import PromptIntentClaim, PromptIntentLedger
 from tui_gateway.turn_marker import (
     clear_turn_marker,
     read_turn_marker,
@@ -1220,6 +1222,13 @@ except (TypeError, ValueError):
     _SESSION_TTL_S = float(6 * 3600)
 _SESSION_TTL_S = max(0.0, _SESSION_TTL_S)
 _REAPER_SCAN_S = 300.0
+
+# Accepted prompt intents outlive any one ephemeral runtime session id, so a
+# lost-ack retry after session.resume still collapses onto the original turn.
+_prompt_intents = PromptIntentLedger(
+    db_path=_hermes_home / "state" / "prompt_intents.sqlite3",
+    session_ttl_s=_SESSION_TTL_S,
+)
 
 
 def _transport_is_dead(transport) -> bool:
@@ -2495,6 +2504,176 @@ def _start_agent_build(sid: str, session: dict) -> None:
 def _sess_nowait(params, rid):
     s = _sessions.get(params.get("session_id") or "")
     return (s, None) if s else (None, _err(rid, 4001, "session not found"))
+
+
+def _prompt_submit_session_contract(
+    params: dict, rid, session: dict
+) -> dict | None:
+    """Return a fail-closed durable-destination error, if any.
+
+    ``session_id`` is only the live runtime handle. New desktop clients also
+    send the stored conversation they selected, which must still identify this
+    session before prompt.submit mutates transport, history, inflight state, or
+    persistence. Omission remains compatible with older clients.
+
+    Normal sessions accept a compression ancestor by resolving both sides
+    through the session's profile-correct DB. An unupgraded lazy/watch session
+    is exact-child only: its parent lineage is not an equivalent destination.
+    """
+    expected = str(
+        params.get("expected_stored_session_id")
+        or params.get("expected_session_key")
+        or ""
+    ).strip()
+    runtime_id = str(params.get("session_id") or "").strip()
+    live_lookup = _session_lookup_key(session, fallback=runtime_id).strip()
+    current_ids = {
+        str(session.get("session_key") or "").strip(),
+        str(session.get("resume_session_id") or "").strip(),
+        live_lookup,
+    }
+    current_ids.discard("")
+
+    # No durable assertion means there is nothing to resolve. This preserves
+    # the legacy fast path and avoids opening the profile session database for
+    # lineage resolution solely because a submit carries a client request id.
+    if not expected:
+        return None
+
+    # The normal desktop path names the live durable id exactly. Reserve DB
+    # lineage resolution for compression ancestors that are not exact matches.
+    if expected in current_ids:
+        return None
+
+    resolved_expected = expected
+    resolved_current_ids = set(current_ids)
+    lazy_watch = bool(session.get("lazy") and session.get("agent") is None)
+
+    if not lazy_watch:
+        try:
+            with _session_db(session) as db:
+                resolver = (
+                    getattr(db, "resolve_resume_session_id", None)
+                    if db is not None
+                    else None
+                )
+                if callable(resolver):
+                    if expected:
+                        resolved_expected = str(
+                            resolver(expected) or expected
+                        ).strip()
+                    resolved_current_ids = {
+                        str(resolver(current) or current).strip()
+                        for current in current_ids
+                    }
+                    resolved_current_ids.discard("")
+        except Exception:
+            logger.debug(
+                "failed to resolve prompt.submit session contract", exc_info=True
+            )
+
+    matches = (
+        not lazy_watch
+        and bool(resolved_expected)
+        and resolved_expected in resolved_current_ids
+    )
+    if matches:
+        return None
+
+    live = ", ".join(sorted(current_ids)) or "unknown"
+    if resolved_current_ids != current_ids or resolved_expected != expected:
+        resolved = ", ".join(sorted(resolved_current_ids)) or "unknown"
+        live = f"{live} (resolved: {resolved})"
+    return _err(
+        rid,
+        4019,
+        f"stored session mismatch: expected {expected!r}; live session is {live}",
+    )
+
+
+def _claim_prompt_submit_intent(
+    params: dict, rid, session: dict
+) -> dict | None:
+    """Atomically reserve a client prompt intent, or return its retry result."""
+    client_request_id = str(params.get("client_request_id") or "").strip()
+    if not client_request_id:
+        return None
+
+    try:
+        claim = _prompt_intents.claim(
+            profile_scope=str(session.get("profile_home") or get_hermes_home()),
+            request_id=client_request_id,
+            route_identity=(
+                params.get("expected_stored_session_id")
+                or params.get("expected_session_key")
+                or _session_lookup_key(
+                    session, fallback=str(params.get("session_id") or "")
+                )
+            ),
+            text=params.get("text"),
+            truncate_ordinal=params.get("truncate_before_user_ordinal"),
+        )
+    except sqlite3.Error:
+        logger.warning("prompt intent ledger unavailable", exc_info=True)
+        return _err(
+            rid,
+            4022,
+            "prompt idempotency is temporarily unavailable; retry later",
+        )
+    if claim is PromptIntentClaim.ACCEPTED:
+        return None
+    if claim is PromptIntentClaim.DUPLICATE:
+        # A busy-path submit can land in the head slot or in the overflow
+        # list, and a text merge can move it between them, so scan every
+        # envelope rather than just the head.
+        queued_match = False
+        for envelope in (
+            session.get("queued_prompt"),
+            *(session.get("queued_prompts") or ()),
+        ):
+            if not isinstance(envelope, dict):
+                continue
+            if client_request_id in (envelope.get("client_request_ids") or ()):
+                # The original queued acknowledgement may have been lost with
+                # its websocket. A matching durable retry must move the
+                # eventual drain to this request's freshly rebound transport.
+                envelope["transport"] = session.get("transport")
+                queued_match = True
+                break
+        status = (
+            "queued"
+            if queued_match
+            else ("streaming" if session.get("running") else "complete")
+        )
+        payload = {"duplicate": True, "status": status}
+        if status == "complete":
+            # prompt.submit holds history_lock while claiming. Returning the
+            # transcript here makes completion + hydration one atomic snapshot,
+            # closing the race where an earlier session.resume saw the turn
+            # streaming just before this duplicate observed it complete.
+            payload["messages"] = list(session.get("history", []))
+        return _ok(rid, payload)
+    if claim is PromptIntentClaim.CONFLICT:
+        return _err(
+            rid,
+            4020,
+            "client_request_id was already used for a different prompt",
+        )
+    if claim is PromptIntentClaim.INVALID:
+        return _err(rid, 4021, "client_request_id must be at most 256 characters")
+    return _err(
+        rid,
+        4022,
+        "prompt idempotency is temporarily unavailable; retry later",
+    )
+
+
+def _abort_prompt_submit_intent(params: dict, session: dict) -> None:
+    """Release an accepted intent when setup failed before agent execution."""
+    _prompt_intents.abort(
+        profile_scope=str(session.get("profile_home") or get_hermes_home()),
+        request_id=str(params.get("client_request_id") or ""),
+    )
 
 
 def _sess(params, rid):
@@ -5393,7 +5572,8 @@ def _current_profile_name() -> str:
 # v5: uvicorn ws_max_size raised for one-shot base64 file.attach frames (>16 MiB).
 # v6: plugins.manage list rows carry the canonical registry key; toggles are
 #     key-addressed (keyless rows render read-only in Desktop Settings).
-DESKTOP_BACKEND_CONTRACT = 6
+# v7: adds prompt.submit durable-destination validation and retry idempotency.
+DESKTOP_BACKEND_CONTRACT = 7
 
 
 def _session_usage_snapshot(session: dict | None) -> dict:
@@ -7811,6 +7991,7 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    client_request_id: str = "",
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -7820,6 +8001,10 @@ def _enqueue_prompt(
     separate envelopes, so their attachment ownership and chronology survive.
     ``transport`` is pinned so the drained turn streams back to the client that
     sent it even if the session transport is rebound meanwhile.
+
+    ``client_request_id`` rides on whichever envelope ends up carrying the
+    text, so a durable retry of a queued prompt can find its envelope and
+    rebind the drain to the retry's transport instead of a dead socket.
     """
     image_paths = list(image_paths or [])
     # #84417: scrub any live-turn self-duplicates first so the consecutive-text
@@ -7839,6 +8024,8 @@ def _enqueue_prompt(
     queued = {"text": text, "transport": transport}
     if image_paths:
         queued["image_paths"] = image_paths
+    if client_request_id:
+        queued["client_request_ids"] = [client_request_id]
     existing = session.get("queued_prompt")
     if (
         existing
@@ -7850,6 +8037,14 @@ def _enqueue_prompt(
     ):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
+        # The merged text is now carried by the existing envelope, so this
+        # request's id has to travel with it — otherwise a retry cannot find
+        # the envelope its prompt actually ended up in.
+        if client_request_id:
+            merged_ids = list(existing.get("client_request_ids") or ())
+            if client_request_id not in merged_ids:
+                merged_ids.append(client_request_id)
+            existing["client_request_ids"] = merged_ids
         return
     if existing:
         session.setdefault("queued_prompts", []).append(queued)
@@ -7969,7 +8164,13 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
 
 
 def _handle_busy_submit(
-    rid, sid: str, session: dict, text: Any, transport: Any, queued: bool = False
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    transport: Any,
+    queued: bool = False,
+    client_request_id: str = "",
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -8047,7 +8248,13 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        _enqueue_prompt(
+            session,
+            text,
+            transport,
+            image_paths=image_paths,
+            client_request_id=client_request_id,
+        )
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without

@@ -303,15 +303,30 @@ def _(rid, params: dict) -> dict:
             logger.info("prompt.submit: typed stop phrase — voice chat ended")
             return _ok(rid, {"voice_stopped": True})
     truncate_user_ordinal = params.get("truncate_before_user_ordinal")
-    if params.get("interrupted"):
-        # Client-side barge-in (desktop VAD / typing over playback) — latch it
-        # so this turn's model message carries the interruption note.
+    intent_checked = False
+
+    def _latch_client_barge_in() -> None:
+        """Client-side barge-in (desktop VAD / typing over playback).
+
+        Latched only once the durable intent is accepted: a duplicate retry
+        must not leak an interruption marker into a later, unrelated turn.
+        """
+        if not params.get("interrupted"):
+            return
         from tools.tts_streaming import mark_speech_interrupted
 
         mark_speech_interrupted()
+
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    # ``session_id`` is only the live runtime handle. New clients also send the
+    # stored conversation they selected; verify it still names this session
+    # before any transport, history, or persistence mutation.
+    if (
+        contract_err := _prompt_submit_session_contract(params, rid, session)
+    ) is not None:
+        return contract_err
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     # Which desktop window this message was typed into. Rewritten on every
@@ -350,9 +365,26 @@ def _(rid, params: dict) -> dict:
                 busy_transport = t or session.get("transport")
             else:
                 break
+        # Rewind/edit/regenerate submits must apply their history truncation
+        # atomically before the replacement turn starts. Queueing only their
+        # text would silently turn a rewind into an append. Return busy before
+        # claiming the durable id so the desktop can interrupt and retry it
+        # unchanged.
+        if has_truncation:
+            return _err(rid, 4009, "session busy")
+        # Reserve the durable client intent before any busy-turn mutation. A
+        # lost-ack retry with the same id returns its original outcome here
+        # instead of steering or queueing the prompt a second time.
+        if not intent_checked:
+            retry_result = _claim_prompt_submit_intent(params, rid, session)
+            if retry_result is not None:
+                return retry_result
+            intent_checked = True
+            _latch_client_barge_in()
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            client_request_id=str(params.get("client_request_id") or "").strip(),
         )
         if busy_response is not None:
             return busy_response
@@ -633,6 +665,17 @@ def _(rid, params: dict) -> dict:
                 len(truncated),
                 ordinal,
             )
+            # Every validation gate has passed and the next step overwrites
+            # durable history, so reserve the client intent here. Claiming
+            # earlier would burn the id on a refused request; claiming later
+            # would let a lost-ack retry re-apply the cut.
+            if not intent_checked:
+                retry_result = _claim_prompt_submit_intent(params, rid, session)
+                if retry_result is not None:
+                    return retry_result
+                intent_checked = True
+                _latch_client_barge_in()
+
             # Write-before-memory (mirrors gateway hygiene / manual /compress):
             # persist the truncated transcript first. If replace_messages fails
             # after we already rewrote session["history"], the turn still runs
@@ -701,6 +744,14 @@ def _(rid, params: dict) -> dict:
                     _message_row_id(truncated[i])
                     for i in _history_user_indices(truncated)
                 ]
+        # Ordinary (non-truncating) submits reserve their intent here, still
+        # under history_lock, so a duplicate cannot start a second turn.
+        if not intent_checked:
+            retry_result = _claim_prompt_submit_intent(params, rid, session)
+            if retry_result is not None:
+                return retry_result
+            intent_checked = True
+            _latch_client_barge_in()
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
@@ -738,6 +789,11 @@ def _(rid, params: dict) -> dict:
             session["running"] = False
             session["last_active"] = time.time()
             _clear_inflight_turn(session)
+        # The turn never reached the agent, so release the reservation —
+        # otherwise the client's retry of this same prompt is refused as a
+        # duplicate of a turn that never ran.
+        if intent_checked:
+            _abort_prompt_submit_intent(params, session)
         if is_disk_full_error(exc):
             return _err(
                 rid,
@@ -771,6 +827,11 @@ def _(rid, params: dict) -> dict:
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
+            # The agent never ran, so the reservation must not outlive the
+            # failure — the user's retry of this prompt is a first attempt,
+            # not a duplicate.
+            if intent_checked:
+                _abort_prompt_submit_intent(params, session)
             _emit("session.info", sid, _session_info(session.get("agent"), session))
             return
         with session["history_lock"]:
@@ -792,6 +853,10 @@ def _(rid, params: dict) -> dict:
                         else "Session no longer running before the agent was ready"
                     },
                 )
+                # Cancelled before execution — same reasoning as the build
+                # failure above: release so the prompt can be sent again.
+                if intent_checked:
+                    _abort_prompt_submit_intent(params, session)
                 return
         _run_prompt_submit(rid, sid, session, text)
 
