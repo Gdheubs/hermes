@@ -239,6 +239,35 @@ async def test_voice_reply_is_intercepted_at_the_stt_boundary(monkeypatch):
     assert command_event.message_type == MessageType.COMMAND
 
 
+@pytest.mark.asyncio
+async def test_write_approval_reply_does_not_drive_goal_continuation():
+    from gateway.run import GatewayRunner
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    session_entry = object()
+    runner.session_store = object()
+    runner._async_session_store = SimpleNamespace(
+        _store=runner.session_store,
+        get_or_create_session=AsyncMock(return_value=session_entry),
+    )
+    runner._post_turn_goal_continuation = AsyncMock()
+    runner._post_turn_loop_completion = AsyncMock()
+    source = _event("approve abc12345", MEMORY_SURFACE).source
+
+    await runner._run_post_turn_hooks(
+        agent_result=WriteApprovalReply("Approved memory", MEMORY_SURFACE),
+        source=source,
+        is_internal=False,
+    )
+
+    runner._post_turn_goal_continuation.assert_not_awaited()
+    runner._post_turn_loop_completion.assert_awaited_once_with(
+        session_entry=session_entry,
+        source=source,
+        final_response="",
+    )
+
+
 class _CallbackRunner:
     def __init__(self, authorized=True):
         self.authorized = authorized

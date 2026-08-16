@@ -21186,6 +21186,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         (already_sent). The delivered reply is stashed on the event so
         those hooks still see it.
         """
+        if isinstance(agent_result, WriteApprovalReply):
+            return ""
         text = ""
         if isinstance(agent_result, dict):
             text = str(agent_result.get("final_response") or "")
