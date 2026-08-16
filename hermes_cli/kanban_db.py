@@ -5349,6 +5349,46 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def record_completion_rejection(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    expected_run_id: Optional[int],
+) -> dict:
+    """Classify and persist a failed completion compare-and-swap."""
+    observed_at = int(time.time())
+    task = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    run = None
+    if expected_run_id is not None:
+        run = conn.execute(
+            "SELECT ended_at, status, outcome FROM task_runs WHERE id = ?",
+            (int(expected_run_id),),
+        ).fetchone()
+    if task is None or (expected_run_id is not None and run is None):
+        reason = "run_missing"
+    elif expected_run_id is not None and task["current_run_id"] != int(expected_run_id):
+        reason = "run_superseded"
+    elif task["status"] in {"done", "archived"}:
+        reason = "task_terminal"
+    else:
+        reason = "status_mismatch"
+    payload = {
+        "reason": reason,
+        "observed_at": observed_at,
+        "expected_run_id": int(expected_run_id) if expected_run_id is not None else None,
+        "current_run_id": int(task["current_run_id"]) if task and task["current_run_id"] else None,
+        "task_status": task["status"] if task else None,
+        "run_exists": run is not None,
+        "run_ended_at": int(run["ended_at"]) if run and run["ended_at"] else None,
+        "run_status": run["status"] if run else None,
+        "run_outcome": run["outcome"] if run else None,
+    }
+    _append_event(conn, task_id, "completion_rejected", payload, run_id=expected_run_id)
+    return payload
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5475,6 +5515,9 @@ def complete_task(
                 (result, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
+            record_completion_rejection(
+                conn, task_id, expected_run_id=expected_run_id,
+            )
             return False
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
