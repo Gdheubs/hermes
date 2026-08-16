@@ -166,13 +166,59 @@ def _check_local_runtime() -> tuple[bool, str | None]:
     aborts at startup on every retain/recall. Import it too so the probe (and
     status) reports the real ImportError.
     """
+    # Perf: the heavy imports below (torch/transformers via `hindsight` and
+    # `sentence_transformers`) cost ~10s in EVERY Hermes process (CLI, cron,
+    # subagents). The breakage this probe guards against (old-CPU NumPy
+    # runtime errors) is a property of the installed package versions, not of
+    # each boot, so cache the verdict in a stamp file keyed by exact package
+    # versions. Version change (upgrade/downgrade) invalidates the stamp and
+    # re-runs the full probe once.
+    import json as _json
+    import platform as _platform
+
+    stamp_path = os.path.join(
+        os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"),
+        "state", "hindsight_runtime_probe.json",
+    )
+    sig = None
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        sig = {
+            "python": _platform.python_version(),
+            **{pkg: _pkg_version(pkg) for pkg in (
+                "hindsight-client", "sentence-transformers", "torch", "numpy",
+            )},
+        }
+    except Exception:
+        sig = None
+
+    if sig is not None:
+        try:
+            with open(stamp_path, "r", encoding="utf-8") as fh:
+                stamp = _json.load(fh)
+            if stamp.get("ok") and stamp.get("sig") == sig:
+                return True, None
+        except Exception:
+            pass
+
     try:
         importlib.import_module("hindsight")
         importlib.import_module("hindsight_embed.daemon_embed_manager")
         importlib.import_module("sentence_transformers")
-        return True, None
     except Exception as exc:
         return False, str(exc)
+
+    if sig is not None:
+        try:
+            os.makedirs(os.path.dirname(stamp_path), exist_ok=True)
+            tmp = stamp_path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                _json.dump({"ok": True, "sig": sig}, fh)
+            os.replace(tmp, stamp_path)
+        except Exception:
+            pass
+    return True, None
 
 
 def _local_runtime_hint(reason: str | None) -> str:
