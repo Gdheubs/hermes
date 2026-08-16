@@ -369,7 +369,10 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
     # computation with the gateway/CLI platform resolver.
     from hermes_cli.tools_config import enabled_mcp_server_names
     enabled_mcp = enabled_mcp_server_names(cfg)
-    if set(result) & enabled_mcp:
+    requested_mcp = {
+        name.removeprefix("mcp-") for name in result if name.removeprefix("mcp-") in enabled_mcp
+    }
+    if requested_mcp:
         return result
     for name in sorted(enabled_mcp):
         if name not in result:
