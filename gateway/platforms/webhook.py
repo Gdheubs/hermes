@@ -131,6 +131,16 @@ DEFAULT_PORT = 8644
 _INSECURE_NO_AUTH = "INSECURE_NO_AUTH"
 _DYNAMIC_ROUTES_FILENAME = "webhook_subscriptions.json"
 _RATE_WINDOW_SECONDS = 60.0
+# Raw-body HMAC-SHA256 signature headers that share the same
+# ``sha256=<hex>`` format.  The order is the validation precedence: the first
+# header present wins and validation fails closed if it is invalid, so a
+# captured/invalid higher-priority signature can never fall through to a
+# second header and silently change the selected protocol.  Keep this list
+# sorted by priority and extend it when another HMAC-format sender is added.
+_RAW_HMAC_SIGNATURE_HEADERS = (
+    "X-Hub-Signature-256",  # GitHub
+    "X-Redmine-Signature-256",  # Redmine 7
+)
 # Hostnames/IP literals that only serve connections originating on the same
 # machine. Anything else is treated as a public bind for safety-rail purposes.
 _LOOPBACK_HOSTS = frozenset({
@@ -1092,14 +1102,10 @@ class WebhookAdapter(BasePlatformAdapter):
                 signature_header=svix_signature,
             )
 
-        # GitHub and Redmine use the same raw-body HMAC-SHA256 format:
-        #   X-Hub-Signature-256 = sha256=<hex>
-        #   X-Redmine-Signature-256 = sha256=<hex>
-        #
-        # Preserve deterministic precedence and fail closed when both are
-        # present: an invalid higher-priority header must not fall through to
-        # a second valid header and silently change the selected protocol.
-        for header in ("X-Hub-Signature-256", "X-Redmine-Signature-256"):
+        # All headers in _RAW_HMAC_SIGNATURE_HEADERS use the same raw-body
+        # HMAC-SHA256 format (``sha256=<hex>``); see the constant for the
+        # documented precedence and fail-closed contract.
+        for header in _RAW_HMAC_SIGNATURE_HEADERS:
             signature = request.headers.get(header, "")
             if not signature:
                 continue
