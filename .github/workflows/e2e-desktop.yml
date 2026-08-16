@@ -46,12 +46,19 @@ jobs:
         run: |
           npm i -g npm@12
 
-      # Full npm ci (not --ignore-scripts): electron's postinstall
-      # downloads the binary we launch, and node-pty's native build is
-      # needed for the terminal pane.
+      # Full npm ci (not --ignore-scripts): node-pty's native build is
+      # needed for the terminal pane. Electron 42+ no longer downloads its
+      # binary from postinstall -- the first `npx electron` invocation
+      # triggers the on-demand download instead, so we force that
+      # explicitly rather than relying on it happening implicitly before
+      # the app under test launches.
       - uses: ./.github/actions/retry
         with:
           command: npm ci
+
+      - name: Warm up electron binary (postinstall no longer auto-downloads on 42+)
+        working-directory: apps/desktop
+        run: npx electron --version
 
       # ── Python (for the hermes serve backend) ──────────────────────────
       - name: Install uv
