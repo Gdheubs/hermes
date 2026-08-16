@@ -7596,6 +7596,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cache_write_tokens: int = 0,
         reasoning_tokens: int = 0,
         estimated_cost_usd: Optional[float] = None,
+        api_call_count: int = 1,
     ) -> None:
         """Record an auxiliary LLM call's usage against *session_id* (issue #23270).
 
@@ -7636,7 +7637,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 actual_cost_usd=None,
                 cost_status=None,
                 cost_source=None,
-                api_call_count=1,
+                api_call_count=api_call_count or 1,
                 task=task,
             )
         self._execute_write(_do)
