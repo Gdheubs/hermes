@@ -1833,7 +1833,7 @@ class AIAgent:
         # (``auxiliary.background_review.enabled: false``). Manual ``/refine``
         # still works — same contract as zeroing the nudge intervals (#87250).
         # Load the task block once here and pass it into the spawn path so
-        # prompt_file / max_iterations / aux routing do not re-read config.
+        # aux routing does not re-read config.
         task_cfg = None
         if focus is None:
             from agent.background_review import load_background_review_settings
@@ -3864,6 +3864,15 @@ class AIAgent:
                     "(another Hermes process was writing to the state "
                     "database). Your message should already be saved — "
                     "please send it again in a moment."
+                )
+            if cause == "corrupt":
+                return (
+                    prefix
+                    + "the turn was stopped because the state database "
+                    "reported structural corruption (the transcript would "
+                    "have been lost on restart). Freeing disk space will "
+                    "not help — run `hermes doctor` to repair the state "
+                    "database, then send your message again."
                 )
             if cause == "disk":
                 return (
