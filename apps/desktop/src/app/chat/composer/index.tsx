@@ -15,6 +15,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { cn } from '@/lib/utils'
 import { interceptsTypedVoiceStop } from '@/lib/voice-stop-word'
 import { sessionCompacting } from '@/store/compaction'
+import { $composerEnterSends } from '@/store/composer-enter'
 import { browseBackward, browseForward, deriveUserHistory, isBrowsingHistory } from '@/store/composer-input-history'
 import { POPOUT_WIDTH_REM } from '@/store/composer-popout'
 import { parkQueuedPrompts, removeQueuedPrompt, unparkQueuedPrompts } from '@/store/composer-queue'
@@ -839,7 +840,18 @@ export function ChatBar({
       return
     }
 
-    if (event.key === 'Enter' && !event.shiftKey) {
+    // Plain Enter sends by default; the "New line" composer setting swaps the
+    // two bare-Enter roles so Enter inserts a newline and Shift+Enter sends.
+    // Read the pref imperatively (not via a render subscription) — the handler
+    // must never re-render on its changes. The contentEditable grants the
+    // non-send path its native newline for free: when Enter isn't the send
+    // key this branch simply returns without preventDefault, so Shift+Enter
+    // (Enter with the send key) becomes the newline in default mode, and plain
+    // Enter in new-line mode. Cmd/Ctrl+Enter above is untouched either way.
+    const composerEnterSends = $composerEnterSends.get()
+    const enterSends = composerEnterSends ? !event.shiftKey : event.shiftKey
+
+    if (event.key === 'Enter' && enterSends) {
       event.preventDefault()
 
       // Decide from the DOM, not React state. `hasComposerPayload` is derived

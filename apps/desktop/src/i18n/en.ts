@@ -612,7 +612,12 @@ export const en: Translations = {
       attachmentSizeDesc:
         'How big a local file Desktop will load for previews and image attach, in MB. Default is 16. Remote non-image attach uses a separate 256 MB cap. Setting this very high loads the whole file into memory and can freeze or crash the app.',
       attachmentSizeUnit: 'MB',
-      attachmentSizeLabel: 'Max preview / image load size in megabytes'
+      attachmentSizeLabel: 'Max preview / image load size in megabytes',
+      enterBehaviorTitle: 'Press Enter to send',
+      enterBehaviorDesc:
+        'What a bare Enter does in the composer. Send matches most chat apps; New line inserts a line break (Shift+Enter sends).',
+      enterBehaviorSend: 'Send',
+      enterBehaviorNewLine: 'New line'
     },
     quickEntry: {
       enabledTitle: 'Quick Entry',

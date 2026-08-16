@@ -6,9 +6,11 @@ import { useSearchParams } from 'react-router'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { SegmentedControl } from '@/components/ui/segmented-control'
 import { getElevenLabsVoices, getHermesConfigSchema, saveHermesConfig } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
+import { $composerEnterSends, setComposerEnterSends } from '@/store/composer-enter'
 import {
   $dataUrlReadMaxMb,
   clampDataUrlReadMaxMb,
@@ -340,10 +342,16 @@ export function ConfigSettings({
           <QuickEntrySettings />
         </>
       )}
-      {/* Device-local attach/preview byte cap (main-process IPC guard). Chat is
-          where image-attachment behavior already lives, so this sits above the
-          schema fields for that section. */}
-      {activeSectionId === 'chat' ? <AttachmentSizeSetting /> : null}
+      {/* Device-local attach/preview byte cap (main-process IPC guard) and the
+          Enter-key behavior toggle (renderer persistentAtom). Chat is where
+          image-attachment and composer behavior already live, so these sit
+          above the schema fields for that section. */}
+      {activeSectionId === 'chat' ? (
+        <>
+          <ComposerEnterSetting />
+          <AttachmentSizeSetting />
+        </>
+      ) : null}
       {visibleFields.length === 0 && activeSectionId !== 'chat' ? (
         <EmptyState description={c.emptyDesc} title={c.emptyTitle} />
       ) : visibleFields.length === 0 ? null : (
@@ -451,6 +459,33 @@ function AttachmentSizeSetting() {
       }
       description={c.attachmentSizeDesc}
       title={c.attachmentSizeTitle}
+    />
+  )
+}
+
+/** Renderer-local Enter-key behavior (persistentAtom, not config.yaml). */
+function ComposerEnterSetting() {
+  const { t } = useI18n()
+  const c = t.settings.config
+  const composerEnterSends = useStore($composerEnterSends)
+
+  return (
+    <ListRow
+      action={
+        <SegmentedControl
+          onChange={id => {
+            triggerHaptic('selection')
+            setComposerEnterSends(id === 'send')
+          }}
+          options={[
+            { id: 'send', label: c.enterBehaviorSend },
+            { id: 'newline', label: c.enterBehaviorNewLine }
+          ]}
+          value={composerEnterSends ? 'send' : 'newline'}
+        />
+      }
+      description={c.enterBehaviorDesc}
+      title={c.enterBehaviorTitle}
     />
   )
 }
