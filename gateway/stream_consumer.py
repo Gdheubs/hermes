@@ -1173,22 +1173,31 @@ class GatewayStreamConsumer:
                 # a real string like "msg_1", not "__no_edit__", so that case
                 # still resets and creates a fresh segment as intended.)
                 if got_segment_break:
-                    # If the segment-break edit failed to deliver the
-                    # accumulated content (flood control that has not yet
-                    # promoted to fallback mode, or fallback mode itself),
-                    # _accumulated still holds pre-boundary text the user
-                    # never saw. Flush that tail as a continuation message
-                    # before the reset below wipes _accumulated — otherwise
-                    # text generated before the tool boundary is silently
-                    # dropped (issue #8124).
-                    if (
-                        self._accumulated
-                        and not current_update_visible
-                        and self._message_id
-                        and self._message_id != "__no_edit__"
-                    ):
-                        await self._flush_segment_tail_on_edit_failure()
-                    self._reset_segment_state(preserve_no_edit=True)
+                    # Stream-is-the-message adapters keep one cumulative native
+                    # stream for the whole turn. Clearing _accumulated here makes
+                    # the next frame a non-prefix snapshot, so the connector's
+                    # append fallback repeats the entire answer at every tool
+                    # boundary. Preserve all stream state; only non-native draft
+                    # and edit-based transports start a new segment.
+                    if getattr(self.adapter, "draft_stream_is_message", False):
+                        pass
+                    else:
+                        # If the segment-break edit failed to deliver the
+                        # accumulated content (flood control that has not yet
+                        # promoted to fallback mode, or fallback mode itself),
+                        # _accumulated still holds pre-boundary text the user
+                        # never saw. Flush that tail as a continuation message
+                        # before the reset below wipes _accumulated — otherwise
+                        # text generated before the tool boundary is silently
+                        # dropped (issue #8124).
+                        if (
+                            self._accumulated
+                            and not current_update_visible
+                            and self._message_id
+                            and self._message_id != "__no_edit__"
+                        ):
+                            await self._flush_segment_tail_on_edit_failure()
+                        self._reset_segment_state(preserve_no_edit=True)
 
                 # Flush barrier satisfied: the buffered segment (if any) has now
                 # been finalized and delivered above, so wake the thread blocked
