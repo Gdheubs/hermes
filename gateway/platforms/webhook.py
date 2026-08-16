@@ -31,10 +31,6 @@ Security:
 """
 
 import asyncio
-import base64
-import binascii
-import hashlib
-import hmac
 import json
 import logging
 import re
@@ -63,6 +59,11 @@ from gateway.platforms.webhook_filters import (
     DEFAULT_SCRIPT_TIMEOUT_SECONDS,
     WebhookRouteProcessor,
 )
+from gateway.platforms.webhook_profile_admission import (
+    WebhookProfileAdmissionMixin,
+    _PROFILE_REJECTED,
+)
+from gateway.platforms.webhook_auth import WebhookAuthMixin, _hmac_str_equal
 from gateway.response_filters import is_autonomous_silence_response
 
 logger = logging.getLogger(__name__)
@@ -95,11 +96,6 @@ def _is_webhook_silence_response(content: Any) -> bool:
     path untouched.
     """
     return is_autonomous_silence_response(content)
-
-# Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
-# names a profile this gateway does not serve (→ 404). Distinct from None
-# (no prefix / multiplexing off → handle as the default profile).
-_PROFILE_REJECTED = object()
 
 _BUILTIN_DELIVER_PLATFORMS = {
     "telegram", "discord", "slack", "signal", "sms", "whatsapp",
@@ -155,26 +151,12 @@ def _is_loopback_host(host: Optional[str]) -> bool:
     return host.strip().lower() in _LOOPBACK_HOSTS
 
 
-def _hmac_str_equal(provided: str, expected: str) -> bool:
-    """Timing-safe equality for two ``str`` values, tolerant of non-ASCII input.
-
-    ``hmac.compare_digest`` raises ``TypeError`` when given a ``str`` that
-    contains non-ASCII characters. The ``provided`` value here is an
-    attacker-controlled signature/token header on a public, unauthenticated
-    webhook endpoint, so a single non-ASCII byte would otherwise raise out of
-    the request handler and return a 500 instead of rejecting the request.
-    Comparing as UTF-8 bytes keeps the constant-time guarantee while making a
-    hostile header fail closed with a clean rejection.
-    """
-    return hmac.compare_digest(provided.encode(), expected.encode())
-
-
 def check_webhook_requirements() -> bool:
     """Check if webhook adapter dependencies are available."""
     return AIOHTTP_AVAILABLE
 
 
-class WebhookAdapter(BasePlatformAdapter):
+class WebhookAdapter(WebhookAuthMixin, WebhookProfileAdmissionMixin, BasePlatformAdapter):
     """Generic webhook receiver that triggers agent runs from HTTP POSTs."""
 
     # No human is present to answer a "session restored — what next?" prompt:
@@ -197,10 +179,6 @@ class WebhookAdapter(BasePlatformAdapter):
         self._dynamic_routes_mtime: float = 0.0
         self._routes: Dict[str, dict] = dict(self._static_routes)
         self._runner = None
-        # Routes already warned about legacy V1 body-only signatures
-        # (once-per-route so a busy sender doesn't spam the log).
-        self._v1_signature_warned: set[str] = set()
-
         # Delivery info keyed by session chat_id.
         #
         # Read by every send() invocation for the chat_id (status messages
@@ -282,6 +260,20 @@ class WebhookAdapter(BasePlatformAdapter):
                         f"deliver is '{deliver}'. Direct delivery requires a "
                         f"real target (telegram, discord, slack, github_comment, etc.)."
                     )
+
+            # Upgrade safety: routes without an explicit signature_mode now
+            # validate with the generic_v2 default instead of header-driven
+            # inference (see webhook_auth). Surface that once at startup so
+            # existing configs that relied on auto-detection get a loud nudge
+            # to pin their provider scheme, not a silent 403 on first POST.
+            if not route.get("signature_mode"):
+                logger.warning(
+                    "[webhook] Route '%s' has no explicit signature_mode; "
+                    "defaulting to 'generic_v2'. Providers with header-based "
+                    "signatures (GitHub X-Hub-Signature-256, GitLab token, "
+                    "Svix) must pin signature_mode to their scheme.",
+                    name,
+                )
 
         # client_max_size makes aiohttp enforce the cap on every read path,
         # including Transfer-Encoding: chunked bodies that carry no
@@ -560,65 +552,6 @@ class WebhookAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("[webhook] Failed to reload dynamic routes: %s", e)
 
-    def _resolve_request_profile(self, request: "web.Request"):
-        """Resolve + validate the /p/<profile>/ URL prefix on a webhook request.
-
-        Returns:
-          - ``None`` when no profile prefix is present, or multiplexing is off
-            (the prefix is ignored, request handled as the default profile).
-          - the profile name (str) when present, multiplexing is on, and the
-            profile is one this gateway serves.
-          - ``_PROFILE_REJECTED`` when a prefix is present but the profile is
-            unknown/unconfigured (handler returns 404).
-        """
-        profile = (request.match_info.get("profile") or "").strip()
-        if not profile:
-            return None
-        runner = self.gateway_runner
-        cfg = getattr(runner, "config", None)
-        if not getattr(cfg, "multiplex_profiles", False):
-            # Prefix supplied but multiplexing is off — ignore it, behave as
-            # the single-profile gateway (don't 404 a would-be valid route).
-            return None
-        try:
-            from hermes_cli.profiles import profiles_to_serve
-            served = {
-                name
-                for name, _ in profiles_to_serve(
-                    multiplex=True,
-                    profile_allowlist=getattr(
-                        cfg, "multiplex_profile_allowlist", None
-                    ),
-                )
-            }
-        except Exception:
-            return _PROFILE_REJECTED
-        if profile not in served:
-            return _PROFILE_REJECTED
-        return profile
-
-    @staticmethod
-    def _route_allows_profile(
-        route_config: dict,
-        request_profile: Optional[str],
-    ) -> bool:
-        """Return whether a route is bound to the URL-selected profile.
-
-        Omitting ``profile`` keeps a route on the default profile. An explicit
-        null, blank, or non-string value is malformed and fails closed.
-        """
-        if "profile" not in route_config:
-            configured_profile = "default"
-        else:
-            configured_profile = route_config.get("profile")
-        if not isinstance(configured_profile, str):
-            return False
-        configured_profile = configured_profile.strip()
-        if not configured_profile:
-            return False
-        effective_profile = request_profile or "default"
-        return configured_profile == effective_profile
-
     async def _handle_webhook(self, request: "web.Request") -> "web.Response":
         """POST /webhooks/{route_name} — receive and process a webhook event."""
         # Hot-reload dynamic subscriptions on each request (mtime-gated, cheap)
@@ -703,7 +636,10 @@ class WebhookAdapter(BasePlatformAdapter):
                 status=403,
             )
         if secret != _INSECURE_NO_AUTH:
-            if not self._validate_signature(request, raw_body, secret):
+            sig_mode = route_config.get("signature_mode", "generic_v2")
+            if not self._validate_signature(
+                request, raw_body, secret, signature_mode=sig_mode
+            ):
                 logger.warning(
                     "[webhook] Invalid signature for route %s", route_name
                 )
@@ -1058,175 +994,6 @@ class WebhookAdapter(BasePlatformAdapter):
                 session_chat_id,
                 e,
             )
-
-    # ------------------------------------------------------------------
-    # Signature validation
-    # ------------------------------------------------------------------
-
-    def _validate_signature(
-        self, request: "web.Request", body: bytes, secret: str
-    ) -> bool:
-        """Validate webhook signature (GitHub, GitLab, Svix, generic HMAC-SHA256)."""
-        def _header(name: str) -> str:
-            return (
-                request.headers.get(name, "")
-                or request.headers.get(name.lower(), "")
-                or request.headers.get(name.upper(), "")
-            )
-
-        # Svix / AgentMail:
-        #   svix-id: msg_...
-        #   svix-timestamp: unix seconds
-        #   svix-signature: v1,<base64-hmac> [v1,<base64-hmac> ...]
-        # Signed content is: "{id}.{timestamp}.{raw_body}".  Svix secrets
-        # usually start with "whsec_" and the remainder is base64-encoded.
-        svix_id = _header("svix-id")
-        svix_timestamp = _header("svix-timestamp")
-        svix_signature = _header("svix-signature")
-        if svix_id or svix_timestamp or svix_signature:
-            return self._validate_svix_signature(
-                body=body,
-                secret=secret,
-                msg_id=svix_id,
-                timestamp=svix_timestamp,
-                signature_header=svix_signature,
-            )
-
-        # GitHub: X-Hub-Signature-256 = sha256=<hex>
-        gh_sig = request.headers.get("X-Hub-Signature-256", "")
-        if gh_sig:
-            expected = "sha256=" + hmac.new(
-                secret.encode(), body, hashlib.sha256
-            ).hexdigest()
-            return _hmac_str_equal(gh_sig, expected)
-
-        # GitLab: X-Gitlab-Token = <plain secret>
-        gl_token = request.headers.get("X-Gitlab-Token", "")
-        if gl_token:
-            return _hmac_str_equal(gl_token, secret)
-
-        # Generic V2: X-Webhook-Signature-V2 = <hex HMAC-SHA256 of "<timestamp>.<body>">
-        #             X-Webhook-Timestamp = <unix seconds> (required for V2)
-        # Checked independently of (and before) legacy V1 below — a sender
-        # that only ever sends V2 headers must still validate here; nesting
-        # this inside `if generic_sig:` would silently skip V2-only senders.
-        #
-        # The presence of X-Webhook-Signature-V2 alone selects V2 mode and
-        # commits to it — it must NOT fall through to the V1 branch just
-        # because the timestamp is missing/malformed/expired. A sender
-        # migrating to V2 typically sends both V1 and V2 headers together
-        # for compatibility; if incomplete V2 fell through to V1, an
-        # attacker who captured one such mixed request could strip the
-        # X-Webhook-Timestamp header from a replay and have it validate
-        # against the still-present, still-unprotected V1 signature instead
-        # — silently downgrading a V2-protected request back to the replay
-        # hole V2 exists to close.
-        v2_sig = request.headers.get("X-Webhook-Signature-V2", "")
-        if v2_sig:
-            v2_timestamp = request.headers.get("X-Webhook-Timestamp", "")
-            if not v2_timestamp:
-                logger.warning(
-                    "[webhook] Route '%s' sent X-Webhook-Signature-V2 with "
-                    "no X-Webhook-Timestamp — rejecting rather than "
-                    "falling back to legacy V1",
-                    request.match_info.get("route_name", ""),
-                )
-                return False
-            try:
-                ts = int(v2_timestamp)
-            except (TypeError, ValueError):
-                return False
-            if abs(int(time.time()) - ts) > 300:
-                logger.warning(
-                    "[webhook] Route '%s' generic HMAC V2 timestamp outside replay window",
-                    request.match_info.get("route_name", ""),
-                )
-                return False
-            signed_content = v2_timestamp.encode() + b"." + body
-            expected_v2 = hmac.new(
-                secret.encode(), signed_content, hashlib.sha256
-            ).hexdigest()
-            return _hmac_str_equal(v2_sig, expected_v2)
-
-        # Generic V1 (legacy): X-Webhook-Signature = <hex HMAC-SHA256 of body>
-        # (deprecated — no replay protection, since the signature only
-        # covers the body: a captured (body, signature) pair replays
-        # indefinitely with no timestamp binding it to a specific delivery.)
-        # Only reachable when X-Webhook-Signature-V2 was not sent at all —
-        # see the guard above.
-        generic_sig = request.headers.get("X-Webhook-Signature", "")
-        if generic_sig:
-            expected = hmac.new(
-                secret.encode(), body, hashlib.sha256
-            ).hexdigest()
-            route_name = request.match_info.get("route_name", "")
-            if route_name not in self._v1_signature_warned:
-                self._v1_signature_warned.add(route_name)
-                logger.warning(
-                    "[webhook] Route '%s' uses legacy body-only HMAC (no "
-                    "timestamp), which is vulnerable to replay attacks. Add "
-                    "an 'X-Webhook-Timestamp' header and switch to "
-                    "'X-Webhook-Signature-V2' (HMAC-SHA256 of "
-                    "'<timestamp>.<body>').",
-                    route_name,
-                )
-            return _hmac_str_equal(generic_sig, expected)
-
-        # No recognised signature header but secret is configured → reject
-        logger.debug(
-            "[webhook] Secret configured but no signature header found"
-        )
-        return False
-
-    def _validate_svix_signature(
-        self,
-        body: bytes,
-        secret: str,
-        msg_id: str,
-        timestamp: str,
-        signature_header: str,
-        tolerance_seconds: int = 300,
-    ) -> bool:
-        """Validate Svix-compatible signatures used by AgentMail webhooks."""
-        if not (msg_id and timestamp and signature_header and secret):
-            return False
-
-        try:
-            ts = int(timestamp)
-        except (TypeError, ValueError):
-            return False
-        if abs(int(time.time()) - ts) > tolerance_seconds:
-            logger.warning("[webhook] Svix signature timestamp outside replay window")
-            return False
-
-        if secret.startswith("whsec_"):
-            encoded_secret = secret.removeprefix("whsec_")
-            try:
-                key = base64.b64decode(encoded_secret, validate=True)
-            except (binascii.Error, ValueError):
-                logger.debug("[webhook] Invalid whsec_ Svix signing secret")
-                return False
-        else:
-            # Be permissive for providers that document Svix-style headers but
-            # hand out raw shared secrets rather than whsec_ base64 secrets.
-            logger.debug("[webhook] Validating Svix-style signature with raw secret")
-            key = secret.encode()
-
-        signed_content = msg_id.encode() + b"." + timestamp.encode() + b"." + body
-        expected = base64.b64encode(
-            hmac.new(key, signed_content, hashlib.sha256).digest()
-        ).decode()
-
-        # Svix can send multiple signatures separated by spaces during secret
-        # rotation. Each entry is formatted as "vN,<base64>".
-        for part in signature_header.split():
-            try:
-                version, signature = part.split(",", 1)
-            except ValueError:
-                continue
-            if version == "v1" and _hmac_str_equal(signature, expected):
-                return True
-        return False
 
     # ------------------------------------------------------------------
     # Prompt rendering

@@ -1366,6 +1366,8 @@ export interface Translations {
     fieldSkillsPlaceholder: string
     fieldDeliver: string
     fieldDeliverOnly: string
+    fieldSignatureMode: string
+    fieldSignatureModePlaceholder: string
     fieldPrompt: string
     fieldPromptPlaceholder: string
     nameRequired: string
