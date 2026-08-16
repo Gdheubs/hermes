@@ -126,10 +126,10 @@ class TestHandleFunctionCall:
         monkeypatch.setattr("hermes_cli.plugins.get_plugin_manager", lambda: manager)
         hook_calls = []
         monkeypatch.setattr(
-            "hermes_cli.plugins.invoke_hook",
+            "hermes_cli.lifecycle.invoke_hook",
             lambda hook_name, **kwargs: hook_calls.append((hook_name, kwargs)) or [],
         )
-        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
+        monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: True)
         monkeypatch.setattr("model_tools.registry.dispatch", fake_dispatch)
 
         result = json.loads(

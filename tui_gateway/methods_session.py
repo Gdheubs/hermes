@@ -124,6 +124,15 @@ def _(rid, params: dict) -> dict:
     # without requiring the user to submit a first prompt.
     _schedule_agent_build(sid)
     _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
+    _notify_session_boundary(
+        "on_session_activate",
+        key,
+        source,
+        runtime_session_id=sid,
+        reason="create",
+        running=False,
+        profile_home=profile_home,
+    )
 
     return _ok(
         rid,
@@ -415,6 +424,17 @@ def _(rid, params: dict) -> dict:
             profile_home
         )
 
+        def _notify_resume_activation(sid: str, payload: dict, session: dict) -> None:
+            _notify_session_boundary(
+                "on_session_activate",
+                _session_lookup_key(session, fallback=target),
+                session.get("source"),
+                runtime_session_id=sid,
+                reason="resume",
+                running=bool(payload.get("running")),
+                profile_home=profile_home,
+            )
+
         def _reuse_live_payload(sid: str, session: dict) -> dict:
             payload = _live_session_payload(
                 sid,
@@ -439,11 +459,16 @@ def _(rid, params: dict) -> dict:
                 payload["status"] = "streaming"
             return payload
 
-        # Fast path: if the session is already live, reuse it under the lock.
+        # Fast path: select the live session and snapshot its payload atomically,
+        # then invoke lifecycle observers after releasing the resume lock.
         with _session_resume_lock:
-            live = _find_live_session_by_key(target)
-            if live is not None:
-                return _ok(rid, _reuse_live_payload(*live))
+            live = _find_live_session_by_key(target, profile_home=profile_home)
+            payload = _reuse_live_payload(*live) if live is not None else None
+        if live is not None:
+            live_sid, live_session = live
+            assert payload is not None
+            _notify_resume_activation(live_sid, payload, live_session)
+            return _ok(rid, payload)
 
         # Lazy/watch resume: register the live session WITHOUT building an agent.
         # Used by the desktop's subagent windows — the child runs inside the
@@ -484,7 +509,10 @@ def _(rid, params: dict) -> dict:
                 lazy=True,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
-                return _ok(rid, _reuse_live_payload(*live))
+                live_sid, live_session = live
+                payload = _reuse_live_payload(live_sid, live_session)
+                _notify_resume_activation(live_sid, payload, live_session)
+                return _ok(rid, payload)
             # A delegated child mid-run emits no session events of its own — report
             # its liveness from the relay registry so the window shows a busy turn.
             child_running = _child_run_active(target)
@@ -502,22 +530,21 @@ def _(rid, params: dict) -> dict:
                 logger.debug("child-watch display projection read failed", exc_info=True)
                 display_history = history
             messages = [] if omit_messages else _history_to_messages(display_history)
-            return _ok(
-                rid,
-                {
-                    "session_id": sid,
-                    "resumed": target,
-                    "message_count": len(display_history) if omit_messages else len(messages),
-                    "messages": messages,
-                    "messages_omitted": omit_messages,
-                    "info": _lazy_resume_info(cwd, profile=profile),
-                    "inflight": None,
-                    "running": child_running,
-                    "session_key": target,
-                    "started_at": record["created_at"],
-                    "status": "streaming" if child_running else "idle",
-                },
-            )
+            payload = {
+                "session_id": sid,
+                "resumed": target,
+                "message_count": len(display_history) if omit_messages else len(messages),
+                "messages": messages,
+                "messages_omitted": omit_messages,
+                "info": _lazy_resume_info(cwd, profile=profile),
+                "inflight": None,
+                "running": child_running,
+                "session_key": target,
+                "started_at": record["created_at"],
+                "status": "streaming" if child_running else "idle",
+            }
+            _notify_resume_activation(sid, payload, record)
+            return _ok(rid, payload)
 
         # Desktop can ask for a bounded acknowledgement and hydrate the display
         # transcript through the paginated REST endpoint. Register the runtime now,
@@ -648,7 +675,10 @@ def _(rid, params: dict) -> dict:
                 resume_runtime_overrides=overrides or None,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
-                return _ok(rid, _reuse_live_payload(*live))
+                live_sid, live_session = live
+                payload = _reuse_live_payload(live_sid, live_session)
+                _notify_resume_activation(live_sid, payload, live_session)
+                return _ok(rid, payload)
 
             _schedule_agent_build(sid)
             _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
@@ -675,6 +705,7 @@ def _(rid, params: dict) -> dict:
             }
             if auto_continue is not None:
                 payload["auto_continue"] = auto_continue
+            _notify_resume_activation(sid, payload, record)
             return _ok(rid, payload)
 
         # Build the agent OUTSIDE the lock — _make_agent can block for seconds
@@ -748,16 +779,13 @@ def _(rid, params: dict) -> dict:
         # Double-checked locking: another concurrent resume may have created the
         # live session while we were building. Re-check under the lock; if it won,
         # discard our just-built agent and reuse theirs (no worker/poller wired yet).
-        with _session_resume_lock:
-            live = _find_live_session_by_key(target)
+        resume_lock_held = True
+        _session_resume_lock.acquire()
+        try:
+            live = _find_live_session_by_key(target, profile_home=profile_home)
             if live is not None:
-                try:
-                    if hasattr(agent, "close"):
-                        agent.close()
-                except Exception:
-                    pass
-                if lease is not None:
-                    lease.release()
+                # Snapshot the winner under the lock, then release before cleanup
+                # or invoking any external/plugin code.
                 other_sid, other_session = live
                 payload = _live_session_payload(
                     other_sid,
@@ -768,6 +796,16 @@ def _(rid, params: dict) -> dict:
                     omit_messages=omit_messages,
                 )
                 payload["resumed"] = target
+                _session_resume_lock.release()
+                resume_lock_held = False
+                try:
+                    if hasattr(agent, "close"):
+                        agent.close()
+                except Exception:
+                    pass
+                if lease is not None:
+                    lease.release()
+                _notify_resume_activation(other_sid, payload, other_session)
                 return _ok(rid, payload)
             try:
                 init_home_token = (
@@ -848,6 +886,9 @@ def _(rid, params: dict) -> dict:
                     lease.release()
                 return _err(rid, 5000, f"resume failed: {e}")
             session = _sessions.get(sid) or {}
+        finally:
+            if resume_lock_held:
+                _session_resume_lock.release()
     finally:
         # Every return that does NOT reach the transfer above abandons this
         # handle — session-not-found, both "resume failed" paths, the live-session
@@ -880,6 +921,7 @@ def _(rid, params: dict) -> dict:
     }
     if auto_continue is not None:
         payload["auto_continue"] = auto_continue
+    _notify_resume_activation(sid, payload, session)
     return _ok(rid, payload)
 
 
@@ -1034,16 +1076,23 @@ def _(rid, params: dict) -> dict:
         return err
     assert session is not None
 
-    return _ok(
-        rid,
-        _live_session_payload(
-            sid,
-            session,
-            touch=True,
-            transport=current_transport() or _stdio_transport,
-            omit_messages=is_truthy_value(params.get("omit_messages", False)),
-        ),
+    payload = _live_session_payload(
+        sid,
+        session,
+        touch=True,
+        transport=current_transport() or _stdio_transport,
+        omit_messages=is_truthy_value(params.get("omit_messages", False)),
     )
+    _notify_session_boundary(
+        "on_session_activate",
+        _session_lookup_key(session, fallback=sid),
+        session.get("source"),
+        runtime_session_id=sid,
+        reason="activate",
+        running=bool(payload.get("running")),
+        profile_home=session.get("profile_home"),
+    )
+    return _ok(rid, payload)
 
 
 @method("session.delete")

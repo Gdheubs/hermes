@@ -12910,6 +12910,353 @@ def test_session_create_lazy_info_reports_desktop_contract(monkeypatch):
     server._sessions.pop(resp["result"]["session_id"], None)
 
 
+def test_session_create_notifies_lifecycle_plugins(monkeypatch, tmp_path):
+    """A new Desktop session must notify plugins in its selected profile scope."""
+    from hermes_cli import lifecycle
+    from hermes_constants import get_hermes_home_override
+
+    class _FakeWorker:
+        def __init__(self, key, model, profile_home=None):
+            self.key = key
+
+        def close(self):
+            return None
+
+    profile_home = tmp_path / "profiles" / "work"
+    calls = []
+    monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_profile_home", lambda profile: profile_home)
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_new_session_key", lambda: "stored-create-hook")
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        lifecycle,
+        "invoke_hook",
+        lambda hook_name, **kwargs: calls.append(
+            (get_hermes_home_override(), hook_name, kwargs)
+        ),
+    )
+
+    resp = server.handle_request(
+        {
+            "id": "create-hook",
+            "method": "session.create",
+            "params": {"cols": 80, "source": "desktop", "profile": "work"},
+        }
+    )
+    assert resp is not None
+    runtime_session_id = resp["result"]["session_id"]
+    try:
+        assert calls == [
+            (
+                str(profile_home),
+                "on_session_activate",
+                {
+                    "session_id": "stored-create-hook",
+                    "runtime_session_id": runtime_session_id,
+                    "platform": "desktop",
+                    "reason": "create",
+                    "running": False,
+                },
+            )
+        ]
+        assert get_hermes_home_override() is None
+    finally:
+        server._sessions.pop(runtime_session_id, None)
+
+
+def test_session_resume_notifies_lifecycle_plugins(monkeypatch, tmp_path):
+    """A cold Desktop resume must notify plugins in its selected profile scope."""
+    import hermes_state
+    from hermes_cli import lifecycle
+    from hermes_constants import get_hermes_home_override
+
+    target = "stored-resume-hook"
+
+    class _FakeDB:
+        def get_session(self, session_id):
+            return {"id": session_id}
+
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+
+        def reopen_session(self, session_id):
+            assert session_id == target
+
+        def get_resume_conversations(self, session_id):
+            assert session_id == target
+            history = [{"role": "user", "content": "hello"}]
+            return history, history
+
+        def get_ancestor_display_prefix(self, session_id):
+            assert session_id == target
+            return []
+
+        def close(self):
+            return None
+
+    profile_home = tmp_path / "profiles" / "work"
+    other_profile_home = tmp_path / "profiles" / "personal"
+    other_runtime_id = "personal-runtime-collision"
+    server._sessions[other_runtime_id] = {
+        "agent": None,
+        "created_at": 123.0,
+        "history": [],
+        "history_lock": threading.RLock(),
+        "last_active": 123.0,
+        "profile_home": str(other_profile_home),
+        "running": False,
+        "session_key": target,
+        "source": "desktop",
+        "transport": server._stdio_transport,
+    }
+
+    calls = []
+    monkeypatch.setattr(server, "_profile_home", lambda profile: profile_home)
+    monkeypatch.setattr(
+        hermes_state,
+        "SessionDB",
+        lambda db_path=None: _FakeDB(),
+    )
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a: None)
+    monkeypatch.setattr(
+        lifecycle,
+        "invoke_hook",
+        lambda hook_name, **kwargs: calls.append(
+            (get_hermes_home_override(), hook_name, kwargs)
+        ),
+    )
+
+    resp = server.handle_request(
+        {
+            "id": "resume-hook",
+            "method": "session.resume",
+            "params": {
+                "session_id": target,
+                "source": "desktop",
+                "profile": "work",
+            },
+        }
+    )
+    assert resp is not None
+    assert "result" in resp, resp
+    runtime_session_id = resp["result"]["session_id"]
+    try:
+        assert runtime_session_id != other_runtime_id
+        assert calls == [
+            (
+                str(profile_home),
+                "on_session_activate",
+                {
+                    "session_id": target,
+                    "runtime_session_id": runtime_session_id,
+                    "platform": "desktop",
+                    "reason": "resume",
+                    "running": False,
+                },
+            )
+        ]
+        assert get_hermes_home_override() is None
+    finally:
+        server._sessions.pop(runtime_session_id, None)
+        server._sessions.pop(other_runtime_id, None)
+
+
+def test_session_resume_live_reuse_notifies_outside_resume_lock(monkeypatch, tmp_path):
+    """Plugin callbacks must not run while the global resume lock is held."""
+    import hermes_state
+    from hermes_cli import lifecycle
+
+    target = "stored-resume-lock-free-hook"
+    rotated_target = "rotated-resume-lock-free-hook"
+    runtime_session_id = "runtime-resume-lock-free-hook"
+    profile_home = tmp_path / "profiles" / "work"
+
+    class _FakeDB:
+        def get_session(self, session_id):
+            return {"id": session_id}
+
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+
+        def close(self):
+            return None
+
+    class _LiveAgent:
+        session_id = target
+
+    live_agent = _LiveAgent()
+    live_session = {
+        "agent": live_agent,
+        "created_at": 123.0,
+        "history": [],
+        "history_lock": threading.RLock(),
+        "last_active": 123.0,
+        "profile_home": str(profile_home),
+        "running": False,
+        "session_key": target,
+        "source": "desktop",
+        "transport": server._stdio_transport,
+    }
+    server._sessions[runtime_session_id] = live_session
+    callback_lock_free = []
+    callback_session_ids = []
+
+    def _rotating_live_payload(sid, session, **kwargs):
+        assert sid == runtime_session_id
+        assert session is live_session
+        live_agent.session_id = rotated_target
+        return {"session_id": sid, "running": False}
+
+    def _record_lock_state(hook_name, **kwargs):
+        acquired = server._session_resume_lock.acquire(blocking=False)
+        callback_lock_free.append(acquired)
+        callback_session_ids.append(kwargs["session_id"])
+        if acquired:
+            server._session_resume_lock.release()
+
+    monkeypatch.setattr(server, "_profile_home", lambda profile: profile_home)
+    monkeypatch.setattr(
+        hermes_state,
+        "SessionDB",
+        lambda db_path=None: _FakeDB(),
+    )
+    monkeypatch.setattr(server, "_live_session_payload", _rotating_live_payload)
+    monkeypatch.setattr(lifecycle, "invoke_hook", _record_lock_state)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "resume-lock-free-hook",
+                "method": "session.resume",
+                "params": {
+                    "session_id": target,
+                    "source": "desktop",
+                    "profile": "work",
+                },
+            }
+        )
+
+        assert resp is not None
+        assert "result" in resp, resp
+        assert resp["result"]["session_id"] == runtime_session_id
+        assert callback_lock_free == [True]
+        assert callback_session_ids == [rotated_target]
+    finally:
+        server._sessions.pop(runtime_session_id, None)
+
+
+def test_session_resume_eager_race_loser_notifies_outside_resume_lock(
+    monkeypatch, tmp_path
+):
+    """The eager-build race loser must notify only after releasing the resume lock."""
+    import hermes_state
+    from hermes_cli import lifecycle
+
+    target = "stored-eager-race-lock-free-hook"
+    rotated_target = "rotated-eager-race-lock-free-hook"
+    winner_sid = "runtime-eager-race-winner"
+    profile_home = tmp_path / "profiles" / "work"
+
+    class _FakeDB:
+        def get_session(self, session_id):
+            return {"id": session_id}
+
+        def resolve_resume_session_id(self, session_id):
+            return session_id
+
+        def reopen_session(self, session_id):
+            assert session_id == target
+
+        def get_resume_conversations(self, session_id):
+            history = [{"role": "user", "content": "hello"}]
+            return history, history
+
+        def get_ancestor_display_prefix(self, session_id):
+            return []
+
+        def close(self):
+            return None
+
+    class _BuiltAgent:
+        def close(self):
+            agent_closed.append(True)
+
+    callback_lock_free = []
+    callback_session_ids = []
+    agent_closed = []
+
+    class _LiveAgent:
+        session_id = target
+
+    live_agent = _LiveAgent()
+
+    def _make_agent(*args, **kwargs):
+        server._sessions[winner_sid] = {
+            "agent": live_agent,
+            "created_at": 123.0,
+            "history": [],
+            "history_lock": threading.RLock(),
+            "last_active": 123.0,
+            "profile_home": str(profile_home),
+            "running": False,
+            "session_key": target,
+            "source": "desktop",
+            "transport": server._stdio_transport,
+        }
+        return _BuiltAgent()
+
+    def _rotating_live_payload(sid, session, **kwargs):
+        assert sid == winner_sid
+        live_agent.session_id = rotated_target
+        return {"session_id": sid, "running": False}
+
+    def _record_lock_state(hook_name, **kwargs):
+        acquired = server._session_resume_lock.acquire(blocking=False)
+        callback_lock_free.append(acquired)
+        callback_session_ids.append(kwargs["session_id"])
+        if acquired:
+            server._session_resume_lock.release()
+
+    monkeypatch.setattr(server, "_profile_home", lambda profile: profile_home)
+    monkeypatch.setattr(
+        hermes_state,
+        "SessionDB",
+        lambda db_path=None: _FakeDB(),
+    )
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_make_agent", _make_agent)
+    monkeypatch.setattr(server, "_live_session_payload", _rotating_live_payload)
+    monkeypatch.setattr(lifecycle, "invoke_hook", _record_lock_state)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "resume-eager-race-lock-free-hook",
+                "method": "session.resume",
+                "params": {
+                    "eager_build": True,
+                    "session_id": target,
+                    "source": "desktop",
+                    "profile": "work",
+                },
+            }
+        )
+
+        assert resp is not None
+        assert "result" in resp, resp
+        assert resp["result"]["session_id"] == winner_sid
+        assert agent_closed == [True]
+        assert callback_lock_free == [True]
+        assert callback_session_ids == [rotated_target]
+    finally:
+        server._sessions.pop(winner_sid, None)
+
+
 def test_session_activate_lazy_info_reports_desktop_contract():
     """Activating an already-live *lazy* session (agent not built yet) must
     still advertise desktop_contract. _live_session_payload falls back to
@@ -12941,6 +13288,184 @@ def test_session_activate_lazy_info_reports_desktop_contract():
         info = resp["result"]["info"]
         assert info["lazy"] is True
         assert info["desktop_contract"] == server.DESKTOP_BACKEND_CONTRACT
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_session_activate_notifies_lifecycle_plugins(monkeypatch, tmp_path):
+    """Selecting a warm session must notify plugins in its profile scope."""
+    from agent.secret_scope import current_secret_scope
+    from hermes_cli import lifecycle
+    from hermes_cli.plugins import VALID_HOOKS
+    from hermes_constants import get_hermes_home_override
+
+    profile_home = tmp_path / "profiles" / "work"
+    profile_home.mkdir(parents=True)
+    (profile_home / ".env").write_text(
+        "HOOK_SECRET=profile-hook-secret\n", encoding="utf-8"
+    )
+    calls = []
+    monkeypatch.setattr(
+        lifecycle,
+        "has_hook",
+        lambda hook_name: hook_name == "on_session_activate",
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "invoke_hook",
+        lambda hook_name, **kwargs: calls.append(
+            (
+                get_hermes_home_override(),
+                dict(current_secret_scope() or {}),
+                hook_name,
+                kwargs,
+            )
+        ),
+    )
+
+    sid = "runtime-activate-hook"
+    server._sessions[sid] = {
+        "agent": None,
+        "created_at": 123.0,
+        "history": [],
+        "history_lock": threading.RLock(),
+        "last_active": 123.0,
+        "profile_home": str(profile_home),
+        "running": True,
+        "session_key": "stored-activate-hook",
+        "source": "desktop",
+        "transport": server._stdio_transport,
+    }
+    try:
+        resp = server.handle_request(
+            {
+                "id": "activate-hook",
+                "method": "session.activate",
+                "params": {"session_id": sid},
+            }
+        )
+
+        assert resp is not None
+        assert "result" in resp
+        assert "on_session_activate" in VALID_HOOKS
+        assert calls == [
+            (
+                str(profile_home),
+                {"HOOK_SECRET": "profile-hook-secret"},
+                "on_session_activate",
+                {
+                    "session_id": "stored-activate-hook",
+                    "runtime_session_id": sid,
+                    "platform": "desktop",
+                    "reason": "activate",
+                    "running": True,
+                },
+            )
+        ]
+        assert get_hermes_home_override() is None
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_session_boundary_restores_profile_scope_after_hook_exception(
+    monkeypatch, tmp_path
+):
+    from agent.secret_scope import (
+        current_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+    from hermes_cli import lifecycle
+    from hermes_constants import get_hermes_home_override
+
+    outer_home = tmp_path / "outer-home"
+    outer_home.mkdir()
+    profile_home = tmp_path / "profiles" / "mlperf"
+    profile_home.mkdir(parents=True)
+    (profile_home / ".env").write_text(
+        "HOOK_SECRET=profile-hook-secret\n", encoding="utf-8"
+    )
+
+    observed = {}
+
+    def failing_hook(*args, **kwargs):
+        observed["profile_home"] = get_hermes_home_override()
+        observed["secret_scope"] = dict(current_secret_scope() or {})
+        raise RuntimeError("plugin failed")
+
+    monkeypatch.setattr(lifecycle, "invoke_hook", failing_hook)
+    home_token = set_hermes_home_override(outer_home)
+    secret_token = set_secret_scope({"OUTER_SECRET": "still-active"})
+    try:
+        server._notify_session_boundary(
+            "on_session_activate",
+            "durable-session",
+            platform="desktop",
+            profile_home=profile_home,
+            reason="activate",
+            running=False,
+        )
+
+        assert observed == {
+            "profile_home": str(profile_home),
+            "secret_scope": {"HOOK_SECRET": "profile-hook-secret"},
+        }
+        assert get_hermes_home_override() == str(outer_home)
+        assert current_secret_scope() == {"OUTER_SECRET": "still-active"}
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
+def test_session_activate_notifies_current_rotated_canonical_id(monkeypatch):
+    """Warm activation follows the agent's current durable ID after rotation."""
+    from types import SimpleNamespace
+
+    from hermes_cli import lifecycle
+
+    calls = []
+    monkeypatch.setattr(
+        server,
+        "_live_session_payload",
+        lambda *args, **kwargs: {"running": False},
+    )
+    monkeypatch.setattr(
+        lifecycle,
+        "invoke_hook",
+        lambda hook_name, **kwargs: calls.append((hook_name, kwargs)),
+    )
+
+    sid = "runtime-rotated-hook"
+    server._sessions[sid] = {
+        "agent": SimpleNamespace(session_id="stored-rotated-tip"),
+        "profile_home": None,
+        "running": False,
+        "session_key": "stored-stale-parent",
+        "source": "desktop",
+    }
+    try:
+        resp = server.handle_request(
+            {
+                "id": "activate-rotated-hook",
+                "method": "session.activate",
+                "params": {"session_id": sid},
+            }
+        )
+
+        assert resp is not None
+        assert "result" in resp
+        assert calls == [
+            (
+                "on_session_activate",
+                {
+                    "session_id": "stored-rotated-tip",
+                    "runtime_session_id": sid,
+                    "platform": "desktop",
+                    "reason": "activate",
+                    "running": False,
+                },
+            )
+        ]
     finally:
         server._sessions.pop(sid, None)
 

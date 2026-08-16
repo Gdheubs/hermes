@@ -556,10 +556,21 @@ def _load_interim_assistant_messages() -> bool:
 
 
 def _notify_session_boundary(
-    event_type: str, session_id: str | None, platform: str | None = None
+    event_type: str,
+    session_id: str | None,
+    platform: str | None = None,
+    profile_home: str | Path | None = None,
+    **kwargs,
 ) -> None:
     """Fire session lifecycle hooks with CLI parity."""
+    home_token = None
+    secret_token = None
     try:
+        if profile_home is not None:
+            home_token = set_hermes_home_override(str(profile_home))
+            secret_token = set_secret_scope(
+                build_profile_secret_scope(Path(str(profile_home)))
+            )
         from hermes_cli.lifecycle import finalize_session, invoke_hook
 
         if event_type == "on_session_finalize":
@@ -572,9 +583,15 @@ def _notify_session_boundary(
                 event_type,
                 session_id=session_id,
                 platform=_resolve_agent_platform(platform),
+                **kwargs,
             )
     except Exception:
         pass
+    finally:
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
 
 
 def _claim_active_session_slot(
@@ -8343,7 +8360,10 @@ def _claim_or_reuse_live(
     resume lock, or — if a concurrent resume already won — release ``lease`` and
     return the winner for the caller to reuse."""
     with _session_resume_lock:
-        live = _find_live_session_by_key(session_key)
+        live = _find_live_session_by_key(
+            session_key,
+            profile_home=record.get("profile_home"),
+        )
         if live is not None:
             if lease is not None:
                 lease.release()
@@ -8517,9 +8537,32 @@ def _session_lookup_key(session: dict, *, fallback: str = "") -> str:
     )
 
 
-def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
+_PROFILE_HOME_UNFILTERED = object()
+
+
+def _profile_home_identity(profile_home) -> str | None:
+    if profile_home is None or not str(profile_home).strip():
+        return None
+    return str(Path(str(profile_home)).expanduser().resolve())
+
+
+def _find_live_session_by_key(
+    session_key: str,
+    *,
+    profile_home=_PROFILE_HOME_UNFILTERED,
+) -> tuple[str, dict] | None:
+    requested_profile = (
+        _profile_home_identity(profile_home)
+        if profile_home is not _PROFILE_HOME_UNFILTERED
+        else _PROFILE_HOME_UNFILTERED
+    )
     for sid, session in list(_sessions.items()):
         if session.get("_finalized"):
+            continue
+        if (
+            requested_profile is not _PROFILE_HOME_UNFILTERED
+            and _profile_home_identity(session.get("profile_home")) != requested_profile
+        ):
             continue
         if _session_lookup_key(session, fallback=sid) == session_key:
             return sid, session

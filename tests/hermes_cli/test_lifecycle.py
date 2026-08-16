@@ -22,6 +22,26 @@ def test_invoke_hook_notifies_builtin_observers_before_plugins(monkeypatch):
     assert [call[0] for call in calls] == ["builtin", "plugin"]
 
 
+def test_invoke_hook_discovers_plugins_before_first_dispatch(monkeypatch):
+    calls = []
+    monkeypatch.setattr(observability, "observe_lifecycle", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        plugins,
+        "discover_plugins",
+        lambda: calls.append("discover"),
+    )
+    monkeypatch.setattr(
+        plugins,
+        "invoke_hook",
+        lambda _name, **_kwargs: calls.append("invoke") or ["ok"],
+    )
+
+    result = lifecycle.invoke_hook("on_session_activate", session_id="session-1")
+
+    assert result == ["ok"]
+    assert calls == ["discover", "invoke"]
+
+
 def test_finalize_session_closes_core_before_plugin_export(monkeypatch):
     calls = []
     manager = SimpleNamespace(
