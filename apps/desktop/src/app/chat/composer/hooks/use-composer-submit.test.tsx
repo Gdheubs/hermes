@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $clarifyRequests } from '@/store/clarify'
 import type { ComposerAttachment } from '@/store/composer'
-import { $gateway } from '@/store/gateway'
+import { $gateway, setPrimaryGateway } from '@/store/gateway'
 import {
   clearAllPrompts,
   hasBlockingPromptRequest,
@@ -196,6 +196,11 @@ describe('useComposerSubmit busy-turn routing', () => {
 
 describe('useComposerSubmit with a clarify parked on the session', () => {
   const gatewayRequest = vi.fn(async () => ({ ok: true }))
+  const gateway = { request: gatewayRequest } as unknown as ReturnType<typeof $gateway.get>
+
+  // The exact source scope a production blocking request carries: the backend
+  // that raised it, not whichever socket happens to be active.
+  const DEFAULT_SOURCE_SCOPE = { connectionId: null, profile: 'default' } as const
 
   const parkClarify = (sessionId: string) => {
     $clarifyRequests.set({
@@ -204,16 +209,19 @@ describe('useComposerSubmit with a clarify parked on the session', () => {
         question: 'which one?',
         choices: ['a', 'b'],
         multiSelect: false,
-        sessionId
+        sessionId,
+        scope: DEFAULT_SOURCE_SCOPE
       }
     })
-    $gateway.set({ request: gatewayRequest } as unknown as ReturnType<typeof $gateway.get>)
+    setPrimaryGateway(gateway, 'default', null)
+    $gateway.set(gateway)
   }
 
   afterEach(() => {
     cleanup()
     gatewayRequest.mockClear()
     $clarifyRequests.set({})
+    setPrimaryGateway(null)
     $gateway.set(null)
     vi.restoreAllMocks()
   })
@@ -274,6 +282,36 @@ describe('useComposerSubmit with a clarify parked on the session', () => {
     await waitFor(() => expect(onSubmit).toHaveBeenCalled())
     expect(gatewayRequest).not.toHaveBeenCalled()
     expect($clarifyRequests.get()['other-session']).toBeDefined()
+  })
+
+  it('never falls back to another gateway when the clarify has no source scope', async () => {
+    const activeRequest = vi.fn(async () => ({ ok: true }))
+    const activeGateway = { request: activeRequest } as unknown as ReturnType<typeof $gateway.get>
+
+    // A blocking request whose source identity was lost (scope omitted) must
+    // fail closed: the skip must not emit clarify.respond through whatever
+    // socket is active. Source is the only legitimate answer route.
+    $clarifyRequests.set({
+      'runtime-session': {
+        requestId: 'req-runtime-session',
+        question: 'which one?',
+        choices: ['a', 'b'],
+        multiSelect: false,
+        sessionId: 'runtime-session'
+      }
+    })
+    setPrimaryGateway(gateway, 'default', null)
+    $gateway.set(activeGateway)
+
+    const { hook, onSubmit } = renderSubmitHook({ text: 'pick for me' })
+
+    act(() => {
+      hook.result.current.submitDraft()
+    })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalled())
+    expect(activeRequest).not.toHaveBeenCalledWith('clarify.respond', expect.anything())
+    expect(gatewayRequest).not.toHaveBeenCalledWith('clarify.respond', expect.anything())
   })
 })
 
