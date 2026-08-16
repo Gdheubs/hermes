@@ -352,7 +352,52 @@ _BASE_SECURITY_ARGS = [
 
 # Default per-container PID limit. Applied as ``--pids-limit`` only when the
 # cgroup ``pids`` controller is available (see ``_cgroup_limits_available``).
+# Configurable via ``terminal.docker_pids_limit`` in config.yaml; ``0``, ``-1``
+# or an empty value omits the flag entirely and leaves the container on the
+# daemon's default (normally unlimited).
+#
+# The default is deliberately left at 256 rather than raised: the ``pids``
+# cgroup counts *threads* as well as processes, so this ceiling is a real
+# containment boundary and lifting it for everyone to satisfy multiprocessing
+# workloads would weaken it everywhere. Profiles that genuinely need more
+# (pytest, DataLoader workers, Chromium, parallel subagents) can now say so.
 _DEFAULT_PIDS_LIMIT = "256"
+
+
+def _extra_args_set_pids_limit(extra_args: list) -> bool:
+    """True when user-supplied docker_extra_args already set ``--pids-limit``.
+
+    Same contract as :func:`_extra_args_set_shm_size`: skip our value so the
+    user's is unambiguous rather than leaving two flags on the command line and
+    relying on last-wins ordering.
+    """
+    return any(
+        isinstance(a, str) and (a == "--pids-limit" or a.startswith("--pids-limit="))
+        for a in (extra_args or [])
+    )
+
+
+def _resolve_pids_limit(pids_limit) -> Optional[str]:
+    """Normalise a configured pids limit, or None to omit the flag.
+
+    Accepts int or str. Unparseable values fall back to the default rather than
+    failing container creation — a typo in one config key should not make the
+    terminal unusable.
+    """
+    raw = str(pids_limit if pids_limit is not None else _DEFAULT_PIDS_LIMIT).strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid terminal.docker_pids_limit %r — falling back to %s",
+            raw, _DEFAULT_PIDS_LIMIT,
+        )
+        return _DEFAULT_PIDS_LIMIT
+    if value <= 0:
+        return None
+    return str(value)
 
 # Default /dev/shm size. Docker's built-in default is a tiny 64 MB, which
 # silently breaks shared-memory-hungry workloads inside the sandbox: Chromium /
@@ -887,6 +932,7 @@ class DockerEnvironment(BaseEnvironment):
         extra_args: list = None,
         persist_across_processes: bool = True,
         shm_size: str = _DEFAULT_SHM_SIZE,
+        pids_limit: str = _DEFAULT_PIDS_LIMIT,
     ):
         if cwd == "~":
             cwd = "/root"
@@ -926,7 +972,12 @@ class DockerEnvironment(BaseEnvironment):
         if memory > 0 and _cgroup_limits_available(image):
             resource_args.extend(["--memory", f"{memory}m"])
         if _cgroup_limits_available(image):
-            resource_args.extend(["--pids-limit", _DEFAULT_PIDS_LIMIT])
+            # Skipped when the user set --pids-limit through docker_extra_args,
+            # so their value stands alone instead of both flags being passed and
+            # the outcome depending on ordering.
+            _pids = _resolve_pids_limit(pids_limit)
+            if _pids is not None and not _extra_args_set_pids_limit(extra_args):
+                resource_args.extend(["--pids-limit", _pids])
         # /dev/shm size (not cgroup-gated: --shm-size is a tmpfs mount option,
         # no controller delegation required). Skip when the user already sets
         # it via docker_extra_args, or opted out with an empty/"0" value.
