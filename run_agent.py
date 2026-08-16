@@ -4790,6 +4790,10 @@ class AIAgent:
         """
         if not isinstance(msg, dict) or msg.get("role") != "assistant":
             return False
+        # Fast path: stamped before reasoning was stripped from the
+        # API copy (see conversation_loop pre-send sanitation).
+        if msg.get("_was_thinking_only"):
+            return True
         if msg.get("tool_calls"):
             return False
         # Prefill stubs are thinking-only by construction; check before content
