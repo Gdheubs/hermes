@@ -531,6 +531,12 @@ compression:
   # Enable automatic context compression (default: true)
   # Set to false if you prefer to manage context manually or want errors on overflow
   enabled: true
+  # Deterministic no-LLM checkpoint for tool-heavy middles (default: false):
+  # a tool-heavy compressible span gets a goal/tool-evidence/next-action
+  # checkpoint instead of the summarizer call. checkpoint_tool_ratio = the
+  # tool-token share (0-1) above which the checkpoint applies (default 0.7).
+  checkpoint_mode: false
+  checkpoint_tool_ratio: 0.7
 
   # Opt-in compression progress notices on chat platforms (default: false).
   # By design, routine automatic compression is SILENT on human-facing chat

@@ -1067,6 +1067,22 @@ _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 # only meant to preserve continuity anchors from the dropped window, not to
 # become another unbounded transcript copy after the LLM summarizer failed.
 _FALLBACK_SUMMARY_MAX_CHARS = 8_000
+
+# Coding/tool-heavy signal set (the checkpoint + the strip share it).
+_CODING_TOOL_NAMES = frozenset({
+    "read_file", "write_file", "edit_file", "apply_patch", "replace_in_file",
+    "grep", "rg", "glob", "search_files", "read_special_file", "run_tests",
+    "bash", "shell", "python", "execute", "compile", "build", "git",
+    "cargo", "go", "gcc", "g++", "clang", "rustc", "npm", "bun", "yarn",
+    "make", "cmake", "pip", "mvn", "gradle", "dotnet", "csharp", "java",
+    "node", "deno", "tsc", "eslint", "pytest", "go test",
+})
+import re as _re
+_CODING_PROMPT_PATTERNS = (
+    _re.compile(r"```|\bdef \b|\bclass \b|\bimport \b|\bfrom \b"),
+    _re.compile(r"(?:src|test|tests|lib|app|agent)/[\w./-]+\.[\w]+"),
+    _re.compile(r"\b(?:refactor|bug|fix|test|compile|build|deploy|commit|optimize|query|schema|endpoint|performance|regression)\b"),
+)
 _FALLBACK_PREVIOUS_SUMMARY_MAX_CHARS = 3_000
 _FALLBACK_TURN_MAX_CHARS = 700
 _AUTO_FOCUS_MAX_TURNS = 3
@@ -2835,6 +2851,8 @@ class ContextCompressor(ContextEngine):
         provider: str = "",
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
+        checkpoint_mode: bool = False,
+        checkpoint_tool_ratio: float = 0.7,
         max_tokens: int | None = None,
         model_thresholds: dict[str, float] | None = None,
         threshold_tokens_cap: Any = None,
@@ -2921,6 +2939,9 @@ class ContextCompressor(ContextEngine):
         # When False (default = historical behavior), insert a
         # deterministic "summary unavailable" handoff and drop the middle window.
         self.abort_on_summary_failure = abort_on_summary_failure
+        # Deterministic no-LLM checkpoint for tool-heavy middles (off by default).
+        self.checkpoint_mode = bool(checkpoint_mode)
+        self.checkpoint_tool_ratio = min(1.0, max(0.0, float(checkpoint_tool_ratio or 0.7)))
 
         # ── Micro-compaction (per-turn rolling compaction) ─────────
         # Default: OFF. Each pass rewrites already-sent history, so it breaks
@@ -6966,6 +6987,85 @@ This compaction should PRIORITISE preserving all information related to the focu
             merged.append(msg)
         return merged
 
+    def _span_tool_ratio(self, turns_to_summarize: List[Dict[str, Any]]) -> float:
+        """Share of the compressible span's TOKENS that are tool messages.
+
+        Token share, not message count: a few giant tool results dominate a
+        conversational middle and still signal a tool-heavy session.
+        """
+        if not turns_to_summarize:
+            return 0.0
+        total = estimate_messages_tokens_rough(turns_to_summarize)
+        if total <= 0:
+            return 0.0
+        tool_tokens = sum(
+            estimate_messages_tokens_rough([m])
+            for m in turns_to_summarize
+            if m.get("role") == "tool" or m.get("tool_call_id") or m.get("tool_calls")
+        )
+        return tool_tokens / total
+
+    def _build_compaction_checkpoint(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        messages: List[Dict[str, Any]],
+        compress_start: int,
+        memory_context: str = "",
+    ) -> str:
+        """Deterministic compaction checkpoint (no LLM summary).
+
+        The middle was tool-heavy: the disk state + the preserved recent tail
+        suffice for continuity. The checkpoint records the goal, the recent
+        tool evidence (head+tail), and the pending next action; the raw middle
+        is dropped (re-runnable from the workspace snapshot in the system
+        prompt). Same summary-message plumbing downstream.
+        """
+        goal = ""
+        for m in reversed(messages[:compress_start]):
+            if m.get("role") == "user" and m.get("content"):
+                goal = str(m["content"])[-400:]
+                break
+        evidence_lines = []
+        for m in reversed(turns_to_summarize):
+            if (m.get("role") == "tool" or m.get("tool_call_id") or m.get("tool_calls")) and len(evidence_lines) < 3:
+                name = m.get("name") or "tool"
+                if not m.get("role") == "tool":
+                    calls = m.get("tool_calls") or []
+                    name = ", ".join(tc.get("function", {}).get("name", "?") for tc in calls) or name
+                content = str(m.get("content") or "")
+                head = content[:200]
+                tail = content[-80:] if len(content) > 280 else ""
+                evidence_lines.append(f"- {name}: {head}" + (f"...{tail}" if tail else ""))
+        next_action = ""
+        for m in reversed(messages[:compress_start] + turns_to_summarize):
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                calls = [tc.get("function", {}).get("name", "?") for tc in m["tool_calls"]]
+                next_action = ", ".join(calls)
+                break
+        NL = "\n"
+        _recovery_sid = getattr(self, "_session_id", "") or ""
+        _recovery_hint = (
+            f"session_search(query=..., session_id='{_recovery_sid}')"
+            if _recovery_sid else "session search"
+        )
+        body = (
+            "Deterministic compaction checkpoint (tool-heavy session, no LLM "
+            f"summary): {len(turns_to_summarize)} middle message(s) dropped; the "
+            f"raw middle stays in the session store (recoverable via {_recovery_hint}) "
+            "and the current workspace state is in the system prompt." + NL +
+            f"GOAL: {goal}" + NL +
+            "RECENT TOOL EVIDENCE:" + NL + NL.join(evidence_lines) + NL +
+            f"NEXT ACTION (pending): {next_action}"
+        )
+        if memory_context and memory_context.strip():
+            body += NL + "MEMORY CONTEXT: " + memory_context.strip()[:400]
+        summary = self._with_summary_prefix(_redact_compaction_text(body.strip()))
+        summary = _reinject_pruned_skill_markers(
+            summary, _collect_ghosted_skill_names(turns_to_summarize)
+        )
+        _augment = getattr(self, "_augment_summary_lean", None)
+        return _augment(summary, turns_to_summarize) if _augment else summary
+
     def compress(
         self,
         messages: List[Dict[str, Any]],
@@ -7366,6 +7466,20 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         if feasibility_skip:
             summary = None  # No LLM call; Phase 4 inserts the deterministic fallback
+        elif (
+            self.checkpoint_mode
+            and self._span_tool_ratio(turns_to_summarize) >= self.checkpoint_tool_ratio
+        ):
+            # Tool-heavy middle: the deterministic checkpoint (no LLM call).
+            summary = self._build_compaction_checkpoint(
+                turns_to_summarize, messages, compress_start, memory_context
+            )
+            # Mirror the LLM path's success bookkeeping.
+            self._previous_summary = summary
+            self._clear_compression_failure_cooldown()
+            self._summary_model_fallen_back = False
+            self._last_summary_error = None
+            self._last_summary_auth_failure = False
         else:
             # Deriving the auto focus topic scans recent user turns — only pay
             # for it when a summary will actually be generated.

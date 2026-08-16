@@ -784,6 +784,8 @@ DEFAULT_CONFIG = {
                                       # where you want nothing pinned except the
                                       # system prompt + rolling summary + recent tail.
         "abort_on_summary_failure": False,  # When True, auto-compression that fails
+        "checkpoint_mode": False,          # deterministic no-LLM checkpoint for tool-heavy middles
+        "checkpoint_tool_ratio": 0.7,      # tool-token share above which the checkpoint applies
                                       # to generate a summary (aux LLM errored / returned
                                       # non-JSON / timed out) aborts entirely instead of
                                       # dropping the middle window with a static
