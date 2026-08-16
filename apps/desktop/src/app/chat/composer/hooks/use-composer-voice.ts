@@ -17,6 +17,12 @@ import { onComposerVoiceToggleRequest } from '../focus'
 import { useComposerScope } from '../scope'
 import type { ChatBarProps } from '../types'
 
+import {
+  clearSpokenReplyBook,
+  createSpokenReplyBook,
+  isAssistantReplyAlreadySpoken,
+  markAssistantReplySpoken
+} from './auto-speak-dedupe'
 import { useAutoSpeakReplies } from './use-auto-speak-replies'
 import { useVoiceConversation } from './use-voice-conversation'
 import { useVoiceRecorder } from './use-voice-recorder'
@@ -62,9 +68,17 @@ export function useComposerVoice({
   // A tile's composer speaks ITS transcript, not the primary chat's.
   const { $messages } = useComposerScope()
   const [voiceConversationActive, setVoiceConversationActive] = useState(false)
-  const lastSpokenIdRef = useRef<string | null>(null)
+  // Id + completed-text book: stream→final hydration changes message ids while
+  // the body stays the same; id-only tracking double-opens speak-stream (#87652).
+  const spokenBookRef = useRef(createSpokenReplyBook())
   const ownsWakeIndicatorRef = useRef(false)
   const voiceStartRequest = useStore($voiceConversationStartRequest)
+  const spokenSessionRef = useRef(sessionId)
+
+  if (spokenSessionRef.current !== sessionId) {
+    spokenSessionRef.current = sessionId
+    clearSpokenReplyBook(spokenBookRef.current)
+  }
 
   const { dictate, voiceActivityState, voiceStatus } = useVoiceRecorder({
     focusInput,
@@ -78,7 +92,7 @@ export function useComposerVoice({
     const messages = $messages.get()
     const last = messages.findLast(m => m.role === 'assistant' && !m.hidden)
 
-    if (!last || last.id === lastSpokenIdRef.current) {
+    if (!last) {
       return null
     }
 
@@ -88,11 +102,19 @@ export function useComposerVoice({
       return null
     }
 
-    return {
+    const reply = {
       id: last.id,
       pending: Boolean(last.pending),
       text
     }
+
+    if (isAssistantReplyAlreadySpoken(spokenBookRef.current, reply)) {
+      // Migrate book if final id replaced stream id for the same body.
+      markAssistantReplySpoken(spokenBookRef.current, reply)
+      return null
+    }
+
+    return reply
   }
 
   /**
@@ -100,14 +122,23 @@ export function useComposerVoice({
    * in order — narration interims AND the final answer, not just whichever
    * bubble happens to be last. See `collectUnspokenTurnSpeech`.
    */
-  const pendingTurnResponse = () => collectUnspokenTurnSpeech($messages.get(), lastSpokenIdRef.current)
+  const pendingTurnResponse = () => {
+    const book = spokenBookRef.current
+    // Prefer the most recently marked id when present; text-dedupe is handled
+    // when consuming individual bubbles via auto-speak.
+    const lastId = book.ids.size > 0 ? [...book.ids].at(-1)! : null
+    return collectUnspokenTurnSpeech($messages.get(), lastId)
+  }
 
   const consumePendingResponse = () => {
     const messages = $messages.get()
     const last = messages.findLast(m => m.role === 'assistant' && !m.hidden)
 
     if (last) {
-      lastSpokenIdRef.current = last.id
+      markAssistantReplySpoken(spokenBookRef.current, {
+        id: last.id,
+        text: chatMessageText(last)
+      })
     }
   }
 
