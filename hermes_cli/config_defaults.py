@@ -336,6 +336,14 @@ DEFAULT_CONFIG = {
         # window so it can't leak indefinitely. 0 disables escalation (SIGTERM
         # only — the historical behavior). Floored internally at 0.
         "daemon_term_grace_seconds": 2.0,
+        # Per-command memory ceiling (MiB) for local terminal commands, so a
+        # runaway build/test process can't OOM the whole machine and stall the
+        # session. 0 (default) = no limit. POSIX-only (RLIMIT_AS on the spawned
+        # process group; ignored on Windows). Container/cloud backends
+        # (docker/modal/...) already have their own isolation and are not
+        # affected. Inspired by Claude Code's CLAUDE_CODE_TOOL_MEMORY_LIMIT
+        # (v2.1.233), adapted to config.yaml per Hermes env-var policy.
+        "memory_limit_mb": 0,
         # Environment variables to pass through to sandboxed execution
         # (terminal and execute_code).  Skill-declared required_environment_variables
         # are passed through automatically; this list is for non-skill use cases.

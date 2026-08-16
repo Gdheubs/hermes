@@ -142,6 +142,7 @@ terminal:
   cwd: "."          # Gateway/cron working directory (CLI always uses launch dir)
   font_family: ""   # Desktop terminal font; e.g. "MesloLGS NF"
   timeout: 180      # Per-command timeout in seconds
+  memory_limit_mb: 0   # Per-command memory ceiling (MiB) for the local backend; 0 = unlimited (POSIX-only)
   home_mode: auto   # auto | real | profile — subprocess HOME policy
   env_passthrough: []  # Env var names to forward to sandboxed execution (terminal + execute_code)
   singularity_image: "docker://nikolaik/python-nodejs:python3.11-nodejs20"  # Container image for Singularity backend
@@ -173,6 +174,8 @@ The default. Commands run directly on your machine with no isolation. No special
 terminal:
   backend: local
 ```
+
+`terminal.memory_limit_mb` (default `0` = unlimited) puts a hard per-command memory ceiling on locally spawned command trees. When set, every `terminal` command runs under an `RLIMIT_AS` cap (applied via a `ulimit -v` prelude in the spawned shell) inherited by all of its child processes, so a runaway build or test run fails with an out-of-memory error inside the command instead of stalling the whole machine into swap. POSIX-only (Linux/macOS); ignored on Windows and on container/cloud backends, which have their own isolation.
 
 By default, local tool subprocesses keep your real OS-user `HOME`. This lets
 external CLIs such as `git`, `ssh`, `gh`, `az`, `npm`, Claude Code, and Codex
