@@ -1738,9 +1738,20 @@ def _dispatch_tick_lock(db_path: Path):
             except (BlockingIOError, OSError):
                 acquired = False
     except OSError:
-        # Could not even open the lock file (permissions, read-only FS).
-        # Degrade to a no-op so a probe failure never blocks dispatch.
-        acquired = True
+        # Could not even open the lock file: antivirus or a sync client
+        # (OneDrive, Dropbox) holding it open on Windows, a permissions blip, a
+        # read-only mount. Skip this tick rather than proceeding as if we held
+        # the lock, because we cannot tell an unlockable file from a file
+        # another dispatcher already owns, and guessing "nobody owns it" is the
+        # multi-writer case this lock exists to prevent (#35240).
+        #
+        # Deliberately NOT the same call as the missing-fcntl/msvcrt degradation
+        # below, which stays a no-op: that is a permanent property of the
+        # platform, so failing closed there would disable dispatch forever. This
+        # is transient and re-evaluated every tick, and skipping is already the
+        # documented behaviour of a dispatcher that loses the lock, so the cost
+        # of being wrong is one deferred interval rather than an outage.
+        acquired = False
         handle = None
     try:
         yield acquired
