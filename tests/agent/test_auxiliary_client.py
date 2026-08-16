@@ -4078,13 +4078,13 @@ class TestCompressionFallbackContextFilter:
     # compression-specific filter does NOT affect vision chains.
 
     def test_compression_task_uses_minimum_context_constant(self):
-        """The task minimum for compression must equal MINIMUM_CONTEXT_LENGTH
+        """The task minimum for compression must equal the configured floor
         so the runtime fallback stays consistent with the startup feasibility
         check in agent/conversation_compression.py."""
         from agent.auxiliary_client import _task_minimum_context_length
-        from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
+        from agent.model_metadata import get_minimum_context_length
 
-        assert _task_minimum_context_length("compression") == MINIMUM_CONTEXT_LENGTH
+        assert _task_minimum_context_length("compression") == get_minimum_context_length()
         # Non-compression tasks have no minimum (None)
         assert _task_minimum_context_length("vision") is None
         assert _task_minimum_context_length("title_generation") is None
@@ -4095,6 +4095,16 @@ class TestCompressionFallbackContextFilter:
         # Empty / unknown tasks have no minimum
         assert _task_minimum_context_length("") is None
         assert _task_minimum_context_length(None) is None
+
+    def test_compression_task_minimum_follows_config_override(self, monkeypatch):
+        """A lowered agent.minimum_context_length must relax the runtime aux
+        filter too, otherwise a 32K aux model configured on purpose would be
+        skipped even though startup accepted it."""
+        import agent.auxiliary_client as ac
+
+        monkeypatch.setattr(ac, "get_minimum_context_length", lambda *a, **kw: 32_768)
+        assert ac._task_minimum_context_length("compression") == 32_768
+        assert ac._task_minimum_context_length("vision") is None
 
 
 class TestCustomEndpointApiKeyInheritance:

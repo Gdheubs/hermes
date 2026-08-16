@@ -35,8 +35,8 @@ from agent.iteration_budget import IterationBudget
 from agent.memory_manager import StreamingContextScrubber
 from agent.session_activity import ActivityProvenance
 from agent.model_metadata import (
-    MINIMUM_CONTEXT_LENGTH,
     fetch_model_metadata,
+    get_minimum_context_length,
     is_local_endpoint,
     query_ollama_num_ctx,
 )
@@ -2651,23 +2651,26 @@ def init_agent(
     )
 
     # Reject models whose context window is below the minimum required
-    # for reliable tool-calling workflows (64K tokens).
+    # for reliable tool-calling workflows (default 64K tokens, overridable
+    # via agent.minimum_context_length in config.yaml).
     _ctx = getattr(agent.context_compressor, "context_length", 0)
+    _minimum_context_length = get_minimum_context_length()
     _allow_lmstudio_explicit_below_floor = (
         str(getattr(agent, "provider", "") or "").strip().lower() == "lmstudio"
         and isinstance(agent._config_context_length, int)
         and not isinstance(agent._config_context_length, bool)
         and agent._config_context_length > 0
     )
-    if _ctx and _ctx < MINIMUM_CONTEXT_LENGTH and not _allow_lmstudio_explicit_below_floor:
+    if _ctx and _ctx < _minimum_context_length and not _allow_lmstudio_explicit_below_floor:
         raise ValueError(
             f"Model {agent.model} has a context window of {_ctx:,} tokens, "
-            f"which is below the minimum {MINIMUM_CONTEXT_LENGTH:,} required "
+            f"which is below the minimum {_minimum_context_length:,} required "
             f"by Hermes Agent.  Choose a model with at least "
-            f"{MINIMUM_CONTEXT_LENGTH // 1000}K context.  If your server "
+            f"{_minimum_context_length:,} tokens of context.  If your server "
             f"reports a window smaller than the model's true window, set "
             f"model.context_length in config.yaml to the real value "
-            f"(this must be at least {MINIMUM_CONTEXT_LENGTH // 1000}K)."
+            f"(this must be at least {_minimum_context_length:,}).  To run "
+            f"smaller models anyway, lower agent.minimum_context_length."
         )
 
     # Nous Hermes 3/4 are chat models, not tool-call-tuned. The interactive

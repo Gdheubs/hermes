@@ -409,16 +409,34 @@ class TestCompress:
             f"#49307), found {count}x:\n{summary}"
         )
 
-    def test_threshold_below_window_at_minimum_ctx(self):
-        """Regression for #14690: at context_length == MINIMUM_CONTEXT_LENGTH
-        the floored threshold used to equal the whole window, so
+    def test_threshold_below_window_at_minimum_ctx(self, monkeypatch):
+        """Regression for #14690: at context_length == the minimum context
+        length the floored threshold used to equal the whole window, so
         auto-compression could never fire. It now triggers at 85% of the
         window — high enough not to waste the small budget, below 100% so it
-        actually fires."""
-        from agent.context_compressor import MINIMUM_CONTEXT_LENGTH
+        actually fires.
+
+        Pinned to the built-in 64K default so the hard-coded expectation can't
+        drift with an ambient agent.minimum_context_length override."""
+        import agent.context_compressor as cc
+        from agent.model_metadata import MINIMUM_CONTEXT_LENGTH
+
+        monkeypatch.setattr(
+            cc, "get_minimum_context_length", lambda *a, **kw: MINIMUM_CONTEXT_LENGTH
+        )
         t = ContextCompressor._compute_threshold_tokens(MINIMUM_CONTEXT_LENGTH, 0.50)
         assert t < MINIMUM_CONTEXT_LENGTH
         assert t == 54400  # 85% of 64000
+
+    def test_threshold_floor_follows_configured_minimum(self, monkeypatch):
+        """The floor tracks agent.minimum_context_length, not the constant:
+        a 32K floor lets a 100K model compact at the 50% ratio value instead
+        of being pushed up to 64K."""
+        import agent.context_compressor as cc
+
+        monkeypatch.setattr(cc, "get_minimum_context_length", lambda *a, **kw: 32_000)
+        t = ContextCompressor._compute_threshold_tokens(100_000, 0.50)
+        assert t == 50_000
 
 
 

@@ -729,6 +729,8 @@ Ollama does **not** use your model's full context window by default. Depending o
 
 Hermes Agent requires at least **64,000 tokens** of context for agent use with tools. Smaller windows are rejected at startup because the system prompt, tool schemas, and working conversation state need enough room for reliable multi-step workflows.
 
+If your hardware can't reach 64K, lower the floor with `agent.minimum_context_length` (see [Configuration](/user-guide/configuration#agent)) — expect shorter sessions and more frequent compaction.
+
 **How to increase it** (pick one):
 
 ```bash

@@ -44,6 +44,13 @@ DEFAULT_CONFIG = {
     },
     "agent": {
         "max_turns": 500,
+        # Minimum context length (tokens) required to run Hermes Agent.
+        # Models with smaller windows are rejected at startup because they
+        # cannot keep enough working memory for tool-calling workflows.
+        # Lower this to run local servers with smaller models (e.g. Ollama
+        # with num_ctx 32768).  Absent/zero/negative/garbage values fall
+        # back to the built-in default (64,000).
+        "minimum_context_length": 64000,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has

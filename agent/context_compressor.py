@@ -34,10 +34,10 @@ from agent.auxiliary_client import (
 from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.model_metadata import (
-    MINIMUM_CONTEXT_LENGTH,
-    get_model_context_length,
     estimate_messages_tokens_rough,
     estimate_tokens_rough,
+    get_minimum_context_length,
+    get_model_context_length,
 )
 from agent.redact import redact_sensitive_text
 from agent.turn_context import drop_stale_api_content
@@ -2771,7 +2771,8 @@ class ContextCompressor(ContextEngine):
         """Compute the compaction trigger threshold in tokens.
 
         The base value is ``effective_input_budget * threshold_percent``, floored
-        at ``MINIMUM_CONTEXT_LENGTH`` so large-context models don't compress
+        at the configured minimum context length (``agent.minimum_context_length``,
+        default ``MINIMUM_CONTEXT_LENGTH``) so large-context models don't compress
         prematurely at 50%. BUT that floor degenerates at small windows: for a
         model whose ``context_length`` is at/below the minimum (e.g. a 64K
         local model), ``max(0.5*64000, 64000) == 64000`` makes the threshold
@@ -2796,7 +2797,7 @@ class ContextCompressor(ContextEngine):
         if effective_window <= 0:
             effective_window = context_length
         pct_value = int(effective_window * threshold_percent)
-        floored = max(pct_value, MINIMUM_CONTEXT_LENGTH)
+        floored = max(pct_value, get_minimum_context_length())
         # If flooring pushed the threshold to/over the effective window it can
         # never be reached. Trigger at 85% of the effective input budget so a
         # minimum-context model rides most of its budget before compacting
