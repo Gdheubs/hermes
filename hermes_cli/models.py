@@ -632,6 +632,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # Entries validated live against a GCP project (global region,
     # HTTP 200) as of 2026-07-21 (PR #68767).
     "vertex": [
+        "google/gemini-3.7-flash",
         "google/gemini-3.1-pro-preview",
         "google/gemini-3-pro-preview",
         "google/gemini-3.6-flash",

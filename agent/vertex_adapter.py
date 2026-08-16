@@ -19,6 +19,7 @@ under the ``vertex:`` section; env vars take precedence over config.yaml.
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Optional, Tuple
 
 from agent.secret_scope import get_secret as _get_secret, is_multiplex_active
@@ -217,12 +218,24 @@ def has_vertex_credentials() -> bool:
     """Fast check for whether Vertex credentials appear configured.
 
     No network calls and no google-auth import — safe for provider
-    auto-detection and setup-status display. True when either a service
-    account JSON path is resolvable, or an explicit project ID is configured
-    (env or config.yaml, implying ADC is intended).
+    auto-detection and setup-status display. True when a service account
+    JSON path is resolvable, an explicit project ID is configured (env or
+    config.yaml, implying ADC is intended), or the well-known ADC file
+    written by ``gcloud auth application-default login`` exists. The ADC
+    check matters for the common Gemini CLI setup: credentials live only in
+    ``~/.config/gcloud/application_default_credentials.json`` (no env var,
+    no explicit project), and without it ``get_vertex_credentials`` succeeds
+    via ``google.auth.default()`` while this gate reports False, silently
+    hiding Vertex from the model picker.
     """
     if _resolve_credentials_path(None):
         return True
     if _resolve_project_override():
         return True
+    try:
+        adc = Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
+        if adc.exists():
+            return True
+    except Exception:
+        pass
     return False

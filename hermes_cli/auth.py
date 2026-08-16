@@ -1982,6 +1982,26 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     except Exception:
         pass
 
+    # 5. Providers named in explicit model-routing slots of config.yaml
+    # (the fallback chain — fallback_providers merged with legacy
+    # fallback_model — and billing_provider) are explicit user
+    # configuration even when their credentials are ambient (e.g. Vertex
+    # ADC). Without this, desktop explicit-only pickers hide a provider
+    # the user deliberately wired into their fallback chain.
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.fallback_config import get_fallback_chain
+
+        for entry in get_fallback_chain(load_config()):
+            if str(entry.get("provider") or "").strip().lower() == normalized:
+                return True
+        billing = load_config().get("billing_provider")
+        if isinstance(billing, dict):
+            if str(billing.get("provider") or "").strip().lower() == normalized:
+                return True
+    except Exception:
+        pass
+
     return False
 
 
@@ -7146,6 +7166,8 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
+    if target == "vertex":
+        return _get_vertex_auth_status()
     # API-key providers
     pconfig = PROVIDER_REGISTRY.get(target)
     if pconfig and pconfig.auth_type == "api_key":
@@ -7158,6 +7180,52 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         except ImportError:
             return {"logged_in": False, "provider": target, "error": "boto3 not installed"}
     return {"logged_in": False}
+
+
+def _get_vertex_auth_status() -> Dict[str, Any]:
+    """Structural auth status for Google Vertex AI.
+
+    Vertex auth is OAuth2 via a service-account JSON or Application Default
+    Credentials (ADC) — there is no static API key to spot-check. The check
+    is purely structural (file existence + google-auth importable); it never
+    mints a token or touches the network, keeping CLI/menu latency flat the
+    same way _get_azure_foundry_auth_status does for Entra ID.
+
+    Covers the three resolution paths of agent.vertex_adapter:
+      * explicit credentials file (VERTEX_CREDENTIALS_PATH /
+        GOOGLE_APPLICATION_CREDENTIALS),
+      * explicit project override (env or config.yaml — implies ADC intent),
+      * the well-known ADC file written by
+        gcloud auth application-default login — required so ADC-only
+        setups (the common Gemini CLI case) show as configured.
+    """
+    info: Dict[str, Any] = {"provider": "vertex", "logged_in": False}
+    try:
+        from agent import vertex_adapter
+    except Exception:
+        info["error"] = "vertex adapter unavailable (google-auth missing?)"
+        return info
+
+    try:
+        creds_path = vertex_adapter._resolve_credentials_path(None)
+        project_override = vertex_adapter._resolve_project_override()
+    except Exception:
+        creds_path, project_override = None, None
+
+    adc_path = ""
+    if not creds_path and not project_override:
+        try:
+            candidate = Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
+            if candidate.exists():
+                adc_path = str(candidate)
+        except Exception:
+            adc_path = ""
+
+    info["credentials_path"] = creds_path or ""
+    info["adc_path"] = adc_path
+    info["project_override"] = project_override or ""
+    info["logged_in"] = bool(creds_path or project_override or adc_path)
+    return info
 
 
 def _get_azure_foundry_auth_status() -> Dict[str, Any]:
