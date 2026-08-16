@@ -1938,7 +1938,15 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
 
 
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Update a job by ID, refreshing derived schedule fields when needed."""
+    """Update a job by ID, refreshing derived schedule fields when needed.
+
+    ``updates`` may carry a ``resnapshot`` boolean control flag (consumed here,
+    never persisted): when true, an unpinned agent job's provider/model
+    snapshots are re-resolved against the current global default, re-baselining
+    the #44585 drift guard so the job keeps following ``cron.model`` /
+    ``model.default`` without being pinned. Pinned and no-agent jobs carry no
+    snapshots, so the flag is a no-op for them.
+    """
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
     # path-escape values into output writes/deletes.
@@ -1972,6 +1980,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates[_mon_field] = _mv or None
 
             previous_inference_axes = _normalized_inference_axes(job)
+            # ``resnapshot`` is a control flag, not a persisted field: re-baseline
+            # the drift-guard snapshots of an unpinned job to the current global
+            # default without pinning it (#75375). Pop it before the merge so it
+            # never lands in the stored record.
+            resnapshot_requested = bool(updates.pop("resnapshot", False))
             updated = _apply_skill_fields({**job, **updates})
 
             # Re-check execution-mode invariants on the MERGED record when
@@ -2037,7 +2050,7 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                         )
                     updated["next_run_at"] = updated_next_run
 
-            if inference_fields_changed:
+            if inference_fields_changed or resnapshot_requested:
                 provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
                     provider=updated.get("provider"),
                     model=updated.get("model"),

@@ -432,6 +432,7 @@ def cron_edit(args):
         workdir=getattr(args, "workdir", None),
         model=getattr(args, "model", None),
         provider=getattr(args, "model_provider", None),
+        resnapshot=getattr(args, "resnapshot", False),
         no_agent=getattr(args, "no_agent", None),
         monitor_script=getattr(args, "monitor_script", None),
         monitor_url=getattr(args, "monitor_url", None),
@@ -458,6 +459,16 @@ def cron_edit(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if updated.get("workdir"):
         print(f"  Workdir: {updated['workdir']}")
+    if getattr(args, "resnapshot", False):
+        if updated.get("model") or updated.get("provider"):
+            print("  Model routing: pinned (resnapshot is a no-op for pinned jobs)")
+        elif updated.get("no_agent"):
+            print("  Model routing: no-agent job (no drift snapshots)")
+        else:
+            print(
+                "  Model routing: following the global default "
+                "(drift-guard snapshots re-baselined)"
+            )
     return 0
 
 

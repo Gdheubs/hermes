@@ -1162,6 +1162,7 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    resnapshot: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     task_id: str = None,
@@ -1511,6 +1512,13 @@ def cronjob(
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
+            if resnapshot is not None:
+                # User-owned control flag (CLI/dashboard/programmatic callers
+                # only — see the registry handler note below): re-baseline the
+                # drift-guard snapshots of an unpinned job to the current
+                # global default without pinning it. update_job() consumes it
+                # and never persists it.
+                updates["resnapshot"] = bool(resnapshot)
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
@@ -1718,7 +1726,11 @@ registry.register(
         # agent's arguments: per-job inference pins are user-owned (dashboard,
         # `hermes cron create/edit --model`, or hand-edited jobs). The agent
         # must not be able to point unattended spend at a different model.
-        # Programmatic callers of cronjob() itself retain the parameters.
+        # The `resnapshot` control flag is user-owned for the same reason: an
+        # agent must not silently re-baseline a drift guard that is currently
+        # blocking a job (which would re-enable unattended spend under a new
+        # global default). Programmatic callers of cronjob() retain the
+        # parameter.
         reason=args.get("reason"),
         script=args.get("script"),
         context_from=args.get("context_from"),

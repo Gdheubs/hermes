@@ -197,6 +197,16 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.",
     )
+    cron_edit.add_argument(
+        "--resnapshot",
+        action="store_true",
+        help=(
+            "Re-baseline this job's model/provider drift-guard snapshots to the "
+            "current global default (cron.model / model.default) without pinning "
+            "it. For an unpinned job this clears a model-drift skip so it keeps "
+            "following the default; no-op for pinned or no-agent jobs."
+        ),
+    )
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")

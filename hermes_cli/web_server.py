@@ -12051,6 +12051,10 @@ def _normalize_dashboard_cron_updates(
         normalized["context_from"] = _cron_string_list(normalized["context_from"])
     if "enabled_toolsets" in normalized:
         normalized["enabled_toolsets"] = _cron_string_list(normalized["enabled_toolsets"])
+    if "resnapshot" in normalized:
+        # Control flag consumed by update_job() (never persisted). Kept a
+        # strict boolean so the dashboard cannot smuggle arbitrary values.
+        normalized["resnapshot"] = bool(normalized["resnapshot"])
     return normalized
 
 
