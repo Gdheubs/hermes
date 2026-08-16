@@ -5111,6 +5111,92 @@ def release_stale_claims(
     return reclaimed
 
 
+def clear_orphaned_claims(
+    conn: sqlite3.Connection,
+) -> int:
+    """Clear stale/expired claims on NON-running cards so they can dispatch again.
+
+    The dispatcher's spawn query only selects ``status='ready' AND claim_lock
+    IS NULL`` (see dispatch_once), and ``release_stale_claims`` only reclaims
+    ``status='running'`` claims. A card whose status was moved out of
+    ``running`` (to ``ready``/``todo``/``blocked``) AFTER its claim was written
+    therefore keeps an orphaned ``claim_lock`` that:
+      - ``release_stale_claims`` ignores (wrong status), and
+      - the spawn query hides (claim_lock IS NULL filter)
+
+    so the card is wedged indefinitely and no dispatcher path ever clears it.
+    This is the recurring "job won't start" failure: stale ``claim_lock`` on a
+    ready card left behind by a dead gateway/worker process (e.g. a gateway
+    restart left ``claim_lock='host:<dead-pid>'`` on ready/todo cards).
+
+    Because only NON-running rows are considered, there is no live worker to
+    protect: a genuine in-flight worker always owns a ``running`` card's claim,
+    which we never touch here. We clear the lock only when its claimer is
+    provably dead-or-zombie (``_pid_alive`` is False for both) or its claim has
+    expired — otherwise we leave it for the next tick (the claim may belong to
+    a just-spawned worker that has not yet transitioned to ``running``; waiting
+    a tick avoids a clearing race).
+
+    Returns the number of orphaned claims cleared.
+    """
+    now = int(time.time())
+    cleared = 0
+    rows = conn.execute(
+        "SELECT id, claim_lock, worker_pid, claim_expires "
+        "FROM tasks "
+        "WHERE status IN ('ready', 'todo', 'blocked') "
+        "  AND claim_lock IS NOT NULL"
+    ).fetchall()
+    for row in rows:
+        lock = row["claim_lock"] or ""
+        expires = row["claim_expires"]
+        # The claimer pid is the part after the last ':' in "host:pid".
+        pid_tok = lock.rsplit(":", 1)
+        claimer_pid = None
+        if len(pid_tok) == 2:
+            try:
+                claimer_pid = int(pid_tok[1])
+            except (TypeError, ValueError):
+                claimer_pid = None
+        claim_expired = expires is not None and expires < now
+        claimer_dead = (
+            claimer_pid is not None and not _pid_alive(claimer_pid)
+        )
+        if not (claim_expired or claimer_dead):
+            # Claimer still around (or unparseable) and not expired: leave it.
+            # If a just-spawned worker is mid-transition we must NOT clear its
+            # claim (would spawn a duplicate next tick).
+            continue
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                "  worker_pid = NULL "
+                "WHERE id = ? AND status IN ('ready','todo','blocked') "
+                "  AND claim_lock IS ?",
+                (row["id"], lock),
+            )
+            if cur.rowcount != 1:
+                continue  # raced: re-checked next tick
+            _append_event(
+                conn, row["id"], "claim_cleared",
+                {
+                    "reason": "orphaned_non_running",
+                    "stale_lock": lock,
+                    "worker_pid": (
+                        int(row["worker_pid"])
+                        if row["worker_pid"] is not None else None
+                    ),
+                    "claim_expires": (
+                        int(expires) if expires is not None else None
+                    ),
+                    "claimer_dead": claimer_dead,
+                    "claim_expired": claim_expired,
+                },
+            )
+            cleared += 1
+    return cleared
+
+
 def reclaim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -7934,6 +8020,11 @@ class DispatchResult:
     """Outcome of a single ``dispatch`` pass."""
 
     reclaimed: int = 0
+    cleared_orphan_claims: int = 0
+    """Number of orphaned non-running claims (dead-claimer or expired) cleared
+    this tick so those cards become dispatchable again. Distinct from
+    ``reclaimed``, which covers running-task TTL/heartbeat reclaims."""
+
     promoted: int = 0
     reconciled_orphans: list[str] = field(default_factory=list)
     """Task ids requeued by :func:`reconcile_orphaned_running` this tick —
@@ -9650,10 +9741,18 @@ def _dispatch_once_locked(
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
+    # Clear orphaned claims on ready/todo/blocked cards left by dead or
+    # expired claimers. These are otherwise invisible to release_stale_claims /
+    # reconcile_orphaned_running (which only touch 'running') and to the spawn
+    # query (which filters claim_lock IS NULL), permanently wedging the card.
+    # Run BEFORE recompute_ready/spawn so a just-cleared ready card can promote
+    # and dispatch THIS tick rather than waiting a full extra cycle.
+    result.cleared_orphan_claims = clear_orphaned_claims(conn)
+    # Orphaned-card reconciliation (upstream): requeue 'running' cards whose
+    # claim bookkeeping is broken (no valid claim, dead/gone worker) that the
+    # TTL/crash/stale paths can never see. Complementary to the non-running
+    # clear above; both are required.
     if reconcile_orphans:
-        # Orphaned-card reconciliation: requeue 'running' cards whose claim
-        # bookkeeping is broken (no valid claim, dead/gone worker) that the
-        # TTL/crash/stale paths can never see. See reconcile_orphaned_running.
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
