@@ -94,8 +94,10 @@ export function repoStatusForCwd(cwd?: null | string): ReadableAtom<HermesRepoSt
  * Is this path a git repo? This function reads the probe cache, and probes on
  * demand when the cache has no entry for the path. Use it to validate any repo
  * that was picked out of candidate FOLDERS: a path in a project row is not
- * evidence that git can branch from it. False on a remote backend, because
- * there is no local git truth to probe.
+ * evidence that git can branch from it. `desktopGit()` returns the REST bridge
+ * on a remote gateway, so the probe runs against the VPS path; if the path does
+ * not exist on the VPS the backend returns null and this returns false. The
+ * probe is the single source of truth for repo-ness on local AND remote.
  */
 export async function isGitRepoPath(cwd: string): Promise<boolean> {
   const key = normalizeCwd(cwd)
@@ -496,6 +498,14 @@ export function _resetCodingStatusForTests(): void {
 // and ⌘⇧B now works from a detached session inside a project. '' means that no
 // repo is in reach. That is a no-op and not an error, because a worktree only
 // exists inside a repo.
+//
+// On a remote gateway the candidate cwd is whatever the backend reported for
+// the focused session / project, and `desktopGit()` already resolves to the
+// REST bridge there, so `isGitRepoPath` probes the VPS path directly — a real
+// repo returns non-null and the dialog opens, while a path that is not a repo
+// on the VPS returns null and stays a no-op. The probe is the single gate on
+// both backends; there is no remote-specific trust bypass, because the backend
+// is what decides "is this a repo" in the first place. (#81724)
 export async function resolveWorktreeRepoPath(): Promise<string> {
   const runtimeId = $focusedRuntimeId.get()
   const scope = $projectScope.get()

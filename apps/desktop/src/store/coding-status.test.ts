@@ -11,9 +11,11 @@ import {
   refreshRepoStatus,
   registerRepoStatusCwd,
   repoChangeKindForPath,
-  repoStatusForCwd
+  repoStatusForCwd,
+  resolveWorktreeRepoPath
 } from './coding-status'
-import { $currentCwd, $selectedStoredSessionId } from './session'
+import { $connection, $currentCwd, $selectedStoredSessionId, setActiveSessionId } from './session'
+import { $sessionStates } from './session-states'
 
 const sampleStatus: HermesRepoStatus = {
   branch: 'feature/login',
@@ -283,5 +285,92 @@ describe('repoChangeKindForPath', () => {
     expect(listener.mock.calls.at(-1)?.[0]).toBe('added')
 
     unsubscribe()
+  })
+})
+
+describe('resolveWorktreeRepoPath (#81724)', () => {
+  beforeEach(async () => {
+    _resetCodingStatusForTests()
+    delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
+    $currentCwd.set('')
+    $selectedStoredSessionId.set(null)
+    $connection.set(null)
+    // Reset session-state atoms so the previous test's runtime/cwd don't leak
+    // into the next case (the `desktopGit().repoStatus` cache and session
+    // runtime map both outlast a single test when not cleared here).
+    $sessionStates.set({})
+    setActiveSessionId(null)
+  })
+
+  afterEach(() => {
+    _resetCodingStatusForTests()
+    delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
+    $connection.set(null)
+  })
+
+  // Stub the remote backend REST bridge. On a remote gateway `desktopGit()`
+  // resolves to the REST mirror, so the repo probe (`/api/git/status?path=…`)
+  // is backend-routed — this IS the source of truth for "is this a repo" on
+  // the VPS, the same way `desktop-git.test.ts` stubs it.
+  function stubRemoteBackend(apiImpl: (path: string) => HermesRepoStatus | null) {
+    ;(window as unknown as { hermesDesktop?: unknown }).hermesDesktop = {
+      api: vi.fn(async ({ path }: { path: string }) => apiImpl(path))
+    }
+  }
+
+  it('opens on a remote gateway when the focused session cwd is a real VPS repo', async () => {
+    // The session cwd is a VPS path. The backend probe answers that the path
+    // really is a repo there, so the dialog should open (#81724: ⌘⇧B used to
+    // silently no-op because the pre-PR gate never probed the VPS).
+    const vpsCwd = '/srv/repos/hermes'
+    const { $focusedRuntimeId, publishSessionState } = await import('./session-states')
+    const { $activeSessionId } = await import('./session')
+
+    stubRemoteBackend(path => (path.startsWith('/api/git/status?path=%2Fsrv%2Frepos%2Fhermes') ? sampleStatus : null))
+    $connection.set({ mode: 'remote' } as never)
+    publishSessionState('rt-1', { cwd: vpsCwd } as never)
+    $activeSessionId.set('rt-1')
+    expect($focusedRuntimeId.get()).toBe('rt-1')
+
+    expect(await resolveWorktreeRepoPath()).toBe(vpsCwd)
+  })
+
+  it('does NOT open on a remote gateway when the VPS path is not actually a repo', async () => {
+    // Regression: the old pre-fix route unconditionally bypassed the repo probe
+    // in remote mode, so a non-repo path leaked through and the backend then
+    // 400'd the `git worktree add`. Reverse: the backend probe returns null, so
+    // the dialog must stay closed — no false positive.
+    const vpsPath = '/srv/not-a-repo'
+    const { publishSessionState } = await import('./session-states')
+    const { $activeSessionId } = await import('./session')
+
+    stubRemoteBackend(() => null)
+    $connection.set({ mode: 'remote' } as never)
+    publishSessionState('rt-1', { cwd: vpsPath } as never)
+    $activeSessionId.set('rt-1')
+
+    expect(await resolveWorktreeRepoPath()).toBe('')
+  })
+
+  it('still returns "" on a remote gateway when no cwd is reachable', async () => {
+    stubRemoteBackend(() => null)
+    $connection.set({ mode: 'remote' } as never)
+
+    expect(await resolveWorktreeRepoPath()).toBe('')
+  })
+
+  it('still requires the local probe to pass on a local backend', async () => {
+    // Negative control: the single probe gate must keep the local-only
+    // behaviour. A candidate that is NOT a git repo on the local machine must
+    // not leak through the gate.
+    stubProbe(async () => null as never)
+    const { publishSessionState } = await import('./session-states')
+    const { $activeSessionId } = await import('./session')
+
+    $connection.set({ mode: 'local' } as never)
+    publishSessionState('rt-1', { cwd: '/not/a/repo' } as never)
+    $activeSessionId.set('rt-1')
+
+    expect(await resolveWorktreeRepoPath()).toBe('')
   })
 })
