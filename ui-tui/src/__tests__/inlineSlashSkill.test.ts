@@ -18,6 +18,13 @@ describe('inlineSlashTrigger', () => {
     expect(inlineSlashTrigger('text\n/skill')).toEqual({ query: 'skill', start: 5 })
   })
 
+  it('accepts a qualified plugin skill token', () => {
+    expect(inlineSlashTrigger('please use /konsta-research:manu')).toEqual({
+      query: 'konsta-research:manu',
+      start: 11
+    })
+  })
+
   it('does not fire at position 0 — that is a command invocation', () => {
     expect(inlineSlashTrigger('/clean')).toBeNull()
     expect(inlineSlashTrigger('/')).toBeNull()
@@ -97,6 +104,13 @@ describe('splitSlashSkillRefs', () => {
     expect(splitSlashSkillRefs('clean this up with /clean')).toEqual([
       { ref: false, text: 'clean this up with ' },
       { ref: true, text: '/clean' }
+    ])
+  })
+
+  it('marks a qualified plugin skill referenced mid-prose', () => {
+    expect(splitSlashSkillRefs('review with /konsta-research:manuscript')).toEqual([
+      { ref: false, text: 'review with ' },
+      { ref: true, text: '/konsta-research:manuscript' }
     ])
   })
 
