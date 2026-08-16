@@ -31,6 +31,7 @@ export const REVIEW_PANE_ID = 'review'
 const OPEN_KEY = 'hermes.desktop.reviewOpen'
 const COMMIT_DEFAULT_KEY = 'hermes.desktop.reviewCommitDefault'
 const TREE_MODE_KEY = 'hermes.desktop.reviewTreeMode'
+const WRAP_LINES_KEY = 'hermes.desktop.reviewWrapLines'
 const SELECTED_KEY = 'hermes.desktop.reviewSelectedPath'
 const REVIEW_REFRESH_DEBOUNCE_MS = 100
 const SHIP_INFO_STALE_MS = 30_000
@@ -56,6 +57,14 @@ export const $reviewTreeMode = persistentAtom<ReviewTreeMode>(TREE_MODE_KEY, 'tr
 
 export function toggleReviewTreeMode(): void {
   $reviewTreeMode.set($reviewTreeMode.get() === 'tree' ? 'list' : 'tree')
+}
+
+// Persisted so a relaunch restores whether long diff lines wrap instead of
+// scrolling horizontally (long markdown lines read better wrapped).
+export const $reviewWrapLines = persistentAtom(WRAP_LINES_KEY, false, Codecs.bool)
+
+export function toggleReviewWrapLines(): void {
+  $reviewWrapLines.set(!$reviewWrapLines.get())
 }
 
 export const $reviewFiles = atom<HermesReviewFile[]>([])

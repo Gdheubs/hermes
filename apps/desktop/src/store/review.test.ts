@@ -18,6 +18,7 @@ import {
   $reviewShipBusy,
   $reviewShipInfo,
   $reviewTreeMode,
+  $reviewWrapLines,
   cancelRevert,
   clearReviewSelection,
   closeReview,
@@ -34,6 +35,7 @@ import {
   selectReviewFile,
   stageReviewFile,
   toggleReviewTreeMode,
+  toggleReviewWrapLines,
   unstageReviewFile
 } from './review'
 import { $currentCwd } from './session'
@@ -96,6 +98,7 @@ beforeEach(() => {
   $reviewCommitMsgBusy.set(false)
   $reviewRevertTarget.set(undefined)
   $reviewScopeCwd.set(null)
+  $reviewWrapLines.set(false)
   $currentCwd.set('/repo')
 })
 
@@ -237,6 +240,14 @@ describe('view state', () => {
     expect($reviewTreeMode.get()).toBe('list')
     toggleReviewTreeMode()
     expect($reviewTreeMode.get()).toBe('tree')
+  })
+
+  it('toggleReviewWrapLines flips the wrap preference', () => {
+    $reviewWrapLines.set(false)
+    toggleReviewWrapLines()
+    expect($reviewWrapLines.get()).toBe(true)
+    toggleReviewWrapLines()
+    expect($reviewWrapLines.get()).toBe(false)
   })
 
   it('openReview opens the pane and kicks off a refresh', async () => {

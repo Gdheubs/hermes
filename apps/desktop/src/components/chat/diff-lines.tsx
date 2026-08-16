@@ -51,7 +51,12 @@ const DIFF_KIND_TEXT: Record<DiffKind, string> = {
 }
 
 const DIFF_LINE_BASE = 'block min-w-max whitespace-pre border-l-2 px-2.5 py-px'
+// Wrapped variant: long lines break instead of forcing a horizontal scroll
+// (the Review pane's wrap toggle). `min-w-max`/`whitespace-pre` drop so text
+// flows; `break-words` keeps pathological tokens (URLs) from overflowing.
+const DIFF_LINE_BASE_WRAP = 'block whitespace-pre-wrap break-words border-l-2 px-2.5 py-px'
 const PREVIEW_DIFF_LINE_BASE = 'block h-5 min-w-max whitespace-pre px-2.5 leading-5'
+const PREVIEW_DIFF_LINE_BASE_WRAP = 'block whitespace-pre-wrap break-words px-2.5 py-px leading-5'
 const PREVIEW_CHUNK_LINES = 200
 const PREVIEW_LINE_PX = 20
 const PREVIEW_OVERSCAN_LINES = 400
@@ -275,12 +280,14 @@ function parseFullFileDiff(diff: string, fullText: string): DiffLine[] {
 }
 
 /** Exported for the lazily-loaded SyntaxDiff (syntax-diff.tsx). */
-export function DiffBody({ lines, syntax }: { lines: DiffLine[]; syntax?: boolean }) {
+export function DiffBody({ lines, syntax, wrap }: { lines: DiffLine[]; syntax?: boolean; wrap?: boolean }) {
+  const lineClass = wrap ? DIFF_LINE_BASE_WRAP : DIFF_LINE_BASE
+
   return (
     <>
       {lines.map((line, index) => (
         <span
-          className={cn(DIFF_LINE_BASE, DIFF_KIND_TINT[line.kind], !syntax && DIFF_KIND_TEXT[line.kind])}
+          className={cn(lineClass, DIFF_KIND_TINT[line.kind], !syntax && DIFF_KIND_TEXT[line.kind])}
           key={`${index}-${line.text}`}
         >
           {line.text || ' '}
@@ -324,13 +331,17 @@ function PreviewDiffRows({
   afterLines = 0,
   beforeLines = 0,
   chunks,
-  tokens
+  tokens,
+  wrap
 }: {
   afterLines?: number
   beforeLines?: number
   chunks: Array<LineChunk<DiffLine>>
   tokens?: ThemedToken[][] | null
+  wrap?: boolean
 }) {
+  const lineClass = wrap ? PREVIEW_DIFF_LINE_BASE_WRAP : PREVIEW_DIFF_LINE_BASE
+
   return (
     <>
       {beforeLines > 0 && <div aria-hidden style={{ height: beforeLines * PREVIEW_LINE_PX }} />}
@@ -341,7 +352,7 @@ function PreviewDiffRows({
             const rowTokens = tokens?.[index] ?? []
 
             return (
-              <span className={cn(PREVIEW_DIFF_LINE_BASE, DIFF_KIND_TINT[line.kind])} key={`${index}-${line.text}`}>
+              <span className={cn(lineClass, DIFF_KIND_TINT[line.kind])} key={`${index}-${line.text}`}>
                 {rowTokens.length > 0
                   ? rowTokens.map((token, tokenIndex) => (
                       <span key={`${tokenIndex}-${token.offset}`} style={tokenStyle(token)}>
@@ -365,7 +376,8 @@ function TokenizedDiffBody({
   chunked = false,
   chunks,
   language,
-  lines
+  lines,
+  wrap
 }: {
   afterLines?: number
   beforeLines?: number
@@ -373,6 +385,7 @@ function TokenizedDiffBody({
   chunks?: Array<LineChunk<DiffLine>>
   language: string
   lines: DiffLine[]
+  wrap?: boolean
 }) {
   const code = React.useMemo(() => lines.map(line => line.text).join('\n'), [lines])
   const theme = useThemeName()
@@ -408,9 +421,10 @@ function TokenizedDiffBody({
         afterLines={afterLines}
         beforeLines={beforeLines}
         chunks={chunks ?? chunkLines(lines, PREVIEW_CHUNK_LINES)}
+        wrap={wrap}
       />
     ) : (
-      <DiffBody lines={lines} />
+      <DiffBody lines={lines} wrap={wrap} />
     )
   }
 
@@ -421,9 +435,12 @@ function TokenizedDiffBody({
         beforeLines={beforeLines}
         chunks={chunks ?? chunkLines(lines, PREVIEW_CHUNK_LINES)}
         tokens={tokens}
+        wrap={wrap}
       />
     )
   }
+
+  const lineClass = wrap ? PREVIEW_DIFF_LINE_BASE_WRAP : PREVIEW_DIFF_LINE_BASE
 
   return (
     <>
@@ -431,7 +448,7 @@ function TokenizedDiffBody({
         const rowTokens = tokens[index] ?? []
 
         return (
-          <span className={cn(PREVIEW_DIFF_LINE_BASE, DIFF_KIND_TINT[line.kind])} key={`${index}-${line.text}`}>
+          <span className={cn(lineClass, DIFF_KIND_TINT[line.kind])} key={`${index}-${line.text}`}>
             {rowTokens.length > 0
               ? rowTokens.map((token, tokenIndex) => (
                   <span key={`${tokenIndex}-${token.offset}`} style={tokenStyle(token)}>
@@ -448,8 +465,9 @@ function TokenizedDiffBody({
 
 // Shiki transformer: tag each `.line` with the diff tint for its kind, so the
 // syntax-highlighted output keeps add/remove backgrounds + the gutter accent.
-// Exported for the lazily-loaded SyntaxDiff (syntax-diff.tsx).
-export function diffLineTransformer(kinds: DiffKind[]): ShikiTransformer {
+// Exported for the lazily-loaded SyntaxDiff (syntax-diff.tsx). `wrap` swaps the
+// line class for the wrapping variant (no horizontal overflow).
+export function diffLineTransformer(kinds: DiffKind[], wrap = false): ShikiTransformer {
   return {
     line(node, line) {
       const kind = kinds[line - 1] ?? 'context'
@@ -460,18 +478,18 @@ export function diffLineTransformer(kinds: DiffKind[]): ShikiTransformer {
           ? [String(node.properties.className)]
           : []
 
-      node.properties.className = [...existing, DIFF_LINE_BASE, DIFF_KIND_TINT[kind]]
+      node.properties.className = [...existing, wrap ? DIFF_LINE_BASE_WRAP : DIFF_LINE_BASE, DIFF_KIND_TINT[kind]]
     }
   }
 }
 
-function SyntaxDiff({ language, lines }: { language: string; lines: DiffLine[] }) {
+function SyntaxDiff({ language, lines, wrap }: { language: string; lines: DiffLine[]; wrap?: boolean }) {
   // The Shiki hook lives in a lazily-loaded module (syntax-diff.tsx) so the
   // multi-MB shiki chunk stays off the cold-start path. Until it (and the
   // highlight itself) resolves, show the plain colored diff — no flash.
   return (
-    <React.Suspense fallback={<DiffBody lines={lines} />}>
-      <LazySyntaxDiff language={language} lines={lines} />
+    <React.Suspense fallback={<DiffBody lines={lines} wrap={wrap} />}>
+      <LazySyntaxDiff language={language} lines={lines} wrap={wrap} />
     </React.Suspense>
   )
 }
@@ -569,6 +587,11 @@ interface FileDiffPanelProps {
    *  diff in a scrolling pane (the review panel), so only visible rows mount
    *  instead of highlighting every line. `showLineNumbers` implies windowing. */
   virtualized?: boolean
+  /** Wrap long lines instead of scrolling horizontally. Designed for the
+   *  line-number-free review pane: fixed-row virtualization can't measure
+   *  wrapped rows, so with `wrap` every chunk mounts and the scroller just
+   *  scrolls vertically (fine for the doc-sized diffs that need wrapping). */
+  wrap?: boolean
 }
 
 export function FileDiffPanel({
@@ -577,7 +600,8 @@ export function FileDiffPanel({
   fullText,
   path,
   showLineNumbers = false,
-  virtualized = false
+  virtualized = false,
+  wrap = false
 }: FileDiffPanelProps) {
   const lines = React.useMemo(
     () => (fullText != null ? parseFullFileDiff(diff, fullText) : parseDiff(diff)),
@@ -593,7 +617,11 @@ export function FileDiffPanel({
     totalRows: lines.length
   })
 
-  const visibleLineChunks = lineChunks.slice(startChunk, endChunk + 1)
+  // Wrapped rows are variable-height, so the fixed-row window math can't slice
+  // them: mount every chunk (the scroller shell stays) and let it scroll.
+  const visibleLineChunks = wrap ? lineChunks : lineChunks.slice(startChunk, endChunk + 1)
+  const effectiveBeforeRows = wrap ? 0 : beforeRows
+  const effectiveAfterRows = wrap ? 0 : afterRows
 
   const language = shikiLanguageForFilename(path)
   const canHighlight = Boolean(language) && !exceedsHighlightBudget(fullText ?? diff)
@@ -604,23 +632,29 @@ export function FileDiffPanel({
   // are small/clamped, so they let Shiki own the rows (SyntaxDiff).
   const windowedBody = canHighlight ? (
     <TokenizedDiffBody
-      afterLines={afterRows}
-      beforeLines={beforeRows}
+      afterLines={effectiveAfterRows}
+      beforeLines={effectiveBeforeRows}
       chunked
       chunks={visibleLineChunks}
       language={language}
       lines={lines}
+      wrap={wrap}
     />
   ) : (
-    <PreviewDiffRows afterLines={afterRows} beforeLines={beforeRows} chunks={visibleLineChunks} />
+    <PreviewDiffRows
+      afterLines={effectiveAfterRows}
+      beforeLines={effectiveBeforeRows}
+      chunks={visibleLineChunks}
+      wrap={wrap}
+    />
   )
 
   const compactBody = !canHighlight ? (
-    <DiffBody lines={lines} />
+    <DiffBody lines={lines} wrap={wrap} />
   ) : fullText != null ? (
-    <TokenizedDiffBody language={language} lines={lines} />
+    <TokenizedDiffBody language={language} lines={lines} wrap={wrap} />
   ) : (
-    <SyntaxDiff language={language} lines={lines} />
+    <SyntaxDiff language={language} lines={lines} wrap={wrap} />
   )
 
   if (!windowed) {

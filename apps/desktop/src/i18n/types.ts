@@ -2339,6 +2339,8 @@ export interface Translations {
     folderTip: (cwd: string) => string
     openFolder: string
     refreshTree: string
+    wrapLines: string
+    unwrapLines: string
     collapseAll: string
     previewUnavailable: string
     couldNotPreview: (path: string) => string

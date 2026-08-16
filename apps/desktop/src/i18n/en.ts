@@ -2757,6 +2757,8 @@ export const en: Translations = {
     folderTip: cwd => cwd,
     openFolder: 'Open folder',
     refreshTree: 'Refresh tree',
+    wrapLines: 'Wrap lines',
+    unwrapLines: 'Unwrap lines',
     collapseAll: 'Collapse all folders',
     previewUnavailable: 'Preview unavailable',
     couldNotPreview: path => `Could not preview ${path}`,

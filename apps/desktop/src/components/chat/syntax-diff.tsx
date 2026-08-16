@@ -13,9 +13,17 @@ import { useShikiHighlighter } from 'react-shiki'
 import { DiffBody, type DiffLine, diffLineTransformer } from '@/components/chat/diff-lines'
 import { SHIKI_THEME } from '@/components/chat/shiki-highlighter'
 
-export default function SyntaxDiff({ language, lines }: { language: string; lines: DiffLine[] }) {
+export default function SyntaxDiff({
+  language,
+  lines,
+  wrap
+}: {
+  language: string
+  lines: DiffLine[]
+  wrap?: boolean
+}) {
   const code = useMemo(() => lines.map(line => line.text).join('\n'), [lines])
-  const transformers = useMemo(() => [diffLineTransformer(lines.map(line => line.kind))], [lines])
+  const transformers = useMemo(() => [diffLineTransformer(lines.map(line => line.kind), wrap)], [lines, wrap])
 
   const highlighted = useShikiHighlighter(code, language, SHIKI_THEME, {
     defaultColor: 'light-dark()',
@@ -23,5 +31,5 @@ export default function SyntaxDiff({ language, lines }: { language: string; line
   })
 
   // Until Shiki resolves, show the plain colored diff so there's no flash.
-  return (highlighted as ReactNode) ?? <DiffBody lines={lines} />
+  return (highlighted as ReactNode) ?? <DiffBody lines={lines} wrap={wrap} />
 }
