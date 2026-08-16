@@ -1699,6 +1699,12 @@ def _get_env_config() -> Dict[str, Any]:
         "docker_orphan_reaper": os.getenv(
             "TERMINAL_DOCKER_ORPHAN_REAPER", "true"
         ).lower() in {"true", "1", "yes"},
+        # Sandbox builds (Cursor-inspired): optional command baked into a
+        # committed image ahead of sessions so containers boot pre-provisioned.
+        "docker_build_command": os.getenv("TERMINAL_DOCKER_BUILD_COMMAND", ""),
+        "docker_build_refresh_hours": _parse_env_var(
+            "TERMINAL_DOCKER_BUILD_REFRESH_HOURS", "24", float, "number"
+        ),
     }
 
 
@@ -1750,6 +1756,8 @@ def _container_config_from_config(config: Dict[str, Any]) -> dict:
         "docker_network": config.get("docker_network", True),
         "docker_persist_across_processes": config.get("docker_persist_across_processes", True),
         "docker_orphan_reaper": config.get("docker_orphan_reaper", True),
+        "docker_build_command": config.get("docker_build_command", ""),
+        "docker_build_refresh_hours": config.get("docker_build_refresh_hours", 24),
     }
 
 
@@ -1808,6 +1816,15 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
             and task_id != "default"
             and not _has_isolation_overrides(task_id)
         )
+        # Sandbox builds (Cursor-inspired): when a build command is configured
+        # and a successful pre-built image exists, boot from it instead of the
+        # raw base image. Fail-safe passthrough — resolve_image never raises
+        # and returns `image` unchanged when builds are unconfigured/broken.
+        try:
+            from tools.sandbox_builds import resolve_image as _resolve_build_image
+            image = _resolve_build_image(image, cc)
+        except Exception:
+            logger.debug("sandbox builds: resolve unavailable", exc_info=True)
         docker_env_obj = _DockerEnvironment(
             image=image, cwd=cwd, timeout=timeout,
             cpu=cpu, memory=memory, disk=disk,

@@ -275,6 +275,26 @@ terminal:
 
 **`terminal.docker_network`** (default `true`; env: `TERMINAL_DOCKER_NETWORK`) — set to `false` to run the sandbox container with `--network=none`, cutting off all network egress from agent commands. This applies to the execution container used by `terminal`, `execute_code`, and the file tools. Because containers persist across Hermes processes, flipping this to `false` while an older networked container exists will remove that container and start a fresh air-gapped one (a warning is logged); background processes running inside it are lost. Prefer this key over passing `--network=none` through `docker_extra_args`.
 
+#### Sandbox builds — pre-provisioned images
+
+When your sandbox needs setup work (pip/npm installs, toolchain downloads), you can bake it into a **pre-built image** so containers boot ready instead of reinstalling on every fresh container:
+
+```yaml
+terminal:
+  backend: docker
+  docker_build_command: "pip install requests pandas && npm install -g typescript"
+  docker_build_refresh_hours: 24   # background rebuild when the active build is older; 0 disables
+```
+
+Hermes runs `docker_build_command` (via `bash -lc`) in a container from `docker_image`, commits the result as `hermes-sandbox-build:<fingerprint>`, and new Docker sandboxes boot from that image. Key behaviors:
+
+- **Fail-safe** — a failed build never replaces the last successful one; sessions keep using the previous good image (or the raw `docker_image` if no build has ever succeeded).
+- **Fingerprinted** — builds are keyed to the (base image, build command) pair; changing either invalidates the old build until a new one succeeds.
+- **Background refresh** — at session start, a build older than `docker_build_refresh_hours` triggers a rebuild in the background; the running session keeps the current image and the *next* session picks up the refresh.
+- **Observable** — `hermes sandbox status` shows the active build, its age, and recent build history with per-build logs; `hermes sandbox build` runs a build in the foreground; `hermes sandbox clear` removes all built images and metadata.
+
+Builds capture **disk state only** — put services and background processes in your session workflow, not the build command.
+
 **Requirements:** Docker Desktop or Docker Engine installed and running. Hermes probes `$PATH` plus common macOS install locations (`/usr/local/bin/docker`, `/opt/homebrew/bin/docker`, Docker Desktop app bundle). Podman is supported out of the box: set `HERMES_DOCKER_BINARY=podman` (or the full path) to force it when both are installed.
 
 #### Container lifecycle
@@ -329,6 +349,8 @@ Every key under `terminal:` has an env-var override of the form `TERMINAL_<KEY_U
 | `TERMINAL_DOCKER_NETWORK` | `docker_network` | `true` / `false` — default `true`; `false` = `--network=none` |
 | `TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES` | `docker_persist_across_processes` | `true` / `false` — default `true` |
 | `TERMINAL_DOCKER_ORPHAN_REAPER` | `docker_orphan_reaper` | `true` / `false` — default `true` |
+| `TERMINAL_DOCKER_BUILD_COMMAND` | `docker_build_command` | Sandbox build command (empty = disabled) |
+| `TERMINAL_DOCKER_BUILD_REFRESH_HOURS` | `docker_build_refresh_hours` | Hours before background rebuild — default `24`, `0` disables |
 | `TERMINAL_CONTAINER_CPU` | `container_cpu` | CPU cores |
 | `TERMINAL_CONTAINER_MEMORY` | `container_memory` | MB |
 | `TERMINAL_CONTAINER_DISK` | `container_disk` | MB |

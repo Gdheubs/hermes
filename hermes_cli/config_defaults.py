@@ -423,6 +423,19 @@ DEFAULT_CONFIG = {
         # When on, SETUID/SETGID caps are omitted from the container since
         # no privilege drop is needed.
         "docker_run_as_host_user": False,
+        # Sandbox builds (Cursor-inspired, opt-in): a command Hermes bakes into
+        # a committed Docker image ahead of sessions (docker run + commit) so
+        # sandbox containers boot with dependencies pre-installed instead of
+        # reinstalling at session start. Runs via `bash -lc` from docker_image.
+        # Example: "pip install requests pandas && npm install -g typescript"
+        # A failed build never replaces the last successful one; with no
+        # successful build yet, sessions use docker_image directly.
+        # Manage with `hermes sandbox build|status|clear`.
+        "docker_build_command": "",
+        # Rebuild in the background when the active build is older than this
+        # many hours (checked at session start; the running session keeps the
+        # current image). 0 disables automatic refresh.
+        "docker_build_refresh_hours": 24,
         # Persistent shell — keep a long-lived bash shell across execute() calls
         # so cwd/env vars/shell variables survive between commands.
         # Enabled by default for non-local backends (SSH); local is always opt-in
