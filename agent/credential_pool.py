@@ -2548,7 +2548,24 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         anthropic_oauth_env = (
             _env_val("ANTHROPIC_TOKEN") or _env_val("CLAUDE_CODE_OAUTH_TOKEN")
         )
-        api_key_path_explicit = bool(anthropic_api_key and not anthropic_oauth_env)
+        # A SUPPRESSED ``env:ANTHROPIC_API_KEY`` means the user ran
+        # ``hermes auth remove anthropic <N>`` against that source: the key may
+        # still sit in .env, but it is not an active credential.  It therefore
+        # must NOT count as the "user picked the API-key path" signal.
+        #
+        # Without this guard the two seeders disagree and the pool ends up
+        # EMPTY: ``_seed_from_env`` honours the suppression and skips seeding
+        # the key, while this function saw the raw value, took the branch
+        # below, and pruned the ``claude_code`` / ``hermes_pkce`` OAuth entries
+        # on its way out.  The result is a hard "no credentials" auth failure
+        # even though a valid key is on disk AND a valid OAuth login exists —
+        # silent, because each half looks locally correct.
+        api_key_suppressed = _is_suppressed(provider, "env:ANTHROPIC_API_KEY")
+        api_key_path_explicit = bool(
+            anthropic_api_key
+            and not anthropic_oauth_env
+            and not api_key_suppressed
+        )
 
         if api_key_path_explicit:
             # Prune any stale autodiscovered OAuth entries that may have been

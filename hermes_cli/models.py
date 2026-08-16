@@ -627,19 +627,32 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # Google Vertex AI — static curated list.  Vertex's OpenAI-compatible
     # endpoint has no /models listing route, so without this entry the
     # /model picker only ever shows the currently-configured model.
-    # Model IDs use the "google/" publisher prefix Vertex's openapi
-    # endpoint expects (see hermes_cli/model_setup_flows.py).
-    # Entries validated live against a GCP project (global region,
-    # HTTP 200) as of 2026-07-21 (PR #68767).
+    # Gemini/MaaS ids use the publisher prefix Vertex's openapi endpoint
+    # expects (see hermes_cli/model_setup_flows.py); Claude ids are bare
+    # because they route through the AnthropicVertex SDK (rawPredict).
+    # Exactly one model per Claude family: resolve_alias() raises
+    # AmbiguousAliasError rather than guessing, so listing two opus
+    # generations here would break the bare `/model opus` shorthand.
+    # Gemini entries validated live against a GCP project (global region,
+    # HTTP 200) as of 2026-07-21 (PR #68767); gemini-3.7-flash added and
+    # re-validated live 2026-08-15 (global only — us-central1/us-east5 404).
     "vertex": [
+        "claude-opus-5",
+        "claude-fable-5",
+        "claude-sonnet-5",
         "google/gemini-3.1-pro-preview",
-        "google/gemini-3-pro-preview",
+        "google/gemini-3.7-flash",
         "google/gemini-3.6-flash",
         "google/gemini-3.5-flash",
         "google/gemini-3.5-flash-lite",
         "google/gemini-3-flash-preview",
-        "google/gemini-3.1-flash-lite-preview",
         "google/gemini-3.1-flash-lite",
+        "deepseek-ai/deepseek-v3.2-maas",
+        "zai-org/glm-5-maas",
+        "moonshotai/kimi-k2-thinking-maas",
+        "xai/grok-4.20-reasoning",
+        "xai/grok-4.1-fast-reasoning",
+        "xai/grok-4.1-fast-non-reasoning",
     ],
     "novita": [
         "moonshotai/kimi-k2.5",
@@ -1168,7 +1181,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("copilot-acp",    "GitHub Copilot ACP",       "GitHub Copilot ACP (Spawns copilot --acp --stdio)"),
     ProviderEntry("huggingface",    "Hugging Face",             "Hugging Face Inference Providers"),
     ProviderEntry("gemini",         "Google AI Studio",         "Google AI Studio (Native Gemini API)"),
-    ProviderEntry("vertex",         "Google Vertex AI",         "Google Vertex AI (Gemini via GCP; OAuth2 service account or ADC, GCP billing/quotas)"),
+    ProviderEntry("vertex",         "Google Vertex AI",         "Google Vertex AI (Gemini + Claude via GCP; OAuth2 service account or ADC, GCP billing/quotas)"),
     ProviderEntry("deepseek",       "DeepSeek",                 "DeepSeek (V3, R1, coder, direct API)"),
     ProviderEntry("xai",            "xAI",                      "xAI Grok (Direct API)"),
     ProviderEntry("zai",            "Z.AI / GLM",               "Z.AI / GLM (Zhipu direct API)"),

@@ -5505,9 +5505,17 @@ class AIAgent:
         keeps a second concurrent call from sharing one pool's close/abort
         lifecycle — it gets a fresh untracked client instead.
 
-        Mirrors ``_rebuild_anthropic_client`` construction (direct + Bedrock,
-        1M-beta drop) but returns a fresh/cached client instead of swapping
-        the shared one.
+        Mirrors ``_rebuild_anthropic_client`` construction (direct + Bedrock +
+        Vertex, 1M-beta drop) but returns a fresh/cached client instead of
+        swapping the shared one. Construction goes through the provider-aware
+        chokepoint ``build_anthropic_client_for_provider``: building the plain
+        client for a Vertex Claude session sends the request to
+        ``{aiplatform_host}/v1/messages`` — Google's HTML 404 — on the very
+        first streamed call of a session. The chokepoint dispatches Bedrock to
+        ``AnthropicBedrock`` and Vertex to ``AnthropicVertex`` itself, so no
+        ``key[0]`` branch is needed here; the 1M-beta flag is read from the
+        agent rather than ``key[4]``, which only exists on the "direct" key
+        shape.
         """
         if self.api_mode == "anthropic_messages":
             self._try_refresh_anthropic_client_credentials()
@@ -5537,17 +5545,16 @@ class AIAgent:
             # thread owns the pool's FDs (same #29507 reasoning as OpenAI).
             self._close_request_anthropic_client(stale, reason=f"reuse_evict:{reason}")
 
-        if key[0] == "bedrock":
-            from agent.anthropic_adapter import build_anthropic_bedrock_client
-            client = build_anthropic_bedrock_client(key[1])
-        else:
-            from agent.anthropic_adapter import build_anthropic_client
-            client = build_anthropic_client(
-                self._anthropic_api_key,
-                getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
-                drop_context_1m_beta=key[4],
-            )
+        from agent.anthropic_adapter import build_anthropic_client_for_provider
+
+        client = build_anthropic_client_for_provider(
+            getattr(self, "provider", None),
+            self._anthropic_api_key,
+            getattr(self, "_anthropic_base_url", None),
+            timeout=get_provider_request_timeout(self.provider, self.model),
+            drop_context_1m_beta=bool(getattr(self, "_oauth_1m_beta_disabled", False)),
+            agent=self,
+        )
         logger.debug(
             "Anthropic request client created (%s, shared=False) provider=%s model=%s",
             reason,
@@ -6211,10 +6218,15 @@ class AIAgent:
             pass
 
         try:
-            self._anthropic_client = build_anthropic_client(
+            # Provider-aware: vertex/bedrock primaries rebuild their SDK
+            # client (the refreshed bearer is irrelevant to SDK auth).
+            from agent.anthropic_adapter import build_anthropic_client_for_provider
+            self._anthropic_client = build_anthropic_client_for_provider(
+                getattr(self, "provider", None),
                 new_token,
                 getattr(self, "_anthropic_base_url", None),
                 timeout=get_provider_request_timeout(self.provider, self.model),
+                agent=self,
             )
         except Exception as exc:
             logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
@@ -6345,7 +6357,10 @@ class AIAgent:
         )
 
         if self.api_mode == "anthropic_messages":
-            from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
+            from agent.anthropic_adapter import (
+                build_anthropic_client_for_provider,
+                _is_oauth_token,
+            )
 
             try:
                 self._anthropic_client.close()
@@ -6354,9 +6369,14 @@ class AIAgent:
 
             self._anthropic_api_key = runtime_key
             self._anthropic_base_url = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
-            self._anthropic_client = build_anthropic_client(
+            # Provider-aware: vertex/bedrock never reach here (no credential
+            # pool), but if they ever do the SDK client is the only valid
+            # rebuild — the plain client 404s on {host}/v1/messages.
+            self._anthropic_client = build_anthropic_client_for_provider(
+                getattr(self, "provider", None),
                 runtime_key, self._anthropic_base_url,
                 timeout=get_provider_request_timeout(self.provider, self.model),
+                agent=self,
             )
             self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
             self.api_key = runtime_key
@@ -6448,28 +6468,27 @@ class AIAgent:
     def _rebuild_anthropic_client(self) -> None:
         """Rebuild the Anthropic client after an interrupt or stale call.
 
-        Handles both direct Anthropic and Bedrock-hosted Anthropic models
-        correctly — rebuilding with the Bedrock SDK when provider is bedrock,
-        rather than always falling back to build_anthropic_client() which
-        requires a direct Anthropic API key.
+        Delegates to ``build_anthropic_client_for_provider`` — the single
+        provider-aware chokepoint that picks AnthropicBedrock for bedrock,
+        AnthropicVertex for vertex (re-resolving credentials, with this
+        agent's cached ``_vertex_*`` attrs as fallback), and the plain
+        Anthropic client otherwise. Recovery/restore/switch paths in
+        agent_runtime_helpers build through the same chokepoint.
 
         Honors ``self._oauth_1m_beta_disabled`` (set by the reactive recovery
         path when an OAuth subscription rejects the 1M-context beta) so the
         rebuilt client carries the reduced beta set.
         """
-        _drop_1m = bool(getattr(self, "_oauth_1m_beta_disabled", False))
-        if getattr(self, "provider", None) == "bedrock":
-            from agent.anthropic_adapter import build_anthropic_bedrock_client
-            region = getattr(self, "_bedrock_region", "us-east-1") or "us-east-1"
-            self._anthropic_client = build_anthropic_bedrock_client(region)
-        else:
-            from agent.anthropic_adapter import build_anthropic_client
-            self._anthropic_client = build_anthropic_client(
-                self._anthropic_api_key,
-                getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
-                drop_context_1m_beta=_drop_1m,
-            )
+        from agent.anthropic_adapter import build_anthropic_client_for_provider
+
+        self._anthropic_client = build_anthropic_client_for_provider(
+            getattr(self, "provider", None),
+            self._anthropic_api_key,
+            getattr(self, "_anthropic_base_url", None),
+            timeout=get_provider_request_timeout(self.provider, self.model),
+            drop_context_1m_beta=bool(getattr(self, "_oauth_1m_beta_disabled", False)),
+            agent=self,
+        )
 
     def _interruptible_api_call(self, api_kwargs: dict):
         """Forwarder — see ``agent.chat_completion_helpers.interruptible_api_call``."""

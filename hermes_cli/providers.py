@@ -674,12 +674,14 @@ def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> st
     Resolution order:
       1. Host-mandated mode (special endpoints that only accept one protocol).
       2. Nous Portal dual-wire (model-derived; overlay alone is openai_chat).
-      3. Known provider → transport → TRANSPORT_TO_API_MODE.
-      4. Direct provider checks (bedrock).
-      5. Default: 'chat_completions'.
+      3. Model-aware provider splits (vertex: Claude vs Gemini/MaaS).
+      4. Known provider → transport → TRANSPORT_TO_API_MODE.
+      5. Direct provider checks (bedrock).
+      6. Default: 'chat_completions'.
 
-    *model* is optional but required for dual-wire providers (Nous) whose
-    transport depends on the catalog id, not just the provider/host.
+    ``model`` is optional but callers that have one in hand should pass it:
+    some providers serve more than one wire protocol (Nous, Vertex) and the
+    provider-level transport alone misroutes the exceptions.
     """
     mandated = host_mandated_api_mode(base_url)
     if mandated is not None:
@@ -692,6 +694,21 @@ def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> st
     provider_norm = (provider or "").strip().lower()
     if provider_norm in {"nous", "nous-portal", "nousresearch"}:
         return nous_api_mode(model)
+
+    # Vertex is a mixed surface: Claude speaks anthropic_messages through the
+    # AnthropicVertex SDK (rawPredict), while Gemini and partner MaaS models
+    # speak chat_completions through the OpenAI-compat endpoint. The
+    # provider-level transport says chat_completions, which silently points a
+    # Claude primary at the OpenAI surface (HTTP 404 / "Malformed publisher
+    # model"). See resolve_runtime_provider's vertex branch for the same split.
+    # Alias tuple mirrors resolve_runtime_provider's vertex branch.
+    if model and normalize_provider(provider) in (
+        "vertex", "google-vertex", "vertex-ai", "gcp-vertex", "vertexai"
+    ):
+        from agent.vertex_adapter import is_anthropic_vertex_model
+
+        if is_anthropic_vertex_model(model):
+            return "anthropic_messages"
 
     pdef = get_provider(provider)
     if pdef is not None:
