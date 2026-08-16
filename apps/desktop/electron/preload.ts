@@ -1,5 +1,10 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
+import { createIpcSelectionSubscription } from './preload-selection'
+
+const onSelectionSpeechRead = createIpcSelectionSubscription(ipcRenderer, 'hermes:selection-speech:read')
+const onSelectionTranslateOpen = createIpcSelectionSubscription(ipcRenderer, 'hermes:selection-translate:open')
+
 contextBridge.exposeInMainWorld('hermesDesktop', {
   getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
   // Registry-scoped backend resolution: { connectionId, profile } → descriptor.
@@ -323,6 +328,12 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     ipcRenderer.on('hermes:notification-action', listener)
 
     return () => ipcRenderer.removeListener('hermes:notification-action', listener)
+  },
+  selectionSpeech: {
+    onReadRequested: onSelectionSpeechRead
+  },
+  selectionTranslate: {
+    onOpenRequested: onSelectionTranslateOpen
   },
   onPreviewFileChanged: callback => {
     const listener = (_event, payload) => callback(payload)

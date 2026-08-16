@@ -228,6 +228,11 @@ import {
 import { missingRendererAssets } from './renderer-bundle'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
 import {
+  buildSelectionActionItems,
+  createChatSelectionAuthorizer,
+  shouldOfferSelectionActions
+} from './selection-context-menu'
+import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,
   createSessionWindowRegistry,
@@ -6077,11 +6082,30 @@ function installZoomShortcuts(window) {
 }
 
 function installContextMenu(window) {
-  window.webContents.on('context-menu', (_event, params) => {
+  const authorizeChatSelection = createChatSelectionAuthorizer(window)
+
+  window.webContents.on('context-menu', async (_event, params) => {
     const template = []
     const hasSelection = Boolean(params.selectionText?.trim())
     const hasLink = Boolean(params.linkURL)
-    const isEditable = Boolean(params.isEditable)
+    const isEditable = params.isEditable
+
+    // Restrict provider- and speech-backed actions to one rendered chat
+    // message. Settings, revealed credentials, and every editable control fail
+    // closed to the ordinary Copy/editing menu.
+    const selectionAuthorization = await authorizeChatSelection(
+      params.frame,
+      params.selectionText ?? '',
+      hasSelection && !isEditable
+    )
+
+    // A newer context-menu event supersedes this async DOM probe. Never let an
+    // older captured selection popup after a later selection has been checked.
+    if (!selectionAuthorization.current || window.isDestroyed()) {
+      return
+    }
+
+    const hasActionableSelection = shouldOfferSelectionActions(params, selectionAuthorization.authorized)
 
     template.push(
       ...imageContextMenuItems(params, {
@@ -6137,6 +6161,13 @@ function installContextMenu(window) {
 
     if (hasSelection || isEditable) {
       if (template.length) {
+        template.push({ type: 'separator' })
+      }
+
+      if (hasActionableSelection) {
+        template.push(
+          ...buildSelectionActionItems(window, params.selectionText, IS_MAC, selectionAuthorization.locale)
+        )
         template.push({ type: 'separator' })
       }
 
