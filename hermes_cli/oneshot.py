@@ -33,7 +33,7 @@ from hermes_cli.fallback_config import get_fallback_chain
 
 
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
-    if not toolsets:
+    if toolsets is None or toolsets == "":
         return None
 
     raw_items = [toolsets] if isinstance(toolsets, str) else toolsets
@@ -47,13 +47,18 @@ def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
         else:
             normalized.append(str(item).strip())
 
-    return [item for item in normalized if item] or None
+    cleaned = [item for item in normalized if item]
+    if cleaned:
+        return cleaned
+    return [] if isinstance(toolsets, (list, tuple)) else None
 
 
 def _validate_explicit_toolsets(toolsets: object = None) -> tuple[list[str] | None, str | None]:
     normalized = _normalize_toolsets(toolsets)
     if normalized is None:
         return None, None
+    if normalized == ["none"]:
+        return [], None
 
     try:
         from toolsets import validate_toolset
@@ -183,6 +188,7 @@ def run_oneshot(
         provider: Optional provider override. Falls back to config.yaml's
             model.provider, then "auto".
         toolsets: Optional comma-separated string or iterable of toolsets.
+            The sentinel ``none`` explicitly enables zero tools.
         usage_file: Optional path; when set, a JSON usage report (estimated
             cost, token counts, model, api_calls) is written there after the
             run — even when the run fails — so pipelines can account for

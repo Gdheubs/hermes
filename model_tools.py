@@ -427,7 +427,8 @@ def _compute_tool_definitions(
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
         if (
-            os.environ.get("HERMES_KANBAN_TASK")
+            effective_enabled_toolsets
+            and os.environ.get("HERMES_KANBAN_TASK")
             and not _is_delegated_child_context()
             and _is_dispatcher_owned_worker()
             and "kanban" not in effective_enabled_toolsets
