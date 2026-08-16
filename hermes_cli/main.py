@@ -1850,16 +1850,18 @@ def _print_tui_exit_summary(
     )
 
 
-_NPM_LOCK_RUNTIME_KEYS = frozenset({"ideallyInert", "peer"})
+_NPM_LOCK_RUNTIME_KEYS = frozenset({"ideallyInert", "peer", "extraneous"})
 """Lockfile fields npm writes non-deterministically at install time.
 
 ``ideallyInert`` is npm's runtime annotation for packages it skipped installing
 (per-platform opt-outs).  ``peer`` is dropped from the hidden ``.package-lock.json``
 on dev-dependencies that are *also* declared as peers — the canonical
 ``package-lock.json`` records the dual role, but npm 9's actualized tree strips
-it.  Neither key represents a real skew between what was declared and what was
-installed, so we exclude them from the comparison in :func:`_tui_need_npm_install`
-to avoid false-positive reinstalls on every launch.
+it.  ``extraneous`` marks packages present in ``node_modules`` but not listed in
+any ``package.json`` — npm adds/removes it non-deterministically.  None of these
+keys represent a real skew between what was declared and what was installed, so
+we exclude them from the comparison in :func:`_tui_need_npm_install` to avoid
+false-positive reinstalls on every launch.
 """
 
 
@@ -1987,12 +1989,30 @@ def _tui_need_npm_install(root: Path) -> bool:
         if name not in installed:
             if pkg.get("optional") or pkg.get("peer"):
                 continue
+            # Skip link:true (npm link战场上常见) and entries not under node_modules/
+            if pkg.get("link") or not name.startswith("node_modules/"):
+                continue
             return True
 
-        if isinstance(installed[name], dict) and comparable(pkg) != comparable(
-            installed[name]
-        ):
-            return True
+        # Compare only non-null keys present on either side, ignoring runtime keys
+        if isinstance(installed[name], dict):
+            wp, ip = comparable(pkg), comparable(installed[name])
+            wk, ik = set(wp.keys()), set(ip.keys())
+            if wk != ik:
+                # Keys differ — check if the difference matters (non-null values)
+                for k in wk & ik:
+                    if wp[k] is not None and ip[k] is not None and wp[k] != ip[k]:
+                        return True
+                for k in wk - ik:
+                    if wp[k] is not None:
+                        return True
+                for k in ik - wk:
+                    if ip[k] is not None:
+                        return True
+            else:
+                for k in wk:
+                    if wp[k] != ip[k]:
+                        return True
 
     return False
 
