@@ -14876,6 +14876,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 if success:
                     profile_map[platform] = adapter
+                    # Push persisted /voice state (enabled/disabled chat sets +
+                    # global voice.auto_tts default) onto this secondary
+                    # profile's adapter at INITIAL connect. Mirror of the
+                    # reconnect path (line ~13338); without it a multiplex
+                    # secondary profile's adapter boots with empty auto-TTS
+                    # opt-in state and never voice-replies to voice input.
+                    self._sync_voice_mode_state_to_adapter(adapter)
                     if credential_claim is not None:
                         claimed[credential_claim] = profile_name
                     if listener_claim is not None:
