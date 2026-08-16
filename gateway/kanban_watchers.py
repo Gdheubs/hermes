@@ -407,11 +407,20 @@ class GatewayKanbanWatchersMixin:
                             # a legacy DB. `_add_column_if_missing` now
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
-                            subs = _kb.list_notify_subs(
-                                conn,
-                                notifier_profiles=notifier_profiles,
-                                include_unowned=include_unowned,
-                            )
+                            try:
+                                subs = _kb.list_notify_subs(
+                                    conn,
+                                    notifier_profiles=notifier_profiles,
+                                    include_unowned=include_unowned,
+                                )
+                            except TypeError:
+                                # Backward compatibility for older kanban_db signatures
+                                # without notifier_profiles.
+                                subs = _kb.list_notify_subs(
+                                    conn,
+                                    task_id=None,
+                                    include_unowned=include_unowned,
+                                )
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
@@ -1669,10 +1678,20 @@ class GatewayKanbanWatchersMixin:
                 # failure cannot block cleanup of unrelated workers.
                 pids = await asyncio.to_thread(_kb.reap_worker_zombies)
                 if pids:
+                    exits = []
+                    for pid in pids:
+                        kind, code = _kb._classify_worker_exit(pid)
+                        exits.append({
+                            "pid": pid,
+                            "exit_kind": kind,
+                            "exit_code": code,
+                        })
                     logger.info(
-                        "kanban dispatcher: reaped %d zombie worker(s), pids=%s",
-                        len(pids),
-                        pids,
+                        "kanban dispatcher: collected %d exited worker child "
+                        "process(es), exits=%s (OS cleanup only; task outcome "
+                        "is determined from board state)",
+                        len(exits),
+                        exits,
                     )
             except Exception:
                 logger.exception("kanban dispatcher: zombie reaper failed")
@@ -1711,7 +1730,20 @@ class GatewayKanbanWatchersMixin:
                             )
                     # Health telemetry (aggregate across boards)
                     ready_pending = await asyncio.to_thread(_ready_nonempty)
-                    if ready_pending and not any_spawned:
+                    # A non-empty queue can be healthy backpressure. The DB
+                    # dispatcher classifies global/per-profile capacity
+                    # deferrals separately from unexplained ready work.
+                    capacity_deferred = any(
+                        bool(getattr(res, "skipped_global_capped", None))
+                        or bool(getattr(res, "skipped_per_profile_capped", None))
+                        for _slug, res in (results or []) if res is not None
+                    )
+                    actionable_pending = any(
+                        bool(getattr(res, "actionable_ready_remaining", None))
+                        for _slug, res in (results or []) if res is not None
+                    )
+                    capacity_only = ready_pending and capacity_deferred and not actionable_pending
+                    if ready_pending and not any_spawned and not capacity_only:
                         bad_ticks += 1
                     else:
                         bad_ticks = 0
