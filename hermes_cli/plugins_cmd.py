@@ -2157,7 +2157,14 @@ def cmd_show(name: str) -> None:
 
     enabled = _get_enabled_set()
     disabled = _get_disabled_set()
-    status = _plugin_status(pname, enabled, disabled, key=key)
+    status = _plugin_status(
+        pname,
+        enabled,
+        disabled,
+        key=key,
+        dir_path=dir_path,
+        active_provider_dir=_active_memory_provider_dir(),
+    )
 
     console.print()
     console.print(f"[bold]{pname}[/bold]" + (f" [dim]v{version}[/dim]" if version else ""))

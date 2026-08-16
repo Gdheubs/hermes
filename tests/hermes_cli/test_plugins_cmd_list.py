@@ -387,3 +387,41 @@ def test_cmd_list_plain_status_column_stays_aligned(monkeypatch, capsys, tmp_pat
     ]
 
 
+def test_e2e_cmd_show_reports_active_provider(monkeypatch, tmp_path, capsys):
+    """`hermes plugins show` is the same surface as `list` and must agree.
+
+    `cmd_show` renders the same activation state for a single plugin, so a
+    provider-backed plugin reported as "active" by `cmd_list` must not read
+    "not enabled" here — the sibling call path of #82898.
+    """
+    home = tmp_path / "hermes_home"
+    home.mkdir(parents=True)
+    _install_real_provider_plugin(home, dir_name="mnemosyne", manifest_name="mnemosyne-hermes")
+    (home / "config.yaml").write_text("memory:\n  provider: mnemosyne\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    plugins_cmd.cmd_show("mnemosyne-hermes")
+
+    out = capsys.readouterr().out
+    assert f"Status: {plugins_cmd.PLUGIN_STATUS_ACTIVE}" in out
+    assert "not enabled" not in out
+
+
+def test_e2e_cmd_show_unrelated_plugin_still_not_enabled(monkeypatch, tmp_path, capsys):
+    """The directory match must not leak onto a plugin that is not the provider."""
+    home = tmp_path / "hermes_home"
+    home.mkdir(parents=True)
+    _install_real_provider_plugin(home, dir_name="mnemosyne", manifest_name="mnemosyne-hermes")
+    other = home / "plugins" / "unrelated"
+    other.mkdir(parents=True)
+    (other / "plugin.yaml").write_text(
+        "name: unrelated\nversion: 1.0.0\ndescription: Not a provider\n", encoding="utf-8"
+    )
+    (home / "config.yaml").write_text("memory:\n  provider: mnemosyne\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    plugins_cmd.cmd_show("unrelated")
+
+    assert "Status: not enabled" in capsys.readouterr().out
+
+
