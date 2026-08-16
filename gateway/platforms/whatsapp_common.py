@@ -169,8 +169,9 @@ class WhatsAppBehaviorMixin:
         """
         source = getattr(self, "_dm_allowlist_source", None)
         if isinstance(source, str) and source != "config":
-            if source in os.environ:
-                return self._coerce_allow_list(os.environ.get(source, ""))
+            live = _get_wsecret(source)
+            if live is not None:
+                return self._coerce_allow_list(live)
             # Key removed (e.g. sole-entry pairing revoke) — do not revive the
             # stale construction snapshot.
             return set()
