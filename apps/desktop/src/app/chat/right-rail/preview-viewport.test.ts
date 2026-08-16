@@ -33,6 +33,11 @@ describe('clampSize', () => {
       height: VIEWPORT_LIMITS.maxHeight
     })
   })
+
+  it('returns non-finite sizes for NaN so the caller can reject them', () => {
+    expect(clampSize(Number('abc'), 720)).toEqual({ width: Number.NaN, height: 720 })
+    expect(Number.isFinite(clampSize(Number('abc'), 720).width)).toBe(false)
+  })
 })
 
 describe('parseViewportMode', () => {

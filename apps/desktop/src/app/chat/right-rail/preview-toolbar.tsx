@@ -107,40 +107,38 @@ export function PreviewToolbar({
   )
 
   return (
-    <form
-      aria-label={copy.navigate}
-      className="flex shrink-0 items-center gap-0.5 border-b border-border/60 bg-background px-1 py-1"
-      onSubmit={handleSubmit}
-    >
+    <div className="flex shrink-0 items-center gap-0.5 border-b border-border/60 bg-background px-1 py-1">
       <TooltipIconButton disabled={!canGoBack} onClick={onBack} tooltip={copy.goBack} type="button">
         <ChevronLeft />
       </TooltipIconButton>
       <TooltipIconButton disabled={!canGoForward} onClick={onForward} tooltip={copy.goForward} type="button">
         <ChevronRight />
       </TooltipIconButton>
-      <Input
-        aria-invalid={address.trim().length > 0 && !addressValid ? true : undefined}
-        aria-label={copy.address}
-        autoCapitalize="off"
-        autoComplete="off"
-        autoCorrect="off"
-        className={cn(loading && 'text-muted-foreground')}
-        inputMode="url"
-        onBlur={onAddressBlur}
-        onChange={event => onAddressChange(event.target.value)}
-        onFocus={onAddressFocus}
-        placeholder={placeholder}
-        size="xs"
-        spellCheck={false}
-        value={address}
-      />
-      <TooltipIconButton disabled={!addressValid} tooltip={copy.navigate} type="submit">
-        <ArrowUpRight />
-      </TooltipIconButton>
+      <form aria-label={copy.navigate} className="flex min-w-0 flex-1 items-center gap-0.5" onSubmit={handleSubmit}>
+        <Input
+          aria-invalid={address.trim().length > 0 && !addressValid ? true : undefined}
+          aria-label={copy.address}
+          autoCapitalize="off"
+          autoComplete="off"
+          autoCorrect="off"
+          className={cn(loading && 'text-muted-foreground')}
+          inputMode="url"
+          onBlur={onAddressBlur}
+          onChange={event => onAddressChange(event.target.value)}
+          onFocus={onAddressFocus}
+          placeholder={placeholder}
+          size="xs"
+          spellCheck={false}
+          value={address}
+        />
+        <TooltipIconButton disabled={!addressValid} tooltip={copy.navigate} type="submit">
+          <ArrowUpRight />
+        </TooltipIconButton>
+      </form>
       <TooltipIconButton onClick={onReload} tooltip={copy.reload} type="button">
         <RefreshCw className={cn(loading && 'animate-spin')} />
       </TooltipIconButton>
       <PreviewViewportControl mode={viewport} onModeChange={onViewportChange} />
-    </form>
+    </div>
   )
 }
