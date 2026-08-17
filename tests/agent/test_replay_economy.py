@@ -182,6 +182,7 @@ _STRIP_WIRES = [
     ("DeepSeek", "deepseek", "deepseek-v4-pro", "https://api.deepseek.com/v1", True),
     ("DeepSeek", "deepseek", "deepseek-v4-flash", "https://api.deepseek.com/v1", True),
     ("MiMo", "xiaomi", "MiMo-V2.5-Pro", "https://api.xiaomimimo.com/v1", True),
+    ("Qwen", "qwen", "qwen3.8-max", "https://portal.qwen.ai/v1", False),
     ("Moonshot AI", "kimi-coding", "kimi-k3", "https://api.moonshot.ai/v1", False),
     ("Z.ai", "zai-org", "glm-5.2", "", False),
     ("OpenAI", "openai", "gpt-5.6", "", False),

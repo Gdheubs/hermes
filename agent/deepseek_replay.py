@@ -95,10 +95,14 @@ def _plain_turn_strip_allowed(
     PROVEN must-keep: Kimi/Moonshot — the official docs require preserving
     reasoning_content from every previous call ("keep the assistant message
     (including reasoning_content) from every previous API call"; preserved
-    thinking is always on for kimi-k3; platform.kimi.com/docs/guide/use-
-    thinking-models), and openclaw/openclaw#92396 backfills it — stripping
-    would break the contract (server discards reasoning_content, silent
-    pauses per can1357/oh-my-pi).
+    thinking is always on for kimi-k3; platform.kimi.com/docs/guide/
+    use-thinking-models); openclaw/openclaw#92396 backfills Kimi — stripping
+    would break the contract (server discards reasoning_content, silent pauses
+    per can1357/oh-my-pi).
+    KEPT by default: Qwen max/plus lines — ``preserve_thinking`` is a
+    per-request parameter defaulting to true (the model homepage), and the
+    agent relies on the default; a user setting it false would make the
+    reasoning strippable.
     """
     if is_deepseek_replay_target(provider, model, base_url):
         return True
