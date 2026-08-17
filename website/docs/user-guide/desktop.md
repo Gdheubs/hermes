@@ -247,6 +247,7 @@ By default the app starts and manages its own **local** backend. You can instead
 **Settings → Gateway → Connection mode** offers the alternatives to the local gateway:
 
 - **Remote gateway** — enter the URL of a `hermes serve` backend you run yourself and sign in. This is the mode the rest of this section walks through.
+- **Connect via SSH** — paste `ssh://host` (or `user@host` / a `~/.ssh/config` Host alias) and Desktop attaches to the `hermes serve` already running on that machine, or starts one if nothing is listening. Key-based SSH (`ssh-agent` / `IdentityFile`) is required; no token or OAuth. First launch **Connect to existing Hermes** accepts the same `ssh://botnet` URL.
 - **Hermes Cloud** — sign in once to Hermes Cloud and pick from the agents on your account; no URL to paste. The app discovers your agents (with an organization picker if your account spans several orgs), and connecting to one switches the session over automatically. The status bar shows the cloud connection while it's active.
 
 Connection modes are configured **per profile** — a per-profile override can point one profile at a remote or cloud backend while others stay local (**Use default gateway** removes an override).
@@ -409,10 +410,12 @@ Build installers:
 npm run dist:mac     # DMG + zip
 npm run dist:win     # NSIS + MSI
 npm run dist:linux   # AppImage + deb + rpm
+npm run dist:linux:appimage  # AppImage only
 npm run pack         # unpacked app under release/ (no installer)
 ```
 
-macOS/Windows signing and notarization run automatically when the relevant credentials are present in the environment (`CSC_LINK` / `CSC_KEY_PASSWORD` / `APPLE_*` for macOS, `WIN_CSC_*` for Windows).
+GitHub Releases attach those installers via `.github/workflows/desktop-release.yml` (macOS, Windows, and Linux AppImage). macOS/Windows signing and notarization run automatically when the relevant credentials are present in the environment (`CSC_LINK` / `CSC_KEY_PASSWORD` / `APPLE_*` for macOS, `WIN_CSC_*` for Windows).
+
 
 ### macOS permissions and local rebuilds (TCC)
 
