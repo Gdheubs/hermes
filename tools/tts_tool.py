@@ -571,7 +571,24 @@ def _split_text_for_tts(text: str, max_chars: int) -> List[str]:
 
     sentences = [
         sentence.strip()
-        for sentence in re.split(r"(?<=[.!?;:,])\s+", normalized)
+        for sentence in re.split(
+            # English/Latin sentence punctuation only breaks when followed by
+            # whitespace (so "3.14" and "Dr." are not split mid-token).
+            # CJK punctuation (。！？；，、：) is a hard break even without
+            # whitespace — Chinese text has no spaces, so without this the
+            # whole paragraph becomes one word and gets hard-split mid-word
+            # (e.g. "发现三个隐|患点").
+            #
+            # NOTE: U+201D (”) / U+2019 (’) are deliberately NOT in the
+            # hard-break class. They are Latin closing-quote and
+            # curly-apostrophe codepoints (don’t, it’s, “quote”), and the
+            # (?=[^\s]) alternative would split English smart-quoted text
+            # mid-word. A Chinese closing quote at sentence end is almost
+            # always preceded by 。/！/？ already, so the boundary still
+            # lands correctly without them (triage #84622).
+            r"(?<=[.!?;:,])\s+|(?<=[。！？；，、：])(?:\s+|(?=[^\s]))",
+            normalized,
+        )
         if sentence.strip()
     ]
     expanded: List[str] = []
