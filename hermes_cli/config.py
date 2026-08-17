@@ -28,9 +28,10 @@ import tempfile
 import threading
 import time
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Any, Optional, List, Tuple, Set
+from typing import Dict, Any, Optional, List, Tuple, Set, Iterator
 
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.secret_prompt import masked_secret_prompt
@@ -3252,10 +3253,52 @@ def read_raw_config_readonly() -> Dict[str, Any]:
         return cached_copy
 
 
+_CONFIG_WRITE_BLOCKS_LOCK = threading.RLock()
+_CONFIG_WRITE_BLOCKS: Dict[object, str] = {}
+
+
+def _activate_config_write_block(reason: str) -> object:
+    """Block canonical config writers process-wide until the token is removed."""
+    token = object()
+    with _CONFIG_WRITE_BLOCKS_LOCK:
+        _CONFIG_WRITE_BLOCKS[token] = reason
+    return token
+
+
+def _deactivate_config_write_block(token: object) -> None:
+    with _CONFIG_WRITE_BLOCKS_LOCK:
+        _CONFIG_WRITE_BLOCKS.pop(token, None)
+
+
+@contextmanager
+def config_writes_blocked(reason: str) -> Iterator[None]:
+    """Scope a process-wide block around a read-only config operation."""
+    token = _activate_config_write_block(reason)
+    try:
+        yield
+    finally:
+        _deactivate_config_write_block(token)
+
+
+def _block_config_writes_for_process(reason: str) -> object:
+    """Install a non-expiring block for a dedicated read-only CLI process."""
+    return _activate_config_write_block(reason)
+
+
+def _config_write_block_reason() -> Optional[str]:
+    with _CONFIG_WRITE_BLOCKS_LOCK:
+        return next(iter(_CONFIG_WRITE_BLOCKS.values()), None)
+
+
 def require_readable_config_before_write(config_path: Optional[Path] = None) -> None:
-    """Refuse to replace an existing config.yaml that cannot be read."""
+    """Refuse config writes from read-only or unreadable contexts."""
     if config_path is None:
         config_path = get_config_path()
+    block_reason = _config_write_block_reason()
+    if block_reason:
+        raise RuntimeError(
+            f"Refusing to write {config_path}: {block_reason}."
+        )
     try:
         config_path.stat()
     except FileNotFoundError:
@@ -5577,7 +5620,16 @@ def unset_config_value(key: str):
 # Command handler
 # =============================================================================
 
+
 def config_command(args):
+    """Handle config subcommands with scoped policy for read-only actions."""
+    if getattr(args, 'config_command', None) == "check":
+        with config_writes_blocked("`hermes config check` is read-only"):
+            return _config_command_impl(args)
+    return _config_command_impl(args)
+
+
+def _config_command_impl(args):
     """Handle config subcommands."""
     subcmd = getattr(args, 'config_command', None)
     

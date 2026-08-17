@@ -691,10 +691,79 @@ def _apply_profile_override() -> None:
 
 _apply_profile_override()
 
+# Top-level flags that consume the following token. Keep this in sync with
+# ``hermes_cli/_parser.py``. It is intentionally available before config
+# imports so startup policy can identify the command without running the full
+# argparse/plugin setup. Treat ``-c / --continue`` as value-taking here because
+# a following subcommand-looking token is its optional session-name value.
+_TOP_LEVEL_VALUE_FLAGS = frozenset({
+    "-z",
+    "--oneshot",
+    "-m",
+    "--model",
+    "--provider",
+    "-t",
+    "--toolsets",
+    "-r",
+    "--resume",
+    "-s",
+    "--skills",
+    "--usage-file",
+    "--in",
+    "-c",
+    "--continue",
+})
+
+
+def _top_level_positionals(argv: list[str], *, limit: int) -> list[str]:
+    """Return leading CLI positionals without mistaking option values for commands."""
+    positionals = []
+    i = 0
+    while i < len(argv) and len(positionals) < limit:
+        token = argv[i]
+        if token == "--":
+            positionals.extend(argv[i + 1 : i + 1 + limit - len(positionals)])
+            break
+        if token.startswith("-"):
+            if (
+                "=" not in token
+                and token in _TOP_LEVEL_VALUE_FLAGS
+                and i + 1 < len(argv)
+            ):
+                i += 2
+            else:
+                i += 1
+            continue
+        positionals.append(token)
+        i += 1
+    return positionals
+
+
+def _is_config_check_invocation(argv: list[str]) -> bool:
+    return _top_level_positionals(argv, limit=2) == ["config", "check"]
+
+
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
-from hermes_cli.config import get_hermes_home
+from hermes_cli.config import (
+    get_hermes_home,
+    _block_config_writes_for_process,
+    _deactivate_config_write_block,
+)
 from hermes_cli.env_loader import load_hermes_dotenv
+
+_CONFIG_CHECK_WRITE_BLOCK_TOKEN = None
+if _is_config_check_invocation(sys.argv[1:]):
+    _CONFIG_CHECK_WRITE_BLOCK_TOKEN = _block_config_writes_for_process(
+        "`hermes config check` is read-only"
+    )
+
+
+def _release_config_check_write_block() -> None:
+    global _CONFIG_CHECK_WRITE_BLOCK_TOKEN
+    if _CONFIG_CHECK_WRITE_BLOCK_TOKEN is not None:
+        _deactivate_config_write_block(_CONFIG_CHECK_WRITE_BLOCK_TOKEN)
+        _CONFIG_CHECK_WRITE_BLOCK_TOKEN = None
 
 # Updating dependencies must not import optional secret-manager libraries into
 # the updater process before ``uv`` replaces the environment.  On Windows,
@@ -11429,33 +11498,6 @@ _BUILTIN_SUBCOMMANDS = frozenset(
 )
 
 
-# Top-level flags that take a value. Needed by ``_first_positional_argv``
-# so that in ``hermes -m gpt5 chat``, ``gpt5`` is correctly skipped as a
-# flag value rather than misclassified as a subcommand. Kept in sync with
-# the top-level flags declared in ``hermes_cli/_parser.py``.
-#
-# Correctness-safe either way: missing an entry here only makes the
-# fast-path bail out too eagerly (we run plugin discovery when we didn't
-# need to); extra entries would make us skip a real positional.
-_TOP_LEVEL_VALUE_FLAGS = frozenset(
-    {
-        "-z", "--oneshot",
-        "-m", "--model",
-        "--provider",
-        "-t", "--toolsets",
-        "-r", "--resume",
-        "-s", "--skills",
-        "--usage-file",
-        "--in",
-        # ``-c / --continue`` is nargs='?' (optional value). Treat it as
-        # value-taking: if the next token is a subcommand-looking word
-        # the user almost certainly meant it as the session name, and
-        # either interpretation keeps us on the safe side.
-        "-c", "--continue",
-    }
-)
-
-
 def _first_positional_argv() -> str | None:
     """Return the first non-flag, non-flag-value token in ``sys.argv[1:]``.
 
@@ -11468,27 +11510,8 @@ def _first_positional_argv() -> str | None:
     bar`` flags degrade gracefully (``bar`` may be wrongly classified as
     a positional, which at worst forces a one-time plugin discovery).
     """
-    argv = sys.argv[1:]
-    i = 0
-    while i < len(argv):
-        tok = argv[i]
-        if tok == "--":
-            # Everything after ``--`` is positional.
-            if i + 1 < len(argv):
-                return argv[i + 1]
-            return None
-        if tok.startswith("-"):
-            # ``--flag=value`` carries its value inline — single token.
-            if "=" in tok:
-                i += 1
-                continue
-            if tok in _TOP_LEVEL_VALUE_FLAGS and i + 1 < len(argv):
-                i += 2
-                continue
-            i += 1
-            continue
-        return tok
-    return None
+    positionals = _top_level_positionals(sys.argv[1:], limit=1)
+    return positionals[0] if positionals else None
 
 
 def _plugin_cli_discovery_needed() -> bool:
@@ -12096,6 +12119,14 @@ def _advertise_agent_env() -> None:
 
 
 def main():
+    """Run one CLI invocation and release process-scoped config policy."""
+    try:
+        return _main()
+    finally:
+        _release_config_check_write_block()
+
+
+def _main():
     """Main entry point for hermes CLI."""
     # Cosmetic: make the process show up as 'hermes' instead of 'python3.11'
     # in ps/top/htop.  Non-fatal — just a nicer UX.
