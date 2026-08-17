@@ -171,6 +171,7 @@ import { WorktreeDialog } from './projects/worktree-dialog'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
 import { buildSessionByAnyId, resolvePinnedSessions } from './session-index'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
+import { SidebarSavedViewsQuickAccess } from './sidebar-views-quick-access'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 
 // Non-session groups (messaging platforms) stay compact: show a few rows up
@@ -1676,7 +1677,13 @@ export function ChatSidebar({
                 // Otherwise project lanes stay chronological whatever the flat
                 // list does — only the flat list can swap its dividers for
                 // WORKING / DONE.
-                grouping={showArchived || rankedGlobally ? 'none' : grouping === 'status' ? 'status' : 'date'}
+                grouping={
+                  showArchived || rankedGlobally
+                    ? 'none'
+                    : grouping === 'status' || grouping === 'none'
+                      ? grouping
+                      : 'date'
+                }
                 groups={displayAgentGroups}
                 headerAction={
                   <>
@@ -1751,6 +1758,7 @@ export function ChatSidebar({
                             </Button>
                           </Tip>
                         ) : null}
+                        <SidebarSavedViewsQuickAccess className={HEADER_NAV_BTN} />
                         <div className="grid size-6 place-items-center">
                           <SidebarFilterMenu className={HEADER_NAV_BTN} />
                         </div>
