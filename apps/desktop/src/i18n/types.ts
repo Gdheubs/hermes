@@ -1125,6 +1125,24 @@ export interface Translations {
     searchTo: string
     searchCount: (n: number) => string
     searchEmpty: string
+    filterTitle: string
+    filterShowing: (shown: number, total: number) => string
+    filterClear: string
+    dateModeLabel: string
+    dateModeRange: string
+    dateModeYear: string
+    dateModeYearMonth: string
+    dateYearAny: string
+    dateMonthLabel: string
+    dateMonthAny: string
+    conclusion: string
+    conclusions: string
+    conclusionStartConversation: string
+    conclusionSeedPrompt: (text: string) => string
+    recallIntoChat: string
+    addToSession: string
+    addToSessionDone: (title: string) => string
+    recallFailed: string
   }
   agents: {
     close: string

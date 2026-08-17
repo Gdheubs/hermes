@@ -324,6 +324,12 @@ class HonchoMemoryProvider(MemoryProvider):
                             "body": content,
                             "timestamp": getattr(c, "created_at", None),
                             "session_id": getattr(c, "session_id", None),
+                            # Honcho's own taxonomy: 'explicit' = a directly
+                            # stated fact (a true memory); 'inductive' /
+                            # 'deductive' = a derived inference (a conclusion).
+                            # The journey graph separates memories from
+                            # conclusions on this. Missing on older servers.
+                            "level": (str(getattr(c, "level", "") or "").strip().lower() or None),
                         })
                         if len(cards) >= limit:
                             break

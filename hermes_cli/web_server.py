@@ -4107,6 +4107,31 @@ async def update_learning_node(body: LearningNodeEdit):
     return res
 
 
+@app.get("/api/learning/recall-draft")
+async def get_learning_recall_draft(id: str, profile: Optional[str] = None):
+    """Safe, provenance-tagged draft text for recalling a journey node's
+    knowledge into a session as reference context ("Add to recent session" /
+    "/recall").
+
+    The recalled body is treated as UNTRUSTED (defends against a tampered
+    memory database): it is scanned with the shared threat detector, its
+    delimiter is defanged, and it is wrapped in an ``untrusted_memory_recall``
+    block telling the model to treat the contents as data, not instructions.
+    The caller stashes the returned ``text`` as the target session's composer
+    draft — the user still reviews and sends it.
+    """
+    from agent.learning_mutations import build_recall_draft
+
+    def _run():
+        with _profile_scope(profile):
+            return build_recall_draft(id)
+
+    res = await asyncio.to_thread(_run)
+    if not res.get("ok"):
+        raise HTTPException(status_code=404, detail=res.get("message", "not found"))
+    return res
+
+
 @app.get("/api/learning/provider-session")
 async def get_learning_provider_session(
     session_id: str, limit: int = 500, profile: Optional[str] = None

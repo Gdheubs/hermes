@@ -713,6 +713,12 @@ export interface StarmapNode {
    *  ('honcho', …) for nodes contributed by an external provider's
    *  journey_cards(). Provider nodes are read-only in the journey. */
   memorySource?: string
+  /** Honcho conclusion taxonomy for provider memory nodes: 'explicit' (a
+   *  directly-stated fact — a true memory), 'inductive' / 'deductive' (a
+   *  derived inference — a conclusion). Absent for file memories, skills, and
+   *  older backends that don't emit it — treated as a plain memory. This is
+   *  the signal that separates true memories from conclusions in the map. */
+  memoryLevel?: string
   /** Where the knowledge originally came from: 'hermes' (born in a Hermes
    *  conversation / file memory / skill) or an import source ('chatgpt', …).
    *  Backend stamps provider nodes; absent (older backend) means 'hermes'. */
@@ -756,6 +762,11 @@ export interface StarmapGraph {
   clusters: StarmapCluster[]
   memory: StarmapMemoryCard[]
   stats: Record<string, unknown>
+  /** Active external memory provider ('honcho', …) or null/absent (file-based
+   *  memory only). Gates provider-specific journey UI — notably the conclusion
+   *  node kind, which is only meaningful when Honcho is the active provider.
+   *  Absent from an un-upgraded backend, so treat missing as null. */
+  memoryProvider?: null | string
 }
 
 export interface ContextUsageCategory {

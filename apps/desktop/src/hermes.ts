@@ -1220,6 +1220,29 @@ export function editLearningNode(
   })
 }
 
+/** Safe, provenance-tagged draft text for recalling a journey node into a
+ *  session as reference context. The recalled body is scanned, delimiter-
+ *  defanged, and wrapped in an untrusted-data block server-side — the caller
+ *  stashes `text` as the target session's composer draft (user reviews + sends). */
+export interface LearningRecallDraft {
+  connected_count: number
+  /** Threat-scan pattern ids matched in the recalled body (empty = clean). */
+  findings: string[]
+  id: string
+  kind: 'memory' | 'skill'
+  label: string
+  ok: boolean
+  text: string
+  truncated: boolean
+}
+
+export function getLearningRecallDraft(id: string): Promise<LearningRecallDraft> {
+  return window.hermesDesktop.api<LearningRecallDraft>({
+    ...profileScoped(),
+    path: `/api/learning/recall-draft?id=${encodeURIComponent(id)}`
+  })
+}
+
 /** One raw message from a provider-side session (journey source corpus). */
 export interface ProviderSessionMessage {
   content: string

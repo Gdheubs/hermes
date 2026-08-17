@@ -4,21 +4,82 @@ import type { StarmapGraph, StarmapNode } from '@/types/hermes'
 // Pure search/filter logic + persisted search state for the star-map sidebar.
 // Kept free of React so the matching rules are unit-testable.
 
+/** How the date filter is expressed. 'range' = explicit from/to days;
+ *  'year' = a whole calendar year; 'yearMonth' = a single month of a year.
+ *  All three collapse to a unix-second [from, to] window via effectiveRange. */
+export type DateMode = 'range' | 'year' | 'yearMonth'
+
 export interface SearchFilters {
-  /** ISO date 'YYYY-MM-DD' (local), or '' for unbounded. */
+  /** Which date control is active. Range uses from/to; year uses year;
+   *  yearMonth uses year (+ optional month). */
+  dateMode: DateMode
+  /** ISO date 'YYYY-MM-DD' (local), or '' for unbounded — range mode. */
   from: string
-  kind: 'all' | 'memory' | 'skill'
+  /** 'memory' excludes conclusions (disjoint categories); 'conclusion' is
+   *  provider-derived durable facts, only meaningful under Honcho. */
+  kind: 'all' | 'conclusion' | 'memory' | 'skill'
+  /** '01'–'12', or '' for the whole year — yearMonth mode. */
+  month: string
   /** 'all' | 'hermes' | any import origin ('chatgpt', …) — open-ended so new
    *  import sources need no code change here. */
   source: string
+  /** ISO date 'YYYY-MM-DD' (local), or '' for unbounded — range mode. */
   to: string
+  /** 'YYYY', or '' for unbounded — year / yearMonth modes. */
+  year: string
 }
 
 export interface SavedSearch extends SearchFilters {
   query: string
 }
 
-export const EMPTY_FILTERS: SearchFilters = { from: '', kind: 'all', source: 'all', to: '' }
+export const EMPTY_FILTERS: SearchFilters = {
+  dateMode: 'range',
+  from: '',
+  kind: 'all',
+  month: '',
+  source: 'all',
+  to: '',
+  year: ''
+}
+
+/** Active provider name, lowercased, or '' — the single Honcho gate. */
+function providerName(graph: Pick<StarmapGraph, 'memoryProvider'>): string {
+  return (graph.memoryProvider ?? '').trim().toLowerCase()
+}
+
+/** Whether the conclusion category + legend + node styling should surface at
+ *  all. Only Honcho exposes conclusions today (its journey_cards() returns
+ *  exactly the user peer's conclusions), so the feature is gated on it. */
+export function conclusionsEnabled(graph: Pick<StarmapGraph, 'memoryProvider'>): boolean {
+  return providerName(graph) === 'honcho'
+}
+
+/** Honcho conclusion levels that mark a node as a DERIVED fact (a conclusion)
+ *  rather than a directly-stated one. Honcho's taxonomy: 'explicit' = a fact
+ *  stated outright (a true memory); 'inductive' / 'deductive' = an inference
+ *  Honcho synthesized (a conclusion). Kept as a set so an unknown future
+ *  derived level can be added in one place. */
+const DERIVED_LEVELS = new Set(['inductive', 'deductive'])
+
+/** A node is a "conclusion" — a durable DERIVED fact — when Honcho is the
+ *  active provider, the node came from Honcho, AND Honcho tagged it with a
+ *  derived level ('inductive'/'deductive'). An 'explicit' level, a missing
+ *  level (older Honcho that predates the field), or any non-Honcho node is a
+ *  plain memory. Keying on the derived level — not merely memorySource ===
+ *  'honcho' — is what stops genuine memories (the vast majority) from being
+ *  mislabeled as conclusions; missing-level safely degrades to memory. */
+export function isConclusion(n: StarmapNode, memoryProvider?: null | string): boolean {
+  if ((memoryProvider ?? '').trim().toLowerCase() !== 'honcho') {
+    return false
+  }
+
+  if ((n.memorySource ?? '').toLowerCase() !== 'honcho') {
+    return false
+  }
+
+  return DERIVED_LEVELS.has((n.memoryLevel ?? '').trim().toLowerCase())
+}
 
 /** Where a node's knowledge originally came from. The backend stamps provider
  *  nodes (explicit `origin`, or the `<source>-import-…` session convention);
@@ -58,17 +119,57 @@ function dayEnd(iso: string): null | number {
   return start === null ? null : start + 86_400 - 1
 }
 
+// Whole-year / whole-month boundaries, local time. yearEnd/monthEnd are
+// "first instant of the next period, minus 1s" so they're inclusive of the
+// period's final day without date-arithmetic edge cases (leap years, 31 vs 30).
+function yearStart(year: number): number {
+  return new Date(year, 0, 1).getTime() / 1000
+}
+
+function yearEnd(year: number): number {
+  return new Date(year + 1, 0, 1).getTime() / 1000 - 1
+}
+
+function monthStart(year: number, month1: number): number {
+  return new Date(year, month1 - 1, 1).getTime() / 1000
+}
+
+function monthEnd(year: number, month1: number): number {
+  return new Date(year, month1, 1).getTime() / 1000 - 1
+}
+
+/** Collapse whichever date control is active into a unix-second [from, to]
+ *  window (null = that edge unbounded). A blank/partial selection widens
+ *  rather than excludes: an empty year → unbounded; a year with no month →
+ *  the whole year. This is the single source of truth for date filtering and
+ *  for whether a date narrowing is even active. */
+export function effectiveRange(f: SearchFilters): { from: null | number; to: null | number } {
+  if (f.dateMode === 'year' || f.dateMode === 'yearMonth') {
+    const y = Number(f.year)
+
+    if (!y) {
+      return { from: null, to: null }
+    }
+
+    const m = f.dateMode === 'yearMonth' ? Number(f.month) : 0
+
+    if (m >= 1 && m <= 12) {
+      return { from: monthStart(y, m), to: monthEnd(y, m) }
+    }
+
+    return { from: yearStart(y), to: yearEnd(y) }
+  }
+
+  return { from: f.from ? dayStart(f.from) : null, to: f.to ? dayEnd(f.to) : null }
+}
+
 /** True when the query/filters actually narrow the graph — the pulse and the
  *  "save this search" affordance key off this, so an idle open sidebar (full
  *  chronological list) doesn't light up every node. */
 export function hasActiveNarrowing(query: string, filters: SearchFilters): boolean {
-  return (
-    query.trim() !== '' ||
-    filters.kind !== 'all' ||
-    filters.source !== 'all' ||
-    filters.from !== '' ||
-    filters.to !== ''
-  )
+  const { from, to } = effectiveRange(filters)
+
+  return query.trim() !== '' || filters.kind !== 'all' || filters.source !== 'all' || from !== null || to !== null
 }
 
 /** Filter + chronologically sort the graph's nodes.
@@ -85,8 +186,8 @@ export function filterNodes(
   filters: SearchFilters
 ): StarmapNode[] {
   const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean)
-  const from = filters.from ? dayStart(filters.from) : null
-  const to = filters.to ? dayEnd(filters.to) : null
+  const { from, to } = effectiveRange(filters)
+  const provider = graph.memoryProvider
 
   // memory:<source>:<index> ids index into graph.memory for full bodies.
   const bodyById = new Map<string, string>()
@@ -96,8 +197,21 @@ export function filterNodes(
   })
 
   const out = graph.nodes.filter(n => {
-    if (filters.kind !== 'all' && n.kind !== filters.kind) {
-      return false
+    // Kind: memory/conclusion are DISJOINT — a conclusion is a Honcho-derived
+    // fact, so 'memory' means a memory that is NOT a conclusion, and the
+    // dedicated 'conclusion' bucket captures the rest. 'skill' is unchanged.
+    if (filters.kind === 'skill') {
+      if (n.kind !== 'skill') {
+        return false
+      }
+    } else if (filters.kind === 'conclusion') {
+      if (!isConclusion(n, provider)) {
+        return false
+      }
+    } else if (filters.kind === 'memory') {
+      if (n.kind !== 'memory' || isConclusion(n, provider)) {
+        return false
+      }
     }
 
     if (filters.source !== 'all' && nodeOrigin(n) !== filters.source) {
@@ -177,15 +291,23 @@ const savedSearches: Codec<SavedSearch[]> = {
       }
 
       const rec = item as Record<string, unknown>
-      const kind = rec.kind === 'memory' || rec.kind === 'skill' ? rec.kind : 'all'
+
+      const kind =
+        rec.kind === 'memory' || rec.kind === 'skill' || rec.kind === 'conclusion' ? rec.kind : 'all'
+
+      const dateMode =
+        rec.dateMode === 'year' || rec.dateMode === 'yearMonth' ? rec.dateMode : 'range'
 
       return [
         {
+          dateMode,
           from: typeof rec.from === 'string' ? rec.from : '',
           kind,
+          month: typeof rec.month === 'string' ? rec.month : '',
           query: typeof rec.query === 'string' ? rec.query : '',
           source: typeof rec.source === 'string' && rec.source ? rec.source : 'all',
-          to: typeof rec.to === 'string' ? rec.to : ''
+          to: typeof rec.to === 'string' ? rec.to : '',
+          year: typeof rec.year === 'string' ? rec.year : ''
         }
       ]
     })
@@ -210,7 +332,8 @@ export function commitSearchHistory(query: string): void {
   $searchHistory.set([q, ...$searchHistory.get().filter(h => h !== q)].slice(0, HISTORY_MAX))
 }
 
-const savedKey = (s: SavedSearch) => JSON.stringify([s.query.trim(), s.kind, s.source, s.from, s.to])
+const savedKey = (s: SavedSearch) =>
+  JSON.stringify([s.query.trim(), s.kind, s.source, s.dateMode, s.from, s.to, s.year, s.month])
 
 /** Persist the current query+filters; replaces an identical existing save. */
 export function saveSearch(next: SavedSearch): void {

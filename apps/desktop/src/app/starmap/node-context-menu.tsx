@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import { ArchiveSkillConfirmDialog, fireOptimistic } from '@/app/learning/archive-skill-confirm-dialog'
 import { CodeEditor } from '@/components/chat/code-editor'
@@ -16,6 +16,10 @@ import { isProviderSource } from './sources'
 
 export interface NodeMenuTarget {
   id: string
+  /** True when this node is a Honcho conclusion (durable derived fact). Adds a
+   *  "Start a conversation about this" action; conclusions are provider-backed
+   *  so they stay read-only (no Edit/Delete). */
+  isConclusion?: boolean
   kind: 'memory' | 'skill'
   label: string
   /** Memory nodes only: 'memory' | 'profile' | a provider name ('honcho', …).
@@ -25,11 +29,32 @@ export interface NodeMenuTarget {
   y: number
 }
 
+/** One recent session offered in the "Add to a session" submenu. `key` is the
+ *  durable composer scope (lineage root) the draft is stashed under; `title` is
+ *  the display label. */
+export interface RecallSessionOption {
+  key: string
+  title: string
+}
+
 interface NodeContextMenuProps {
   onClose: () => void
   onNodeRemoved: () => void
   /** Open the provenance dialog ("Where this came from…") for this node. */
   onShowProvenance: (id: string) => void
+  /** Conclusion nodes only: seed a NEW chat about this conclusion (for review
+   *  — never auto-sent). Absent when the host doesn't support it. */
+  onStartConversation?: (target: NodeMenuTarget) => void
+  /** Feature A — "Add to a session": stash this node's knowledge (as a reviewed,
+   *  injection-hardened draft) into an existing session's composer. Given the
+   *  durable session key. Available for ALL node kinds. */
+  onAddToSession?: (target: NodeMenuTarget, sessionKey: string) => void
+  /** Feature B — /recall: insert this node's knowledge into the CURRENT chat's
+   *  composer for review. Available for ALL node kinds. */
+  onRecallIntoChat?: (target: NodeMenuTarget) => void
+  /** Most-recently-active sessions (already capped + ordered) for the
+   *  "Add to a session" submenu. Empty/undefined hides that action. */
+  recentSessions?: RecallSessionOption[]
   target: NodeMenuTarget | null
 }
 
@@ -42,13 +67,20 @@ interface EditState {
 /** Right-click actions for a star-map node: provenance, edit (modal), delete (confirm).
  *  Provider-backed memory nodes are read-only (their storage lives in the
  *  provider's backend), so Edit/Delete are replaced by a hint. */
-export function NodeContextMenu({ onClose, onNodeRemoved, onShowProvenance, target }: NodeContextMenuProps) {
+export function NodeContextMenu({ onAddToSession, onClose, onNodeRemoved, onRecallIntoChat, onShowProvenance, onStartConversation, recentSessions, target }: NodeContextMenuProps) {
   const { t } = useI18n()
   const [editing, setEditing] = useState<EditState | null>(null)
   const [deleting, setDeleting] = useState<Omit<NodeMenuTarget, 'x' | 'y'> | null>(null)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<null | string>(null)
+  // Whether the "Add to a session" submenu is expanded. Reset whenever the menu
+  // retargets (a new right-click) so it never opens pre-expanded on another node.
+  const [showSessions, setShowSessions] = useState(false)
+
+  useEffect(() => {
+    setShowSessions(false)
+  }, [target?.id])
 
   // Bumped on profile switch so an in-flight openEdit fetch from profile A can't
   // reopen the editor with A's node content after switching to B.
@@ -140,10 +172,74 @@ export function NodeContextMenu({ onClose, onNodeRemoved, onShowProvenance, targ
             >
               {t.starmap.provenanceMenu}
             </button>
-            {isProviderSource(target.memorySource) ? (
-              <div className="max-w-56 px-2 py-1 text-[0.68rem] text-muted-foreground">
-                {t.starmap.providerReadOnly(target.memorySource)}
+            {/* Feature B — /recall: insert this node's knowledge into THIS chat.
+                Offered for every node kind. The host fetches an
+                injection-hardened, provenance-tagged draft and inserts it into
+                the live composer for the user to review + send. */}
+            {onRecallIntoChat ? (
+              <button
+                className="block w-full cursor-pointer rounded-md px-2 py-1 text-left text-xs hover:bg-(--ui-control-active-background) hover:text-foreground"
+                onClick={() => {
+                  onRecallIntoChat(target)
+                  onClose()
+                }}
+                type="button"
+              >
+                {t.starmap.recallIntoChat}
+              </button>
+            ) : null}
+            {/* Feature A — "Add to a session ▸": stash this node's knowledge into
+                one of the most-recently-active sessions' composers. Inline
+                submenu (canvas-anchored menu can't host a native nested menu). */}
+            {onAddToSession && recentSessions && recentSessions.length > 0 ? (
+              <div>
+                <button
+                  aria-expanded={showSessions}
+                  className="flex w-full cursor-pointer items-center justify-between rounded-md px-2 py-1 text-left text-xs hover:bg-(--ui-control-active-background) hover:text-foreground"
+                  onClick={() => setShowSessions(open => !open)}
+                  type="button"
+                >
+                  <span>{t.starmap.addToSession}</span>
+                  <span className="ml-2 text-muted-foreground">{showSessions ? '▾' : '▸'}</span>
+                </button>
+                {showSessions ? (
+                  <div className="ml-2 border-l border-(--ui-stroke-secondary) pl-1">
+                    {recentSessions.map(session => (
+                      <button
+                        className="block w-full cursor-pointer truncate rounded-md px-2 py-1 text-left text-xs hover:bg-(--ui-control-active-background) hover:text-foreground"
+                        key={session.key}
+                        onClick={() => {
+                          onAddToSession(target, session.key)
+                          onClose()
+                        }}
+                        title={session.title}
+                        type="button"
+                      >
+                        {session.title}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
               </div>
+            ) : null}
+            {isProviderSource(target.memorySource) ? (
+              <>
+                {target.isConclusion && onStartConversation ? (
+                  <button
+                    className="block w-full cursor-pointer rounded-md px-2 py-1 text-left text-xs hover:bg-(--ui-control-active-background) hover:text-foreground"
+                    onClick={() => {
+                      onStartConversation(target)
+                      onClose()
+                    }}
+                    type="button"
+                  >
+                    {t.starmap.conclusionStartConversation}
+                  </button>
+                ) : null}
+                <div className="max-w-56 px-2 py-1 text-[0.68rem] text-muted-foreground">
+                  {t.starmap.providerReadOnly(target.memorySource)}
+                </div>
+              </>
             ) : (
               <>
                 <button

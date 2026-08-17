@@ -245,6 +245,24 @@ def _memory_cards() -> list[dict[str, Any]]:
     return cards
 
 
+def _active_provider_name() -> Optional[str]:
+    """Name of the active external memory provider ('honcho', …), or None.
+
+    Exposed on the graph payload so the desktop can gate provider-specific UI
+    (e.g. the conclusion node kind, which only makes sense under Honcho)
+    explicitly — never by inferring it from the presence of provider nodes,
+    which would silently misclassify when a provider has zero durable entries.
+    Best-effort by contract: any failure → None.
+    """
+    try:
+        from plugins.memory import _get_active_memory_provider
+
+        name = _get_active_memory_provider()
+        return str(name).strip().lower() or None if name else None
+    except Exception:
+        return None
+
+
 def _provider_memory_cards(limit: int = 10000) -> list[dict[str, Any]]:
     """Durable entries from the active external memory provider, as cards.
 
@@ -281,6 +299,7 @@ def _provider_memory_cards(limit: int = 10000) -> list[dict[str, Any]]:
         if not title:
             title = body.splitlines()[0].strip()
         session_id = str(entry.get("session_id") or "").strip()
+        level = str(entry.get("level") or "").strip().lower()
         cards.append(
             {
                 "source": name,
@@ -288,6 +307,7 @@ def _provider_memory_cards(limit: int = 10000) -> list[dict[str, Any]]:
                 "timestamp": _to_int_ts(entry.get("timestamp")),
                 "title": (title[:80] + "…") if len(title) > 80 else title,
                 "body": body[:1200],
+                **({"level": level} if level else {}),
                 **({"sessionId": session_id} if session_id else {}),
             }
         )
@@ -374,6 +394,7 @@ def build_learning_graph() -> dict[str, Any]:
                 "kind": "memory",
                 "memorySource": card["source"],
                 "origin": card.get("origin") or "hermes",
+                **({"memoryLevel": card["level"]} if card.get("level") else {}),
                 "timestamp": card.get("timestamp"),
                 "category": "memory",
                 "useCount": 0,
@@ -392,6 +413,10 @@ def build_learning_graph() -> dict[str, Any]:
             for c, n in sorted(clusters.items(), key=lambda kv: -kv[1])
         ],
         "memory": memory_cards,
+        # Active external memory provider ('honcho', …) or None. The desktop
+        # gates provider-specific journey UI (conclusion nodes) on this rather
+        # than inferring the provider from node presence.
+        "memoryProvider": _active_provider_name(),
         "stats": {
             **density_stats(learned_skills, skill_edges),
             "memory_nodes": len(memory_cards),

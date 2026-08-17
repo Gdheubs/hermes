@@ -79,6 +79,35 @@ def test_full_payload_shape_and_edge_integrity(tmp_path):
     assert graph["stats"]["nodes"] == len(skill_nodes)
     assert graph["stats"]["memory_nodes"] == len(graph["memory"])
     assert all("timestamp" in n for n in graph["nodes"])
+    # Provider gate: the payload always carries memoryProvider (None here — no
+    # active external provider in the temp home) so the desktop never has to
+    # infer the provider from node presence.
+    assert "memoryProvider" in graph
+    assert graph["memoryProvider"] is None
+
+
+def test_memory_provider_name_reflects_active_provider(monkeypatch, tmp_path):
+    """memoryProvider echoes the active provider name (lowercased), or None."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+
+    import plugins.memory as pm
+
+    # Active provider present → its name flows to the payload, normalized.
+    monkeypatch.setattr(pm, "_get_active_memory_provider", lambda: "Honcho")
+    token = set_hermes_home_override(home)
+    try:
+        assert learning_graph.build_learning_graph()["memoryProvider"] == "honcho"
+    finally:
+        reset_hermes_home_override(token)
+
+    # No active provider → None (never inferred from nodes).
+    monkeypatch.setattr(pm, "_get_active_memory_provider", lambda: None)
+    token = set_hermes_home_override(home)
+    try:
+        assert learning_graph.build_learning_graph()["memoryProvider"] is None
+    finally:
+        reset_hermes_home_override(token)
 
 
 # ── External provider memory (journey_cards) ────────────────────────────────
@@ -126,6 +155,46 @@ def test_provider_cards_normalized_and_tagged_with_provider_name(monkeypatch):
     # Title defaults to the first line; ISO timestamps normalize to unix secs.
     assert cards[1]["title"] == "line one"
     assert cards[1]["timestamp"] == 1_777_550_400
+
+
+def test_provider_card_level_propagates_to_node(monkeypatch, tmp_path):
+    """Honcho's conclusion 'level' must flow card → node as ``memoryLevel`` so
+    the desktop can separate true memories ('explicit') from derived
+    conclusions ('inductive'/'deductive'). A card without a level omits the
+    field entirely (older backend → treated as a plain memory downstream)."""
+    _patch_active_provider(
+        monkeypatch,
+        "honcho",
+        _FakeProvider(
+            [
+                {"body": "toby texts himself instructions", "level": "explicit"},
+                {"body": "toby values reproducibility", "level": "INDUCTIVE"},
+                {"body": "a fact from an older backend"},  # no level
+            ]
+        ),
+    )
+
+    cards = learning_graph._provider_memory_cards()
+    # Level is normalized to lowercase; absent stays absent (no empty string).
+    assert cards[0]["level"] == "explicit"
+    assert cards[1]["level"] == "inductive"
+    assert "level" not in cards[2]
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    try:
+        graph = learning_graph.build_learning_graph()
+    finally:
+        reset_hermes_home_override(token)
+
+    mem_nodes = [n for n in graph["nodes"] if n["kind"] == "memory"]
+    by_level = {n["label"][:20]: n.get("memoryLevel") for n in mem_nodes}
+    # explicit + inductive carry through; the level-less card has no memoryLevel.
+    assert "explicit" in by_level.values()
+    assert "inductive" in by_level.values()
+    levelless = [n for n in mem_nodes if "older backend" in n["label"]]
+    assert levelless and "memoryLevel" not in levelless[0]
 
 
 def test_provider_cards_empty_when_no_provider_or_legacy_or_raising(monkeypatch):

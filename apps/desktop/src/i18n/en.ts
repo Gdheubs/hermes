@@ -1281,7 +1281,27 @@ export const en: Translations = {
     searchFrom: 'From date',
     searchTo: 'To date',
     searchCount: (n: number) => `${n} ${n === 1 ? 'result' : 'results'}`,
-    searchEmpty: 'Nothing matches this search.'
+    searchEmpty: 'Nothing matches this search.',
+    // Filter enhancement (dedicated filter icon, date modes, conclusions).
+    filterTitle: 'Filter',
+    filterShowing: (shown: number, total: number) => `Showing ${shown} of ${total}`,
+    filterClear: 'Clear',
+    dateModeLabel: 'Date filter',
+    dateModeRange: 'Custom range',
+    dateModeYear: 'Year',
+    dateModeYearMonth: 'Year / month',
+    dateYearAny: 'Any year',
+    dateMonthLabel: 'Month',
+    dateMonthAny: 'Any month',
+    conclusion: 'conclusion',
+    conclusions: 'conclusions',
+    conclusionStartConversation: 'Start a conversation about this…',
+    conclusionSeedPrompt: (text: string) =>
+      `I want to talk about something you've concluded about me:\n\n> ${text}\n\n`,
+    recallIntoChat: 'Insert into this chat',
+    addToSession: 'Add to a session',
+    addToSessionDone: (title: string) => `Added to "${title}" — open it to review and send.`,
+    recallFailed: 'Could not load that memory to insert.'
   },
   agents: {
     close: 'Close agents',

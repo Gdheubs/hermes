@@ -12,10 +12,12 @@ import {
   $savedSearches,
   $searchHistory,
   commitSearchHistory,
+  type DateMode,
   distinctOrigins,
   EMPTY_FILTERS,
   filterNodes,
   hasActiveNarrowing,
+  isConclusion,
   nodeOrigin,
   removeSavedSearch,
   type SavedSearch,
@@ -24,16 +26,26 @@ import {
 } from './search'
 
 interface SearchSidebarProps {
+  /** Legend/row color for conclusion nodes (matches the canvas hexagon ink). */
+  conclusionColor: string
+  /** Which section to open focused on: 'search' focuses the query input,
+   *  'filter' scrolls to + highlights the filters. Both share this one panel. */
+  focusSection: 'filter' | 'search'
   graph: StarmapGraph
-  /** Push the current match set up to the canvas (pulse + focus). Called with
-   *  null when the sidebar closes or nothing narrows the graph. */
-  onMatchesChange: (ids: null | Set<string>) => void
+  memoryColor: string
   onClose: () => void
   /** Row click: focus the node on the canvas. */
   onFocusNode: (id: string) => void
+  /** Push the current match set up to the canvas (pulse + filtered rendering).
+   *  Called with null when the sidebar closes or nothing narrows the graph. */
+  onMatchesChange: (ids: null | Set<string>) => void
   /** Row context/⋯ action: open the same right-click menu nodes get. */
   onNodeMenu: (id: string, x: number, y: number) => void
-  memoryColor: string
+  /** Hand the host a stable "reset my query + filters" callback (for the
+   *  canvas "showing N of M · Clear" chip). */
+  onRegisterClear: (clear: () => void) => void
+  /** Whether the Conclusions category is offered (Honcho active). */
+  showConclusions: boolean
 }
 
 function fmtTs(ts: null | number | undefined): string {
@@ -51,17 +63,39 @@ function fmtTs(ts: null | number | undefined): string {
 const selectCls =
   'h-6 rounded-md border border-(--ui-stroke-secondary) bg-transparent px-1 text-[0.65rem] text-muted-foreground outline-none focus-visible:ring-1 focus-visible:ring-ring/40'
 
+// Short month labels for the year-month picker. Index 0 = January; the control
+// stores a 1-based '01'–'12' string.
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+// The set of calendar years that actually have nodes, newest first — so the
+// year picker only offers years the map contains.
+function yearsWithNodes(nodes: StarmapNode[]): number[] {
+  const set = new Set<number>()
+
+  for (const n of nodes) {
+    if (n.timestamp) {
+      set.add(new Date(n.timestamp * 1000).getFullYear())
+    }
+  }
+
+  return [...set].sort((a, b) => b - a)
+}
+
 // Search / filter sidebar for the star map. Opens from the search icon;
 // filters narrow live, matches pulse on the canvas, and the result list is
 // chronological (newest first). Committed queries build a Google-style
 // recents dropdown; the bookmark saves query+filters.
 export function SearchSidebar({
+  conclusionColor,
+  focusSection,
   graph,
   memoryColor,
   onClose,
   onFocusNode,
   onMatchesChange,
-  onNodeMenu
+  onNodeMenu,
+  onRegisterClear,
+  showConclusions
 }: SearchSidebarProps) {
   const { t } = useI18n()
   const history = useStore($searchHistory)
@@ -71,10 +105,26 @@ export function SearchSidebar({
   const [filters, setFilters] = useState<SearchFilters>(EMPTY_FILTERS)
   const [dropdownOpen, setDropdownOpen] = useState(false)
   const inputRef = useRef<HTMLInputElement | null>(null)
+  const filtersRef = useRef<HTMLDivElement | null>(null)
 
   const origins = useMemo(() => distinctOrigins(graph.nodes), [graph.nodes])
+  const years = useMemo(() => yearsWithNodes(graph.nodes), [graph.nodes])
   const narrowed = hasActiveNarrowing(query, filters)
   const results = useMemo(() => filterNodes(graph, query, filters).reverse(), [filters, graph, query])
+
+  const conclusionSet = useMemo(() => {
+    const s = new Set<string>()
+
+    if (showConclusions) {
+      for (const n of graph.nodes) {
+        if (isConclusion(n, graph.memoryProvider)) {
+          s.add(n.id)
+        }
+      }
+    }
+
+    return s
+  }, [graph.memoryProvider, graph.nodes, showConclusions])
 
   // Publish matches to the canvas only when something narrows — an idle open
   // sidebar must not pulse the whole map.
@@ -85,9 +135,25 @@ export function SearchSidebar({
   // Clear the canvas highlight when the sidebar unmounts.
   useEffect(() => () => onMatchesChange(null), [onMatchesChange])
 
+  // Hand the host a stable "clear my query + filters" callback for the canvas
+  // "showing N of M · Clear" chip.
   useEffect(() => {
-    inputRef.current?.focus()
-  }, [])
+    onRegisterClear(() => {
+      setQuery('')
+      setFilters(EMPTY_FILTERS)
+    })
+  }, [onRegisterClear])
+
+  // Open focused on the requested section: the search icon lands on the query
+  // box; the filter icon scrolls the filters into view (nothing to focus, since
+  // native selects don't take text focus meaningfully).
+  useEffect(() => {
+    if (focusSection === 'search') {
+      inputRef.current?.focus()
+    } else {
+      filtersRef.current?.scrollIntoView({ block: 'nearest' })
+    }
+  }, [focusSection])
 
   const commit = () => {
     commitSearchHistory(query)
@@ -96,7 +162,15 @@ export function SearchSidebar({
 
   const applySaved = (s: SavedSearch) => {
     setQuery(s.query)
-    setFilters({ from: s.from, kind: s.kind, source: s.source, to: s.to })
+    setFilters({
+      dateMode: s.dateMode,
+      from: s.from,
+      kind: s.kind,
+      month: s.month,
+      source: s.source,
+      to: s.to,
+      year: s.year
+    })
     setDropdownOpen(false)
   }
 
@@ -146,7 +220,10 @@ export function SearchSidebar({
                   {t.starmap.searchSaved}
                 </div>
                 {saved.map(s => (
-                  <div className="group flex items-center" key={`saved:${s.query}:${s.kind}:${s.source}:${s.from}:${s.to}`}>
+                  <div
+                    className="group flex items-center"
+                    key={`saved:${s.query}:${s.kind}:${s.source}:${s.dateMode}:${s.from}:${s.to}:${s.year}:${s.month}`}
+                  >
                     <button
                       className="flex min-w-0 flex-1 cursor-pointer items-center gap-1.5 px-2 py-1 text-left text-xs hover:bg-(--ui-control-active-background)"
                       onMouseDown={e => {
@@ -161,7 +238,7 @@ export function SearchSidebar({
                         {[
                           s.kind !== 'all' ? s.kind : null,
                           s.source !== 'all' ? s.source : null,
-                          s.from || s.to ? '📅' : null
+                          hasActiveNarrowing('', s) && (s.from || s.to || s.year) ? '📅' : null
                         ]
                           .filter(Boolean)
                           .join(' · ')}
@@ -208,8 +285,8 @@ export function SearchSidebar({
         ) : null}
       </div>
 
-      {/* Filters: kind, source (open-ended origins), date range. */}
-      <div className="flex flex-wrap items-center gap-1.5">
+      {/* Filters: kind, source (open-ended origins), date (range/year/month). */}
+      <div className="flex flex-wrap items-center gap-1.5" ref={filtersRef}>
         <select
           aria-label={t.starmap.searchKind}
           className={selectCls}
@@ -219,6 +296,7 @@ export function SearchSidebar({
           <option value="all">{t.starmap.searchKindAll}</option>
           <option value="memory">{t.starmap.memory}</option>
           <option value="skill">{t.starmap.searchKindSkills}</option>
+          {showConclusions ? <option value="conclusion">{t.starmap.conclusions}</option> : null}
         </select>
 
         <select
@@ -248,22 +326,70 @@ export function SearchSidebar({
         </Tip>
       </div>
 
+      {/* Date filter: a mode dropdown swaps the controls between an explicit
+          custom range, a whole year, or a single year+month. */}
       <div className="flex items-center gap-1.5">
-        <input
-          aria-label={t.starmap.searchFrom}
-          className={`${selectCls} min-w-0 flex-1`}
-          onChange={e => setFilters(f => ({ ...f, from: e.target.value }))}
-          type="date"
-          value={filters.from}
-        />
-        <span className="text-[0.6rem] text-muted-foreground/60">→</span>
-        <input
-          aria-label={t.starmap.searchTo}
-          className={`${selectCls} min-w-0 flex-1`}
-          onChange={e => setFilters(f => ({ ...f, to: e.target.value }))}
-          type="date"
-          value={filters.to}
-        />
+        <select
+          aria-label={t.starmap.dateModeLabel}
+          className={selectCls}
+          onChange={e => setFilters(f => ({ ...f, dateMode: e.target.value as DateMode }))}
+          value={filters.dateMode}
+        >
+          <option value="range">{t.starmap.dateModeRange}</option>
+          <option value="year">{t.starmap.dateModeYear}</option>
+          <option value="yearMonth">{t.starmap.dateModeYearMonth}</option>
+        </select>
+
+        {filters.dateMode === 'range' ? (
+          <>
+            <input
+              aria-label={t.starmap.searchFrom}
+              className={`${selectCls} min-w-0 flex-1`}
+              onChange={e => setFilters(f => ({ ...f, from: e.target.value }))}
+              type="date"
+              value={filters.from}
+            />
+            <span className="text-[0.6rem] text-muted-foreground/60">→</span>
+            <input
+              aria-label={t.starmap.searchTo}
+              className={`${selectCls} min-w-0 flex-1`}
+              onChange={e => setFilters(f => ({ ...f, to: e.target.value }))}
+              type="date"
+              value={filters.to}
+            />
+          </>
+        ) : (
+          <>
+            <select
+              aria-label={t.starmap.dateModeYear}
+              className={`${selectCls} min-w-0 flex-1`}
+              onChange={e => setFilters(f => ({ ...f, year: e.target.value }))}
+              value={filters.year}
+            >
+              <option value="">{t.starmap.dateYearAny}</option>
+              {years.map(y => (
+                <option key={y} value={String(y)}>
+                  {y}
+                </option>
+              ))}
+            </select>
+            {filters.dateMode === 'yearMonth' ? (
+              <select
+                aria-label={t.starmap.dateMonthLabel}
+                className={`${selectCls} min-w-0 flex-1`}
+                onChange={e => setFilters(f => ({ ...f, month: e.target.value }))}
+                value={filters.month}
+              >
+                <option value="">{t.starmap.dateMonthAny}</option>
+                {MONTHS.map((label, i) => (
+                  <option key={label} value={String(i + 1).padStart(2, '0')}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+            ) : null}
+          </>
+        )}
       </div>
 
       {/* Chronological results (newest first). Click focuses the node; the ⋯
@@ -274,7 +400,15 @@ export function SearchSidebar({
           <p className="pt-2 text-xs text-muted-foreground">{t.starmap.searchEmpty}</p>
         ) : (
           results.map(n => (
-            <SearchRow key={n.id} memoryColor={memoryColor} node={n} onFocusNode={onFocusNode} onNodeMenu={onNodeMenu} />
+            <SearchRow
+              conclusionColor={conclusionColor}
+              isConclusion={conclusionSet.has(n.id)}
+              key={n.id}
+              memoryColor={memoryColor}
+              node={n}
+              onFocusNode={onFocusNode}
+              onNodeMenu={onNodeMenu}
+            />
           ))
         )}
       </div>
@@ -283,11 +417,15 @@ export function SearchSidebar({
 }
 
 function SearchRow({
+  conclusionColor,
+  isConclusion,
   memoryColor,
   node,
   onFocusNode,
   onNodeMenu
 }: {
+  conclusionColor: string
+  isConclusion: boolean
   memoryColor: string
   node: StarmapNode
   onFocusNode: (id: string) => void
@@ -306,8 +444,14 @@ function SearchRow({
       role="button"
       tabIndex={0}
     >
-      {/* Kind glyph mirrors the canvas: diamond = memory, circle = skill. */}
-      {node.kind === 'memory' ? (
+      {/* Kind glyph mirrors the canvas: hexagon = conclusion, diamond = memory,
+          circle = skill. */}
+      {isConclusion ? (
+        <span
+          className="mt-1 inline-block size-2 shrink-0"
+          style={{ backgroundColor: conclusionColor, clipPath: 'polygon(25% 0,75% 0,100% 50%,75% 100%,25% 100%,0 50%)' }}
+        />
+      ) : node.kind === 'memory' ? (
         <span className="mt-1 inline-block size-2 shrink-0 rotate-45" style={{ backgroundColor: memoryColor }} />
       ) : (
         <span className="mt-1 inline-block size-2 shrink-0 rounded-full bg-[var(--theme-primary)]/80" />
