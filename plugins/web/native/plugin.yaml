@@ -1,0 +1,7 @@
+name: web-native-fetch
+version: 1.1.0
+description: "Local HTTP fetch + trafilatura extract — no API key required. Uses httpx with trafilatura for main-content extraction (markdown, headings preserved) and html2text as fallback. Extract-only (pair with any search provider)."
+author: VHSgunzo
+kind: backend
+provides_web_providers:
+  - native

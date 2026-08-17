@@ -2205,6 +2205,7 @@ web:
 | **Parallel** | `PARALLEL_API_KEY` | ✔ | ✔ |
 | **Tavily** | `TAVILY_API_KEY` | ✔ | ✔ |
 | **Exa** | `EXA_API_KEY` | ✔ | ✔ |
+| **Native** | — (no key) | — | ✔ |
 
 **Backend selection:** If `web.backend` is not set, the backend is auto-detected from available API keys. If only `SEARXNG_URL` is set, SearXNG is used. If only `EXA_API_KEY` is set, Exa is used. If only `TAVILY_API_KEY` is set, Tavily is used. If only `PARALLEL_API_KEY` is set, Parallel is used. Otherwise Firecrawl is the default.
 
@@ -2215,6 +2216,8 @@ web:
 **Parallel search modes:** Set `PARALLEL_SEARCH_MODE` to control search behavior — `fast`, `one-shot`, or `agentic` (default: `agentic`).
 
 **Exa:** Set `EXA_API_KEY` in `~/.hermes/.env`. Supports `category` filtering (`company`, `research paper`, `news`, `people`, `personal site`, `pdf`) and domain/date filters.
+
+**Native** fetches and parses pages locally (httpx + trafilatura), so `web_extract` works with no API key. Install with `pip install "hermes-agent[native-fetch]"`. It is extract-only — set it as `web.extract_backend` and pair it with a search backend; setting it as the shared `web.backend` would leave `web_search` without a usable provider. Its own settings live under `web.native` (request timeout, redirect limit, `max_response_bytes`, `cache_ttl`, extraction toggles) and are documented in the [plugin README](https://github.com/NousResearch/hermes-agent/blob/main/plugins/web/native/README.md).
 
 ## Browser
 

@@ -361,6 +361,8 @@ If no backend is explicitly configured, Hermes picks the first available one bas
 | `BRAVE_SEARCH_API_KEY` | brave-free |
 | `ddgs` package importable | ddgs |
 
+When nothing above matches, a capability that the shared fallback cannot serve is rescued by any installed provider that can: an install with no keys at all resolves to `ddgs` for search and `native` for extract. An explicitly configured backend is never overridden this way.
+
 xAI Web Search is **not** in the auto-detection chain — having `XAI_API_KEY` set (or being signed in via xAI Grok OAuth) does not automatically route web traffic through xAI, since those credentials are also used for inference / TTS / image gen and the user may want a different backend for web. Opt in explicitly with `web.backend: "xai"`.
 
 ---
@@ -405,8 +407,10 @@ SearXNG cannot extract URL content. Set `web.extract_backend` to a provider that
 ```yaml
 web:
   search_backend: "searxng"
-  extract_backend: "firecrawl"  # or tavily / exa / parallel
+  extract_backend: "native"  # or firecrawl / tavily / exa / parallel
 ```
+
+`native` is the keyless option — it fetches and parses pages locally, so it pairs with a free search backend without adding an API key. Install it with `pip install "hermes-agent[native-fetch]"`. See the [plugin README](https://github.com/NousResearch/hermes-agent/blob/main/plugins/web/native/README.md) for its settings.
 
 ### SearXNG returns 0 results
 

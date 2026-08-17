@@ -454,6 +454,23 @@ DEFAULT_CONFIG = {
         "search_backend": "",    # per-capability override for web_search (e.g. "searxng")
         "extract_backend": "",   # per-capability override for web_extract (e.g. "native")
         "extract_char_limit": 15000,  # per-page char budget for web_extract; larger pages truncate + store full text in cache/web
+        # Settings for the bundled keyless "native" extract provider
+        # (plugins/web/native). Mirrored by ``_NATIVE_DEFAULTS`` in that
+        # provider, which is the fallback when config can't be loaded — keep
+        # the two in sync.
+        # The per-page character budget is NOT here: extract_char_limit above
+        # governs it for every backend, native included.
+        "native": {
+            "timeout": 30,               # HTTP request timeout (seconds)
+            "max_redirects": 5,          # max redirects to follow (each hop SSRF-checked)
+            "max_response_bytes": 2000000,  # hard cap on bytes read from a response (2 MB)
+            "cache_ttl": 900,            # in-memory cache TTL (seconds); 0 disables caching
+            "trust_env": False,          # trust env for BOTH proxy (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY) and TLS (SSL_CERT_FILE/SSL_CERT_DIR)
+            "user_agent": "",            # override User-Agent; empty → provider default
+            "trafilatura": True,         # use trafilatura main-content extraction
+            "favor_precision": False,    # trafilatura: prefer precision over recall
+            "include_links": True,       # trafilatura: keep hyperlinks in markdown
+        },
     },
 
     "browser": {
