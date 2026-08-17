@@ -77,6 +77,49 @@ def _ra():
     return run_agent
 
 
+def _build_file_write_sandbox_guidance() -> str:
+    """Tell the model where file tools can safely create scratch files."""
+    try:
+        from agent.file_safety import get_safe_write_roots
+
+        safe_roots = sorted(get_safe_write_roots())
+    except Exception:
+        return ""
+    if not safe_roots:
+        return ""
+
+    hermes_home = os.path.realpath(str(get_hermes_home()))
+    scratch_root = next(
+        (
+            os.path.join(hermes_home, "tmp")
+            for safe_root in safe_roots
+            if hermes_home == safe_root or hermes_home.startswith(safe_root + os.sep)
+        ),
+        os.path.join(safe_roots[0], ".hermes-tmp"),
+    )
+    roots_json = json.dumps(safe_roots, ensure_ascii=True)
+    scratch_json = json.dumps(scratch_root, ensure_ascii=True)
+    return (
+        "# File-write sandbox\n"
+        f"File-write sandbox roots: {roots_json}\n"
+        "`write_file` and `patch` may only mutate paths under those roots. "
+        f"For temporary files, create them under {scratch_json}; never use `/tmp` or "
+        "`/private/tmp` unless explicitly listed above. Do not bypass this boundary with "
+        "shell redirection or another tool."
+    )
+
+
+def _safe_write_roots_json() -> str:
+    """Return a prompt-safe, deterministically ordered safe-root snapshot."""
+    try:
+        from agent.file_safety import get_safe_write_roots
+
+        safe_roots = sorted(get_safe_write_roots())
+    except Exception:
+        safe_roots = []
+    return json.dumps(safe_roots, ensure_ascii=True)
+
+
 def _resolve_platform_hint(agent: Any, platform_key: str, default_hint: str) -> str:
     """Apply a per-platform prompt-hint override to the default hint.
 
@@ -432,6 +475,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(KANBAN_GUIDANCE)
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
+
+    if any(name in agent.valid_tool_names for name in ("write_file", "patch")):
+        write_sandbox_guidance = _build_file_write_sandbox_guidance()
+        if write_sandbox_guidance:
+            stable_parts.append(write_sandbox_guidance)
 
     # Steering only lands inside tool results, so it's only reachable when the
     # agent has tools. Static text → byte-stable prompt (no cache hit).
@@ -853,6 +901,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nProvider: {agent.provider}"
     if agent.platform:
         timestamp_line += f"\nPlatform: {agent.platform}"
+    timestamp_line += f"\nFile-write sandbox roots: {_safe_write_roots_json()}"
     volatile_parts.append(timestamp_line)
 
     return {

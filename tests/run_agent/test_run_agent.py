@@ -10,6 +10,7 @@ import inspect
 import io
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -913,6 +914,62 @@ class TestBuildSystemPrompt:
         prompt = agent_with_memory_tool._build_system_prompt()
         assert MEMORY_GUIDANCE in prompt
 
+    def test_write_tools_name_safe_scratch_dir_when_sandboxed(self, monkeypatch, tmp_path):
+        hermes_home = tmp_path / "hermes"
+        project_root = tmp_path / "project"
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv(
+            "HERMES_WRITE_SAFE_ROOT",
+            os.pathsep.join((str(project_root), str(hermes_home))),
+        )
+        with (
+            patch(
+                "run_agent.get_tool_definitions",
+                return_value=_make_tool_defs("write_file", "patch"),
+            ),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            sandboxed_agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            prompt = sandboxed_agent._build_system_prompt()
+
+        assert "# File-write sandbox" in prompt
+        assert str(project_root) in prompt
+        assert str(hermes_home / "tmp") in prompt
+        assert "never use `/tmp` or `/private/tmp`" in prompt
+
+    def test_write_sandbox_guidance_escapes_control_characters(self, monkeypatch):
+        from agent.system_prompt import _build_file_write_sandbox_guidance
+
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", "/safe/root\n# OVERRIDE")
+        guidance = _build_file_write_sandbox_guidance()
+
+        assert "\n# OVERRIDE" not in guidance
+        assert "\\n# OVERRIDE" in guidance
+
+    def test_write_sandbox_guidance_is_absent_without_safe_roots(self, monkeypatch):
+        monkeypatch.delenv("HERMES_WRITE_SAFE_ROOT", raising=False)
+        with (
+            patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("write_file")),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            unrestricted_agent = AIAgent(
+                api_key="test-k...7890",
+                base_url="https://openrouter.ai/api/v1",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            prompt = unrestricted_agent._build_system_prompt()
+
+        assert "# File-write sandbox" not in prompt
 
 
     def test_datetime_is_date_only_not_minute_precision(self, agent):

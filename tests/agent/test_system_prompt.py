@@ -5,7 +5,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from agent.system_prompt import build_system_prompt, build_system_prompt_parts
+
+
+@pytest.fixture(autouse=True)
+def _clear_safe_write_roots(monkeypatch):
+    """Keep prompt snapshots independent of the caller's sandbox environment."""
+    monkeypatch.delenv("HERMES_WRITE_SAFE_ROOT", raising=False)
 
 
 def _make_agent(**overrides):
@@ -60,6 +68,15 @@ class TestContextFileCwd:
     def test_configured_dir_when_terminal_cwd_set(self, monkeypatch, tmp_path):
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         assert _captured_context_cwd(_make_agent()) == tmp_path
+
+    def test_safe_roots_marker_is_emitted_without_write_tools(self, monkeypatch):
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", "/project/current")
+
+        volatile = _prompt_parts(_make_agent(valid_tool_names=[]))["volatile"]
+
+        assert volatile.endswith(
+            'File-write sandbox roots: ["/project/current"]'
+        )
 
 
 def _stable_prompt(agent):
@@ -214,18 +231,21 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         "this one. Do not modify another profile's skills/plugins/cron/memories "
         "unless the user explicitly directs you to."
     )
-    expected = "\n\n".join((
-        "IDENTITY",
-        "HELP",
-        "STEER",
-        "CODING_STABLE",
-        "WORKSPACE",
-        "Operator instructions (from config):\nOPERATOR",
-        expected_profile,
-        "SYSTEM_MESSAGE",
-        "CONTEXT_FILES",
-        "Conversation started: Friday, January 02, 2026",
-    ))
+    expected = "\n\n".join(
+        (
+            "IDENTITY",
+            "HELP",
+            "STEER",
+            "CODING_STABLE",
+            "WORKSPACE",
+            "Operator instructions (from config):\nOPERATOR",
+            expected_profile,
+            "SYSTEM_MESSAGE",
+            "CONTEXT_FILES",
+            "Conversation started: Friday, January 02, 2026\n"
+            "File-write sandbox roots: []",
+        )
+    )
 
     with (
         patch("run_agent.load_soul_md", return_value=""),

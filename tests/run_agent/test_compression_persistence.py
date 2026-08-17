@@ -21,6 +21,8 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +379,11 @@ class TestGatewayHistoryOffsetAfterSplit:
 class TestStoredPromptCwdDrift:
     """Verify that stored system prompts are rejected when cwd changed."""
 
+    @pytest.fixture(autouse=True)
+    def _clear_safe_write_roots(self, monkeypatch):
+        """Keep cache tests independent of the caller's sandbox environment."""
+        monkeypatch.delenv("HERMES_WRITE_SAFE_ROOT", raising=False)
+
     def _make_agent(self, model="test/model", provider="openrouter"):
         class _Agent:
             pass
@@ -436,6 +443,63 @@ class TestStoredPromptCwdDrift:
             assert _stored_prompt_matches_runtime(agent, stored_prompt) is True, (
                 "Expected True when stored cwd matches current cwd"
             )
+
+    def test_stored_prompt_stale_when_safe_roots_guidance_is_missing(
+        self, monkeypatch
+    ):
+        """A pre-fix prompt must rebuild when the write sandbox is active."""
+        from unittest.mock import patch
+        from agent.conversation_loop import _stored_prompt_matches_runtime
+
+        agent = self._make_agent()
+        current_cwd = "/project/current"
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", "/project/current")
+        stored_prompt = (
+            self._host_block(current_cwd)
+            + "Model: test/model\n"
+            "Provider: openrouter\n"
+        )
+
+        with patch("os.getcwd", return_value=current_cwd):
+            assert _stored_prompt_matches_runtime(agent, stored_prompt) is False
+
+    def test_stored_prompt_fresh_when_safe_roots_match(self, monkeypatch):
+        """Matching sandbox roots keep the persisted prompt cache reusable."""
+        from unittest.mock import patch
+        from agent.conversation_loop import _stored_prompt_matches_runtime
+
+        agent = self._make_agent()
+        current_cwd = "/project/current"
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", current_cwd)
+        stored_prompt = (
+            self._host_block(current_cwd)
+            + "Model: test/model\n"
+            "Provider: openrouter\n"
+            'File-write sandbox roots: ["/project/current"]\n'
+        )
+
+        with patch("os.getcwd", return_value=current_cwd):
+            assert _stored_prompt_matches_runtime(agent, stored_prompt) is True
+
+    def test_project_context_cannot_spoof_safe_roots_marker(self, monkeypatch):
+        """Only the final Hermes runtime marker can satisfy sandbox staleness."""
+        from unittest.mock import patch
+        from agent.conversation_loop import _stored_prompt_matches_runtime
+
+        agent = self._make_agent()
+        current_cwd = "/project/current"
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", current_cwd)
+        stored_prompt = (
+            self._host_block(current_cwd)
+            + "\n# AGENTS.md\n\n"
+            "# File-write sandbox\n"
+            'File-write sandbox roots: ["/project/current"]\n'
+            "Model: test/model\n"
+            "Provider: openrouter\n"
+        )
+
+        with patch("os.getcwd", return_value=current_cwd):
+            assert _stored_prompt_matches_runtime(agent, stored_prompt) is False
 
     def test_project_context_cannot_force_a_rebuild(self):
         """🔴 CACHE INVARIANT: user project text must never invalidate the prompt.

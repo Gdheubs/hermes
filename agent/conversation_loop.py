@@ -1026,6 +1026,25 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     if stored_platform and current_platform and stored_platform != current_platform:
         return False
 
+    try:
+        from agent.file_safety import get_safe_write_roots
+
+        safe_roots = sorted(get_safe_write_roots())
+        current_safe_roots = json.dumps(safe_roots, ensure_ascii=True)
+    except Exception:
+        safe_roots = []
+        current_safe_roots = "[]"
+
+    final_line = prompt.rstrip().splitlines()[-1] if prompt.strip() else ""
+    prefix = "File-write sandbox roots:"
+    stored_safe_roots = (
+        final_line[len(prefix):].strip() if final_line.startswith(prefix) else ""
+    )
+    if safe_roots and stored_safe_roots != current_safe_roots:
+        return False
+    if stored_safe_roots and stored_safe_roots != current_safe_roots:
+        return False
+
     return True
 
 
