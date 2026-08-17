@@ -2019,6 +2019,10 @@ DEFAULT_CONFIG = {
         # and single-mutation `hermes curator rollback <entry-id>`.
         # Telemetry, never a gate: ledger failures cannot block a mutation.
         "ledger": True,
+        # Per-skill protection from the background self-improvement review
+        # fork. Skills named here cannot be modified by skill_manage during
+        # background review turns — only during foreground (normal) turns.
+        "review_protected": [],
     },
 
     # Curator — background skill maintenance.

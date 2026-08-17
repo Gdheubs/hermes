@@ -23,7 +23,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from agent.thread_scoped_output import thread_scoped_silence
 
@@ -1172,6 +1172,46 @@ def _run_review_in_thread(
             except Exception:
                 pass
 
+            # Per-skill protection: read the config list and set the
+            # threadlocal so skill_manage refuses writes to protected
+            # skills during the review fork.
+            _protected_names: Set[str] = set()
+            _protection_parse_failed = False
+            try:
+                from hermes_cli.config import load_config, cfg_get
+                _cfg = load_config()
+                _raw_protected = cfg_get(_cfg, "skills", "review_protected", default=[])
+                if isinstance(_raw_protected, str):
+                    import json as _json
+                    _raw_protected = _json.loads(_raw_protected)
+                if isinstance(_raw_protected, list):
+                    _protected_names = {
+                        str(n).strip() for n in _raw_protected if str(n).strip()
+                    }
+                elif _raw_protected is None or _raw_protected == []:
+                    # Absent or empty — no protection (default).
+                    pass
+                else:
+                    # Explicit non-list, non-None value (e.g. scalar, dict) — malformed.
+                    _protection_parse_failed = True
+            except Exception:
+                _protection_parse_failed = True
+
+            if _protection_parse_failed:
+                logger.warning(
+                    "Failed to parse skills.review_protected config; "
+                    "blocking all skill writes for this review pass"
+                )
+
+            from tools.skill_manager_tool import (
+                set_review_protected_skills,
+                clear_review_protected_skills,
+            )
+            if _protection_parse_failed:
+                set_review_protected_skills({"*"})
+            else:
+                set_review_protected_skills(_protected_names or None)
+
             try:
                 # Routed to a different model -> replay a digest (cache is cold
                 # on that model anyway, so minimise cold-written tokens). Same
@@ -1205,6 +1245,7 @@ def _run_review_in_thread(
                 # next live turn. Runs on both the success and exception
                 # path (this whole block is inside the try/finally above).
                 _unregister_review_agent(review_agent)
+                clear_review_protected_skills()
 
             # Snapshot review actions before teardown. close() is allowed to
             # clean per-session state, but the user-visible self-improvement
