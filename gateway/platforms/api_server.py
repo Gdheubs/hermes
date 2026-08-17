@@ -2627,6 +2627,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        request_tools_disabled: bool = False,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2891,7 +2892,11 @@ class APIServerAdapter(BasePlatformAdapter):
             self._last_resolved_model["*"] = model
 
         user_config = _load_gateway_config()
-        enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        enabled_toolsets = (
+            ["no_tools"]
+            if request_tools_disabled
+            else sorted(_get_platform_tools(user_config, "api_server"))
+        )
 
         max_iterations = _current_max_iterations()
 
@@ -4145,6 +4150,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
+        request_tools_disabled = False
+        if "tools" in body:
+            if body.get("tools") != []:
+                return web.json_response(
+                    _openai_error(
+                        "Only an empty 'tools' array is supported; external tool definitions are not accepted",
+                        code="unsupported_tools",
+                    ),
+                    status=400,
+                )
+            if body.get("tool_choice") not in (None, "none"):
+                return web.json_response(
+                    _openai_error(
+                        "tool_choice must be 'none' when tools is empty",
+                        code="invalid_tool_choice",
+                    ),
+                    status=400,
+                )
+            request_tools_disabled = True
+
         stream = _coerce_request_bool(body.get("stream"), default=False)
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
@@ -4263,6 +4288,7 @@ class APIServerAdapter(BasePlatformAdapter):
             virtual_model=self._model_name,
             allow_bare_model=self._direct_model_requests,
         )
+        agent_overrides["request_tools_disabled"] = request_tools_disabled
         selection_error = self._request_route_conflict_error(
             session_id=session_id,
             gateway_session_key=gateway_session_key,
@@ -6293,6 +6319,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        request_tools_disabled: bool = False,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6354,6 +6381,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        request_tools_disabled=request_tools_disabled,
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
