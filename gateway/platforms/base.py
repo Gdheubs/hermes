@@ -1478,7 +1478,15 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
     # loop so the home-tree exception (which un-denies /root for a root-run
     # gateway) cannot rescue a bare home-root file.
     if home is not None and resolved.parent == home:
-        return True
+        # F6/P2 (Purple round 2): a file the agent freshly produced at the
+        # home root (cwd=$HOME workflows, e.g. ``pandoc -o ~/report.pdf``)
+        # is a deliverable, not pre-existing personal data. Recency is the
+        # discriminator (same window as strict mode): fresh files pass,
+        # pre-existing user files are denied. When the operator disables
+        # recency trust, home-root files stay denied.
+        _window = _media_delivery_recency_seconds()
+        if not (_window > 0 and _file_is_recently_produced(resolved, _window)):
+            return True
     # OS scratch dir (tempfile.gettempdir()) — on Windows this lives under
     # AppData\Local\Temp, which is inside a user-data deny prefix. Temp is
     # scratch, not personal data: an agent-produced deliverable written to

@@ -642,17 +642,37 @@ class TestMediaDeliveryDefaultMode:
 
         assert BasePlatformAdapter.validate_media_delivery_path(str(target)) is None
 
-    def test_default_mode_denies_direct_home_root_files(self, tmp_path, monkeypatch):
-        """F6: files sitting directly in the home root (~/secret.txt) are
-        user data and must not be deliverable, even though the home-tree
-        exception un-blocks working subdirectories (~/work/...)."""
+    def test_default_mode_denies_stale_home_root_files(self, tmp_path, monkeypatch):
+        """F6/P2: a PRE-EXISTING user file at the home root (~/secret.txt,
+        mtime older than the recency window) is user data and must not be
+        deliverable, even though the home-tree exception un-blocks working
+        subdirectories (~/work/...)."""
         self._patch_roots(monkeypatch)
         fake_home = self._pin_home(tmp_path, monkeypatch)
 
         secret = fake_home / "secret.txt"
         secret.write_text("password hunter2\n")
+        # Age it beyond the recency window so it reads as pre-existing data.
+        import os as _os
+        import time as _time
+        _os.utime(secret, (_time.time() - 7200, _time.time() - 7200))
 
         assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
+
+    def test_default_mode_accepts_fresh_home_root_deliverable(self, tmp_path, monkeypatch):
+        """F6/P2 control: a file the agent freshly produced at the home root
+        (cwd=$HOME workflow, e.g. ``pandoc -o ~/report.pdf``) is a
+        deliverable, not pre-existing personal data."""
+        self._patch_roots(monkeypatch)
+        fake_home = self._pin_home(tmp_path, monkeypatch)
+
+        doc = fake_home / "report.pdf"
+        doc.write_bytes(b"%PDF-1.4")  # mtime = now
+
+        assert (
+            BasePlatformAdapter.validate_media_delivery_path(str(doc))
+            == str(doc.resolve())
+        )
 
     def test_default_mode_still_accepts_work_subdir_of_home(self, tmp_path, monkeypatch):
         """F6 control: a deliverable in a home SUBDIRECTORY the agent works
