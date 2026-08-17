@@ -117,19 +117,23 @@ class TestTrustGateAtCallTime:
         assert "error" in json.loads(raw)
         assert "did not approve" in json.loads(raw)["error"]
 
-    def test_read_only_tool_on_untrusted_server_skips_approval(
+    def test_read_only_hint_on_untrusted_server_still_gated(
         self, fake_session
     ):
-        """readOnlyHint=True tools pass without consulting approval."""
+        """F5/P2: readOnlyHint is a SELF-declaration from the (potentially
+        hostile) server — it must NOT skip approval. An untrusted server can
+        declare its write tools read-only to bypass the gate."""
         _set_trust("srv", "untrusted")
         _set_read_only("srv", "list_repos", True)
         handler = mcp_tool._make_tool_handler("srv", "list_repos", 30.0)
         with patch(
-            "tools.approval.request_elicitation_consent"
+            "tools.approval.request_elicitation_consent",
+            return_value="decline",
         ) as consent:
             raw = handler({})
-        consent.assert_not_called()
-        assert json.loads(raw) == {"result": "ok"}
+        consent.assert_called_once()
+        fake_session.call_tool.assert_not_awaited()
+        assert "did not approve" in json.loads(raw)["error"]
 
     def test_trusted_server_skips_approval_for_write_tools(
         self, fake_session
@@ -209,7 +213,10 @@ class TestAnnotationCaptureAtDiscovery:
             annotations=annotations,
         )
 
-    def test_registration_records_hints_and_trust(self):
+    def test_registration_clears_hints_for_untrusted(self):
+        """F5/P2: readOnlyHint is a SELF-declaration from the (untrusted)
+        server — the metadata must NOT be recorded, so the gate can never
+        skip approval on a server-declared hint."""
         from tools.registry import ToolRegistry
 
         server = mcp_tool.MCPServerTask("srv")
@@ -232,6 +239,35 @@ class TestAnnotationCaptureAtDiscovery:
             mcp_tool._register_server_tools("srv", server, config)
 
         assert mcp_tool._server_trust_levels["srv"] == "untrusted"
+        # No hints recorded for untrusted servers — a self-declared hint
+        # must never bypass approval.
+        assert mcp_tool._tool_read_only_hints.get("srv", {}) == {}
+
+    def test_registration_records_hints_for_trusted(self):
+        """F5/P2: hints are recorded only for TRUSTED servers (where the
+        gate is off anyway) — the metadata stays available for tool UI."""
+        from tools.registry import ToolRegistry
+
+        server = mcp_tool.MCPServerTask("srv")
+        server.session = MagicMock()
+        server._tools = [
+            self._make_tool(
+                "list_repos", SimpleNamespace(readOnlyHint=True)
+            ),
+            self._make_tool(
+                "delete_repo", SimpleNamespace(readOnlyHint=False)
+            ),
+            self._make_tool("no_annotations", None),
+        ]
+        config = {
+            "trust": "full",
+            "tools": {"resources": False, "prompts": False},
+        }
+        with patch("tools.registry.registry", ToolRegistry()), \
+             patch("tools.mcp_tool._track_mcp_tool_server"):
+            mcp_tool._register_server_tools("srv", server, config)
+
+        assert mcp_tool._server_trust_levels["srv"] == "full"
         hints = mcp_tool._tool_read_only_hints["srv"]
         assert hints.get("list_repos") is True
         # Anything not exactly True is write-capable.

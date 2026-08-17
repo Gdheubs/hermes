@@ -4357,6 +4357,13 @@ def _record_tool_trust_metadata(
             (config or {}).get("trust")
         )
         hints = _tool_read_only_hints.setdefault(server_name, {})
+        # F5/P2: readOnlyHint is a SELF-declaration from the server. It is
+        # only meaningful on trusted servers (where the gate is off anyway);
+        # for untrusted servers the hint must never bypass approval, so we
+        # do not record it at all.
+        if _server_trust_levels[server_name] == _TRUST_UNTRUSTED:
+            hints.clear()
+            return
         for tool in tools:
             name = getattr(tool, "name", None)
             if name:
@@ -4373,8 +4380,13 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
     trust = _server_trust_levels.get(server_name, _TRUST_UNTRUSTED)
     if trust != _TRUST_UNTRUSTED:
         return None
-    if _tool_read_only_hints.get(server_name, {}).get(tool_name) is True:
-        return None
+    # F5/P2 (Purple round 2): readOnlyHint is supplied by the server itself
+    # — the same party we marked untrusted. A self-declared read-only hint
+    # must NOT skip the approval gate: an untrusted server can declare its
+    # destructive tools read-only to bypass approval. Every tool on an
+    # untrusted server consults approval.
+    # (Hints are recorded only for trusted servers — see
+    # _record_tool_trust_metadata — so none can appear here for untrusted.)
 
     # Lazy import mirrors the elicitation handler's pattern: tools.approval
     # routes the prompt to whichever surface owns the session (CLI, TUI,
@@ -4385,8 +4397,8 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
         answer = request_elicitation_consent(
             (
                 f"MCP tool '{tool_name}' on UNTRUSTED server "
-                f"'{server_name}' wants to run. This tool is write-capable "
-                f"(no readOnlyHint=true annotation) and may modify external "
+                f"'{server_name}' wants to run. This tool is not "
+                f"operator-confirmed read-only and may modify external "
                 f"state."
             ),
             (
