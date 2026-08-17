@@ -8210,39 +8210,9 @@ class AIAgent:
             self._executing_tools = False
 
     def _dispatch_delegate_task(self, function_args: dict) -> str:
-        """Single call site for delegate_task dispatch.
-
-        New DELEGATE_TASK_SCHEMA fields only need to be added here to reach all
-        invocation paths (concurrent, sequential, inline).
-        """
-        from tools.delegate_tool import (
-            _strip_model_hidden_task_fields,
-            delegate_task as _delegate_task,
-        )
-        # Delegations from the top-level MODEL always run in the background —
-        # the model does not get to choose. delegate_task returns immediately
-        # with a handle (one per task) and each subagent's result re-enters the
-        # conversation as a new message when it finishes. This applies to BOTH
-        # a single task and a fan-out batch (each task becomes its own
-        # independent background subagent). The one exception:
-        #   - A delegation from an ORCHESTRATOR SUBAGENT (depth > 0) stays
-        #     synchronous: the orchestrator needs its workers' results within
-        #     its own turn to compose a summary, and a subagent doesn't own the
-        #     gateway session the async result would route back to.
-        # The schema-level `background` param is intentionally ignored here.
-        _is_subagent = getattr(self, "_delegate_depth", 0) > 0
-        return _delegate_task(
-            goal=function_args.get("goal"),
-            context=function_args.get("context"),
-            tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
-            max_iterations=function_args.get("max_iterations"),
-            role=function_args.get("role"),
-            background=(not _is_subagent),
-            action=function_args.get("action"),
-            subagent_id=function_args.get("subagent_id"),
-            message=function_args.get("message"),
-            parent_agent=self,
-        )
+        """Forwarder — see ``agent.tool_dispatch.dispatch_delegate_task``."""
+        from agent.tool_dispatch import dispatch_delegate_task
+        return dispatch_delegate_task(self, function_args)
 
     def _invoke_tool(self, function_name: str, function_args: dict, effective_task_id: str,
                      tool_call_id: Optional[str] = None, messages: list = None,
@@ -8250,8 +8220,8 @@ class AIAgent:
                      skip_tool_request_middleware: bool = False,
                      tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None,
                      skip_tool_execution_middleware: bool = False) -> str:
-        """Forwarder — see ``agent.agent_runtime_helpers.invoke_tool``."""
-        from agent.agent_runtime_helpers import invoke_tool
+        """Forwarder — see ``agent.tool_dispatch.invoke_tool``."""
+        from agent.tool_dispatch import invoke_tool
         return invoke_tool(
             self,
             function_name,
