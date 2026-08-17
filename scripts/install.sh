@@ -396,6 +396,45 @@ is_termux() {
     [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"com.termux/files/usr"* ]]
 }
 
+# Replace the pip-installed cryptography overlay with the Termux dpkg build.
+#
+# PyPI cryptography>=50.0.0 links PyLong_Type/PyExc_Warning expecting them in
+# the main executable; Termux's CPython keeps them only in libpython3.x.so, so
+# the abi3 extension fails to dlopen at runtime (NousResearch/hermes-agent#83680).
+# The distro python-cryptography is patched with NEEDED libpython3.x.so +
+# RUNPATH, so it loads. We copy it over the broken overlay. The smoke test
+# imports a hazmat submodule (not a shallow `import cryptography`, which does
+# not trigger the dlopen and falsely passes). Exits 1 on persistent failure so
+# setup aborts loudly instead of shipping a broken install.
+_fix_termux_cryptography_overlay() {
+    [ -n "${VIRTUAL_ENV:-}" ] || return 0
+    local _pyminor
+    _pyminor="$("$PIP_PYTHON" -c 'import sys;print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)" || return 0
+    local _sysdir="$PREFIX/lib/python${_pyminor}/site-packages"
+    local _vsite="$VIRTUAL_ENV/lib/python${_pyminor}/site-packages"
+    [ -d "$_sysdir/cryptography" ] || { log_info "Termux python-cryptography not found — skipping overlay fix."; return 0; }
+    [ -d "$_vsite" ] || return 0
+
+    if "$VIRTUAL_ENV/bin/python" -c 'from cryptography.hazmat.primitives import hashes' 2>/dev/null; then
+        log_info "Termux cryptography already working (distro build) — skipping overlay fix."
+        return 0
+    fi
+
+    log_info "Android: replacing pip cryptography with Termux distro build (PyLong_Type fix)..."
+    "$PIP_PYTHON" -m pip uninstall -y cryptography >/dev/null 2>&1 || true
+    rm -rf "$_vsite/cryptography" "$_vsite"/cryptography-*.dist-info
+    cp -r "$_sysdir/cryptography" "$_vsite/"
+    cp -r "$_sysdir"/cryptography-*.dist-info "$_vsite/" 2>/dev/null || true
+
+    if "$VIRTUAL_ENV/bin/python" -c 'from cryptography.hazmat.primitives import hashes; import cryptography; print("cryptography", cryptography.__version__, "ok")' 2>&1; then
+        log_success "cryptography Termux build in place (PyLong_Type resolved)"
+    else
+        log_error "cryptography Termux build still failing — Hermes will crash on Bitwarden/secret sources at startup."
+        log_info "Manual fix: cp -r $PREFIX/lib/python${_pyminor}/site-packages/cryptography* $VIRTUAL_ENV/lib/python${_pyminor}/site-packages/"
+        return 1
+    fi
+}
+
 # Decide where the repo checkout + venv live, and where the `hermes` command
 # symlink goes.  Called after detect_os so $OS/$DISTRO are known.
 #
@@ -1517,6 +1556,27 @@ install_deps() {
             if ! "$PIP_PYTHON" "$INSTALL_DIR/scripts/install_psutil_android.py" --pip "$PIP_PYTHON -m pip"; then
                 log_warn "psutil Android prebuild failed — package install will likely fail next."
                 log_info "Workaround: manually rerun 'python scripts/install_psutil_android.py' once your toolchain is set up."
+            fi
+        fi
+
+        # On Termux/Android, PyPI's cryptography>=50.0.0 fails at runtime with
+        # "ImportError: dlopen failed: cannot locate symbol PyLong_Type" (or
+        # PyExc_Warning). Cause: Termux's CPython does not re-export those
+        # symbols from the main executable — they live only in libpython3.x.so.
+        # PyPI's _rust.abi3.so expects them in the main exe and carries no
+        # NEEDED libpython3.x.so, so dlopen dies. The Termux dpkg
+        # python-cryptography is patched (NEEDED libpython3.x.so + RUNPATH), so
+        # it loads. Copy it over the broken pip overlay. Covers BOTH Termux
+        # platform reports: modern Termux reports sys.platform == "android",
+        # older (<3.13) reports "linux" (see agent/skill_utils.py) — gate on
+        # is_termux, not on sys.platform. A shallow `import cryptography` does
+        # NOT load _rust and falsely passes; the smoke test MUST import a hazmat
+        # submodule. See NousResearch/hermes-agent#83680 / #85972.
+        if is_termux; then
+            if ! _fix_termux_cryptography_overlay; then
+                # Smoke test failed after the distro copy — abort setup loudly
+                # rather than ship an install that crashes on Bitwarden at startup.
+                exit 1
             fi
         fi
 

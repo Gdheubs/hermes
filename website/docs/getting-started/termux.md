@@ -114,6 +114,23 @@ If you only want the minimal core agent, this also works:
 python -m pip install -e '.' -c constraints-termux.txt
 ```
 
+> **cryptography on Termux:** PyPI's `cryptography>=50.0.0` fails at runtime with
+> `ImportError: dlopen failed: cannot locate symbol "PyLong_Type"` because Termux's
+> CPython does not re-export that symbol from the main executable (it lives only in
+> `libpython3.x.so`). The installer and `hermes update` auto-detect Termux and copy
+> the distro `python-cryptography` package over the broken pip overlay. If you
+> install manually, run `pkg install python-cryptography` first, then after the pip
+> step copy it over:
+>
+> ```bash
+> pkg install python-cryptography
+> rm -rf venv/lib/python*/site-packages/cryptography*
+> cp -r "$PREFIX/lib/python*/site-packages/cryptography"* venv/lib/python*/site-packages/
+> ```
+>
+> Verify with `venv/bin/python -c 'from cryptography.hazmat.primitives import hashes'`
+> (a plain `import cryptography` does **not** trigger the failing `dlopen`).
+
 ### 5. Put `hermes` on your Termux PATH
 
 ```bash

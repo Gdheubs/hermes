@@ -1108,6 +1108,14 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
     # #70636).
     _m()._refresh_active_memory_provider_dependencies()
 
+    # Termux/Android: the pip reinstall above re-introduces the broken PyPI
+    # cryptography overlay (NousResearch/hermes-agent#83680). Replace it with the
+    # distro python-cryptography before the import check, so the update ships a
+    # working install instead of one that crashes on Bitwarden at startup.
+    if _m()._is_termux_env():
+        from hermes_cli.termux_crypto_fix import fix_termux_cryptography_overlay
+        fix_termux_cryptography_overlay(_m().PROJECT_ROOT / "venv")
+
     # Now that dependencies are installed, verify the tree actually imports.
     # The copy loop above replaces top-level entries one at a time in
     # os.listdir order, so an interruption between (say) `agent/` and `tools/`
