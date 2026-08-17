@@ -2852,9 +2852,24 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             return False
 
     try:
+        from hermes_cli.config import load_config
+        _cfg = load_config()
+        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
+        _raw_max_in_progress = _kanban_cfg.get("max_in_progress")
+        try:
+            _max_in_progress = int(_raw_max_in_progress) if _raw_max_in_progress is not None else None
+        except (TypeError, ValueError):
+            _max_in_progress = None
+        if _max_in_progress is not None and _max_in_progress < 1:
+            _max_in_progress = None
+    except Exception:
+        _max_in_progress = None
+
+    try:
         kb.run_daemon(
             interval=args.interval,
             max_spawn=args.max,
+            max_in_progress=_max_in_progress,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             on_tick=_on_tick,
         )
