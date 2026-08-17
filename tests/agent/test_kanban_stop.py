@@ -74,6 +74,47 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+# ── #80507 / #87671: only the dispatcher-owned worker is nudged ─────────
+# A delegate_task child inherits HERMES_KANBAN_TASK from the worker's
+# process env (children run in-process), but its kanban toolset is stripped
+# — so the guard must never demand a terminal board call from it. In-process
+# cron jobs fired from a worker have the same problem. The guard stays on
+# for the real dispatcher-owned worker and is restored after the scope ends.
+
+def test_delegated_child_disables_guard(clear_kanban_env):
+    from agent.delegation_context import delegated_child_context
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    with delegated_child_context(session_id="child-1"):
+        assert kanban_stop_nudge_enabled() is False
+        assert build_kanban_stop_nudge(messages=[]) is None
+
+
+def test_non_dispatcher_owned_disables_guard(clear_kanban_env):
+    from agent.delegation_context import non_dispatcher_owned_context
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    with non_dispatcher_owned_context():
+        assert kanban_stop_nudge_enabled() is False
+        assert build_kanban_stop_nudge(messages=[]) is None
+
+
+def test_guard_restored_after_context_exit(clear_kanban_env):
+    from agent.delegation_context import (
+        delegated_child_context,
+        non_dispatcher_owned_context,
+    )
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    assert kanban_stop_nudge_enabled() is True
+    with delegated_child_context(session_id="child-1"):
+        assert kanban_stop_nudge_enabled() is False
+    assert kanban_stop_nudge_enabled() is True
+    with non_dispatcher_owned_context():
+        assert kanban_stop_nudge_enabled() is False
+    assert kanban_stop_nudge_enabled() is True
+
+
 
 
 

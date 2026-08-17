@@ -296,3 +296,54 @@ def test_child_attempting_default_complete_does_not_finish_parent_or_delete_work
     assert task.status == "running"
     assert run.status == "running"
     assert workspace.is_dir()
+
+
+def test_child_env_u_cli_cannot_complete_parent_task(monkeypatch, tmp_path):
+    """#87671 E2E: clearing HERMES_DELEGATED_CHILD_CONTEXT in a fresh
+    subprocess (``env -u … hermes kanban complete …``) must NOT let a
+    delegated child prematurely complete its parent's running kanban task.
+
+    This is the exact escalation observed in production (7 incidents): the
+    nudged child shells out with the lineage marker removed, so the env-marker
+    CLI guard sees a plain interactive user.  The DB-backed claim-lock guard
+    must still refuse the completion, because the child's subprocess env has
+    every ``HERMES_KANBAN_*`` variable scrubbed — including the worker's
+    ``HERMES_KANBAN_CLAIM_LOCK``.
+    """
+    kb, tid, workspace, _attachments_root = _make_running_kanban_task(
+        monkeypatch, tmp_path,
+    )
+    from agent.delegation_context import delegated_child_context
+    from tools.environments.local import LocalEnvironment
+
+    code = (
+        "from hermes_cli import kanban; "
+        "import argparse; "
+        "p=argparse.ArgumentParser(); "
+        "sub=p.add_subparsers(dest='cmd'); "
+        "kanban.build_parser(sub); "
+        f"args=p.parse_args(['kanban','complete','{tid}','--result','escaped child']); "
+        "raise SystemExit(kanban.kanban_command(args))"
+    )
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+    try:
+        with delegated_child_context():
+            result = env.execute(
+                "env -u HERMES_DELEGATED_CHILD_CONTEXT "
+                + _python_with_repo_path(code),
+                timeout=15,
+            )
+    finally:
+        env.cleanup()
+
+    assert result["returncode"] == 1
+    assert "claim" in result["output"], result["output"]
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        run = kb.latest_run(conn, tid)
+    finally:
+        conn.close()
+    assert task.status == "running"
+    assert run.status == "running"
+    assert workspace.is_dir()

@@ -1050,6 +1050,16 @@ def kanban_command(args: argparse.Namespace) -> int:
         )
         return 1
 
+    # Close the `env -u HERMES_DELEGATED_CHILD_CONTEXT` bypass (#87671): a
+    # delegated child can clear the lineage marker in a fresh subprocess and
+    # look like an interactive user. The durable boundary is the DB — a task
+    # actively claimed by a running worker may only be closed via CLI by a
+    # process that presents that worker's claim lock.
+    _claim_guard_error = _cli_mutation_claim_guard(args)
+    if _claim_guard_error:
+        print(_claim_guard_error, file=sys.stderr)
+        return 1
+
     # Board-management commands operate on board metadata and the persisted
     # current-board pointer itself. They must ignore the shared `--board`
     # task-routing override; otherwise `/kanban --board beta boards show`
@@ -1238,6 +1248,89 @@ def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
         return is_delegated_child_process_context()
     except Exception:
         return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+
+
+# CLI lifecycle mutations that close a worker's run.  ``complete`` is the
+# one whose DB layer has no ownership guard when ``expected_run_id`` is
+# absent (``complete_task`` accepts a merely-ready task for manual CLI use),
+# so an escaped delegated child — whose scrubbed subprocess env carries
+# neither ``HERMES_KANBAN_RUN_ID`` nor ``HERMES_KANBAN_CLAIM_LOCK`` — could
+# close the parent's task unguarded.  ``request-review`` is NOT listed here:
+# ``kanban_db.request_review`` already refuses unowned requests on a live
+# claim (``force=True`` is the explicit operator override), so it needs no
+# CLI-layer guard.  ``block``/``reclaim`` etc. remain human recovery paths.
+_CLAIM_GUARDED_CLI_ACTIONS: frozenset[str] = frozenset({
+    "complete",
+})
+
+
+def _cli_mutation_target_task_ids(args: argparse.Namespace) -> list[str]:
+    """Collect the task ids a CLI mutation action targets, across arg shapes."""
+    ids: list[str] = []
+    raw = getattr(args, "task_ids", None)
+    if raw:
+        ids.extend(raw if isinstance(raw, (list, tuple)) else [raw])
+    raw = getattr(args, "task_id", None)
+    if raw:
+        ids.append(raw)
+    raw = getattr(args, "ids", None)
+    if raw:
+        ids.extend(raw if isinstance(raw, (list, tuple)) else [raw])
+    return [tid for tid in dict.fromkeys(ids) if tid]
+
+
+def _cli_mutation_claim_guard(args: argparse.Namespace) -> Optional[str]:
+    """Return an error string when a CLI lifecycle mutation targets a task
+    actively claimed by a running worker and this process cannot present that
+    worker's claim lock.
+
+    Closes the ``env -u HERMES_DELEGATED_CHILD_CONTEXT`` bypass (#87671).  The
+    env-marker check in :func:`_is_delegated_child_cli_mutation` only sees a
+    child while the marker survives; a fresh ``hermes kanban …`` subprocess
+    spawned with the marker cleared carries no ContextVar and no marker, so it
+    is indistinguishable from an interactive user by env alone.  This guard
+    moves the boundary to the DB: a task in ``running`` with a non-null
+    ``claim_lock`` belongs to a live dispatcher worker, and only a process
+    presenting that exact ``HERMES_KANBAN_CLAIM_LOCK`` (dispatcher-spawned
+    workers carry it in env; child subprocess envs have every
+    ``HERMES_KANBAN_*`` variable scrubbed by ``scrub_kanban_env``) may close
+    it.  ``request-review`` is deliberately not guarded here — the DB-layer
+    live-claim guard in ``kanban_db.request_review`` already refuses unowned
+    requests (``--force`` is the explicit operator override).
+    """
+    action = getattr(args, "kanban_action", None)
+    if action not in _CLAIM_GUARDED_CLI_ACTIONS:
+        return None
+    task_ids = _cli_mutation_target_task_ids(args)
+    if not task_ids:
+        return None
+    claimed = (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+    try:
+        from hermes_cli import kanban_db as kb
+
+        with kb.connect_closing() as conn:
+            for tid in task_ids:
+                task = kb.get_task(conn, tid)
+                if task is None:
+                    continue  # unknown id handled by the action's own error path
+                if task.status == "running" and task.claim_lock:
+                    if not claimed or claimed != task.claim_lock:
+                        return (
+                            f"kanban: {action} of {tid} refused: the task is "
+                            "actively claimed by a running worker and this "
+                            "process does not present that worker's claim "
+                            "lock (HERMES_KANBAN_CLAIM_LOCK). A delegate_task "
+                            "child that cleared its lineage marker cannot "
+                            "close a worker-owned task."
+                        )
+    except Exception:
+        # Fail closed: if ownership cannot be verified, the mutation must not
+        # proceed against a task that may belong to a live worker.
+        return (
+            f"kanban: {action} refused: could not verify task ownership "
+            "against the kanban database."
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------

@@ -69,7 +69,29 @@ def _record_kanban_budget_exhausted(
     (``WHERE ended_at IS NULL``) guarantees idempotence — if another path
     already closed the run this is a no-op — so it is safe to call from
     multiple exit paths.
+
+    Only the dispatcher-owned worker may record a failure on its task.  A
+    delegate_task child (or an in-process cron job) inherits
+    ``HERMES_KANBAN_TASK`` from the worker's process env but is not the run
+    owner, so its own budget exhaustion must never record a bogus
+    ``timed_out`` on the parent's task or release the parent's claim
+    (#87671 — the same missing-ownership-check class as the stop-nudge
+    misfire).  Defaults to the pre-existing behavior (record) if the
+    ownership predicate cannot be resolved.
     """
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        owned = is_dispatcher_owned_worker_context()
+    except Exception:
+        owned = True  # degraded env: keep the #87096 bounded fallback
+    if not owned:
+        logger.info(
+            "skipping kanban timed_out recording for %s: this execution "
+            "is not the dispatcher-owned worker",
+            kanban_task,
+        )
+        return
     try:
         from hermes_cli import kanban_db as _kb
         _conn = _kb.connect()

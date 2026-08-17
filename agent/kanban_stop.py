@@ -25,14 +25,23 @@ _DEFAULT_MAX_ATTEMPTS = 2
 def kanban_stop_nudge_enabled() -> bool:
     """Return whether the kanban stop-guard is active for this process.
 
-    On when ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), unless
-    ``HERMES_KANBAN_STOP_NUDGE`` explicitly disables it.
+    On only when ``HERMES_KANBAN_TASK`` is set AND this execution owns the
+    dispatcher's Kanban task, unless ``HERMES_KANBAN_STOP_NUDGE`` explicitly
+    disables it.  Uses the canonical :func:`is_dispatcher_owned_worker_context`
+    predicate so the guard stays off for delegate_task children and in-process
+    cron jobs that merely inherit the worker's ``HERMES_KANBAN_*`` env vars
+    (#80507, #87671): the kanban toolset is stripped from them, so nudging
+    them toward ``kanban_complete`` demands a tool they cannot call.
     """
     env = os.environ.get("HERMES_KANBAN_STOP_NUDGE")
     if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
         return False
     task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    return bool(task)
+    if not task:
+        return False
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+
+    return is_dispatcher_owned_worker_context()
 
 
 def _tool_call_name(tc: Any) -> str:
