@@ -1358,6 +1358,25 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # No-op on Windows (POSIX mode bits not enforced); ignore failures.
     # secure_parent_dir refuses to chmod / or top-level dirs (#25821).
     secure_parent_dir(auth_file)
+    # ``os.replace`` swaps in the temp inode, including its UID/GID.  That is
+    # normally invisible when the CLI and gateway run as the same user, but a
+    # privileged ``hermes auth`` invocation would otherwise replace a
+    # service-owned 0600 store with a root-owned one and lock the gateway out.
+    # Preserve the existing store owner; on first creation inherit the
+    # HERMES_HOME directory owner.  Do this before creating/replacing the
+    # destination so a wrong-owner credential inode is never published.
+    owner: Optional[tuple[int, int]] = None
+    if hasattr(os, "fchown"):
+        try:
+            owner_stat = os.stat(auth_file)
+        except FileNotFoundError:
+            owner_stat = os.stat(auth_file.parent)
+        owner = (owner_stat.st_uid, owner_stat.st_gid)
+        # The replacement inode is already created as this process. Avoid an
+        # unnecessary fchown (which some network filesystems reject) when the
+        # intended owner is exactly the current process identity.
+        if owner == (os.getuid(), os.getgid()):
+            owner = None
     auth_store["version"] = AUTH_STORE_VERSION
     auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
     payload = json.dumps(auth_store, indent=2) + "\n"
@@ -1374,6 +1393,8 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
         )
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(payload)
+            if owner is not None:
+                os.fchown(handle.fileno(), *owner)
             handle.flush()
             os.fsync(handle.fileno())
         atomic_replace(tmp_path, auth_file)
