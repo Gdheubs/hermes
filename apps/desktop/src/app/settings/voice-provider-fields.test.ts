@@ -36,6 +36,17 @@ describe('voiceProviderKeys', () => {
     expect(voiceProviderKeys('tts', 'mini')).toEqual([])
     expect(voiceProviderKeys('stt', 'openai')).toEqual(['stt.openai.model'])
   })
+
+  it('discovers plugin fields from backend schema and config presence', () => {
+    expect(
+      voiceProviderKeys(
+        'stt',
+        'bifrost',
+        { 'stt.bifrost.model': { type: 'select' } },
+        { stt: { bifrost: { language: 'ru' } } }
+      )
+    ).toEqual(['stt.bifrost.model', 'stt.bifrost.language'])
+  })
 })
 
 describe('voice field option coverage', () => {

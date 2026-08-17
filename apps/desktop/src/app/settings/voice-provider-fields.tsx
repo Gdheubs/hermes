@@ -17,10 +17,25 @@ import { enumOptionsFor, getNested, inferFieldSchema, setNested } from './helper
 // Capabilities TTS panel derive from it so the two surfaces never drift.
 const VOICE_KEYS = SECTIONS.find(s => s.id === 'voice')?.keys ?? []
 
-export function voiceProviderKeys(section: 'tts' | 'stt', providerKey: string): string[] {
+export function voiceProviderKeys(
+  section: 'tts' | 'stt',
+  providerKey: string,
+  schema: Record<string, unknown> = {},
+  config: HermesConfigRecord | null = null
+): string[] {
   const prefix = `${section}.${providerKey}.`
+  const keys = new Set(VOICE_KEYS.filter(key => key.startsWith(prefix)))
 
-  return VOICE_KEYS.filter(key => key.startsWith(prefix))
+  Object.keys(schema)
+    .filter(key => key.startsWith(prefix))
+    .forEach(key => keys.add(key))
+
+  const providerConfig = config ? getNested(config, `${section}.${providerKey}`) : undefined
+  if (providerConfig && typeof providerConfig === 'object' && !Array.isArray(providerConfig)) {
+    Object.keys(providerConfig).forEach(key => keys.add(`${prefix}${key}`))
+  }
+
+  return [...keys]
 }
 
 /**
@@ -32,7 +47,6 @@ export function voiceProviderKeys(section: 'tts' | 'stt', providerKey: string): 
  */
 export function VoiceProviderFields({ section, providerKey }: { section: 'tts' | 'stt'; providerKey: string }) {
   const { t } = useI18n()
-  const keys = useMemo(() => voiceProviderKeys(section, providerKey), [section, providerKey])
   const { data: loadedConfig } = useHermesConfigRecord()
 
   const { data: schemaResponse } = useQuery({
@@ -40,6 +54,11 @@ export function VoiceProviderFields({ section, providerKey }: { section: 'tts' |
     queryFn: getHermesConfigSchema,
     staleTime: 5 * 60 * 1000
   })
+
+  const keys = useMemo(
+    () => voiceProviderKeys(section, providerKey, schemaResponse?.fields ?? {}, loadedConfig ?? null),
+    [section, providerKey, schemaResponse?.fields, loadedConfig]
+  )
 
   // Local editable draft, seeded once from the shared cache (background
   // refetches must not clobber in-progress edits) — the same shape as
