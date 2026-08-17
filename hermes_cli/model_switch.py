@@ -13,9 +13,12 @@ This module ties together the foundation layers:
 - ``hermes_cli.providers``        -- canonical provider identity + overlays
 - ``hermes_cli.model_normalize``  -- per-provider name formatting
 
-Provider switching uses the ``--provider`` flag exclusively.
-No colon-based ``provider:model`` syntax — colons are reserved for
-OpenRouter variant suffixes (``:free``, ``:extended``, ``:fast``).
+Provider switching supports the ``--provider`` flag and the ``provider:model``
+colon shorthand. On aggregators, a colon form such as ``vendor:model`` is
+converted to the ``vendor/model`` slug when the input has no slash; when a
+slash is already present, the colon is treated as a variant suffix
+(``:free``, ``:extended``, ``:fast``) and preserved. Bare names resolve
+within the current provider first. See :func:`switch_model`.
 """
 
 from __future__ import annotations
