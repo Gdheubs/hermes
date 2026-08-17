@@ -46,6 +46,30 @@ from plugins.platforms.discord.adapter import (
 )
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        {"action": "list"},
+        {"action": "send", "target": "telegram:123", "message": "hello"},
+        {"action": "react", "target": "photon:space", "emoji": "👍"},
+        {"action": "unreact", "target": "photon:space"},
+    ],
+)
+def test_guest_query_cannot_use_cross_channel_messaging(args):
+    """A one-shot Guest Query must not create messaging side effects."""
+
+    def _session_value(name, default=""):
+        return {
+            "HERMES_SESSION_PLATFORM": "telegram",
+            "HERMES_SESSION_THREAD_ID": "guest:q-1",
+        }.get(name, default)
+
+    with patch("gateway.session_context.get_session_env", side_effect=_session_value):
+        result = json.loads(send_message_tool(args))
+
+    assert "Guest Quer" in result["error"]
+
+
 async def _send_discord(
     token,
     chat_id,

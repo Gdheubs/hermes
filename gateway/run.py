@@ -5172,8 +5172,16 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        _is_telegram_guest_query = bool(
+            (ctx._status_thread_metadata or {}).get("telegram_guest_query_id")
+        )
+        if _is_telegram_guest_query:
+            _streaming_enabled = False
         _want_stream_deltas = _streaming_enabled
-        _want_interim_messages = ctx.interim_assistant_messages_enabled
+        _want_interim_messages = (
+            ctx.interim_assistant_messages_enabled
+            and not _is_telegram_guest_query
+        )
         _want_interim_consumer = _want_interim_messages
         if _want_stream_deltas or _want_interim_consumer:
             try:
@@ -5220,6 +5228,8 @@ class TurnRunner:
                     _stts_consumer_ref.on_delta(text)
 
         def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
+            if _is_telegram_guest_query:
+                return
             if not ctx._run_still_current():
                 return
             display_text = text
@@ -5688,6 +5698,12 @@ class TurnRunner:
 
             if not ctx._status_adapter:
                 return ""
+            if (ctx._status_thread_metadata or {}).get("telegram_guest_query_id"):
+                return (
+                    "[interactive clarification is unavailable for this one-shot "
+                    "Telegram Guest Query; continue with the safest reasonable "
+                    "assumption or explain what information is missing]"
+                )
 
             clarify_id = _uuid.uuid4().hex[:10]
             _clarify_mod.register(
@@ -5844,6 +5860,7 @@ class TurnRunner:
         from tools.approval import (
             register_gateway_notify,
             reset_current_session_key,
+            resolve_gateway_approval,
             set_current_session_key,
             unregister_gateway_notify,
         )
@@ -5856,6 +5873,16 @@ class TurnRunner:
                 UX.  Otherwise fall back to a plain text message with
                 ``/approve`` instructions.
                 """
+            if (ctx._status_thread_metadata or {}).get("telegram_guest_query_id"):
+                resolve_gateway_approval(
+                    _approval_session_key,
+                    "deny",
+                    reason=(
+                        "Interactive approval is unavailable for a one-shot "
+                        "Telegram Guest Query"
+                    ),
+                )
+                return
             # Pause the typing indicator while the agent waits for
             # user approval.  Critical for Slack's Assistant API where
             # assistant_threads_setStatus disables the compose box — the
@@ -19753,6 +19780,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             response = agent_result.get("final_response") or ""
+            # Guest Mode has exactly one text-only answer endpoint. Ignore any
+            # optimistic already_sent marker from direct-send/tool paths so the
+            # complete response (including any enabled final footer) continues
+            # through the hardened BasePlatform one-shot delivery path.
+            if (
+                event.source.platform == Platform.TELEGRAM
+                and isinstance(getattr(event.source, "thread_id", None), str)
+                and event.source.thread_id.startswith("guest:")
+            ):
+                agent_result["already_sent"] = False
             # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
             # ("Codex response remained incomplete after 3 continuation
             # attempts") doubles as final_response, so it would be delivered
@@ -21591,6 +21628,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
           in which case the base adapter won't have text for auto-TTS so the
           runner must handle it.
         """
+        if (
+            event.source.platform == Platform.TELEGRAM
+            and isinstance(getattr(event.source, "thread_id", None), str)
+            and event.source.thread_id.startswith("guest:")
+        ):
+            return False
         if not response or response.startswith("Error:"):
             return False
 
@@ -23194,6 +23237,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if team_id:
                 metadata = dict(metadata or {})
                 metadata["slack_team_id"] = str(team_id)
+        thread_id = getattr(source, "thread_id", None)
+        if (
+            getattr(source, "platform", None) == Platform.TELEGRAM
+            and isinstance(thread_id, str)
+            and thread_id.startswith("guest:")
+        ):
+            metadata = dict(metadata or {})
+            metadata["telegram_guest_query_id"] = thread_id.removeprefix("guest:")
         return metadata
 
     def _thread_metadata_for_target(
@@ -27214,6 +27265,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
+        # Telegram Guest Mode allows exactly one answerGuestQuery response.
+        # A stream consumer can finalize independently and bypass the shared
+        # one-shot sanitization path (for example leaking a MEDIA: directive),
+        # so Guest queries must remain non-streaming even when Telegram
+        # streaming is enabled globally or per-platform.
+        if (_thread_metadata or {}).get("telegram_guest_query_id"):
+            _streaming_enabled = False
+
         if _streaming_enabled:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
@@ -27244,7 +27303,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Send typing indicator
         _adapter = self._adapter_for_source(source)
-        if _adapter:
+        if _adapter and not (_thread_metadata or {}).get("telegram_guest_query_id"):
             try:
                 await _adapter.send_typing(source.chat_id, metadata=_thread_metadata)
             except Exception:
@@ -27667,6 +27726,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _env_tp and not _tool_progress_configured
             else (_resolved_tp or _env_tp or "all")
         )
+        _is_telegram_guest_source = (
+            getattr(source.platform, "value", source.platform) == "telegram"
+            and isinstance(getattr(source, "thread_id", None), str)
+            and source.thread_id.startswith("guest:")
+        )
+        if _is_telegram_guest_source:
+            progress_mode = "off"
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog

@@ -245,8 +245,30 @@ SEND_MESSAGE_SCHEMA = {
 }
 
 
+def _is_telegram_guest_query_context() -> bool:
+    """Return whether this tool call belongs to a one-shot Guest Query turn."""
+    try:
+        from gateway.session_context import get_session_env
+
+        return (
+            str(get_session_env("HERMES_SESSION_PLATFORM", "") or "")
+            .strip()
+            .lower()
+            == "telegram"
+            and str(get_session_env("HERMES_SESSION_THREAD_ID", "") or "").startswith(
+                "guest:"
+            )
+        )
+    except Exception:
+        return False
+
+
 def send_message_tool(args, **kw):
     """Handle cross-channel send_message tool calls."""
+    if _is_telegram_guest_query_context():
+        return tool_error(
+            "Cross-channel messaging is unavailable for Telegram Guest Queries"
+        )
     action = args.get("action", "send")
 
     if action == "list":

@@ -112,6 +112,9 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
         scope_id = getattr(source, "scope_id", None)
         if scope_id:
             metadata["slack_team_id"] = str(scope_id)
+    if _platform_name(getattr(source, "platform", None)) == "telegram" and str(thread_id).startswith("guest:"):
+        metadata["telegram_guest_query_id"] = str(thread_id).split(":", 1)[1]
+        return metadata
     if not metadata:
         return None
     if _platform_name(getattr(source, "platform", None)) == "telegram" and getattr(source, "chat_type", None) == "dm":
@@ -5494,6 +5497,13 @@ class BasePlatformAdapter(ABC):
         if result.success:
             return result
 
+        # Telegram Guest Queries permit exactly one answer. Any second send —
+        # including this generic retry/plain-text fallback path — violates the
+        # Bot API one-shot contract and can never recover an expired/consumed
+        # query. Preserve the original failure for delivery accounting.
+        if isinstance(metadata, dict) and metadata.get("telegram_guest_query_id"):
+            return result
+
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
 
@@ -6248,8 +6258,14 @@ class BasePlatformAdapter(ABC):
         # never spawned, so no "typing…" / "is thinking…" status is shown.
         # typing_task stays None; _stop_typing_refresh already no-ops on None.
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+        _is_telegram_guest_query = bool(
+            (_thread_metadata or {}).get("telegram_guest_query_id")
+        )
         typing_task: Optional[asyncio.Task] = None
-        if getattr(self.config, "typing_indicator", True):
+        if (
+            getattr(self.config, "typing_indicator", True)
+            and not _is_telegram_guest_query
+        ):
             _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
             try:
                 _keep_typing_sig = inspect.signature(self._keep_typing)
@@ -6306,6 +6322,13 @@ class BasePlatformAdapter(ABC):
                     session_key,
                 )
                 response = None
+            if _is_telegram_guest_query and (
+                response is None or not str(response).strip()
+            ):
+                response = (
+                    "I couldn't produce a response for this Telegram Guest Query. "
+                    "Please try again."
+                )
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
@@ -6369,6 +6392,23 @@ class BasePlatformAdapter(ABC):
                     if local_files:
                         logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
 
+                # Telegram Guest Mode permits exactly one text answer through
+                # answerGuestQuery. Native media/file sends have no chat target
+                # in this transport, so retain any text and suppress every
+                # extracted attachment. If the response is attachment-only,
+                # provide one useful text answer instead of returning silence.
+                if _is_telegram_guest_query and (
+                    images or local_files or media_files
+                ):
+                    images = []
+                    local_files = []
+                    media_files = []
+                    if not text_content:
+                        text_content = (
+                            "This response includes attachments, which cannot "
+                            "be delivered through Telegram Guest Mode."
+                        )
+
                 # A2 (#29346): extraction can reduce a non-empty response to
                 # empty text with no attachment, and the `if text_content` guard
                 # below then drops it silently. Recover on every platform (#33842
@@ -6403,6 +6443,7 @@ class BasePlatformAdapter(ABC):
                 _tts_paths: List[str] = []
                 _tts_requested_path = None
                 if (self._should_auto_tts_for_chat(event.source.chat_id)
+                        and not _is_telegram_guest_query
                         and event.message_type == MessageType.VOICE
                         and text_content
                         and not media_files
@@ -6513,9 +6554,13 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
-                    if not is_ephemeral_response and not str(
+                    if (
+                        not _is_telegram_guest_query
+                        and not is_ephemeral_response
+                        and not str(
                         event.text or ""
-                    ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
+                        ).lstrip().startswith(("/", self.typed_command_prefix or "!"))
+                    ):
                         try:
                             from gateway.delivery_ledger import (
                                 compute_obligation_id,
@@ -6809,19 +6854,37 @@ class BasePlatformAdapter(ABC):
             raise
         except BaseException as e:
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
-            logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
+            if _is_telegram_guest_query:
+                # Guest queries cross an untrusted, one-shot transport boundary.
+                # Do not serialize exception details or tracebacks here: provider
+                # errors can contain credentials, request URLs, or sender PII.
+                logger.error(
+                    "[%s] Error handling Telegram Guest Query (%s)",
+                    self.name,
+                    type(e).__name__,
+                )
+            else:
+                logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
             try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
                 _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                await self.send(
-                    chat_id=event.source.chat_id,
-                    content=(
+                if _is_telegram_guest_query:
+                    _thread_metadata = _mark_notify_metadata(_thread_metadata)
+                    error_content = (
+                        "Sorry, I encountered an error while processing this "
+                        "Telegram Guest Query. Please try again."
+                    )
+                else:
+                    error_type = type(e).__name__
+                    error_detail = str(e)[:300] if str(e) else "no details available"
+                    error_content = (
                         f"Sorry, I encountered an error ({error_type}).\n"
                         f"{error_detail}\n"
                         "Try again or use /reset to start a fresh session."
-                    ),
+                    )
+                await self.send(
+                    chat_id=event.source.chat_id,
+                    content=error_content,
                     metadata=_thread_metadata,
                 )
             except Exception as notify_err:
