@@ -201,6 +201,117 @@ class TestResolutionYieldsACallable:
         assert runtime["api_key"] == "sk-explicit-override"
 
 
+class TestCallableExplicitKeySurvivesReResolution:
+    """A callable ``explicit_api_key`` must round-trip, not become its repr.
+
+    This is the ``/model`` switch path. ``cli.py`` persists the resolved
+    ``api_key`` into ``self._explicit_api_key``, and the next turn's
+    ``_ensure_runtime_credentials()`` feeds it straight back into
+    ``resolve_runtime_provider(explicit_api_key=…)``. Every resolver branch
+    normalized it with ``str(explicit_api_key or "").strip()`` — and ``str()``
+    runs BEFORE ``.strip()``, so the callable became
+    ``"<…CommandTokenSource object at 0x…>"``. That repr is long enough and
+    non-placeholder enough to satisfy ``has_usable_secret()``, so two things
+    broke at once: the repr was handed to the SDK as the credential, and the
+    ``key_cmd`` guard saw an "explicit key" and never minted a real token.
+
+    On the anthropic_messages wire the damage is a hard crash rather than a
+    401: a callable routes to the per-request bearer-hook client, while a
+    string routes to ``x-api-key`` — and an empty/garbage string leaves the
+    Anthropic SDK with neither header, raising
+    ``TypeError: Could not resolve authentication method``.
+    """
+
+    CONFIG = {
+        "providers": {
+            "dbx": {
+                "base_url": "https://example.invalid/anthropic",
+                "api_mode": "anthropic_messages",
+                "model": "m1",
+                "key_cmd": "printf minted-token",
+            }
+        }
+    }
+
+    @staticmethod
+    def _patch(monkeypatch, config):
+        from hermes_cli import runtime_provider as rp
+
+        monkeypatch.setattr(rp, "load_config", lambda *a, **k: config)
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda *a, **k: config)
+        return rp
+
+    def test_callable_round_trips_as_a_callable(self, monkeypatch):
+        rp = self._patch(monkeypatch, self.CONFIG)
+
+        first = rp.resolve_runtime_provider(requested="custom:dbx")["api_key"]
+        assert callable(first)
+
+        # The switch persisted `first`; the next turn re-resolves with it.
+        second = rp.resolve_runtime_provider(
+            requested="custom:dbx", explicit_api_key=first
+        )["api_key"]
+        assert callable(second), "a callable must never be coerced to its repr"
+        assert second() == "minted-token"
+
+    def test_repr_is_never_returned_as_the_credential(self, monkeypatch):
+        rp = self._patch(monkeypatch, self.CONFIG)
+
+        provider = rp.resolve_runtime_provider(requested="custom:dbx")["api_key"]
+        resolved = rp.resolve_runtime_provider(
+            requested="custom:dbx", explicit_api_key=provider
+        )["api_key"]
+        assert not (isinstance(resolved, str) and "object at 0x" in resolved)
+
+    def test_round_tripped_callable_keeps_the_bearer_hook_path(self, monkeypatch):
+        """The wire-level consequence: bearer hook, not an empty x-api-key.
+
+        Guards the reported crash directly — an empty/garbage string here
+        leaves the Anthropic SDK with no auth header at all.
+        """
+        import agent.anthropic_adapter as aa
+
+        rp = self._patch(monkeypatch, self.CONFIG)
+        provider = rp.resolve_runtime_provider(requested="custom:dbx")["api_key"]
+        runtime = rp.resolve_runtime_provider(
+            requested="custom:dbx", explicit_api_key=provider
+        )
+
+        client = aa.build_anthropic_client(runtime["api_key"], runtime["base_url"])
+        # Bearer-hook clients clear api_key so ANTHROPIC_API_KEY can't leak in
+        # as a second x-api-key, and carry a sentinel auth_token the hook
+        # overwrites per request.
+        assert client.api_key is None
+        assert client.auth_token
+
+
+class TestCatalogCacheFingerprintIgnoresRotation:
+    """A real ``CommandTokenSource`` must not bust the model-catalog cache.
+
+    The general contract is covered against a stand-in provider in
+    ``tests/hermes_cli/test_callable_credential_model_probe.py``; this pins it
+    to the actual ``key_cmd`` type, whose two instances genuinely mint
+    different values through a subprocess.
+    """
+
+    @staticmethod
+    def _fp(api_key):
+        from hermes_cli.models import _custom_endpoint_fingerprint
+
+        return _custom_endpoint_fingerprint(api_key, "chat_completions", None)
+
+    def test_two_different_mints_share_one_fingerprint(self):
+        first = build_command_token_provider("printf token-one", "dbx")
+        second = build_command_token_provider("printf token-two", "dbx")
+        assert first is not None and second is not None
+        assert first() != second(), "guard: the providers must mint different values"
+        assert self._fp(first) == self._fp(second)
+
+    def test_rotating_a_static_key_still_busts_the_cache(self):
+        """The callable carve-out must not weaken the static-key case."""
+        assert self._fp("key-v1") != self._fp("key-v2")
+
+
 class TestCallableKeyGetsBearerAuth:
     """A callable api_key must reach the Anthropic bearer-hook client path.
 

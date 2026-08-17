@@ -6,11 +6,20 @@ import logging
 import os
 import re
 from urllib.parse import urlparse
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+# What an explicit api_key actually is at this boundary. Most callers pass a
+# string, but the ``key_cmd`` / Entra ID / MiniMax OAuth paths pass a zero-arg
+# callable that mints a bearer per request — and a ``/model`` switch feeds that
+# same callable back in as ``explicit_api_key`` on the next turn. Annotating
+# this ``Optional[str]`` is what hid the coercion bug ``is_token_provider``
+# guards, so the callable is spelled out. Mirrors ``hermes_cli.models``.
+ApiKeyLike = Optional[str | Callable[[], str]]
+
 from hermes_cli import auth as auth_mod
+from agent.azure_identity_adapter import is_token_provider
 from agent.credential_pool import (
     CredentialPool,
     PooledCredential,
@@ -1716,6 +1725,59 @@ def _resolve_explicit_runtime(
 
 
 def resolve_runtime_provider(
+    *,
+    requested: Optional[str] = None,
+    explicit_api_key: ApiKeyLike = None,
+    explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Resolve runtime provider credentials for agent execution.
+
+    Thin boundary around :func:`_resolve_runtime_provider_resolved` that keeps
+    a callable ``explicit_api_key`` out of the string-coercing resolver
+    branches. A callable is a per-request token provider (``key_cmd``, Entra
+    ID, MiniMax OAuth): it is withheld on the way in — so the resolver behaves
+    exactly as it does for a caller that passed no explicit key, and a
+    configured ``key_cmd`` is re-minted rather than shadowed — then restored on
+    the way out, since the callable IS the credential the caller already held.
+
+    Why the boundary and not the branches: the resolver normalizes an explicit
+    key with ``str(explicit_api_key or "").strip()`` in several places, and
+    ``str()`` runs before ``.strip()`` — so a callable silently becomes its
+    ``repr`` and gets sent to the provider as the credential. One guard here
+    covers every branch; teaching each branch about callables does not.
+
+    This is the round-trip a ``/model`` switch performs: ``cli.py`` persists
+    the resolved ``api_key`` into ``self._explicit_api_key``, and the next
+    turn's ``_ensure_runtime_credentials()`` feeds it straight back in here.
+    """
+    if is_token_provider(explicit_api_key):
+        _token_provider: Optional[Callable[[], str]] = explicit_api_key  # type: ignore[assignment]
+        _explicit_text: Optional[str] = None
+    else:
+        _token_provider = None
+        _explicit_text = explicit_api_key  # type: ignore[assignment]
+
+    runtime = _resolve_runtime_provider_resolved(
+        requested=requested,
+        explicit_api_key=_explicit_text,
+        explicit_base_url=explicit_base_url,
+        target_model=target_model,
+    )
+    if _token_provider is not None and isinstance(runtime, dict):
+        # Only reinstate the caller's provider when the resolver did not
+        # already supply a live credential of its own (a credential pool
+        # entry, or a freshly built key_cmd provider for this same entry).
+        # Overwriting one of those would discard the resolver's decision.
+        _resolved = runtime.get("api_key")
+        if is_token_provider(_resolved):
+            pass
+        elif not has_usable_secret(_resolved) or _resolved == "no-key-required":
+            runtime["api_key"] = _token_provider
+    return runtime
+
+
+def _resolve_runtime_provider_resolved(
     *,
     requested: Optional[str] = None,
     explicit_api_key: Optional[str] = None,

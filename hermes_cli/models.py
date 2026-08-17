@@ -19,7 +19,7 @@ import urllib.error
 import time
 from difflib import get_close_matches
 from pathlib import Path
-from typing import Any, NamedTuple, Optional, TYPE_CHECKING
+from typing import Any, Callable, NamedTuple, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from typing import TypeGuard
@@ -29,6 +29,49 @@ from hermes_cli.urllib_security import open_credentialed_url
 from utils import base_url_host_matches
 
 logger = logging.getLogger(__name__)
+
+# What ``api_key`` actually is across this module. ``resolve_runtime_provider()``
+# hands back a zero-arg callable for the ``key_cmd`` / Entra ID paths (a bearer
+# minted per request) and a plain string everywhere else. Annotating these
+# helpers ``Optional[str]`` hid exactly the bug class ``_materialized_api_key``
+# fixes, so the callable is spelled out in the signatures instead.
+ApiKeyLike = Optional[str | Callable[[], str]]
+
+
+def _materialized_api_key(api_key: Any) -> str:
+    """Return *api_key* as a string, minting it when it is a token provider.
+
+    ``api_key`` reaches this module from ``resolve_runtime_provider()``, which
+    hands back a **callable** for the ``key_cmd`` (short-lived bearer) and
+    Entra ID auth paths — the wire clients invoke it per request. The helpers
+    here build HTTP requests by hand instead, so they need a concrete value:
+    passing the callable through puts the object itself in an
+    ``x-api-key`` / ``Authorization`` header, or blows up on ``.strip()`` /
+    ``.startswith()``.
+
+    Minting failures degrade to ``""`` rather than propagating: these call
+    sites only probe a ``/models`` catalog, and their callers already treat an
+    unreachable catalog as "accept the model unverified". Raising here would
+    turn a best-effort probe into a failed ``/model`` switch.
+    """
+    if api_key is None:
+        return ""
+    if isinstance(api_key, str):
+        return api_key.strip()
+    if callable(api_key):
+        try:
+            minted = api_key()
+        except Exception as exc:  # noqa: BLE001 — probe is best-effort
+            logger.debug("Token provider could not mint for model probe: %s", exc)
+            return ""
+        return minted.strip() if isinstance(minted, str) else ""
+    # Not a string, not callable, not None — some unexpected type. Do NOT
+    # ``str()`` it: that yields "<Foo object at 0x…>", which is long enough and
+    # non-placeholder enough to pass every credential check and get sent to the
+    # provider verbatim. Degrade to "" like the mint-failure path above.
+    logger.debug("Ignoring api_key of unsupported type %s for model probe", type(api_key).__name__)
+    return ""
+
 
 # Identify ourselves so endpoints fronted by Cloudflare's Browser Integrity
 # Check (error 1010) don't reject the default ``Python-urllib/*`` signature.
@@ -2106,7 +2149,7 @@ def compute_sale_discount(
 
 
 def fetch_models_with_pricing(
-    api_key: str | None = None,
+    api_key: ApiKeyLike = None,
     base_url: str = "https://openrouter.ai/api",
     timeout: float = 8.0,
     *,
@@ -2138,7 +2181,7 @@ def fetch_models_with_pricing(
         "User-Agent": _HERMES_USER_AGENT,
     }
     if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+        headers["Authorization"] = f"Bearer {_materialized_api_key(api_key)}"
 
     try:
         req = urllib.request.Request(url, headers=headers)
@@ -3678,7 +3721,7 @@ def _fetch_anthropic_models(
     timeout: float = 5.0,
     *,
     base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
+    api_key: ApiKeyLike = None,
 ) -> Optional[list[str]]:
     """Fetch available models from the Anthropic /v1/models endpoint.
 
@@ -3691,7 +3734,9 @@ def _fetch_anthropic_models(
     except ImportError:
         return None
 
-    token = (api_key or "").strip() or resolve_anthropic_token()
+    # A ``key_cmd`` / Entra credential is a callable token provider; mint it
+    # before any string inspection (``_is_oauth_token`` calls ``.startswith``).
+    token = _materialized_api_key(api_key) or resolve_anthropic_token()
     if not token:
         return None
 
@@ -3825,7 +3870,7 @@ _GITHUB_MODEL_CATALOG_CACHE_TTL = 300  # 5 minutes
 
 
 def fetch_github_model_catalog(
-    api_key: Optional[str] = None, timeout: float = 5.0
+    api_key: ApiKeyLike = None, timeout: float = 5.0
 ) -> Optional[list[dict[str, Any]]]:
     """Fetch the live GitHub Copilot model catalog for this account."""
     global _github_model_catalog_cache, _github_model_catalog_cache_key
@@ -3844,7 +3889,7 @@ def fetch_github_model_catalog(
     if api_key:
         attempts.append({
             **copilot_default_headers(),
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {_materialized_api_key(api_key)}",
         })
     attempts.append(copilot_default_headers())
 
@@ -3945,10 +3990,10 @@ def _lmstudio_server_root(base_url: Optional[str]) -> Optional[str]:
     return root or None
 
 
-def _lmstudio_request_headers(api_key: Optional[str] = None) -> dict:
+def _lmstudio_request_headers(api_key: ApiKeyLike = None) -> dict:
     """Build HTTP headers for LM Studio native API requests."""
     headers = {"User-Agent": _HERMES_USER_AGENT}
-    token = str(api_key or "").strip()
+    token = _materialized_api_key(api_key)
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
@@ -4221,7 +4266,7 @@ def lmstudio_model_reasoning_options(
 def ollama_model_supports_thinking(
     model: str,
     base_url: Optional[str],
-    api_key: Optional[str] = None,
+    api_key: ApiKeyLike = None,
     timeout: float = 5.0,
 ) -> Optional[bool]:
     """Return True if an Ollama (Cloud or local) model advertises ``thinking``.
@@ -4250,7 +4295,7 @@ def ollama_model_supports_thinking(
     if not bare_model:
         return None
 
-    token = str(api_key or "").strip()
+    token = _materialized_api_key(api_key)
     headers = {"Authorization": f"Bearer {token}"} if token else {}
 
     try:
@@ -4631,7 +4676,7 @@ def github_model_reasoning_efforts(
 
 
 def probe_api_models(
-    api_key: Optional[str],
+    api_key: ApiKeyLike,
     base_url: Optional[str],
     timeout: float = 5.0,
     api_mode: Optional[str] = None,
@@ -4677,11 +4722,16 @@ def probe_api_models(
     headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
     if urllib.parse.urlparse(normalized).hostname == "generativelanguage.googleapis.com":
         headers["X-Goog-Api-Client"] = f"hermes-agent/{_HERMES_VERSION}"
-    if api_key and api_mode == "anthropic_messages":
-        headers["x-api-key"] = api_key
+    # A ``key_cmd`` / Entra credential arrives as a callable token provider.
+    # Mint it here: this request is built by hand, so the callable would
+    # otherwise be set AS the header value and urllib would reject it (or, in
+    # older Pythons, str() the object into the auth header).
+    materialized_key = _materialized_api_key(api_key)
+    if materialized_key and api_mode == "anthropic_messages":
+        headers["x-api-key"] = materialized_key
         headers["anthropic-version"] = "2023-06-01"
-    elif api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+    elif materialized_key:
+        headers["Authorization"] = f"Bearer {materialized_key}"
     if normalized.startswith(COPILOT_BASE_URL):
         headers.update(copilot_default_headers())
     if isinstance(request_headers, dict):
@@ -4976,7 +5026,7 @@ def _fetch_ai_gateway_models(timeout: float = 5.0) -> Optional[list[str]]:
 
 
 def fetch_api_models(
-    api_key: Optional[str],
+    api_key: ApiKeyLike,
     base_url: Optional[str],
     timeout: float = 5.0,
     api_mode: Optional[str] = None,
@@ -4997,7 +5047,7 @@ def fetch_api_models(
 
 
 def _custom_endpoint_fingerprint(
-    api_key: Optional[str],
+    api_key: ApiKeyLike,
     api_mode: Optional[str],
     headers: Optional[dict[str, str]],
 ) -> str:
@@ -5011,8 +5061,20 @@ def _custom_endpoint_fingerprint(
     """
     import hashlib
 
+    if isinstance(api_key, str):
+        credential_part = api_key
+    elif api_key is None:
+        credential_part = ""
+    else:
+        # A callable credential (``key_cmd`` / Entra) mints a NEW bearer on its
+        # own schedule. Hashing the minted value would change the fingerprint on
+        # every rotation, so every catalog read would miss the cache and
+        # re-probe. Every callable therefore contributes the same constant; the
+        # endpoint URL in the cache key already scopes the entry.
+        credential_part = "callable-token-provider"
+
     blob = "|".join((
-        api_key or "",
+        credential_part,
         api_mode or "",
         json.dumps(headers or {}, sort_keys=True),
     )).encode("utf-8", errors="replace")
@@ -5039,7 +5101,7 @@ def _cache_entry_valid(entry: Any, fp: str) -> "TypeGuard[dict[str, Any]]":
 
 
 def cached_fetch_api_models(
-    api_key: Optional[str],
+    api_key: ApiKeyLike,
     base_url: Optional[str],
     *,
     timeout: float = 5.0,
