@@ -9731,6 +9731,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return row[0] if row else None
 
+    def _message_storage_key(
+        self, msg: Dict[str, Any]
+    ) -> tuple[str, Any, Optional[str], Optional[str], Any]:
+        """Return the persisted identity fields for a message.
+
+        Compaction compares incoming messages with rows already on disk before
+        reinserting them. Keep that comparison coupled to the exact encoding
+        used by ``_insert_message_rows`` so changes to content or tool-call
+        serialization cannot make carried-forward rows stop matching silently.
+        The final item is the normalized tool-call value for counter updates.
+        """
+        role = msg.get("role", "unknown")
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, str):
+            try:
+                tool_calls = json.loads(tool_calls)
+            except (json.JSONDecodeError, TypeError):
+                tool_calls = []
+        return (
+            role,
+            self._encode_content(msg.get("content")),
+            msg.get("tool_call_id"),
+            json.dumps(tool_calls) if tool_calls else None,
+            tool_calls,
+        )
+
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
@@ -9744,8 +9770,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         inserted = 0
         tool_calls_total = 0
         for msg in messages:
-            role = msg.get("role", "unknown")
-            tool_calls = msg.get("tool_calls")
+            role, stored_content, tool_call_id, tool_calls_json, tool_calls = (
+                self._message_storage_key(msg)
+            )
             message_timestamp = now_ts
             if msg.get("timestamp") is not None:
                 try:
@@ -9766,16 +9793,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             reasoning_details_json = self._reasoning_json_text(reasoning_details)
             codex_items_json = self._reasoning_json_text(codex_reasoning_items)
             codex_message_items_json = self._reasoning_json_text(codex_message_items)
-            # tool_calls may arrive as a Python list (from the live agent)
-            # or as a JSON string (from import_sessions / export_session,
-            # which store it as TEXT). json.dumps on an already-serialized
-            # string double-encodes it, so parse first.
-            if isinstance(tool_calls, str):
-                try:
-                    tool_calls = json.loads(tool_calls)
-                except (json.JSONDecodeError, TypeError):
-                    tool_calls = []
-            tool_calls_json = json.dumps(tool_calls) if tool_calls else None
+
             # Accept either `platform_message_id` (new explicit name) or
             # `message_id` (yuanbao's existing convention on message dicts).
             platform_msg_id = (
@@ -9793,8 +9811,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (
                     session_id,
                     role,
-                    self._encode_content(msg.get("content")),
-                    msg.get("tool_call_id"),
+                    stored_content,
+                    tool_call_id,
                     tool_calls_json,
                     _scrub_surrogates(msg.get("tool_name")),
                     msg.get("effect_disposition"),
@@ -9924,6 +9942,52 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.fetchone() is not None
 
+    def _carry_forward_row_ids(
+        self, conn, session_id: str, compacted_messages: List[Dict[str, Any]]
+    ) -> List[int]:
+        """Row ids of active messages that *compacted_messages* keeps verbatim.
+
+        The compressor emits ``[summary] + [recent tail]`` where the tail is a
+        byte-identical copy of the newest active rows, so those rows are about
+        to be re-inserted rather than replaced.
+
+        Matched as a longest common suffix, not by content alone: an older turn
+        that happens to repeat the tail's text — a re-run command, a re-read
+        file — was genuinely summarized away and has to stay discoverable as
+        ``compacted = 1``. Anchoring to the suffix is what keeps the two cases
+        apart.
+
+        Keys mirror what :meth:`_insert_message_rows` will store, so the
+        comparison is against the encoded form actually on disk.
+        """
+        if not compacted_messages:
+            return []
+
+        active = list(
+            conn.execute(
+                "SELECT id, role, content, tool_call_id, tool_calls FROM messages"
+                " WHERE session_id = ? AND active = 1 ORDER BY id DESC LIMIT ?",
+                (session_id, len(compacted_messages)),
+            )
+        )
+        active.reverse()
+        if not active:
+            return []
+
+        carried: List[int] = []
+        i = len(active) - 1
+        j = len(compacted_messages) - 1
+        while i >= 0 and j >= 0:
+            row = active[i]
+            if (row[1], row[2], row[3], row[4]) != self._message_storage_key(
+                compacted_messages[j]
+            )[:4]:
+                break
+            carried.append(row[0])
+            i -= 1
+            j -= 1
+        return carried
+
     def get_active_message_watermark(self, session_id: str) -> int:
         """MAX(id) of the session's active rows — the compression watermark.
 
@@ -10047,8 +10111,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # rewind/undo's active=0+compacted=0, which means "user took it
             # back"). search_messages includes compacted=1 rows by default so
             # the pre-compaction transcript stays discoverable; live-context
-            # loads (active=1 only) still exclude them. Tail originals are
-            # archived too — their clones (below) carry the live copy.
+            # loads (active=1 only) still exclude them.
+            #
+            # The recent tail is NOT summarized away — it is re-inserted below,
+            # verbatim, as fresh active rows. Stamping compacted=1 on its
+            # originals would publish a second copy of still-live content to
+            # recall (search_messages matches active=1 OR compacted=1) and label
+            # live turns "summarized away", once more per compaction. Those
+            # originals are superseded duplicates, so they take the rewind state
+            # instead: still on disk and reachable via include_inactive=True,
+            # hidden from recall. Only turns the summary actually replaced keep
+            # compacted=1.
+            carried = self._carry_forward_row_ids(conn, session_id, compacted_messages)
+            if carried:
+                placeholders = ",".join("?" * len(carried))
+                conn.execute(
+                    "UPDATE messages SET active = 0, compacted = 0 "
+                    f"WHERE session_id = ? AND active = 1 AND id IN ({placeholders})",
+                    (session_id, *carried),
+                )
             conn.execute(
                 "UPDATE messages SET active = 0, compacted = 1 "
                 "WHERE session_id = ? AND active = 1",

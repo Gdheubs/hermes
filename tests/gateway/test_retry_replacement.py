@@ -138,11 +138,12 @@ async def test_gateway_retry_preserves_archived_compaction_rows_when_probe_fails
         m for m in store._db.get_messages(session_id, include_inactive=True)
         if not m["active"]
     ]
-    assert [(m["role"], m["content"]) for m in archived] == [
-        ("user", "old question"),
-        ("assistant", "old answer"),
+    assert [(m["role"], m["content"], m["compacted"]) for m in archived] == [
+        ("user", "old question", 1),
+        # The old answer was carried forward verbatim by compaction. It is a
+        # superseded duplicate, not a turn summarized away.
+        ("assistant", "old answer", 0),
     ]
-    assert all(m["compacted"] == 1 for m in archived)
     # The live set reflects the truncation plus the retried exchange.
     transcript_after = store.load_transcript(session_id)
     assert [m.get("content") for m in transcript_after if m.get("role") == "user"] == [
