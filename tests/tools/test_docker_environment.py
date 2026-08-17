@@ -55,6 +55,7 @@ def _make_dummy_env(**kwargs):
         extra_args=kwargs.get("extra_args", []),
         persist_across_processes=kwargs.get("persist_across_processes", True),
         shm_size=kwargs.get("shm_size", docker_env._DEFAULT_SHM_SIZE),
+        daemon_hermes_home=kwargs.get("daemon_hermes_home"),
     )
 
 
@@ -99,6 +100,85 @@ def test_auto_mount_host_cwd_adds_volume(monkeypatch, tmp_path):
     assert run_calls, "docker run should have been called"
     run_args_str = " ".join(run_calls[0][0])
     assert f"{project_dir}:/workspace" in run_args_str
+
+
+def test_daemon_hermes_home_rewrites_only_automatic_profile_mounts(
+    monkeypatch, tmp_path,
+):
+    """Remote daemons receive their own view of Hermes-managed bind sources."""
+    hermes_home = tmp_path / "caller-home"
+    skills_dir = hermes_home / "skills"
+    cache_dir = hermes_home / "cache" / "documents"
+    credential = hermes_home / "service-token.json"
+    skills_dir.mkdir(parents=True)
+    cache_dir.mkdir(parents=True)
+    credential.write_text("token", encoding="utf-8")
+    external = tmp_path / "external"
+    external.mkdir()
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(hermes_home / "sandboxes"))
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(
+        "tools.credential_files.get_credential_file_mounts",
+        lambda: [{
+            "host_path": str(credential),
+            "container_path": "/root/.hermes/service-token.json",
+        }],
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_skills_directory_mount",
+        lambda: [
+            {"host_path": str(skills_dir), "container_path": "/root/.hermes/skills"},
+            {"host_path": str(external), "container_path": "/root/.hermes/external_skills/0"},
+        ],
+    )
+    monkeypatch.setattr(
+        "tools.credential_files.get_cache_directory_mounts",
+        lambda: [{
+            "host_path": str(cache_dir),
+            "container_path": "/root/.hermes/cache/documents",
+        }],
+    )
+    monkeypatch.setattr(
+        docker_env,
+        "_egress_proxy_args_for_docker",
+        lambda: (["-v", f"{hermes_home}/proxy/ca.crt:/etc/hermes-ca.crt:ro"], {}, []),
+    )
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(
+        persistent_filesystem=True,
+        volumes=[f"{external}:/operator-owned:ro"],
+        daemon_hermes_home="/daemon/hermes-data",
+    )
+
+    run_args = next(
+        call[0] for call in calls
+        if isinstance(call[0], list) and call[0][1:2] == ["run"]
+    )
+    mount_specs = {
+        run_args[index + 1]
+        for index, arg in enumerate(run_args[:-1])
+        if arg == "-v"
+    }
+
+    expected_profile_sources = {
+        "/daemon/hermes-data/sandboxes/docker/test-task/home:/root",
+        "/daemon/hermes-data/sandboxes/docker/test-task/workspace:/workspace",
+        "/daemon/hermes-data/service-token.json:/root/.hermes/service-token.json:ro",
+        "/daemon/hermes-data/skills:/root/.hermes/skills:ro",
+        "/daemon/hermes-data/cache/documents:/root/.hermes/cache/documents:ro",
+        "/daemon/hermes-data/proxy/ca.crt:/etc/hermes-ca.crt:ro",
+    }
+    assert expected_profile_sources <= mount_specs
+    assert f"{external}:/root/.hermes/external_skills/0:ro" in mount_specs
+    assert f"{external}:/operator-owned:ro" in mount_specs
+    assert not any(str(hermes_home) in spec for spec in mount_specs)
+    mount_root_label = docker_env.hashlib.sha256(
+        b"/daemon/hermes-data"
+    ).hexdigest()[:24]
+    assert f"hermes-mount-root={mount_root_label}" in run_args
 
 
 def test_non_persistent_cleanup_removes_container(monkeypatch):
@@ -605,6 +685,7 @@ def test_labels_attribute_populated_after_init(monkeypatch):
         "hermes-task-id": "abc",
         "hermes-profile": "default",
         "hermes-egress": "off",
+        "hermes-mount-root": "local",
     }
 
 
