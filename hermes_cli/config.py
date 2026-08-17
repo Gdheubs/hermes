@@ -2157,8 +2157,25 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
     return issues
 
 
+def _emit_startup_warning_block(lines: list) -> None:
+    """Emit a startup warning block through prompt_toolkit's renderer.
+
+    Raw ANSI escapes written via ``sys.stderr.write()`` are mangled once
+    the TUI owns the console: ``patch_stdout``'s ``StdoutProxy`` strips the
+    ESC byte and leaves visible ``?[33m...?[0m`` artifacts (#87919).
+    ``banner.cprint`` routes through ``prompt_toolkit.print_formatted_text(
+    ANSI(...))`` so the escapes render as real colors, degrading to plain
+    print() where prompt_toolkit has no console — the established #2448
+    pattern for status output under ``patch_stdout``.
+    """
+    from hermes_cli.banner import cprint
+
+    cprint("\n".join(lines))
+    cprint("")
+
+
 def print_config_warnings(config: Optional[Dict[str, Any]] = None) -> None:
-    """Print config structure warnings to stderr at startup.
+    """Print config structure warnings at startup.
 
     Called early in CLI and gateway init so users see problems before
     they hit cryptic "Unknown provider" errors.  Prints nothing if
@@ -2176,14 +2193,15 @@ def print_config_warnings(config: Optional[Dict[str, Any]] = None) -> None:
         marker = "\033[31m✗\033[0m" if ci.severity == "error" else "\033[33m⚠\033[0m"
         lines.append(f"  {marker} {ci.message}")
     lines.append("  \033[2mRun 'hermes doctor' for fix suggestions.\033[0m")
-    sys.stderr.write("\n".join(lines) + "\n\n")
+    _emit_startup_warning_block(lines)
 
 
 def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> None:
     """Warn if MESSAGING_CWD or TERMINAL_CWD is set in .env instead of config.yaml.
 
     These env vars are deprecated — the canonical setting is terminal.cwd
-    in config.yaml.  Prints a migration hint to stderr.
+    in config.yaml.  Prints a migration hint via the prompt_toolkit
+    renderer (see ``_emit_startup_warning_block``).
     """
     messaging_cwd = os.environ.get("MESSAGING_CWD")
     terminal_cwd_env = os.environ.get("TERMINAL_CWD")
@@ -2223,7 +2241,7 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
         lines.append(
             f"  \033[2mThen remove the old entries from {hint_path}/.env\033[0m"
         )
-        sys.stderr.write("\n".join(lines) + "\n\n")
+        _emit_startup_warning_block(lines)
 
 
 def _persist_migration(config: Dict[str, Any]) -> None:
