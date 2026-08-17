@@ -320,6 +320,11 @@ def check_info(text: str):
 STATE_DB_SIZE_WARN_BYTES = 1 * 1024 * 1024 * 1024   # 1 GiB logical size
 
 
+def _should_run_full_state_db_integrity_check(db_path: Path) -> bool:
+    """Keep doctor's synchronous full scan away from already-large stores."""
+    return db_path.stat().st_size < STATE_DB_SIZE_WARN_BYTES
+
+
 # Shared byte formatter, aliased to the name this module's three rendering
 # call sites already use.
 from hermes_cli.sizefmt import format_bytes as _human_bytes
@@ -1704,7 +1709,24 @@ def run_doctor(args):
             # repaired in place with --fix).
             from hermes_state import _db_opens_cleanly, repair_state_db_schema
 
-            _write_reason = _db_opens_cleanly(state_db_path)
+            # A full SQLite integrity check is O(database size) and can make
+            # doctor appear hung for minutes on a healthy multi-GB store. The
+            # normal repair/recovery paths still run it; doctor keeps its
+            # journal/schema/read and rolled-back FTS read/write probes, but
+            # defers the full scan for stores already classified as large.
+            _run_full_integrity = _should_run_full_state_db_integrity_check(
+                state_db_path
+            )
+            _write_reason = _db_opens_cleanly(
+                state_db_path,
+                check_integrity=_run_full_integrity,
+            )
+            if not _run_full_integrity:
+                check_info(
+                    "Skipped full state.db integrity scan in doctor "
+                    f"({_human_bytes(state_db_path.stat().st_size)} database); "
+                    "run 'hermes sessions repair --check-only' offline for the full scan"
+                )
             if _write_reason is not None:
                 check_warn(
                     f"{_DHH}/state.db fails a write-health probe (FTS index may be corrupt)",

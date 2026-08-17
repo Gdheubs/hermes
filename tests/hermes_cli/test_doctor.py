@@ -16,6 +16,21 @@ from hermes_cli import doctor as doctor_mod
 from hermes_cli.doctor import _has_provider_env_config
 
 
+class TestStateDbIntegrityPolicy:
+    def test_full_scan_runs_below_large_db_threshold(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        db_path.write_bytes(b"sqlite")
+
+        assert doctor._should_run_full_state_db_integrity_check(db_path) is True
+
+    def test_full_scan_is_deferred_at_large_db_threshold(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        with db_path.open("wb") as handle:
+            handle.truncate(doctor.STATE_DB_SIZE_WARN_BYTES)
+
+        assert doctor._should_run_full_state_db_integrity_check(db_path) is False
+
+
 class TestDoctorPlatformHints:
     def test_termux_package_hint(self, monkeypatch):
         monkeypatch.setenv("TERMUX_VERSION", "0.118.3")

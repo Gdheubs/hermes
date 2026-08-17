@@ -273,6 +273,18 @@ def test_fts_write_corruption_detected_by_write_probe(tmp_path):
     assert reason is not None
 
 
+def test_fts_write_probe_still_runs_when_integrity_check_is_skipped(tmp_path):
+    """Doctor's large-DB path keeps the targeted FTS write-health probe."""
+    from hermes_state import _db_opens_cleanly
+
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_fts_index_data(db_path)
+
+    reason = _db_opens_cleanly(db_path, check_integrity=False)
+    assert reason is not None
+
+
 def test_fts_write_corruption_repaired_in_place(tmp_path):
     """repair_state_db_schema rebuilds the FTS index; reads + writes resume."""
     from hermes_state import _db_opens_cleanly

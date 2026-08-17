@@ -1109,6 +1109,34 @@ class TestCallConverseStreamIamFallback:
 class TestRequireBoto3VersionCheck:
     """Test that _require_boto3() rejects boto3 versions older than 1.34.59."""
 
+    def test_import_does_not_trigger_lazy_install(self):
+        """Provider discovery and doctor may import the adapter read-only."""
+        import importlib
+        import agent.bedrock_adapter as adapter
+
+        with patch("tools.lazy_deps.ensure") as ensure:
+            importlib.reload(adapter)
+
+        ensure.assert_not_called()
+
+    def test_first_real_use_triggers_lazy_install_when_boto3_is_missing(self):
+        import sys
+
+        from agent.bedrock_adapter import _require_boto3
+
+        fake_boto3 = MagicMock()
+        fake_boto3.__version__ = "1.34.59"
+
+        def install_boto3(*_args, **_kwargs):
+            sys.modules["boto3"] = fake_boto3
+
+        with patch.dict("sys.modules", {"boto3": None}):
+            with patch("tools.lazy_deps.ensure", side_effect=install_boto3) as ensure:
+                result = _require_boto3()
+
+        ensure.assert_called_once_with("provider.bedrock", prompt=False)
+        assert result is fake_boto3
+
     def test_raises_runtime_error_when_boto3_too_old(self):
         """boto3 < 1.34.59 should raise RuntimeError with upgrade instructions."""
         from agent.bedrock_adapter import _require_boto3

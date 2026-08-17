@@ -2135,13 +2135,17 @@ def preflight_db_writability(
             _ensure_writable(p)
 
 
-def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+def _db_opens_cleanly(
+    db_path: Path,
+    *,
+    check_integrity: bool = True,
+) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
     Runs the same first-statement (``PRAGMA journal_mode``) that trips the
-    malformed-schema parse, then ``PRAGMA integrity_check`` and a canonical
-    ``sessions`` read, and finally a rolled-back ``messages`` write so that
-    FTS5 index corruption — which leaves base-table reads and
+    malformed-schema parse, optionally runs ``PRAGMA integrity_check``, then
+    performs a canonical ``sessions`` read and a rolled-back ``messages``
+    write so that FTS5 index corruption — which leaves base-table reads and
     ``integrity_check`` passing while every ``INSERT INTO messages`` fails
     through the FTS triggers — is reported as unhealthy rather than slipping
     past as a false "ok" (#50502).
@@ -2156,10 +2160,11 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         # working), so tokenizer absence must never classify as corruption.
         load_fts5_cjk_extension(conn)
         conn.execute("PRAGMA journal_mode").fetchone()
-        rows = conn.execute("PRAGMA integrity_check").fetchall()
-        problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
-        if problems:
-            return "; ".join(problems[:3])
+        if check_integrity:
+            rows = conn.execute("PRAGMA integrity_check").fetchall()
+            problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
+            if problems:
+                return "; ".join(problems[:3])
         conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
 
         # FTS5 read probe: run a representative MATCH query against the

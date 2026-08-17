@@ -37,16 +37,11 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Ensure boto3/botocore are installed before any code in this module runs.
-# Upstream removed boto3 from [all] extras (PRs #24220, #24515); lazy_deps
-# handles on-demand installation so the Bedrock provider still works in the
-# EKS deployment without baking boto3 into the base image.
+# Upstream removed boto3 from [all] extras (PRs #24220, #24515). Keep the
+# dependency lazy: importing this module for diagnostics or provider discovery
+# must not start a network install. _require_boto3() installs on first actual
+# Bedrock use, preserving the EKS path without baking boto3 into the base image.
 # ---------------------------------------------------------------------------
-try:
-    from tools.lazy_deps import ensure
-    ensure("provider.bedrock", prompt=False)
-except Exception:
-    pass  # lazy_deps unavailable or install failed — let downstream imports surface the real error
 
 
 # ---------------------------------------------------------------------------
@@ -66,11 +61,17 @@ def _require_boto3():
     try:
         import boto3
     except ImportError:
-        raise ImportError(
-            "The 'boto3' package is required for the AWS Bedrock provider. "
-            "Install it with: pip install boto3\n"
-            "Or install Hermes with Bedrock support: pip install -e '.[bedrock]'"
-        )
+        try:
+            from tools.lazy_deps import ensure
+
+            ensure("provider.bedrock", prompt=False)
+            import boto3
+        except Exception as exc:
+            raise ImportError(
+                "The 'boto3' package is required for the AWS Bedrock provider. "
+                "Install it with: pip install boto3\n"
+                "Or install Hermes with Bedrock support: pip install -e '.[bedrock]'"
+            ) from exc
     # converse() / converse_stream() were added in boto3 1.34.59.
     # When Hermes is installed editable into system Python, the system boto3
     # (e.g. Ubuntu 24.04 ships 1.34.46) may take precedence over the venv
