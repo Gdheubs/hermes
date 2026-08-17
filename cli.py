@@ -10306,6 +10306,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def _snapshot_model_runtime(self) -> dict:
         """Capture current CLI and agent model runtime for one-turn restore."""
+        from agent.agent_runtime_helpers import copy_primary_runtime
+
         agent = getattr(self, "agent", None)
         return {
             "model": self.model,
@@ -10316,7 +10318,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
-            "agent_primary_runtime": copy.deepcopy(
+            "agent_primary_runtime": copy_primary_runtime(
                 getattr(agent, "_primary_runtime", None)
             ) if agent is not None else None,
         }
@@ -10344,8 +10346,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         primary = snapshot.get("agent_primary_runtime")
         if primary and hasattr(agent, "_restore_primary_runtime"):
+            from agent.agent_runtime_helpers import copy_primary_runtime
+
             try:
-                agent._primary_runtime = copy.deepcopy(primary)
+                agent._primary_runtime = copy_primary_runtime(primary)
                 agent._fallback_activated = True
                 agent._rate_limited_until = 0
                 if agent._restore_primary_runtime():
