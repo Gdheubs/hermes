@@ -893,6 +893,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
+        # Fixed action button state: action_id → session_key.
+        self._action_button_state: Dict[str, str] = {}
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -6347,6 +6349,70 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_clarify failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
+    async def send_action_buttons(
+        self,
+        chat_id: str,
+        question: str,
+        choices: list[str],
+        action_id: str,
+        session_key: str,
+        thread_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send compact fixed-choice action buttons for the action_buttons tool."""
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            safe_choices = [str(choice) for choice in (choices or [])]
+            if not safe_choices:
+                return SendResult(success=False, error="No choices supplied")
+
+            text = _html.escape(str(question or "Choose an option"))
+            option_lines = "\n".join(
+                f"{idx + 1}. {_html.escape(choice)}"
+                for idx, choice in enumerate(safe_choices)
+            )
+            text = f"{text}\n\n{option_lines}"
+
+            number_buttons = [
+                InlineKeyboardButton(
+                    str(idx + 1),
+                    callback_data=f"act:{action_id}:{idx}",
+                )
+                for idx in range(len(safe_choices))
+            ]
+            rows = [number_buttons]
+
+            metadata = dict(metadata or {})
+            if thread_id is not None:
+                metadata.setdefault("thread_id", str(thread_id))
+            actual_thread_id = self._metadata_thread_id(metadata)
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata)
+            kwargs: Dict[str, Any] = {
+                "chat_id": normalize_telegram_chat_id(chat_id),
+                "text": text,
+                "parse_mode": ParseMode.HTML,
+                "reply_markup": InlineKeyboardMarkup(rows),
+                "reply_to_message_id": reply_to_id,
+                **self._link_preview_kwargs(),
+            }
+            kwargs.update(
+                self._thread_kwargs_for_send(
+                    chat_id,
+                    actual_thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                )
+            )
+
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+            self._action_button_state[action_id] = session_key
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_action_buttons failed: %s", self.name, _redact_telegram_error_text(e))
+            return SendResult(success=False, error=_redact_telegram_error_text(e))
+
     async def send_model_picker(
         self,
         chat_id: str,
@@ -7349,6 +7415,66 @@ class TelegramAdapter(BasePlatformAdapter):
                         "Telegram clarify button: resolve_gateway_clarify returned False (id=%s)",
                         clarify_id,
                     )
+            return
+
+        # --- Fixed action button callbacks (act:action_id:idx) ---
+        if data.startswith("act:"):
+            parts = data.split(":", 2)
+            if len(parts) == 3:
+                action_id = parts[1]
+                choice_token = parts[2]
+
+                caller_id = str(getattr(query.from_user, "id", ""))
+                if not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                ):
+                    await query.answer(text="⛔ You are not authorized to answer this prompt.")
+                    return
+
+                session_key = self._action_button_state.pop(action_id, None)
+                if not session_key:
+                    await query.answer(text="This prompt has already been resolved.")
+                    return
+
+                try:
+                    idx = int(choice_token)
+                except ValueError:
+                    await query.answer(text="Invalid choice.")
+                    return
+
+                try:
+                    from tools import action_buttons_gateway as _action_mod
+                    entry = _action_mod.get_entry(action_id)
+                    if entry is None:
+                        await query.answer(text="This prompt has expired.")
+                        return
+                    choices = list(entry.choices)
+                    if idx < 0 or idx >= len(choices):
+                        await query.answer(text="Invalid choice.")
+                        return
+                    resolved_text = choices[idx]
+                    resolved = _action_mod.resolve(action_id, resolved_text)
+                except Exception as exc:
+                    logger.error("[%s] action-buttons callback failed: %s", self.name, exc, exc_info=True)
+                    await query.answer(text="Failed to resolve choice.")
+                    return
+
+                user_display = getattr(query.from_user, "first_name", "User")
+                label = f"✅ {idx + 1}"
+                await query.answer(text=label)
+                if resolved:
+                    try:
+                        await query.edit_message_text(
+                            text=f"{label} — {_html.escape(str(resolved_text))} by {_html.escape(str(user_display))}",
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=None,
+                        )
+                    except Exception:
+                        pass
             return
 
         # --- Update prompt callbacks ---

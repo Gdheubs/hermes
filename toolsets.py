@@ -68,8 +68,8 @@ _HERMES_CORE_TOOLS = [
     # off every CLI/messaging/cron schema (narrow waist).
     # Session history search
     "session_search",
-    # Clarifying questions
-    "clarify",
+    # Clarifying questions and compact fixed-choice actions
+    "clarify", "action_buttons",
     # Code execution + delegation
     "execute_code", "delegate_task",
     # Cronjob management

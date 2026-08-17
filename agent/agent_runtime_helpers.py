@@ -3200,7 +3200,18 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     question=next_args.get("question", ""),
                     choices=next_args.get("choices"),
                     multi_select=next_args.get("multi_select", False),
-                    callback=agent.clarify_callback,
+                    callback=getattr(agent, "clarify_callback", None),
+                ),
+                next_args,
+            )
+    elif function_name == "action_buttons":
+        def _execute(next_args: dict) -> Any:
+            from tools.action_buttons_tool import action_buttons_tool as _action_buttons_tool
+            return _finish_agent_tool(
+                _action_buttons_tool(
+                    question=next_args.get("question", ""),
+                    choices=next_args.get("choices", []),
+                    callback=getattr(agent, "action_buttons_callback", None),
                 ),
                 next_args,
             )

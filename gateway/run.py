@@ -5766,6 +5766,77 @@ class TurnRunner:
 
         agent.clarify_callback = _clarify_callback_sync
 
+        def _action_buttons_callback_sync(question: str, choices) -> str:
+            from tools import action_buttons_gateway as _action_mod
+            import uuid as _uuid
+
+            action_id = str(_uuid.uuid4())
+            normalized_choices = list(choices or [])
+            if not normalized_choices:
+                return "[action buttons unavailable: no choices supplied]"
+            _action_mod.register(
+                action_id=action_id,
+                session_key=session_key,
+                question=question,
+                choices=normalized_choices,
+            )
+
+            timeout = 600.0
+            try:
+                timeout = float(
+                    getattr(getattr(self.config, "platforms", None), "clarify_timeout", None)
+                    or getattr(self.config, "clarify_timeout", None)
+                    or 600.0
+                )
+            except Exception:
+                timeout = 600.0
+
+            adapter = ctx._status_adapter
+            if adapter is None:
+                _action_mod.cancel(action_id)
+                return "[action buttons unavailable: no gateway adapter]"
+            send_action = getattr(adapter, "send_action_buttons", None)
+            if send_action is not None:
+                fut = safe_schedule_threadsafe(
+                    send_action(
+                        chat_id=ctx._status_chat_id,
+                        question=question,
+                        choices=normalized_choices,
+                        action_id=action_id,
+                        session_key=session_key,
+                        thread_id=getattr(ctx, "_status_thread_id", None),
+                    ),
+                    self._loop,
+                )
+                if fut is not None:
+                    try:
+                        fut.result(timeout=30)
+                    except Exception:
+                        logger.debug("send_action_buttons failed for session %s", session_key, exc_info=True)
+            else:
+                fallback_lines = [question, "", *[f"{i}. {choice}" for i, choice in enumerate(normalized_choices, start=1)]]
+                fut = safe_schedule_threadsafe(
+                    adapter.send_message(
+                        chat_id=ctx._status_chat_id,
+                        text="\n".join(fallback_lines),
+                        thread_id=getattr(ctx, "_status_thread_id", None),
+                    ) if adapter else None,
+                    self._loop,
+                )
+                if fut is not None:
+                    try:
+                        fut.result(timeout=30)
+                    except Exception:
+                        logger.debug("send action-buttons fallback failed for session %s", session_key, exc_info=True)
+
+            response = _action_mod.wait_for_response(action_id, timeout=timeout)
+            if response is None:
+                _action_mod.cancel(action_id)
+                return f"[user did not respond within {int(timeout / 60)}m]"
+            return response
+
+        agent.action_buttons_callback = _action_buttons_callback_sync
+
         # Show assistant thinking between tool calls — independent of
         # tool_progress mode. Mattermost needs an explicit per-platform
         # opt-in so global scratch-text display does not leak into threads.
