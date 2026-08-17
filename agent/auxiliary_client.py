@@ -4656,6 +4656,7 @@ def _retry_same_provider_sync(
         reasoning_config=reasoning_config,
         base_url=retry_base or resolved_base_url,
         task=task,
+        api_key=resolved_api_key,
     )
     # Preserve per-request attribution headers (e.g. Copilot's
     # ``x-initiator: user``) across the rebuilt-client retry — dropping them
@@ -4731,6 +4732,7 @@ async def _retry_same_provider_async(
         reasoning_config=reasoning_config,
         base_url=retry_base or resolved_base_url,
         task=task,
+        api_key=resolved_api_key,
     )
     # Preserve per-request attribution headers across the rebuilt-client
     # retry — see the sync variant above (#60293).
@@ -5069,7 +5071,10 @@ def _call_fallback_candidate_sync(
         temperature=temperature, max_tokens=max_tokens,
         tools=fallback_tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
-        base_url=destination.base_url, task=task)
+        base_url=destination.base_url,
+        task=task,
+        api_key=getattr(fb_client, "api_key", None),
+    )
     try:
         return _validate_llm_response(
             _relay_sync_completion(
@@ -5114,7 +5119,10 @@ def _call_fallback_candidate_sync(
                     tools=retry_tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
-                    base_url=retry_destination.base_url, task=task)
+                    base_url=retry_destination.base_url,
+                    task=task,
+                    api_key=getattr(retry_client, "api_key", None),
+                )
                 try:
                     return _validate_llm_response(
                         _relay_sync_completion(
@@ -5175,7 +5183,10 @@ async def _call_fallback_candidate_async(
         temperature=temperature, max_tokens=max_tokens,
         tools=fallback_tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
-        base_url=destination.base_url, task=task)
+        base_url=destination.base_url,
+        task=task,
+        api_key=getattr(fb_client, "api_key", None),
+    )
     try:
         return _validate_llm_response(
             await _relay_async_completion(
@@ -5221,7 +5232,10 @@ async def _call_fallback_candidate_async(
                     tools=retry_tools, timeout=effective_timeout,
                     extra_body=effective_extra_body,
                     reasoning_config=reasoning_config,
-                    base_url=retry_destination.base_url, task=task)
+                    base_url=retry_destination.base_url,
+                    task=task,
+                    api_key=getattr(retry_client, "api_key", None),
+                )
                 try:
                     return _validate_llm_response(
                         await _relay_async_completion(
@@ -8370,6 +8384,7 @@ def _build_call_kwargs(
     reasoning_config: Optional[dict] = None,
     base_url: Optional[str] = None,
     task: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> dict:
     """Build kwargs for .chat.completions.create() with model/provider adjustments."""
     kwargs: Dict[str, Any] = {
@@ -8510,6 +8525,7 @@ def _build_call_kwargs(
                     supports_reasoning=reasoning_config is not None,
                     model=model,
                     base_url=effective_base,
+                    api_key=api_key if isinstance(api_key, str) else "",
                 )
             )
             profile_reasoning_extra = profile_reasoning_extra or {}
@@ -9327,7 +9343,8 @@ def _call_llm_impl(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
-        base_url=_base_info or resolved_base_url, task=task)
+        base_url=_base_info or resolved_base_url, task=task,
+        api_key=resolved_api_key or getattr(client, "api_key", None))
     if extra_headers:
         kwargs["extra_headers"] = dict(extra_headers)
 
@@ -10107,7 +10124,8 @@ async def _async_call_llm_impl(
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
         reasoning_config=reasoning_config,
-        base_url=_client_base or resolved_base_url, task=task)
+        base_url=_client_base or resolved_base_url, task=task,
+        api_key=resolved_api_key or getattr(client, "api_key", None))
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     if _is_anthropic_compat_endpoint(request_provider, _client_base):
