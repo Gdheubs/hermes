@@ -433,3 +433,135 @@ def test_cmd_backspace_alias_not_clobbered():
     install_cmd_backspace_alias()
     install_modify_other_keys_aliases()
     assert _parse("\x1b[127;9u") == [Keys.ControlU]
+
+
+# ---------------------------------------------------------------------------
+# Kitty num_lock bit (128) ORed into the modifier field (#88221)
+#
+# The kitty keyboard protocol encodes the modifier field as bitmask+1
+# (shift=1, alt=2, ctrl=4, super=8, ..., num_lock=128). While NumLock is on
+# kitty sets that bit on EVERY key event, so Ctrl+C arrives as ESC[99;133u
+# (5 + 128) rather than ESC[99;5u. Each registration must therefore install
+# its num_lock twin, or the sequence leaks into the buffer as literal text.
+# ---------------------------------------------------------------------------
+
+NUM_LOCK = 128
+
+
+@pytest.mark.parametrize("letter", CTRL_LETTERS)
+def test_num_lock_ctrl_letter_matches_num_lock_off(letter):
+    """Ctrl+<letter> with NumLock on must parse exactly like NumLock off."""
+    cp = ord(letter)
+    expected = _parse(f"\x1b[{cp};5u")
+    assert expected == _parse(chr(cp & 0x1F))
+    assert _parse(f"\x1b[{cp};{5 + NUM_LOCK}u") == expected
+    assert _parse(f"\x1b[27;{5 + NUM_LOCK};{cp}~") == expected
+
+
+def test_num_lock_ctrl_c_is_control_c():
+    """The reported symptom: Ctrl+C under NumLock leaked as literal text."""
+    assert _parse("\x1b[99;133u") == [Keys.ControlC]
+    assert _parse("\x1b[27;133;99~") == [Keys.ControlC]
+
+
+@pytest.mark.parametrize("base_modifier", [2, 3, 4, 5, 6, 7, 8])
+def test_num_lock_variant_matches_base_modifier(base_modifier):
+    """For every letter modifier the module registers, the num_lock twin
+    must parse identically to the bare form."""
+    for cp in (ord("a"), ord("r")):
+        expected = _parse(f"\x1b[{cp};{base_modifier}u")
+        assert len(expected) >= 1
+        got = _parse(f"\x1b[{cp};{base_modifier + NUM_LOCK}u")
+        assert got == expected, (
+            f"CSI-u cp={cp} mod={base_modifier}+num_lock parsed as {got!r}, "
+            f"expected {expected!r}"
+        )
+        got_mok = _parse(f"\x1b[27;{base_modifier + NUM_LOCK};{cp}~")
+        assert got_mok == expected
+
+
+@pytest.mark.parametrize("base_modifier", [2, 3, 5])
+def test_num_lock_variant_matches_base_for_special_keys(base_modifier):
+    """Backspace and Space carry explicit per-modifier registrations; their
+    num_lock twins must match the bare form too."""
+    for cp in (127, 32):
+        expected = _parse(f"\x1b[{cp};{base_modifier}u")
+        assert len(expected) >= 1
+        assert _parse(f"\x1b[{cp};{base_modifier + NUM_LOCK}u") == expected
+        assert _parse(f"\x1b[27;{base_modifier + NUM_LOCK};{cp}~") == expected
+
+
+def test_num_lock_plain_backspace_is_backspace():
+    """Modifier 1 means 'no modifiers'; with NumLock on it becomes 129, and
+    kitty then sends plain Backspace as ESC[127;129u instead of \\x7f."""
+    assert _parse("\x1b[127;129u") == _parse("\x7f")
+
+
+@pytest.mark.parametrize(
+    "codepoint,raw",
+    [(9, "\t"), (13, "\r"), (32, " "), (127, "\x7f")],
+)
+def test_num_lock_unmodified_keys_match_raw_byte(codepoint, raw):
+    """Unmodified Tab/Enter/Space/Backspace under NumLock must behave like
+    the legacy raw byte, under both the bare mod-1 and mod-129 spellings."""
+    expected = _parse(raw)
+    assert _parse(f"\x1b[{codepoint};1u") == expected
+    assert _parse(f"\x1b[{codepoint};129u") == expected
+
+
+def test_num_lock_escape_key_is_escape():
+    """The Esc key with NumLock on (ESC[27;129u) must not leak."""
+    assert _parse("\x1b[27;129u") == [Keys.Escape]
+    assert _parse("\x1b[27;133u") == [Keys.Escape]
+
+
+def test_num_lock_alt_letter_matches_bare_escape_letter():
+    """Alt+a with NumLock on (mod 3+128) = bare ESC+a."""
+    bare = _parse("\x1ba")
+    assert _parse("\x1b[97;131u") == bare
+    assert _parse("\x1b[27;131;97~") == bare
+
+
+def test_num_lock_shift_letter_produces_uppercase():
+    assert _parse("\x1b[97;130u") == ["A"]
+
+
+def test_num_lock_shift_enter_alias_covered():
+    """install_shift_enter_alias must also cover the NumLock spelling."""
+    from hermes_cli.pt_input_extras import install_shift_enter_alias
+    install_shift_enter_alias()
+    assert _parse("\x1b[13;130u") == _parse("\x1b\r")
+
+
+def test_num_lock_ctrl_enter_alias_covered():
+    """install_ctrl_enter_alias must also cover the NumLock spelling."""
+    from hermes_cli.pt_input_extras import install_ctrl_enter_alias
+    install_ctrl_enter_alias()
+    assert _parse("\x1b[13;133u") == _parse("\x1b\r")
+
+
+def test_num_lock_cmd_backspace_alias_covered():
+    """install_cmd_backspace_alias must also cover the NumLock spellings."""
+    from hermes_cli.pt_input_extras import install_cmd_backspace_alias
+    install_cmd_backspace_alias()
+    assert _parse("\x1b[127;137u") == [Keys.ControlU]
+    assert _parse("\x1b[3;137~") == [Keys.ControlK]
+
+
+def test_num_lock_install_still_idempotent():
+    """The num_lock twins must be registered on the first pass, so a second
+    install still reports zero newly-installed sequences."""
+    install_modify_other_keys_aliases()
+    assert install_modify_other_keys_aliases() == 0
+    from hermes_cli.pt_input_extras import (
+        install_cmd_backspace_alias,
+        install_ctrl_enter_alias,
+        install_shift_enter_alias,
+    )
+    for fn in (
+        install_shift_enter_alias,
+        install_ctrl_enter_alias,
+        install_cmd_backspace_alias,
+    ):
+        fn()
+        assert fn() == 0

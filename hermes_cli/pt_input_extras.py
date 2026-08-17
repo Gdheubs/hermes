@@ -12,6 +12,22 @@ can be unit-tested without importing the whole CLI runtime.
 from __future__ import annotations
 
 
+# Kitty's keyboard protocol encodes the modifier field as a bitmask + 1:
+# shift=1, alt=2, ctrl=4, super=8, hyper=16, meta=32, caps_lock=64,
+# num_lock=128. The lock bits are ORed into EVERY key event while the lock
+# is on, so a user with NumLock enabled sends ``ESC[99;133u`` (5 + 128) for
+# Ctrl+C and ``ESC[127;129u`` (1 + 128) for a plain Backspace. Every
+# fixed-modifier registration below therefore also installs its NumLock-on
+# twin, otherwise those events are absent from ``ANSI_SEQUENCES`` and leak
+# into the prompt as literal text (#88221).
+_NUM_LOCK = 128
+
+
+def _num_lock_variants(modifier: int) -> tuple[int, int]:
+    """Return ``(modifier, modifier | num_lock)`` for a kitty modifier value."""
+    return (modifier, modifier + _NUM_LOCK)
+
+
 def _clear_vt100_prefix_cache() -> None:
     """Drop prompt_toolkit's memoized "is this a prefix of a longer match?"
     answers after mutating ``ANSI_SEQUENCES``.
@@ -62,10 +78,11 @@ def install_shift_enter_alias() -> int:
 
     alt_enter = (Keys.Escape, Keys.ControlM)
     changed = 0
-    for seq in ("\x1b[13;2u", "\x1b[27;2;13~", "\x1b[27;2;13u"):
-        if ANSI_SEQUENCES.get(seq) != alt_enter:
-            ANSI_SEQUENCES[seq] = alt_enter
-            changed += 1
+    for mod in _num_lock_variants(2):
+        for seq in (f"\x1b[13;{mod}u", f"\x1b[27;{mod};13~", f"\x1b[27;{mod};13u"):
+            if ANSI_SEQUENCES.get(seq) != alt_enter:
+                ANSI_SEQUENCES[seq] = alt_enter
+                changed += 1
     if changed:
         _clear_vt100_prefix_cache()
     return changed
@@ -96,10 +113,11 @@ def install_ctrl_enter_alias() -> int:
 
     alt_enter = (Keys.Escape, Keys.ControlM)
     changed = 0
-    for seq in ("\x1b[13;5u", "\x1b[27;5;13~", "\x1b[27;5;13u"):
-        if ANSI_SEQUENCES.get(seq) != alt_enter:
-            ANSI_SEQUENCES[seq] = alt_enter
-            changed += 1
+    for mod in _num_lock_variants(5):
+        for seq in (f"\x1b[13;{mod}u", f"\x1b[27;{mod};13~", f"\x1b[27;{mod};13u"):
+            if ANSI_SEQUENCES.get(seq) != alt_enter:
+                ANSI_SEQUENCES[seq] = alt_enter
+                changed += 1
     if changed:
         _clear_vt100_prefix_cache()
     return changed
@@ -133,13 +151,12 @@ def install_cmd_backspace_alias() -> int:
     except Exception:
         return 0
 
-    aliases = {
-        "\x1b[127;9u": Keys.ControlU,
-        "\x1b[127;10u": Keys.ControlU,
-        "\x1b[27;9;127~": Keys.ControlU,
-        "\x1b[3;9~": Keys.ControlK,
-        "\x1b[3;10~": Keys.ControlK,
-    }
+    aliases: dict[str, object] = {}
+    for mod in _num_lock_variants(9) + _num_lock_variants(10):
+        aliases[f"\x1b[127;{mod}u"] = Keys.ControlU
+        aliases[f"\x1b[3;{mod}~"] = Keys.ControlK
+    for mod in _num_lock_variants(9):
+        aliases[f"\x1b[27;{mod};127~"] = Keys.ControlU
     changed = 0
     for seq, key in aliases.items():
         if ANSI_SEQUENCES.get(seq) != key:
@@ -200,6 +217,11 @@ def install_modify_other_keys_aliases() -> int:
     ``install_shift_enter_alias`` / ``install_ctrl_enter_alias``) are never
     overwritten — ``setdefault`` semantics.
 
+    Every modifier above is registered twice: once bare and once with
+    kitty's ``num_lock`` bit (128) ORed in, since kitty stamps that bit onto
+    the modifier field of *every* key event while NumLock is on — Ctrl+C
+    becomes ``ESC[99;133u`` and plain Backspace ``ESC[127;129u`` (#88221).
+
     Returns the number of sequences whose mapping was newly installed.
     """
     try:
@@ -246,16 +268,21 @@ def install_modify_other_keys_aliases() -> int:
 
     def _install_paired(modifier: int, mapping: dict) -> None:
         """Install both modifyOtherKeys (ESC[27;N;CP~) and CSI-u (ESC[CP;Nu)
-        mappings for the given modifier and codepoint→key mapping."""
+        mappings for the given modifier and codepoint→key mapping.
+
+        Each modifier is installed twice: once bare, once with kitty's
+        num_lock bit (128) ORed in, because kitty reports that bit on every
+        key event while NumLock is on (#88221)."""
         nonlocal changed
-        for codepoint, key_val in mapping.items():
-            for seq in (
-                f"\x1b[27;{modifier};{codepoint}~",
-                f"\x1b[{codepoint};{modifier}u",
-            ):
-                if seq not in ANSI_SEQUENCES:
-                    ANSI_SEQUENCES[seq] = key_val
-                    changed += 1
+        for mod in _num_lock_variants(modifier):
+            for codepoint, key_val in mapping.items():
+                for seq in (
+                    f"\x1b[27;{mod};{codepoint}~",
+                    f"\x1b[{codepoint};{mod}u",
+                ):
+                    if seq not in ANSI_SEQUENCES:
+                        ANSI_SEQUENCES[seq] = key_val
+                        changed += 1
 
     # Ctrl+letter / Ctrl+digit / Ctrl+symbol (modifier 5)
     _install_paired(5, ctrl_key_map)
@@ -321,7 +348,11 @@ def install_modify_other_keys_aliases() -> int:
     # (#56684 — previously leaked "[27u" as literal text into the prompt).
     # Modifiers run to 16 because kitty reports Cmd as the super bit
     # (mod 9+) — same reason install_cmd_backspace_alias maps 9/10.
-    for seq in ["\x1b[27u"] + [f"\x1b[27;{m}u" for m in range(2, 17)]:
+    for seq in ["\x1b[27u"] + [
+        f"\x1b[27;{m}u"
+        for base in range(2, 17)
+        for m in _num_lock_variants(base)
+    ]:
         if seq not in ANSI_SEQUENCES:
             ANSI_SEQUENCES[seq] = Keys.Escape
             changed += 1
@@ -343,6 +374,21 @@ def install_modify_other_keys_aliases() -> int:
         9: Keys.ControlI,                   # Ctrl+Tab — degrade to Tab
         127: (Keys.Escape, Keys.ControlH),  # Ctrl+Backspace — backward-kill-word,
                                             # matching Ink TUI + Desktop (#78285)
+    })
+
+    # -- Unmodified keys with a lock bit set (kitty modifier 1 = "none") ----
+    # With NumLock on, kitty stamps the num_lock bit onto keys pressed with
+    # NO real modifier too, so plain Backspace arrives as ESC[127;129u
+    # (1 + 128) rather than \x7f. _install_paired(1, ...) registers both the
+    # bare mod-1 spelling and its NumLock twin. Only keys kitty CSI-u-encodes
+    # on their own are listed; plain text characters are still delivered as
+    # UTF-8, lock bits or not.
+    _install_paired(1, {
+        9: Keys.ControlI,     # Tab
+        13: Keys.ControlM,    # Enter
+        27: Keys.Escape,      # Esc
+        32: " ",              # Space
+        127: Keys.ControlH,   # Backspace
     })
 
     # -- Kitty functional keys (Private Use Area codepoints) ----
