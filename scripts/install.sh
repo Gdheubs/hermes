@@ -618,21 +618,45 @@ install_uv() {
 check_python() {
     if [ "$DISTRO" = "termux" ]; then
         log_info "Checking Termux Python..."
+        # Hermes requires Python 3.11–3.13 (pyproject.toml: requires-python = ">=3.11,<3.14").
+        # Termux's `pkg install python` ships whatever the Termux distro is on — as of
+        # 2026-Q3 that's 3.14.x, which pip rejects against the project's version cap
+        # and produces an opaque "different Python: 3.14.6 not in '<3.14,>=3.11'" failure
+        # later in the run (#76901). Detect that here and bail with a fixable message
+        # instead of letting the whole installer fail downstream.
+        _termux_py_ok() {
+            "$1" -c 'import sys; v = sys.version_info; raise SystemExit(0 if (3, 11) <= v < (3, 14) else 1)' 2>/dev/null
+        }
         if command -v python >/dev/null 2>&1; then
             PYTHON_PATH="$(command -v python)"
-            if "$PYTHON_PATH" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+            if _termux_py_ok "$PYTHON_PATH"; then
                 PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
                 log_success "Python found: $PYTHON_FOUND_VERSION"
                 return 0
             fi
+            PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
+            log_warn "Termux has $PYTHON_FOUND_VERSION but Hermes requires 3.11–3.13 (<3.14)."
         fi
 
         log_info "Installing Python via pkg..."
         pkg install -y python >/dev/null
         PYTHON_PATH="$(command -v python)"
+        if _termux_py_ok "$PYTHON_PATH"; then
+            PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
+            log_success "Python installed: $PYTHON_FOUND_VERSION"
+            return 0
+        fi
+        # pkg only ships the current CPython slot; if that is 3.14+ the
+        # project's requires-python cap ("<3.14") is the real blocker.
         PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
-        log_success "Python installed: $PYTHON_FOUND_VERSION"
-        return 0
+        log_error "Termux pkg installed $PYTHON_FOUND_VERSION but Hermes requires Python 3.11–3.13."
+        log_info "The Termux python package tracks only the current CPython release, so there"
+        log_info "is no pkg-provided 3.12/3.13 interpreter to switch to. Workarounds:"
+        log_info "  - Track issue #76901 for a Python-3.14-compatible Hermes release."
+        log_info "  - Run Hermes inside proot-distro (e.g. Ubuntu 24.04), where python3.12"
+        log_info "    is available: pkg install proot-distro && proot-distro install ubuntu"
+        log_info "See https://github.com/NousResearch/hermes-agent/issues/76901 for details."
+        exit 1
     fi
 
     log_info "Checking Python $PYTHON_VERSION..."
