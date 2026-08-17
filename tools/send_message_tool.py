@@ -1777,6 +1777,7 @@ async def _send_signal(extra, chat_id, message, media_files=None):
         _signal_send_timeout,
         get_scheduler,
     )
+    from gateway.platforms.signal import set_signal_notify_self
     from gateway.platforms.signal_format import markdown_to_signal
 
     try:
@@ -1817,6 +1818,7 @@ async def _send_signal(extra, chat_id, message, media_files=None):
                 params["groupId"] = chat_id[6:]
             else:
                 params["recipient"] = [chat_id]
+                set_signal_notify_self(params, account, chat_id)
             if batch_attachments:
                 params["attachments"] = batch_attachments
 
@@ -1839,6 +1841,7 @@ async def _send_signal(extra, chat_id, message, media_files=None):
                 notice_params["groupId"] = chat_id[6:]
             else:
                 notice_params["recipient"] = [chat_id]
+                set_signal_notify_self(notice_params, account, chat_id)
             try:
                 async with httpx.AsyncClient(timeout=30.0) as _client:
                     await _client.post(
