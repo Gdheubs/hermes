@@ -74,18 +74,24 @@ def test_unparseable_json_fails_closed_and_preserves_a_copy(store_file):
     assert corrupt.read_text(encoding="utf-8") == "{ not json"
 
 
-def test_empty_store_file_returns_empty_store(store_file):
-    """F10/P2: a zero-byte / whitespace-only store is an initialized-but-
-    EMPTY store, not corruption — first-run / ``> auth.json`` flows must not
-    brick auth with a false "corrupt" error (availability regression)."""
-    store_file.write_text("", encoding="utf-8")
-    result = auth._load_auth_store(store_file)
-    assert result == {"version": auth.AUTH_STORE_VERSION, "providers": {}}
-    assert not store_file.with_suffix(".json.corrupt").exists()
+@pytest.mark.parametrize("payload", ["", "   \n\t  "], ids=["zero-byte", "whitespace-only"])
+def test_empty_store_file_fails_closed(store_file, payload):
+    """F10: an existing zero-byte / whitespace-only store is corruption,
+    NOT an initialized-but-empty store. ``> auth.json`` is the canonical
+    truncation of an existing file; this module never writes an empty file
+    (every write path persists the full JSON envelope atomically), so an
+    empty file is indistinguishable from interruption, failed replacement,
+    or manual truncation. Fail closed: preserve it for recovery and refuse
+    to continue — a later save must never silently replace a damaged
+    artifact (that is one read-modify-write away from erasing every stored
+    credential)."""
+    store_file.write_text(payload, encoding="utf-8")
+    with pytest.raises(ValueError, match="fail closed"):
+        auth._load_auth_store(store_file)
 
-    store_file.write_text("   \n\t  ", encoding="utf-8")
-    result = auth._load_auth_store(store_file)
-    assert result == {"version": auth.AUTH_STORE_VERSION, "providers": {}}
+    corrupt = store_file.with_suffix(".json.corrupt")
+    assert corrupt.exists(), "damaged store must be preserved for recovery"
+    assert corrupt.read_text(encoding="utf-8") == payload
 
 
 def test_healthy_store_is_returned_unchanged(store_file):

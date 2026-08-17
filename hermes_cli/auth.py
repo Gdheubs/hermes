@@ -1284,13 +1284,14 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
 
     try:
         raw_text = auth_file.read_text(encoding="utf-8-sig")
-        # F10/P2 (Purple round 2): an EMPTY or whitespace-only store is a
-        # legitimately-initialized-but-empty store — NOT corruption. Treat
-        # it like the missing-file path so first-run / ``> auth.json`` flows
-        # do not brick auth with a false "corrupt" error (availability
-        # regression).
-        if not raw_text.strip():
-            return {"version": AUTH_STORE_VERSION, "providers": {}}
+        # F10 (fail closed): an existing file that is zero-byte or
+        # whitespace-only is NOT a legitimately-initialized store — this
+        # module never creates one (every write path persists the full JSON
+        # envelope atomically), so an empty file is indistinguishable from
+        # interruption, failed replacement, disk damage, or manual
+        # truncation (``> auth.json``). Treat it as corruption: preserve it
+        # for recovery and refuse to continue. A missing file is the only
+        # state that means "not initialized yet" (handled above).
         raw = json.loads(raw_text)
     except OSError:
         # The file exists (checked above) but could not be READ: EMFILE under
