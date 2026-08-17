@@ -730,7 +730,7 @@ export function useMessageStream({
         shouldHydrate =
           !completionError &&
           !hasInlineError &&
-          !unresolvedUserTail &&
+          (!unresolvedUserTail || !finalText) &&
           (state.adoptedRunningTurn || !state.sawAssistantPayload || !finalText)
 
         return {

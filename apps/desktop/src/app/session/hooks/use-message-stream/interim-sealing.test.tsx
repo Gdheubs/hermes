@@ -4,7 +4,7 @@ import { useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ClientSessionState } from '@/app/types'
-import { chatMessageText } from '@/lib/chat-messages'
+import { chatMessageText, textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { clearSessionTodos } from '@/store/todos'
 import type { RpcEvent } from '@/types/hermes'
@@ -15,17 +15,23 @@ const SID = 'session-1'
 
 let handleEvent: ((event: RpcEvent) => void) | null = null
 let sessionStates: Map<string, ClientSessionState>
+let initialSessionState: ClientSessionState | null
+let hydrateFromStoredSession: ReturnType<typeof vi.fn<() => Promise<void>>>
 let mockCompleteSound: ReturnType<typeof vi.fn>
 let mockHaptic: ReturnType<typeof vi.fn>
 
 function Harness() {
   const activeSessionIdRef = useRef<string | null>(SID)
-  const sessionStateByRuntimeIdRef = useRef(new Map<string, ClientSessionState>())
+
+  const sessionStateByRuntimeIdRef = useRef(
+    new Map<string, ClientSessionState>(initialSessionState ? [[SID, initialSessionState]] : [])
+  )
+
   const queryClientRef = useRef(new QueryClient())
 
   const stream = useMessageStream({
     activeSessionIdRef,
-    hydrateFromStoredSession: vi.fn(async () => undefined),
+    hydrateFromStoredSession,
     queryClient: queryClientRef.current,
     refreshHermesConfig: vi.fn(async () => undefined),
     refreshSessions: vi.fn(async () => undefined),
@@ -47,8 +53,9 @@ function Harness() {
   return null
 }
 
-async function mountStream() {
+async function mountStream(state: ClientSessionState | null = null) {
   sessionStates = new Map()
+  initialSessionState = state
   render(<Harness />)
   await waitFor(() => expect(handleEvent).not.toBeNull())
 }
@@ -88,6 +95,8 @@ function assistantMessages(): string[] {
 describe('useMessageStream interim text sealing', () => {
   beforeEach(() => {
     handleEvent = null
+    initialSessionState = null
+    hydrateFromStoredSession = vi.fn<() => Promise<void>>(async () => undefined)
     clearSessionTodos(SID)
   })
 
@@ -109,6 +118,19 @@ describe('useMessageStream interim text sealing', () => {
     const texts = assistantMessages()
     expect(texts).toContain('awaaaaa clean!! tsc zero errors')
     expect(texts).toContain('All checks passed.')
+  })
+
+  it('hydrates an empty completion when the live transcript still ends with the user message', async () => {
+    await mountStream(
+      createClientSessionState('stored-session-1', [
+        { id: 'user-1', role: 'user', parts: [textPart('finish the task')] }
+      ])
+    )
+    await start()
+
+    await complete('')
+
+    expect(hydrateFromStoredSession).toHaveBeenCalledWith(3, 'stored-session-1', SID)
   })
 
   it('marks sealed interim bubbles interim and leaves the final reply unmarked', async () => {
