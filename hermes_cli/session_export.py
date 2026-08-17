@@ -56,8 +56,14 @@ def render_sessions_export(
     export_only = normalize_export_only(only)
 
     if export_format == "jsonl":
-        return _render_jsonl(session_list, only=export_only)
-    return _render_markdown(session_list, only=export_only)
+        rendered = _render_jsonl(session_list, only=export_only)
+    else:
+        rendered = _render_markdown(session_list, only=export_only)
+    # Never let exported transcripts carry credential values (#20785).
+    # Redaction replaces matches with a plain placeholder, so JSON/MD
+    # structure stays intact.
+    from agent.redact import redact_sensitive_text
+    return redact_sensitive_text(rendered)
 
 
 def export_record_count(

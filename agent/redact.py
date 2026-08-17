@@ -91,6 +91,7 @@ _PREFIX_PATTERNS = [
     r"pplx-[A-Za-z0-9]{10,}",           # Perplexity
     r"fal_[A-Za-z0-9_-]{10,}",          # Fal.ai
     r"fc-[A-Za-z0-9]{10,}",             # Firecrawl
+    r"GOCSPX-[A-Za-z0-9_-]{10,}",       # Google OAuth client secret
     r"bb_live_[A-Za-z0-9_-]{10,}",      # BrowserBase
     r"gAAAA[A-Za-z0-9_=-]{20,}",        # Codex encrypted tokens
     r"AKIA[A-Z0-9]{16}",                # AWS Access Key ID
@@ -316,7 +317,7 @@ def _key_has_secret_keyword(key: str) -> bool:
     return False
 
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
-_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
+_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|secret_key|client_secret|app_secret|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
 _JSON_FIELD_RE = re.compile(
     rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"',
     re.IGNORECASE,

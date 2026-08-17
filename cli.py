@@ -15939,6 +15939,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         display_reasoning += f"\n{_DIM}  ... ({len(lines) - 10} more lines — /reasoning full to show){_RST}"
                     else:
                         display_reasoning = reasoning.strip()
+                    # Scrub credential patterns from scratch thinking before
+                    # it renders (#20785) — reasoning is display-only text.
+                    from agent.redact import redact_sensitive_text
+                    display_reasoning = redact_sensitive_text(display_reasoning)
                     _cprint(f"\n{r_top}\n{_DIM}{display_reasoning}{_RST}\n{r_bot}")
 
             if response and not response_previewed:

@@ -19871,6 +19871,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         display_reasoning += f"\n_... ({len(lines) - 15} more lines)_"
                     else:
                         display_reasoning = last_reasoning.strip()
+                    # Never let reasoning/thinking scratch text carry
+                    # credential values into user-facing chat (#20785).
+                    from agent.redact import redact_sensitive_text
+                    display_reasoning = redact_sensitive_text(display_reasoning)
                     # Render style is per-platform: Discord defaults to "-# "
                     # subtext (native small grey metadata text); other
                     # platforms keep the fenced code block.
