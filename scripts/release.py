@@ -2070,6 +2070,7 @@ LEGACY_AUTHOR_MAP = {
     "1torhan@protonmail.com": "uzaylisak",  # PR #29988 salvage (detect_local_server_type process-lifetime cache)
     "zhchl@hermes-agent.local": "8294",  # PR #50572 salvage (honor config context_length on banner)
     "yansh2017@gmail.com": "ya-nsh",  # PR #26790 salvage (normalize local terminal relative cwd; #26783)
+    "for.it.ak07@gmail.com": "andriy4k07",  # PR #61982 (kanban: sanitized external REST API)
 }
 
 
