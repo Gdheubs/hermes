@@ -744,7 +744,16 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 if not skill_matches_environment(frontmatter):
                     continue
 
-                name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
+                # Use the directory name as the canonical skill identifier
+                # rather than the SKILL.md `name:` frontmatter field (#81839):
+                # the directory name is the on-disk source of truth that
+                # disable lists, file paths, and shell completion all index
+                # by, so an accidental mismatch in the frontmatter
+                # (whitespace, case, typo, deliberate rebrand) would
+                # otherwise silently bypass disable checks and confuse
+                # path resolution. The listing entry carries only
+                # name/description/category — no separate display label.
+                name = skill_dir.name[:MAX_NAME_LENGTH]
                 if name in seen_names:
                     continue
                 if name in disabled:
@@ -1293,20 +1302,14 @@ def skill_view(
                     _record(None, categorized_path.with_suffix(".md"))
 
             # Strategy 2: recursive by directory name (catches nested skills
-            # like "foundations/runtime/explore-codebase" called by bare name),
-            # plus frontmatter `name:` lookup. `skills_list()` exposes the
-            # frontmatter name, so `skill_view(name)` must accept it too even
-            # when the on-disk directory is a shorter category/alias.
+            # like "foundations/runtime/explore-codebase" called by bare name).
+            # The directory name is the canonical identifier (#81839): the
+            # listing and the web API (`_find_skill`) only index by it, so a
+            # frontmatter `name:` that differs from the directory is NOT a
+            # lookup alias here either — matching it would resolve names in
+            # skill_view that the web API 404s on.
             for found_skill_md in iter_skill_index_files(search_dir, "SKILL.md"):
                 if found_skill_md.parent.name == name:
-                    _record(found_skill_md.parent, found_skill_md)
-                    continue
-                try:
-                    fm_content = found_skill_md.read_text(encoding="utf-8-sig", errors="replace")
-                    fm, _ = _parse_frontmatter(fm_content)
-                except Exception:
-                    fm = {}
-                if fm.get("name") == name:
                     _record(found_skill_md.parent, found_skill_md)
 
             # Strategy 3: legacy flat <name>.md files anywhere under the dir.
@@ -1344,7 +1347,7 @@ def skill_view(
                 candidates = project_candidates
 
         if len(candidates) > 1:
-            paths = [str(smd) for _, smd in candidates]
+            paths = [smd.as_posix() for _, smd in candidates]
             logging.getLogger(__name__).warning(
                 "Skill name collision for '%s': %d candidates — %s",
                 name, len(candidates), "; ".join(paths),
@@ -1440,8 +1443,13 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        # Check if the skill is disabled by the user
-        resolved_name = parsed_frontmatter.get("name", skill_md.parent.name)
+        # Check if the skill is disabled by the user. The disabled set keys on
+        # the directory name (the canonical identifier this PR establishes for
+        # _find_all_skills / _find_skill / skills_list), so the disable check
+        # must use the directory name too — resolving the frontmatter ``name:``
+        # here would let a disabled skill with a mismatched frontmatter name
+        # slip past the gate (#81839).
+        resolved_name = skill_md.parent.name
         if _is_skill_disabled(resolved_name):
             return json.dumps(
                 {
@@ -1495,7 +1503,7 @@ def skill_view(
                 # Scan for all readable files
                 for f in skill_dir.rglob("*"):
                     if f.is_file() and f.name != "SKILL.md":
-                        rel = str(f.relative_to(skill_dir))
+                        rel = f.relative_to(skill_dir).as_posix()
                         if rel.startswith("references/"):
                             available_files["references"].append(rel)
                         elif rel.startswith("templates/"):
@@ -1582,7 +1590,8 @@ def skill_view(
             references_dir = skill_dir / "references"
             if references_dir.exists():
                 reference_files = [
-                    str(f.relative_to(skill_dir)) for f in references_dir.glob("*.md")
+                    f.relative_to(skill_dir).as_posix()
+                    for f in references_dir.glob("*.md")
                 ]
 
             templates_dir = skill_dir / "templates"
@@ -1598,7 +1607,7 @@ def skill_view(
                 ]:
                     template_files.extend(
                         [
-                            str(f.relative_to(skill_dir))
+                            f.relative_to(skill_dir).as_posix()
                             for f in templates_dir.rglob(ext)
                         ]
                     )
@@ -1608,13 +1617,16 @@ def skill_view(
             if assets_dir.exists():
                 for f in assets_dir.rglob("*"):
                     if f.is_file():
-                        asset_files.append(str(f.relative_to(skill_dir)))
+                        asset_files.append(f.relative_to(skill_dir).as_posix())
 
             scripts_dir = skill_dir / "scripts"
             if scripts_dir.exists():
                 for ext in ["*.py", "*.sh", "*.bash", "*.js", "*.ts", "*.rb"]:
                     script_files.extend(
-                        [str(f.relative_to(skill_dir)) for f in scripts_dir.glob(ext)]
+                        [
+                            f.relative_to(skill_dir).as_posix()
+                            for f in scripts_dir.glob(ext)
+                        ]
                     )
 
         # Read tags/related_skills with backward compat:
@@ -1641,10 +1653,14 @@ def skill_view(
             linked_files["scripts"] = script_files
 
         try:
-            rel_path = str(skill_md.relative_to(active_skills_dir))
+            rel_path = skill_md.relative_to(active_skills_dir).as_posix()
         except ValueError:
             # External skill — use path relative to the skill's own parent dir
-            rel_path = str(skill_md.relative_to(skill_md.parent.parent)) if skill_md.parent.parent else skill_md.name
+            rel_path = (
+                skill_md.relative_to(skill_md.parent.parent).as_posix()
+                if skill_md.parent.parent
+                else skill_md.name
+            )
         skill_name = frontmatter.get(
             "name", skill_md.stem if not skill_dir else skill_dir.name
         )
