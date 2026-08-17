@@ -48,6 +48,28 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
+
+
+def _safe_int_turns(val, default: int = DEFAULT_MAX_TURNS) -> int:
+    """Normalize *val* to a positive int, handling YAML string spellings.
+
+    YAML parses unquoted ``none`` as ``"none"`` (not Python ``None``).
+    Bare ``int("none")`` raises ``ValueError``.  This helper returns
+    *default* for any non-numeric or non-positive input.
+    """
+    if val is None:
+        return default
+    if isinstance(val, (int, float)):
+        return int(val) if val > 0 else default
+    s = str(val).strip().lower()
+    if s in ("none", "null", "unlimited", "infinite", "inf", ""):
+        return default
+    try:
+        n = int(s)
+        return n if n > 0 else default
+    except (ValueError, TypeError):
+        return default
+
 DEFAULT_JUDGE_TIMEOUT = 30.0
 # Judge output budget. The freeform judge returns a one-line JSON verdict, but
 # reasoning models (deepseek-v4, qwq, etc.) burn tokens on hidden reasoning
@@ -614,7 +636,7 @@ class GoalState:
             goal=data.get("goal", ""),
             status=data.get("status", "active"),
             turns_used=int(data.get("turns_used", 0) or 0),
-            max_turns=int(data.get("max_turns", DEFAULT_MAX_TURNS) or DEFAULT_MAX_TURNS),
+            max_turns=_safe_int_turns(data.get("max_turns"), DEFAULT_MAX_TURNS),
             created_at=float(data.get("created_at", 0.0) or 0.0),
             last_turn_at=float(data.get("last_turn_at", 0.0) or 0.0),
             last_verdict=data.get("last_verdict"),
@@ -1255,7 +1277,7 @@ class GoalManager:
 
     def __init__(self, session_id: str, *, default_max_turns: int = DEFAULT_MAX_TURNS):
         self.session_id = session_id
-        self.default_max_turns = int(default_max_turns or DEFAULT_MAX_TURNS)
+        self.default_max_turns = _safe_int_turns(default_max_turns, DEFAULT_MAX_TURNS)
         self._state: Optional[GoalState] = load_goal(session_id)
 
     # --- introspection ------------------------------------------------
@@ -1311,7 +1333,7 @@ class GoalManager:
             goal=goal,
             status="active",
             turns_used=0,
-            max_turns=int(max_turns) if max_turns else self.default_max_turns,
+            max_turns=_safe_int_turns(max_turns, self.default_max_turns),
             created_at=time.time(),
             last_turn_at=0.0,
             contract=contract if contract is not None else GoalContract(),
@@ -2042,7 +2064,7 @@ def run_kanban_goal_loop(
             except Exception:
                 pass
 
-    max_turns = int(max_turns or DEFAULT_MAX_TURNS)
+    max_turns = _safe_int_turns(max_turns, DEFAULT_MAX_TURNS)
     if max_turns < 1:
         max_turns = DEFAULT_MAX_TURNS
 

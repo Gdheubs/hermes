@@ -5102,8 +5102,24 @@ def run_job(
                     logger.warning("Job '%s': failed to parse prefill messages file '%s': %s", job_id, pfpath, e)
                     prefill_messages = None
 
-        # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 500
+        # Max iterations -- normalize string spellings (e.g. YAML "none") to
+        # Python None so the ``or`` fallback triggers instead of raising
+        # TypeError when comparing int < str.  Fixes #82815.
+        def _norm_max_turns(v):
+            if v is None:
+                return None
+            if isinstance(v, (int, float)):
+                return v
+            s = str(v).strip().lower()
+            if s in ("none", "null", "unlimited", "infinite", "inf", ""):
+                return None
+            try:
+                return int(s)
+            except (ValueError, TypeError):
+                return None
+
+        _raw_mt = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns")
+        max_iterations = _norm_max_turns(_raw_mt) or 500
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
