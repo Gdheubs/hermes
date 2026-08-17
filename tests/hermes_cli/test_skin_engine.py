@@ -167,6 +167,18 @@ class TestUserSkins:
 
 
 class TestDisplayIntegration:
+    @pytest.fixture(autouse=True)
+    def _unicode_display(self, monkeypatch):
+        """Force Unicode rendering for skin-prefix assertions.
+
+        terminal_prefers_ascii() is True on MSYS/Windows terminals; the
+        ascii fallback (fix for #24277/#24278) downgrades glyphs there.
+        These tests assert the Unicode skin path, so pin the preference off.
+        """
+        import agent.display as display_mod
+
+        monkeypatch.setattr(display_mod, "terminal_prefers_ascii", lambda: False)
+        monkeypatch.delenv("HERMES_FORCE_ASCII_DISPLAY", raising=False)
 
 
     def test_tool_message_uses_skin_prefix(self):
