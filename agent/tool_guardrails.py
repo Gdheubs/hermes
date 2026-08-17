@@ -182,7 +182,7 @@ class ToolCallSignature:
 
     @classmethod
     def from_call(cls, tool_name: str, args: Mapping[str, Any] | None) -> "ToolCallSignature":
-        canonical = canonical_tool_args(args or {})
+        canonical = canonical_tool_args(normalize_tool_args_for_guardrail(tool_name, args or {}))
         return cls(tool_name=tool_name, args_hash=_sha256(canonical))
 
     def to_metadata(self) -> dict[str, str]:
@@ -220,6 +220,43 @@ class ToolGuardrailDecision:
         if self.signature is not None:
             data["signature"] = self.signature.to_metadata()
         return data
+
+
+def normalize_tool_args_for_guardrail(tool_name: str, args: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a loop-detection view of args with no-op jitter removed.
+
+    This is deliberately conservative. It only normalizes tool payloads where
+    the repeated-call semantics are declarative and stable. Shell commands,
+    browser input, and arbitrary mutating tools keep their raw canonical args.
+    """
+    normalized = dict(args)
+
+    if tool_name == "todo":
+        # ``merge`` changes how the todo tool applies an update, but repeated
+        # writes of the same final list with merge toggled are the same
+        # bookkeeping no-op from the guardrail's perspective.
+        normalized.pop("merge", None)
+        todos = normalized.get("todos")
+        if isinstance(todos, list):
+            normalized["todos"] = sorted(
+                todos,
+                key=lambda item: str(item.get("id", "")) if isinstance(item, Mapping) else str(item),
+            )
+        return normalized
+
+    if tool_name == "skill_view":
+        if normalized.get("file_path") is None:
+            normalized.pop("file_path", None)
+        return normalized
+
+    if tool_name == "read_file":
+        if normalized.get("offset") in (None, 1):
+            normalized.pop("offset", None)
+        if normalized.get("limit") in (None, 2000):
+            normalized.pop("limit", None)
+        return normalized
+
+    return normalized
 
 
 def canonical_tool_args(args: Mapping[str, Any]) -> str:
@@ -280,7 +317,14 @@ class ToolCallGuardrailController:
     def reset_for_turn(self) -> None:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
-        self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        # No-progress counters deliberately survive the turn boundary. A new
+        # ``run_conversation`` starts on context compaction and on every new
+        # user message, so clearing them here would let a bookkeeping loop that
+        # spans a compaction restart its streak at 1 and never reach
+        # ``no_progress_block_after``. They are cleared instead when the world
+        # actually moves (see ``note_progress``), not when a turn rolls over.
+        if not hasattr(self, "_no_progress"):
+            self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
         self._halt_decision: ToolGuardrailDecision | None = None
         # Per-turn runaway-loop cap counters. Reset every turn (this method
         # runs at the start of each run_conversation), so the caps bound a
@@ -325,25 +369,25 @@ class ToolCallGuardrailController:
             self._halt_decision = decision
             return decision
 
-        if self._is_idempotent(tool_name):
-            record = self._no_progress.get(signature)
-            if record is not None:
-                _result_hash, repeat_count = record
-                if repeat_count >= self.config.no_progress_block_after:
-                    decision = ToolGuardrailDecision(
-                        action="block",
-                        code="idempotent_no_progress_block",
-                        message=(
-                            f"Blocked {tool_name}: this read-only call returned the same "
-                            f"result {repeat_count} times. Stop repeating it unchanged; "
-                            "use the result already provided or try a different query."
-                        ),
-                        tool_name=tool_name,
-                        count=repeat_count,
-                        signature=signature,
-                    )
-                    self._halt_decision = decision
-                    return decision
+        record = self._no_progress.get(signature)
+        if record is not None:
+            _result_hash, repeat_count = record
+            if repeat_count >= self.config.no_progress_block_after:
+                decision = ToolGuardrailDecision(
+                    action="block",
+                    code="no_progress_block",
+                    message=(
+                        f"Blocked {tool_name}: this call returned no-progress "
+                        f"{repeat_count} times with identical arguments. Stop "
+                        "repeating it unchanged; use the result already provided "
+                        "or change the approach."
+                    ),
+                    tool_name=tool_name,
+                    count=repeat_count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
 
         return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
@@ -412,25 +456,37 @@ class ToolCallGuardrailController:
         self._exact_failure_counts.pop(signature, None)
         self._same_tool_failure_counts.pop(tool_name, None)
 
-        if not self._is_idempotent(tool_name):
-            self._no_progress.pop(signature, None)
+        if file_mutation_result_landed(tool_name, result or ""):
+            # A write actually landed on disk: the world moved, so every
+            # carried-over no-progress streak is stale. Membership in
+            # ``mutating_tools`` is not sufficient evidence here — bookkeeping
+            # tools such as ``todo`` live in that set but change nothing.
+            self.note_progress()
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
+        # No-progress tracking applies to every tool, not just read-only ones:
+        # a successful call repeated with identical arguments that keeps
+        # producing no new world state is definitionally making no progress.
         result_hash = _result_hash(result)
         previous = self._no_progress.get(signature)
         repeat_count = 1
-        if previous is not None and previous[0] == result_hash:
+        if previous is not None:
+            # Count repeated identical tool signatures, not repeated result
+            # hashes. Context compression and tool-level de-duplication may
+            # intentionally return a different payload for the same no-op call
+            # (for example a duplicate-output stub), but the repeated call is
+            # still not progress.
             repeat_count = previous[1] + 1
         self._no_progress[signature] = (result_hash, repeat_count)
 
         if self.config.warnings_enabled and repeat_count >= self.config.no_progress_warn_after:
             return ToolGuardrailDecision(
                 action="warn",
-                code="idempotent_no_progress_warning",
+                code="no_progress_warning",
                 message=(
-                    f"{tool_name} returned the same result {repeat_count} times. "
-                    "Use the result already provided or change the query instead of "
-                    "repeating it unchanged."
+                    f"{tool_name} made no progress {repeat_count} times with "
+                    "identical arguments. Use the result already provided "
+                    "or change the approach instead of repeating it unchanged."
                 ),
                 tool_name=tool_name,
                 count=repeat_count,
@@ -438,6 +494,14 @@ class ToolCallGuardrailController:
             )
 
         return ToolGuardrailDecision(tool_name=tool_name, count=repeat_count, signature=signature)
+
+    def note_progress(self) -> None:
+        """Clear no-progress streaks because the world actually moved.
+
+        Called when a mutating tool succeeds. Repeating a read after a real
+        write is progress, so the carried-over counters must not block it.
+        """
+        self._no_progress.clear()
 
     def _is_idempotent(self, tool_name: str) -> bool:
         if tool_name in self.config.mutating_tools:
