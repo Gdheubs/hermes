@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import os
 import shlex
 import sys
@@ -26,6 +27,8 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +333,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
     p_create.add_argument("--body", default=None, help="Optional opening post")
+    p_create.add_argument(
+        "--metadata",
+        default=None,
+        help="Stable task metadata as a JSON object (for worker integrations)",
+    )
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
@@ -1562,6 +1570,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    metadata = None
+    raw_metadata = getattr(args, "metadata", None)
+    if raw_metadata:
+        try:
+            metadata = json.loads(raw_metadata)
+            if not isinstance(metadata, dict):
+                raise ValueError("must decode to a JSON object")
+        except (json.JSONDecodeError, ValueError) as exc:
+            print(f"kanban: --metadata: {exc}", file=sys.stderr)
+            return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
@@ -1586,6 +1604,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            metadata=metadata,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2658,9 +2677,21 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
+    try:
+        from hermes_cli.plugins import build_worker_lane_dispatch
+
+        worker_lane_spawn, worker_lane_is_spawnable = build_worker_lane_dispatch()
+    except Exception:
+        logger.warning(
+            "kanban dispatch: worker lane discovery failed; using native profiles",
+            exc_info=True,
+        )
+        worker_lane_spawn, worker_lane_is_spawnable = None, None
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
             conn,
+            spawn_fn=worker_lane_spawn,
+            spawnable_assignee_fn=worker_lane_is_spawnable,
             dry_run=args.dry_run,
             max_spawn=max_spawn,
             max_in_progress=max_in_progress,

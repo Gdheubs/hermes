@@ -598,6 +598,7 @@ def get_task(
 class CreateTaskBody(BaseModel):
     title: str
     body: Optional[str] = None
+    metadata: Optional[dict[str, Any]] = None
     assignee: Optional[str] = None
     tenant: Optional[str] = None
     priority: int = 0
@@ -629,6 +630,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             conn,
             title=payload.title,
             body=payload.body,
+            metadata=payload.metadata,
             assignee=payload.assignee,
             created_by="dashboard",
             workspace_kind=payload.workspace_kind,
@@ -2287,8 +2289,26 @@ def dispatch(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        try:
+            from hermes_cli.plugins import build_worker_lane_dispatch
+
+            worker_lane_spawn, worker_lane_is_spawnable = (
+                build_worker_lane_dispatch()
+            )
+        except Exception:
+            log.warning(
+                "kanban dashboard dispatch: worker lane discovery failed; "
+                "using native profiles",
+                exc_info=True,
+            )
+            worker_lane_spawn, worker_lane_is_spawnable = None, None
         result = kanban_db.dispatch_once(
-            conn, dry_run=dry_run, max_spawn=max_n, board=board,
+            conn,
+            spawn_fn=worker_lane_spawn,
+            spawnable_assignee_fn=worker_lane_is_spawnable,
+            dry_run=dry_run,
+            max_spawn=max_n,
+            board=board,
         )
         # DispatchResult is a dataclass.
         try:

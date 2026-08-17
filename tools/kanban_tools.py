@@ -1359,6 +1359,11 @@ def _handle_create(args: dict, **kw) -> str:
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
     body = args.get("body")
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error(
+            f"metadata must be an object/dict, got {type(metadata).__name__}"
+        )
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
     # Stamp the originating session id when the agent loop runs under
@@ -1461,6 +1466,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                metadata=metadata,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -2162,6 +2168,15 @@ KANBAN_CREATE_SCHEMA = {
                     "links. The assigned worker reads this as part of "
                     "its context."
                 ),
+            },
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Stable machine-readable task context for worker integrations. "
+                    "Do not include secrets. Example: "
+                    "{'agentplane': {'task_id': '20260817-ABC'}}."
+                ),
+                "additionalProperties": True,
             },
             "parents": {
                 "type": "array",

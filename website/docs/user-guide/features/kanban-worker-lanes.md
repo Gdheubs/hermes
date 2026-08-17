@@ -26,7 +26,7 @@ To be a kanban worker lane, an integration must provide three things:
 
 ### 1. An assignee string
 
-The dispatcher matches `task.assignee` against either a Hermes profile name (the default lane shape) or a registered non-spawnable identifier (the plugin lane shape — see [Adding an external CLI worker lane](#adding-an-external-cli-worker-lane) below). Tasks whose assignee doesn't resolve are left on `ready` with a `skipped_nonspawnable` event so a board operator can fix them; they are not silently dropped or executed by an arbitrary fallback.
+The dispatcher matches `task.assignee` against either a Hermes profile name (the default lane shape) or a plugin-registered worker lane (see [Adding an external CLI worker lane](#adding-an-external-cli-worker-lane) below). Tasks whose assignee doesn't resolve are left on `ready` with a `skipped_nonspawnable` event so a board operator can fix them; they are not silently dropped or executed by an arbitrary fallback.
 
 ### 2. A spawn mechanism
 
@@ -44,7 +44,7 @@ For Hermes profile lanes, the dispatcher's `_default_spawn` runs `hermes -p <ass
 | `HERMES_PROFILE` | the worker's own profile name (for `kanban_comment` author attribution) |
 | `HERMES_TENANT` | tenant namespace, if the task has one |
 
-For non-Hermes lanes (registered via a plugin), the plugin supplies its own `spawn_fn` callable that gets `task`, `workspace`, and `board` and returns an optional pid for crash detection.
+For non-Hermes lanes, a plugin registers an assignee pattern and supplies its own `spawn_fn`. The callback receives the claimed `task` object, resolved `workspace`, and `board`, and returns an optional pid for crash detection. The task object includes the canonical task id plus the current run and claim context; the plugin does not query or mutate the Kanban database directly.
 
 ### 3. A lifecycle terminator
 
@@ -93,9 +93,31 @@ A specialisation of the profile lane: an orchestrator is a Hermes profile whose 
 
 ## Adding an external CLI worker lane
 
-Wiring a non-Hermes CLI tool (Codex CLI, Claude Code CLI, OpenCode CLI, a local coding-model runner, etc.) as a kanban worker lane is *not yet a paved path*. The dispatcher's spawn function is pluggable (`spawn_fn` is a parameter on `dispatch_once`), and a plugin could register its own `spawn_fn` for a non-Hermes assignee, but the surrounding integration work — wrapping the CLI's exit code into `kanban_complete` / `kanban_block` calls, mapping the CLI's workspace/sandbox conventions onto the dispatcher's `HERMES_KANBAN_WORKSPACE` env, handling auth and per-CLI policy — is still per-integration design work.
+Plugins can add a non-Hermes lane without patching the dispatcher:
 
-If you're considering adding a CLI lane, open an issue describing the specific CLI and the workflow you're trying to enable. The contract above is the constraints any such lane must satisfy; the implementation shape (one plugin per CLI vs a generic CLI-runner plugin parameterised by config) is open.
+```python
+def register(ctx):
+    ctx.register_worker_lane(
+        match="my-runner-*",
+        spawn_fn=spawn_my_runner,
+    )
+```
+
+`match` accepts an exact assignee or a shell-style glob. The same resolver is used by CLI dispatch, dashboard dispatch, the gateway dispatcher, dry-run, and readiness telemetry. Hermes still owns the claim, run record, retry policy, concurrency caps, crash detection, timeout, and final Kanban state. The plugin owns only process creation for matching tasks and must return a pid when crash detection should track the child.
+
+Integration identifiers belong in stable task metadata, not in prose or an overloaded Hermes card id:
+
+```bash
+hermes kanban create "Execute AgentPlane task" \
+  --assignee agentplane-executor \
+  --metadata '{"agentplane":{"task_id":"20260817-ABC"}}'
+```
+
+The same `metadata` object is accepted by `kanban_create` and the dashboard task API and is exposed on the claimed `Task` passed to `spawn_fn`.
+
+The external worker must eventually terminate the current run through the public Kanban lifecycle API. Integrations may wrap Codex CLI, Claude Code CLI, OpenCode CLI, a local model runner, or a control-plane supervisor, but they must map their result into `kanban_complete`, `kanban_request_review`, or `kanban_block` and preserve the supplied task/run/claim identity. Authentication, sandbox policy, and environment forwarding remain integration-specific.
+
+Lane registration deliberately has no `profile_exists` option. A plugin lane is spawnable because its registered pattern resolves; Hermes profile existence remains an internal native-lane concern.
 
 The historical issue for this is [#19931](https://github.com/NousResearch/hermes-agent/issues/19931) and the closed-not-merged Codex-specific PR [#19924](https://github.com/NousResearch/hermes-agent/pull/19924) — those describe the original architecture proposal but didn't land a runner.
 

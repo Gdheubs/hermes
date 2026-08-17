@@ -1141,6 +1141,10 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Stable integration context supplied when the card is created. This is
+    # distinct from per-run completion metadata and is available to worker-lane
+    # spawn callbacks after the dispatcher has claimed the task.
+    metadata: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1154,6 +1158,14 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        metadata_value: Optional[dict] = None
+        if "metadata" in keys and row["metadata"]:
+            try:
+                parsed_metadata = json.loads(row["metadata"])
+                if isinstance(parsed_metadata, dict):
+                    metadata_value = parsed_metadata
+            except Exception:
+                metadata_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1235,6 +1247,7 @@ class Task:
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
             ),
+            metadata=metadata_value,
         )
 
 
@@ -1351,6 +1364,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
+    -- Stable card-level integration context. Distinct from task_runs.metadata.
+    metadata             TEXT,
     result               TEXT,
     idempotency_key      TEXT,
     -- Unified consecutive-failure counter. Incremented on spawn
@@ -2538,6 +2553,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "tenant", "tenant TEXT")
     if "result" not in cols:
         _add_column_if_missing(conn, "tasks", "result", "result TEXT")
+    if "metadata" not in cols:
+        _add_column_if_missing(conn, "tasks", "metadata", "metadata TEXT")
     if "branch_name" not in cols:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
     if "project_id" not in cols:
@@ -3183,6 +3200,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    metadata: Optional[dict] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3244,6 +3262,20 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    if metadata is not None and not isinstance(metadata, dict):
+        raise ValueError("metadata must be an object/dict")
+    try:
+        metadata_json = (
+            json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+            if metadata is not None
+            else None
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"metadata must be JSON-serializable: {exc}") from exc
+    if metadata_json and len(metadata_json.encode("utf-8")) > _CTX_MAX_FIELD_BYTES:
+        raise ValueError(
+            f"metadata exceeds {_CTX_MAX_FIELD_BYTES}-byte task context limit"
+        )
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -3494,11 +3526,12 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
+                        metadata,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3515,6 +3548,7 @@ def create_task(
                         project_id,
                         tenant,
                         idempotency_key,
+                        metadata_json,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
@@ -9537,7 +9571,28 @@ def check_respawn_guard(
     return None
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
+def _assignee_is_spawnable(assignee: object, spawnable_assignee_fn=None) -> bool:
+    """Return whether an assignee can be launched by a native or plugin lane."""
+    if spawnable_assignee_fn is not None:
+        try:
+            if spawnable_assignee_fn(assignee):
+                return True
+        except Exception:
+            _log.debug(
+                "kanban dispatch: plugin lane predicate failed for %r",
+                assignee,
+                exc_info=True,
+            )
+    try:
+        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+    except Exception:
+        # Can't introspect profiles in a partial install. Preserve the legacy
+        # fail-open behavior so diagnostics still report queued work.
+        return True
+    return bool(profile_exists(str(assignee or "")))
+
+
+def has_spawnable_ready(conn: sqlite3.Connection, *, spawnable_assignee_fn=None) -> bool:
     """Return True iff there is at least one ready+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
 
@@ -9558,18 +9613,13 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     if not rows:
         return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        # Can't introspect — assume spawnable, preserve legacy behavior.
-        return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _assignee_is_spawnable(row["assignee"], spawnable_assignee_fn):
             return True
     return False
 
 
-def has_spawnable_review(conn: sqlite3.Connection) -> bool:
+def has_spawnable_review(conn: sqlite3.Connection, *, spawnable_assignee_fn=None) -> bool:
     """Return True iff there is at least one review+assigned+unclaimed task
     whose assignee maps to a real Hermes profile.
 
@@ -9584,12 +9634,8 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     ).fetchall()
     if not rows:
         return False
-    try:
-        from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-    except Exception:
-        return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        if _assignee_is_spawnable(row["assignee"], spawnable_assignee_fn):
             return True
     return False
 
@@ -9809,6 +9855,7 @@ def dispatch_once(
     conn: sqlite3.Connection,
     *,
     spawn_fn=None,
+    spawnable_assignee_fn=None,
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
@@ -9844,6 +9891,7 @@ def dispatch_once(
         result = _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
+            spawnable_assignee_fn=spawnable_assignee_fn,
             ttl_seconds=ttl_seconds,
             dry_run=dry_run,
             max_spawn=max_spawn,
@@ -9864,6 +9912,7 @@ def dispatch_once(
             result = _dispatch_once_locked(
                 conn,
                 spawn_fn=spawn_fn,
+                spawnable_assignee_fn=spawnable_assignee_fn,
                 ttl_seconds=ttl_seconds,
                 dry_run=dry_run,
                 max_spawn=max_spawn,
@@ -9891,6 +9940,7 @@ def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
     spawn_fn=None,
+    spawnable_assignee_fn=None,
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
@@ -10097,20 +10147,14 @@ def _dispatch_once_locked(
             _per_profile_running[prow["assignee"]] = int(prow["n"])
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
-    # We also resolve profile_exists once here for the same reason.
+    # Resolve both native profiles and plugin lanes through the same predicate
+    # used by the dispatch loops and health telemetry.
     _default_assignee = (default_assignee or "").strip() or None
     _default_assignee_resolved = False
     if _default_assignee:
-        try:
-            from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
-        except Exception:
-            # Profiles module not importable (test stubs, exotic envs).
-            # Trust the operator's config and try the assignment; the
-            # downstream profile_exists check on the assigned row will
-            # bucket it as nonspawnable if the profile genuinely isn't
-            # there, with the existing diagnostic.
-            _default_assignee_resolved = True
+        _default_assignee_resolved = _assignee_is_spawnable(
+            _default_assignee, spawnable_assignee_fn
+        )
     for row in ready_rows:
         if ready_budget is not None and spawned >= ready_budget:
             break
@@ -10168,11 +10212,7 @@ def _dispatch_once_locked(
         # subprocess would crash on startup, get reaped as a zombie,
         # the task would loop back to ``ready`` on next tick, and we'd
         # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
+        if not _assignee_is_spawnable(row_assignee, spawnable_assignee_fn):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -10322,11 +10362,7 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if not _assignee_is_spawnable(row["assignee"], spawnable_assignee_fn):
             result.skipped_nonspawnable.append(row["id"])
             continue
         if _per_profile_cap is not None:

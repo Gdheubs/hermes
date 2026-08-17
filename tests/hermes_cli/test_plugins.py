@@ -2066,3 +2066,79 @@ class TestDispatchToolWithoutCliRef:
             assert calls[0][1].get("parent_agent") is None
         finally:
             registry.deregister("_test_dispatch_probe")
+
+
+class TestWorkerLaneRegistration:
+    """Plugin lanes share one resolver across dispatch and readiness."""
+
+    def test_registration_resolves_and_disposes(self, monkeypatch):
+        from hermes_cli import plugins as plugins_mod
+
+        manager = PluginManager()
+        manager._discovered = True
+        ctx = PluginContext(
+            PluginManifest(name="lane-plugin", key="lane-plugin", source="user"),
+            manager,
+        )
+        spawn = MagicMock(return_value=4321)
+        handle = ctx.register_worker_lane(match="agentplane-*", spawn_fn=spawn)
+        monkeypatch.setattr(plugins_mod, "get_plugin_manager", lambda: manager)
+
+        lane = plugins_mod.resolve_worker_lane("agentplane-executor")
+        assert lane is not None
+        assert lane.plugin == "lane-plugin"
+        assert plugins_mod.resolve_worker_lane("default") is None
+
+        composite_spawn, is_spawnable = plugins_mod.build_worker_lane_dispatch()
+        task = types.SimpleNamespace(assignee="agentplane-executor")
+        assert is_spawnable is not None and is_spawnable(task.assignee)
+        assert composite_spawn is not None
+        assert composite_spawn(task, "/workspace", board="main") == 4321
+        spawn.assert_called_once_with(task, "/workspace", board="main")
+
+        handle.dispose()
+        assert plugins_mod.resolve_worker_lane("agentplane-executor") is None
+
+    def test_registration_has_no_profile_exists_override(self):
+        manager = PluginManager()
+        ctx = PluginContext(PluginManifest(name="lane-plugin"), manager)
+
+        with pytest.raises(TypeError):
+            ctx.register_worker_lane(
+                match="external-*",
+                spawn_fn=lambda *_args, **_kwargs: None,
+                profile_exists=True,
+            )
+
+    def test_enabled_plugin_lane_is_discovered(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins as plugins_mod
+
+        home = tmp_path / "home"
+        plugin = home / "plugins" / "lane-plugin"
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.yaml").write_text(
+            yaml.safe_dump({"name": "lane-plugin", "version": "1.0.0"})
+        )
+        (plugin / "__init__.py").write_text(
+            "def _spawn(task, workspace, *, board=None):\n"
+            "    return 9876\n\n"
+            "def register(ctx):\n"
+            "    ctx.register_worker_lane(match='agentplane-*', spawn_fn=_spawn)\n"
+        )
+        home.mkdir(exist_ok=True)
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["lane-plugin"]}})
+        )
+        bundled = tmp_path / "bundled"
+        bundled.mkdir()
+        monkeypatch.setenv("HOME", str(tmp_path / "os-home"))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(plugins_mod, "get_bundled_plugins_dir", lambda: bundled)
+
+        manager = PluginManager()
+        manager.discover_and_load()
+        monkeypatch.setattr(plugins_mod, "get_plugin_manager", lambda: manager)
+
+        lane = plugins_mod.resolve_worker_lane("agentplane-planner")
+        assert lane is not None
+        assert lane.spawn_fn(types.SimpleNamespace(), "/workspace", board="main") == 9876

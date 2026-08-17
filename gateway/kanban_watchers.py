@@ -73,6 +73,51 @@ def _kanban_dispatch_allowed() -> bool:
     return not check_paused("kanban", logger)
 
 
+def _worker_lane_callbacks(context: str):
+    """Resolve plugin lane callbacks without making plugins a hard dependency."""
+    try:
+        from hermes_cli.plugins import build_worker_lane_dispatch
+
+        return build_worker_lane_dispatch()
+    except Exception:
+        logger.warning(
+            "%s: worker lane discovery failed; using native profiles",
+            context,
+            exc_info=True,
+        )
+        return None, None
+
+
+def _dispatch_kanban_once(kanban_db, conn, **kwargs):
+    """Dispatch one gateway tick with the shared plugin lane resolver."""
+    spawn_fn, is_spawnable = _worker_lane_callbacks("kanban dispatcher")
+    return kanban_db.dispatch_once(
+        conn,
+        spawn_fn=spawn_fn,
+        spawnable_assignee_fn=is_spawnable,
+        **kwargs,
+    )
+
+
+def _has_spawnable_kanban_work(kanban_db, conn, *, review: bool) -> bool:
+    """Probe readiness with the same lane predicate used for dispatch."""
+    _unused_spawn, is_spawnable = _worker_lane_callbacks(
+        "kanban dispatcher health"
+    )
+    if kanban_db.has_spawnable_ready(
+        conn,
+        spawnable_assignee_fn=is_spawnable,
+    ):
+        return True
+    return bool(
+        review
+        and kanban_db.has_spawnable_review(
+            conn,
+            spawnable_assignee_fn=is_spawnable,
+        )
+    )
+
+
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
 
@@ -1471,7 +1516,8 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
-                return _kb.dispatch_once(
+                return _dispatch_kanban_once(
+                    _kb,
                     conn,
                     board=slug,
                     max_spawn=max_spawn,
@@ -1564,9 +1610,9 @@ class GatewayKanbanWatchersMixin:
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
-                        return True
-                    if _review_probe and _kb.has_spawnable_review(conn):
+                    if _has_spawnable_kanban_work(
+                        _kb, conn, review=_review_probe
+                    ):
                         return True
                 except Exception:
                     continue

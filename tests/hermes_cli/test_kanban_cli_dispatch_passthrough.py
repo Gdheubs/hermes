@@ -56,6 +56,12 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
         return kanban_db.DispatchResult()
 
     monkeypatch.setattr(kanban_db, "dispatch_once", fake_dispatch_once)
+    lane_spawn = lambda *_args, **_kwargs: None
+    lane_predicate = lambda _assignee: True
+    monkeypatch.setattr(
+        "hermes_cli.plugins.build_worker_lane_dispatch",
+        lambda: (lane_spawn, lane_predicate),
+    )
 
     args = argparse.Namespace(dry_run=True, max=None, failure_limit=2, json=False)
     kb_cli._cmd_dispatch(args)
@@ -69,6 +75,8 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     )
     assert captured.get("default_assignee") == "default"
     assert captured.get("max_in_progress_per_profile") == 2
+    assert captured.get("spawn_fn") is lane_spawn
+    assert captured.get("spawnable_assignee_fn") is lane_predicate
 
 
 def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypatch):
@@ -92,5 +100,4 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     assert captured.get("max_spawn") == 2, (
         f"CLI --max=2 must override config kanban.max_spawn=10; got {captured.get('max_spawn')!r}"
     )
-
 

@@ -40,6 +40,7 @@ def _load_plugin_router():
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
+    mod.router._test_plugin_module = mod
     return mod.router
 
 
@@ -57,7 +58,9 @@ def kanban_home(tmp_path, monkeypatch):
 @pytest.fixture
 def client(kanban_home):
     app = FastAPI()
-    app.include_router(_load_plugin_router(), prefix="/api/plugins/kanban")
+    router = _load_plugin_router()
+    app.include_router(router, prefix="/api/plugins/kanban")
+    app.state.kanban_plugin_module = router._test_plugin_module
     return TestClient(app)
 
 
@@ -94,6 +97,7 @@ def test_create_task_appears_on_board(client):
             "assignee": "researcher",
             "priority": 3,
             "tenant": "acme",
+            "metadata": {"agentplane": {"task_id": "20260817-ABC"}},
         },
     )
     assert r.status_code == 200, r.text
@@ -103,6 +107,7 @@ def test_create_task_appears_on_board(client):
     assert task["status"] == "ready"  # no parents -> immediately ready
     assert task["priority"] == 3
     assert task["tenant"] == "acme"
+    assert task["metadata"] == {"agentplane": {"task_id": "20260817-ABC"}}
     task_id = task["id"]
 
     # Board now lists it under 'ready'.
@@ -503,16 +508,36 @@ def test_add_comment(client):
 # ---------------------------------------------------------------------------
 
 
-def test_dispatch_dry_run(client):
+def test_dispatch_dry_run(client, monkeypatch):
+    from hermes_cli import plugins as plugins_mod
+
     client.post(
         "/api/plugins/kanban/tasks",
         json={"title": "work", "assignee": "researcher"},
     )
+    lane_spawn = lambda *_args, **_kwargs: None
+    lane_predicate = lambda _assignee: True
+    monkeypatch.setattr(
+        plugins_mod,
+        "build_worker_lane_dispatch",
+        lambda: (lane_spawn, lane_predicate),
+    )
+    endpoint_kb = client.app.state.kanban_plugin_module.kanban_db
+    original_dispatch = endpoint_kb.dispatch_once
+    captured = {}
+
+    def capture_dispatch(conn, **kwargs):
+        captured.update(kwargs)
+        return original_dispatch(conn, **kwargs)
+
+    monkeypatch.setattr(endpoint_kb, "dispatch_once", capture_dispatch)
     r = client.post("/api/plugins/kanban/dispatch?dry_run=true&max=4")
     assert r.status_code == 200
     body = r.json()
     # DispatchResult is serialized as a dataclass dict.
     assert isinstance(body, dict)
+    assert captured["spawn_fn"] is lane_spawn
+    assert captured["spawnable_assignee_fn"] is lane_predicate
 
 
 # ---------------------------------------------------------------------------
@@ -1228,5 +1253,3 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
-

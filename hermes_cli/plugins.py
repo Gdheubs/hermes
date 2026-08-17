@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import fnmatch
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -1200,6 +1201,20 @@ class PluginRegistration:
                 self._on_dispose(self)
 
 
+@dataclass(frozen=True)
+class WorkerLaneRegistration:
+    """One plugin-owned Kanban worker lane.
+
+    ``match`` is an exact assignee name or a shell-style glob.  The host owns
+    task claiming and lifecycle state; the plugin callback owns only process
+    creation for a matching task.
+    """
+
+    match: str
+    spawn_fn: Callable
+    plugin: str
+
+
 # ---------------------------------------------------------------------------
 # PluginContext  – handed to each plugin's ``register()`` function
 # ---------------------------------------------------------------------------
@@ -2164,6 +2179,48 @@ class PluginContext:
             ),
         )
         logger.debug("Plugin %s registered command: /%s", self.manifest.name, clean)
+        return handle
+
+    # -- kanban worker lane registration ------------------------------------
+
+    def register_worker_lane(
+        self,
+        *,
+        match: str,
+        spawn_fn: Callable,
+    ) -> PluginRegistration:
+        """Register a plugin-owned Kanban worker lane.
+
+        ``match`` is an exact assignee name or shell-style glob such as
+        ``agentplane-*``. Matching tasks remain fully owned by the Hermes
+        dispatcher (claim, run, retry, timeout, and completion state); only
+        process creation is delegated to ``spawn_fn(task, workspace, board=...)``.
+        """
+        pattern = str(match or "").strip()
+        if not pattern:
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' worker lane match cannot be empty"
+            )
+        if not callable(spawn_fn):
+            raise ValueError(
+                f"Plugin '{self.manifest.name}' worker lane {pattern!r} "
+                "requires a callable spawn_fn"
+            )
+        owner_id = self.manifest.key or self.manifest.name
+        lane = WorkerLaneRegistration(
+            match=pattern,
+            spawn_fn=spawn_fn,
+            plugin=owner_id,
+        )
+        self._manager._worker_lanes.append(lane)
+        handle = self._track(
+            "worker_lane",
+            pattern,
+            lambda: self._manager._remove_identity(
+                self._manager._worker_lanes, lane
+            ),
+        )
+        logger.debug("Plugin %s registered worker lane: %s", owner_id, pattern)
         return handle
 
     # -- tool dispatch -------------------------------------------------------
@@ -3403,6 +3460,7 @@ class PluginManager:
         self._cli_commands: Dict[str, dict] = {}
         self._context_engine = None  # Set by a plugin via register_context_engine()
         self._plugin_commands: Dict[str, dict] = {}  # Slash commands registered by plugins
+        self._worker_lanes: List[WorkerLaneRegistration] = []
         self._system_prompt_sections: Dict[str, PluginSystemPromptSection] = {}
         self._discovered: bool = False
         self._cli_ref = None  # Set by CLI after plugin discovery
@@ -3719,6 +3777,7 @@ class PluginManager:
             self._plugin_platform_names.clear()
             self._cli_commands.clear()
             self._plugin_commands.clear()
+            self._worker_lanes.clear()
             self._plugin_skills.clear()
             self._portable_mcp_servers.clear()
             self._aux_tasks.clear()
@@ -6498,6 +6557,56 @@ def get_plugin_auxiliary_tasks() -> List[Dict[str, Any]]:
     """
     manager = _ensure_plugins_discovered()
     return [manager._aux_tasks[k] for k in sorted(manager._aux_tasks)]
+
+
+def _resolve_worker_lane(
+    manager: PluginManager,
+    assignee: object,
+) -> Optional[WorkerLaneRegistration]:
+    name = str(assignee or "").strip()
+    if not name:
+        return None
+    for lane in manager._worker_lanes:
+        if fnmatch.fnmatchcase(name, lane.match):
+            return lane
+    return None
+
+
+def resolve_worker_lane(assignee: object) -> Optional[WorkerLaneRegistration]:
+    """Resolve a plugin worker lane for an assignee, if one is registered.
+
+    Registrations are checked in discovery order.  This is the single lane
+    predicate used by dispatch, dry-run, and readiness telemetry so those
+    surfaces cannot disagree about whether a non-profile assignee is runnable.
+    """
+    return _resolve_worker_lane(_ensure_plugins_discovered(), assignee)
+
+
+def build_worker_lane_dispatch(
+) -> tuple[Optional[Callable], Optional[Callable[[object], bool]]]:
+    """Build the composite dispatcher callbacks for registered worker lanes.
+
+    The spawn callback delegates matching assignees to their plugin and falls
+    back to Hermes' native profile spawner.  The predicate is passed to both
+    dispatch and readiness probes.  ``(None, None)`` preserves the built-in
+    path when no plugin lanes exist.
+    """
+    manager = _ensure_plugins_discovered()
+    if not manager._worker_lanes:
+        return None, None
+
+    def is_spawnable(assignee: object) -> bool:
+        return _resolve_worker_lane(manager, assignee) is not None
+
+    def spawn(task: Any, workspace: str, *, board: Optional[str] = None) -> Any:
+        lane = _resolve_worker_lane(manager, getattr(task, "assignee", None))
+        if lane is not None:
+            return lane.spawn_fn(task, workspace, board=board)
+        from hermes_cli import kanban_db
+
+        return kanban_db._default_spawn(task, workspace, board=board)
+
+    return spawn, is_spawnable
 
 
 def get_plugin_subscriptions() -> Dict[str, List[Callable]]:
