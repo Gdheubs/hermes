@@ -52,6 +52,29 @@ class TestCachedFetchApiModels:
         assert out == ["m1"]
         live.assert_not_called()
 
+    def test_cloudflare_compat_filters_an_existing_raw_cache_entry(self):
+        import hermes_cli.models as mod
+
+        base_url = "https://gateway.ai.cloudflare.com/v1/account/gateway/compat"
+        cache = {
+            f"custom:{base_url}": self._entry(
+                [
+                    "grok/grok-4.6",
+                    "grok/grok-4.6-20260810",
+                    "openrouter/x-ai/grok-4.6",
+                    "xai/xai/grok-4.6",
+                ],
+                age_seconds=10,
+            )
+        }
+        with patch.object(mod, "_load_provider_models_cache", return_value=cache), \
+             patch.object(mod, "_custom_endpoint_fingerprint", return_value="fp"), \
+             patch.object(mod, "fetch_api_models") as live:
+            out = mod.cached_fetch_api_models("sk-key", base_url)
+
+        assert out == ["grok/grok-4.6"]
+        live.assert_not_called()
+
     def test_expired_entry_triggers_live_fetch_and_is_persisted(self):
         import hermes_cli.models as mod
 

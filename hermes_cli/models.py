@@ -4630,6 +4630,104 @@ def github_model_reasoning_efforts(
     return _github_reasoning_efforts_for_model_id(str(model_id or normalized))
 
 
+_CLOUDFLARE_COMPAT_PROVIDER_PREFIXES: frozenset[str] = frozenset({
+    # Cloudflare's documented Unified API providers.
+    "anthropic",
+    "baseten",
+    "cerebras",
+    "cohere",
+    "deepseek",
+    "dynamic",
+    "google-ai-studio",
+    "google-vertex-ai",
+    "grok",
+    "groq",
+    "mistral",
+    "openai",
+    "parallel",
+    "perplexity-ai",
+    "workers-ai",
+    # Bedrock is documented separately as supporting Claude and Nova through
+    # the same /compat/chat/completions surface.
+    "aws-bedrock",
+})
+
+_CLOUDFLARE_COMPAT_NON_CHAT_RE = re.compile(
+    r"(?i)(?:embedding|embed|rerank|moderation|image|imagen|imagine|video|"
+    r"tts|stt|speech|transcrib|whisper|audio|realtime|voice)"
+)
+
+_MODEL_SNAPSHOT_SUFFIXES = (
+    re.compile(r"-20\d{6}$"),
+    re.compile(r"-20\d{2}-\d{2}-\d{2}$"),
+    re.compile(r"-\d{4}$"),
+)
+
+
+def _is_cloudflare_compat_base_url(base_url: str) -> bool:
+    parsed = urllib.parse.urlparse(str(base_url or ""))
+    return (
+        parsed.hostname == "gateway.ai.cloudflare.com"
+        and parsed.path.rstrip("/").endswith("/compat")
+    )
+
+
+def _normalize_discovered_model_ids(
+    base_url: str,
+    model_ids: list[str],
+) -> list[str]:
+    """Return endpoint-appropriate, stable model IDs for picker surfaces.
+
+    Cloudflare's ``/compat/models`` currently returns the union of several
+    internal/provider catalogs rather than only IDs accepted by
+    ``/compat/chat/completions``. That includes unsupported provider prefixes,
+    duplicated ``provider/provider/model`` IDs, batch/non-chat models, and
+    dated aliases whose canonical alias is the only accepted route. Filter that
+    one endpoint while leaving every other OpenAI-compatible catalog untouched.
+    """
+    deduped = list(dict.fromkeys(
+        str(model_id or "").strip()
+        for model_id in model_ids
+        if str(model_id or "").strip()
+    ))
+    if not _is_cloudflare_compat_base_url(base_url):
+        return deduped
+
+    compatible: list[str] = []
+    for model_id in deduped:
+        parts = model_id.split("/")
+        provider_prefix = parts[0].lower()
+        if provider_prefix not in _CLOUDFLARE_COMPAT_PROVIDER_PREFIXES:
+            continue
+        if provider_prefix == "aws-bedrock" and not any(
+            family in model_id.lower() for family in ("anthropic", "nova")
+        ):
+            # Cloudflare documents only Claude and Nova families on Bedrock's
+            # OpenAI-compatible surface; the raw catalog includes other
+            # Bedrock families that require the provider-native API.
+            continue
+        if len(parts) > 1 and parts[1].lower() == provider_prefix:
+            continue
+        if model_id.endswith(":batch"):
+            continue
+        if _CLOUDFLARE_COMPAT_NON_CHAT_RE.search(model_id):
+            continue
+        compatible.append(model_id)
+
+    compatible_set = set(compatible)
+    canonical: list[str] = []
+    for model_id in compatible:
+        snapshot_alias = False
+        for suffix in _MODEL_SNAPSHOT_SUFFIXES:
+            base_alias = suffix.sub("", model_id)
+            if base_alias != model_id and base_alias in compatible_set:
+                snapshot_alias = True
+                break
+        if not snapshot_alias:
+            canonical.append(model_id)
+    return canonical
+
+
 def probe_api_models(
     api_key: Optional[str],
     base_url: Optional[str],
@@ -4705,8 +4803,12 @@ def probe_api_models(
         try:
             with _urlopen_model_catalog_request(req, **_open_kwargs) as resp:
                 data = json.loads(resp.read().decode())
+                models = _normalize_discovered_model_ids(
+                    candidate_base,
+                    [m.get("id", "") for m in data.get("data", [])],
+                )
                 return {
-                    "models": [m.get("id", "") for m in data.get("data", [])],
+                    "models": models,
                     "probed_url": url,
                     "resolved_base_url": candidate_base.rstrip("/"),
                     "suggested_base_url": alternate_base if alternate_base != candidate_base else normalized,
@@ -5084,6 +5186,11 @@ def cached_fetch_api_models(
     entry = cache.get(cache_key)
     now = time.time()
 
+    def _normalized_for_endpoint(models: list[str]) -> list[str]:
+        return _normalize_discovered_model_ids(
+            str(base_url or normalized_url), list(models)
+        )
+
     if cache_only:
         # Same trust window as the stale-while-revalidate tier below, minus
         # the revalidation: an entry this side of the bound is good enough to
@@ -5093,12 +5200,12 @@ def cached_fetch_api_models(
             return None
         if now - entry["at"] >= _PROVIDER_MODELS_STALE_SERVE_MAX:
             return None
-        return list(entry["models"])
+        return _normalized_for_endpoint(entry["models"])
 
     if not force_refresh and _cache_entry_valid(entry, fp):
         age = now - entry["at"]
         if age < ttl_seconds:
-            return list(entry["models"])
+            return _normalized_for_endpoint(entry["models"])
         if age < _PROVIDER_MODELS_STALE_SERVE_MAX:
             # Stale-while-revalidate: serve the expired entry immediately so
             # picker opens never block on a live /v1/models round-trip
@@ -5111,14 +5218,19 @@ def cached_fetch_api_models(
                 )
                 if not live:
                     return None
-                return {"fp": fp, "at": time.time(), "models": list(live)}
+                normalized_live = _normalized_for_endpoint(live)
+                if not normalized_live:
+                    return None
+                return {"fp": fp, "at": time.time(), "models": normalized_live}
 
             _spawn_swr_refresh(cache_key, _refresh_custom)
-            return list(entry["models"])
+            return _normalized_for_endpoint(entry["models"])
 
     live = fetch_api_models(
         api_key, base_url, timeout=timeout, api_mode=api_mode, headers=headers
     )
+    if live:
+        live = _normalized_for_endpoint(live)
     if live:
         cache[cache_key] = {"fp": fp, "at": now, "models": list(live)}
         _save_provider_models_cache(cache)
@@ -5127,7 +5239,7 @@ def cached_fetch_api_models(
     # Live fetch returned nothing (offline endpoint, timeout, auth hiccup).
     # A stale same-fingerprint entry beats an empty result.
     if _cache_entry_valid(entry, fp):
-        return list(entry["models"])
+        return _normalized_for_endpoint(entry["models"])
     return live
 
 

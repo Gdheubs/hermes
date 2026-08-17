@@ -1,5 +1,6 @@
 """Tests for provider-aware `/model` validation in hermes_cli.models."""
 
+import json
 from unittest.mock import MagicMock, patch
 
 from hermes_cli.models import (
@@ -218,6 +219,69 @@ class TestFetchApiModels:
         assert probe["models"] == ["gpt-5.4", "claude-sonnet-4.6"]
         assert probe["resolved_base_url"] == "https://api.githubcopilot.com"
         assert probe["used_fallback"] is False
+
+    def test_probe_filters_cloudflare_compat_catalog_to_canonical_chat_routes(self):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "data": [
+                            {"id": "grok/grok-4.6"},
+                            {"id": "grok/grok-4.6-20260810"},
+                            {"id": "openrouter/x-ai/grok-4.6"},
+                            {"id": "xai/xai/grok-4.6"},
+                            {"id": "grok/grok-imagine-image"},
+                            {"id": "openai/gpt-5.6-sol"},
+                            {"id": "openai/openai/gpt-5.6-sol"},
+                            {"id": "openai/gpt-5.6-sol:batch"},
+                            {"id": "aws-bedrock/amazon.nova-micro-v1:0"},
+                            {"id": "aws-bedrock/meta.llama3-70b-instruct-v1:0"},
+                        ]
+                    }
+                ).encode()
+
+        with patch(
+            "hermes_cli.models._urlopen_model_catalog_request",
+            return_value=_Resp(),
+        ):
+            probe = probe_api_models(
+                "key",
+                "https://gateway.ai.cloudflare.com/v1/account/gateway/compat",
+            )
+
+        assert probe["models"] == [
+            "grok/grok-4.6",
+            "openai/gpt-5.6-sol",
+            "aws-bedrock/amazon.nova-micro-v1:0",
+        ]
+
+    def test_probe_does_not_filter_other_openai_compatible_catalogs(self):
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"data": [{"id": "openrouter/x-ai/grok-4.6"}, {"id": "xai/xai/grok-4.6"}]}'
+
+        with patch(
+            "hermes_cli.models._urlopen_model_catalog_request",
+            return_value=_Resp(),
+        ):
+            probe = probe_api_models("key", "https://proxy.example/v1")
+
+        assert probe["models"] == [
+            "openrouter/x-ai/grok-4.6",
+            "xai/xai/grok-4.6",
+        ]
 
 
 class TestGithubReasoningEfforts:
