@@ -179,6 +179,10 @@ model:
 """)
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test")
         _fresh_modules()
+        text_only_caps = type("Caps", (), {"supports_vision": False})()
+        monkeypatch.setattr(
+            "agent.models_dev.get_model_capabilities", lambda *a, **k: text_only_caps
+        )
 
         from agent.auxiliary_client import resolve_vision_provider_client
         provider, client, _model = resolve_vision_provider_client(provider="auto")
