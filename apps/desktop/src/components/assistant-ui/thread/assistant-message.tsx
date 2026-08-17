@@ -9,6 +9,7 @@ import {
 import { useStore } from '@nanostores/react'
 import { type FC, useCallback, useMemo, useState } from 'react'
 
+import { useSessionView } from '@/app/chat/session-view'
 import { ChangedFilesCard } from '@/components/assistant-ui/thread/changed-files-card'
 import {
   contentHasVisibleText,
@@ -335,6 +336,10 @@ const ReadAloudButton: FC<{ getText: () => string; messageId: string }> = ({ get
   const { t } = useI18n()
   const copy = t.assistant.thread
   const voicePlayback = useStore($voicePlayback)
+  // Scopes the spoken-text dedupe (see `wasTextAlreadySpoken`) to this
+  // message's own session, so a manual read never suppresses auto-speak of
+  // the same text in an unrelated session.
+  const sessionId = useStore(useSessionView().$runtimeId)
 
   const readAloudStatus =
     voicePlayback.source === 'read-aloud' && voicePlayback.messageId === messageId ? voicePlayback.status : 'idle'
@@ -353,11 +358,11 @@ const ReadAloudButton: FC<{ getText: () => string; messageId: string }> = ({ get
     }
 
     try {
-      await playSpeechText(text, { messageId, source: 'read-aloud' })
+      await playSpeechText(text, { messageId, sessionId, source: 'read-aloud' })
     } catch (error) {
       notifyError(error, copy.readAloudFailed)
     }
-  }, [copy.readAloudFailed, getText, messageId])
+  }, [copy.readAloudFailed, getText, messageId, sessionId])
 
   return (
     <TooltipIconButton

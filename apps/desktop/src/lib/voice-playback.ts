@@ -66,7 +66,46 @@ function currentState(
 
 export interface VoicePlaybackOptions {
   messageId?: string | null
+  /** Scopes the spoken-text dedupe (see `wasTextAlreadySpoken`) to one
+   *  session/tile, so unrelated composers never suppress each other's
+   *  replies just because the text happens to match. */
+  sessionId?: string | null
   source: VoicePlaybackSource
+}
+
+// ---------------------------------------------------------------------------
+// Spoken-text registry — the audio-side dedupe for reply TTS.
+//
+// Deduping "already spoken" by message id breaks when the end-of-turn commit
+// rewrites the live row under its durable id (same reply, new handle): the
+// auto-speak idle-edge listener then re-reads the reply and plays it a second
+// time. Text survives that rewrite, so it is the identity anchor here.
+//
+// Text is marked ONLY after playback actually succeeded, so a failed or
+// barged-in attempt never suppresses a later retry of the same reply. The
+// registry is session-scoped (auto-speak, the manual Read aloud button and
+// voice conversation all pass their session) and holds at most the last
+// spoken reply per session — bounded by sessions open in this window.
+// ---------------------------------------------------------------------------
+
+const normalizeSpokenText = (text: string) => text.replace(/\s+/g, ' ').trim()
+
+const spokenTextBySession = new Map<string, string | null>()
+
+function spokenKey(sessionId: string | null | undefined): string {
+  return sessionId ?? '\u0000'
+}
+
+/** Record that a reply's text was played to completion in `sessionId`. */
+export function markTextSpoken(text: string, sessionId: string | null | undefined): void {
+  spokenTextBySession.set(spokenKey(sessionId), normalizeSpokenText(text) || null)
+}
+
+/** True when this exact reply text was already played in `sessionId`. */
+export function wasTextAlreadySpoken(text: string, sessionId: string | null | undefined): boolean {
+  const last = spokenTextBySession.get(spokenKey(sessionId))
+
+  return last !== undefined && normalizeSpokenText(text) === last
 }
 
 export function stopVoicePlayback() {
@@ -463,6 +502,7 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
         }
 
         setVoicePlaybackState(currentState('idle'))
+        markTextSpoken(speakableText, options.sessionId)
 
         return true
       }
@@ -476,6 +516,7 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
 
     if (played) {
       setVoicePlaybackState(currentState('idle'))
+      markTextSpoken(speakableText, options.sessionId)
     }
 
     return played
