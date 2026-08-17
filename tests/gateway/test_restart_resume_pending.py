@@ -313,6 +313,17 @@ class TestResumePendingSystemNote:
         # But still guards against re-running already-recorded tool calls.
         assert "already appear in the history" in note
 
+    def test_restart_recovery_blocks_blind_replay_but_allows_new_necessary_intent(self):
+        note = build_resume_recovery_note("restart_timeout", "continue", interactive=True)
+        assert "Do not blindly replay the same restart/shutdown intent" in note
+        assert "new target revision or configuration" in note
+        assert "freshness evidence is missing" in note
+        assert "health checks fail" in note
+        assert "create a new restart intent" in note
+        assert "restart again" in note
+        assert "verify the new process" in note
+        assert "do NOT re-execute or verify it" not in note
+
 
     def test_resume_pending_fires_without_tool_tail(self):
         """Key improvement over PR #9934: the restart-resume note fires
