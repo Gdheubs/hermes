@@ -343,3 +343,27 @@ def test_compacted_content_reaches_bedrock_tool_result_block():
                    for b in (c.get("toolResult", {}).get("content") or []) if isinstance(b, dict)]
     text = " ".join(str(b.get("text", "")) for b in text_blocks)
     assert "compacted for model replay" in text and "--- head ---" in text
+
+
+def test_send_copy_only_unit_pin():
+    """The wire economy mutates the SEND COPY it is given — the caller's
+    copy protects the session store (the integration test pins the real flow;
+    this pins the contract at the unit level)."""
+    import copy
+    from agent.deepseek_replay import apply_deepseek_replay_compaction
+
+    msgs = [
+        {"role": "assistant", "content": "plain", "reasoning_content": "R" * 300},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "f", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "L" * 13000},
+    ]
+    stored = copy.deepcopy(msgs)  # the session store holds a deep copy
+    out, _ = apply_deepseek_replay_compaction(
+        copy.deepcopy(msgs), provider="deepseek", model="deepseek-v4-pro",
+        base_url="https://api.deepseek.com/v1",
+    )
+    assert stored[0].get("reasoning_content") == "R" * 300   # the stored reasoning intact
+    assert stored[2]["content"] == "L" * 13000               # the stored tool result raw
+    wire_tool = next(m for m in out if m.get("role") == "tool")
+    assert wire_tool["content"] != "L" * 13000               # the wire compacted
