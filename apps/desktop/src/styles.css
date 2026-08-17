@@ -2443,7 +2443,7 @@ button[data-slot='aui_msg-reactions'] svg {
 /* The band's sheet, behind the transcript: a tint wearing the same gradient
    mask as the text, so the whole surface ramps out together and the band has no
    top edge at all.
- 
+
    No desktop blur under it, and that is a limit rather than an omission. CSS
    backdrop-filter reaches nothing here — a transparent window's backdrop root
    is the document, and the desktop was never in it (verified on the real
@@ -2472,7 +2472,7 @@ button[data-slot='aui_msg-reactions'] svg {
      because the one time the transcript's own container was collapsed the
      messages spilled out of a zero-height box. Translate rather than scale: the
      panel keeps its proportions on the way out instead of being squashed.
- 
+
      The height below still tracks the transcript; only the offset animates on
      exit, and it finishes ahead of the fade so the panel has left while the last
      of the text is still going. */
