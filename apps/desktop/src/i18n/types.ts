@@ -1091,6 +1091,8 @@ export interface Translations {
     importSuccess: (nodes: number) => string
     importedBadge: string
     resetToMine: string
+    exportVideo: string
+    exportGif: string
   }
   agents: {
     close: string
