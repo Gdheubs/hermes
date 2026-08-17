@@ -652,7 +652,7 @@ DEFAULT_CONFIG = {
         # searches or spawning dozens of subagents is already pathological, so
         # the defaults are low. Set either to 0 to disable that cap (unlimited).
         "loop_caps": {
-            "max_web_searches": 50,   # max web_search calls per turn (0 = unlimited)
+            "max_web_searches": 12,   # shared web_search/web_extract budget per turn (0 = unlimited)
             "max_subagents": 50,      # max subagents spawned per turn (0 = unlimited)
         },
     },

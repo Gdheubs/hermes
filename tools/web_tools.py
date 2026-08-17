@@ -630,7 +630,8 @@ def web_search_tool(query: str, limit: int = 5) -> str:
     with multiple backends (Parallel or Firecrawl).
 
     Note: This function returns search result metadata only (URLs, titles, descriptions).
-    Use web_extract_tool to get full content from specific URLs.
+    Use web_extract_tool to get full content from specific URLs when it is
+    available; otherwise open promising results with the browser tools.
     
     Args:
         query (str): The search query to look up
@@ -1053,42 +1054,62 @@ async def web_extract_tool(
 
 
 # Convenience function to check Firecrawl credentials
-def check_web_api_key() -> bool:
-    """Check whether the configured web backend is available.
+def _check_web_capability(capability: str) -> bool:
+    """Return whether at least one provider can serve *capability*.
 
-    Used as the ``check_fn`` gate for the ``web_search`` and ``web_extract``
-    tool registry entries — so a plugin-registered provider that reports
-    ``is_available()`` must light the tools up even when no built-in backend
-    has credentials (issues #28651, #31873). Resolution funnels through
-    :func:`_is_backend_available`, which delegates non-legacy names to the
-    registry.
+    Search-only providers must not make ``web_extract`` visible to the model.
+    Advertising a tool that cannot run encourages futile fallback loops (for
+    example DDGS search -> web_extract -> DDGS capability error -> more search).
+    Keep this probe capability-aware and network-free; provider
+    ``is_available()`` implementations are required to be cheap local checks.
     """
-    # ``or ""``: a null ``web.backend`` value yields None from ``.get``, and
-    # ``None.lower()`` would raise. Mirrors ``_get_backend``.
-    configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured and _is_backend_available(configured):
-        return True
-    # Any built-in backend with credentials present. This is a boolean OR, so
-    # unlike _get_backend() the probe order is irrelevant.
-    if any(_is_backend_available(backend) for backend in _LEGACY_WEB_BACKENDS):
-        return True
-    # Any plugin-registered provider the registry considers active for either
-    # capability. Delegating to the registry's own availability-filtered
-    # resolvers keeps a single authority for "is a custom provider usable"
-    # rather than re-implementing the walk here.
     try:
+        _ensure_web_plugins_loaded()
         from agent.web_search_registry import (
-            get_active_search_provider,
             get_active_extract_provider,
+            get_active_search_provider,
         )
 
-        return (
-            get_active_search_provider() is not None
-            or get_active_extract_provider() is not None
+        resolver = (
+            get_active_search_provider
+            if capability == "search"
+            else get_active_extract_provider
         )
-    except Exception as exc:  # noqa: BLE001 — registry optional; never fatal
-        logger.debug("web provider registry availability check failed: %s", exc)
+        if resolver() is not None:
+            return True
+
+        # Registry discovery can be deliberately unavailable in stripped
+        # installs and tests. Preserve the legacy built-in probes, but filter
+        # them by capability so a search-only backend never enables extract.
+        builtins = (
+            _LEGACY_WEB_BACKENDS
+            if capability == "search"
+            else frozenset({"firecrawl", "tavily", "exa", "parallel"})
+        )
+        return any(_is_backend_available(name) for name in builtins)
+    except Exception as exc:  # noqa: BLE001 — availability is best-effort
+        logger.debug("web %s capability check failed: %s", capability, exc)
         return False
+
+
+def check_web_search_available() -> bool:
+    """Return whether the configured providers support web search."""
+    return _check_web_capability("search")
+
+
+def check_web_extract_available() -> bool:
+    """Return whether the configured providers support URL extraction."""
+    return _check_web_capability("extract")
+
+
+def check_web_api_key() -> bool:
+    """Backward-compatible check for any configured web capability.
+
+    External callers historically used this as an "any web tool" probe, so
+    retain that contract while registry entries use the capability-specific
+    checks below.
+    """
+    return check_web_search_available() or check_web_extract_available()
 
 
 if __name__ == "__main__":
@@ -1175,7 +1196,7 @@ from tools.registry import registry, tool_error
 
 WEB_SEARCH_SCHEMA = {
     "name": "web_search",
-    "description": "Search the web for information. Returns up to 5 results by default with titles, URLs, and descriptions. The query is passed through to the configured backend, so operators such as site:domain, filetype:pdf, intitle:word, -term, and \"exact phrase\" may work when the backend supports them.",
+    "description": "Search the web for information. Returns up to 5 results by default with titles, URLs, and descriptions. Use a small number of focused searches, inspect each batch before reformulating, and stop searching once enough relevant candidates exist. Open promising URLs with web_extract when available or browser tools otherwise. If the available evidence supports fewer items than requested, answer with the verified subset and state the gap instead of issuing a broad query fan-out. The query is passed through to the configured backend, so operators such as site:domain, filetype:pdf, intitle:word, -term, and \"exact phrase\" may work when the backend supports them.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1222,7 +1243,7 @@ registry.register(
     toolset="web",
     schema=WEB_SEARCH_SCHEMA,
     handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=args.get("limit", 5)),
-    check_fn=check_web_api_key,
+    check_fn=check_web_search_available,
     requires_env=_web_requires_env(),
     emoji="🔍",
     max_result_size_chars=100_000,
@@ -1236,7 +1257,7 @@ registry.register(
         "markdown",
         char_limit=args.get("char_limit"),
     ),
-    check_fn=check_web_api_key,
+    check_fn=check_web_extract_available,
     requires_env=_web_requires_env(),
     is_async=True,
     emoji="📄",

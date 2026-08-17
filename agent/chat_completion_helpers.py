@@ -1822,10 +1822,41 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
+_WEB_RESEARCH_TOOL_NAMES = frozenset({"web_search", "web_extract"})
+
+
+def _tool_definition_name(tool: object) -> str:
+    """Best-effort extraction for the canonical OpenAI-style tool schema."""
+    if not isinstance(tool, dict):
+        return ""
+    function = tool.get("function")
+    if isinstance(function, dict):
+        return str(function.get("name") or "")
+    return str(tool.get("name") or "")
+
+
+def _filter_exhausted_web_tools(agent, tools_for_api: list | None) -> list | None:
+    """Return a request-local tool list without web tools after budget use.
+
+    Never mutate ``agent.tools`` or a prompt-cache-derived list: the budget is
+    per turn, so the complete registry must be available again after reset.
+    """
+    guardrails = getattr(agent, "_tool_guardrails", None)
+    if not getattr(guardrails, "web_budget_exhausted", False):
+        return tools_for_api
+    if not tools_for_api:
+        return tools_for_api
+    return [
+        tool for tool in tools_for_api
+        if _tool_definition_name(tool) not in _WEB_RESEARCH_TOOL_NAMES
+    ]
+
+
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
         tools_for_api = agent.tools
+    tools_for_api = _filter_exhausted_web_tools(agent, tools_for_api)
 
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()

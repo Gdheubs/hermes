@@ -423,3 +423,76 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+def test_web_budget_halt_response_is_actionable_and_not_an_internal_loop_dump():
+    from agent.tool_guardrails import ToolGuardrailDecision
+
+    agent = _make_agent("web_search")
+    response = agent._toolguard_controlled_halt_response(
+        ToolGuardrailDecision(
+            action="block",
+            code="loop_web_research_cap",
+            tool_name="web_search",
+            count=12,
+        )
+    )
+
+    assert "12 search/extract requests" in response
+    assert "direct/official data source" in response
+    assert "loop_web_research_cap" not in response
+
+
+def test_web_budget_denial_allows_next_model_iteration_to_synthesize():
+    agent = _make_agent(
+        "web_search", "web_extract", "terminal",
+        max_iterations=4,
+        config={
+            "tool_loop_guardrails": {
+                "loop_caps": {"max_web_searches": 1},
+            }
+        },
+    )
+    calls = [
+        _mock_tool_call("web_search", json.dumps({"query": "focused"}), "c-allowed"),
+        _mock_tool_call("web_search", json.dumps({"query": "fanout"}), "c-denied"),
+    ]
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=calls),
+        _mock_response(content="Encontré un resultado verificado.", finish_reason="stop"),
+    ]
+    agent._disable_streaming = True
+
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"success": True})),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("find results")
+
+    assert result["turn_exit_reason"].startswith("text_response")
+    assert result["final_response"] == "Encontré un resultado verificado."
+    assert "guardrail" not in result
+    batch_results = [
+        message for message in result["messages"]
+        if message.get("tool_call_id") in {"c-allowed", "c-denied"}
+    ]
+    denied = [
+        message for message in batch_results
+        if "loop_web_research_cap" in message.get("content", "")
+    ]
+    allowed = [message for message in batch_results if message not in denied]
+    assert len(batch_results) == 2
+    assert len(denied) == 1
+    assert "loop_web_research_cap" in denied[0]["content"]
+    assert len(allowed) == 1
+    assert '"success": true' in allowed[0]["content"]
+
+    assert agent.client.chat.completions.create.call_count == 2
+    second_tools = agent.client.chat.completions.create.call_args_list[1].kwargs["tools"]
+    second_names = {tool["function"]["name"] for tool in second_tools}
+    assert second_names == {"terminal"}
+    assert {tool["function"]["name"] for tool in agent.tools} == {
+        "web_search", "web_extract", "terminal",
+    }

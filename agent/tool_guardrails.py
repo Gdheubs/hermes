@@ -132,7 +132,7 @@ class ToolCallGuardrailConfig:
 # single turn" rather than cumulative over the whole session. A single loop
 # issuing dozens of web searches or spawning dozens of subagents is already
 # pathological, so the defaults are deliberately low.
-_DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 50
+_DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 12
 _DEFAULT_MAX_SUBAGENTS_PER_TURN = 50
 
 
@@ -145,8 +145,9 @@ class LoopCapConfig:
     loops. Here the caps count *within a single agent loop* (one turn): the
     counters reset in ``reset_for_turn`` at the start of every
     ``run_conversation``, so a legitimate multi-turn session is never starved,
-    but a single turn that spirals into an unbounded search / delegation loop
-    is stopped.
+    but a single turn cannot keep executing an unbounded search / delegation
+    loop. Web calls beyond the budget are denied so the model can synthesize
+    from collected results; runaway delegation still halts the turn.
 
     Semantics differ from the per-turn loop *detector* above (which keys on
     repeated identical/failing calls): these caps are a hard ceiling on the
@@ -194,7 +195,7 @@ class ToolCallSignature:
 class ToolGuardrailDecision:
     """Decision returned by the tool-call guardrail controller."""
 
-    action: str = "allow"  # allow | warn | block | halt
+    action: str = "allow"  # allow | warn | deny | block | halt
     code: str = "allow"
     message: str = ""
     tool_name: str = ""
@@ -285,12 +286,24 @@ class ToolCallGuardrailController:
         # Per-turn runaway-loop cap counters. Reset every turn (this method
         # runs at the start of each run_conversation), so the caps bound a
         # single agent loop rather than accumulating across the session.
-        self._turn_web_search_count = 0
+        self._turn_web_request_count = 0
         self._turn_subagent_count = 0
+        self._web_budget_exhausted = False
+        self._web_budget_denial_count = 0
 
     @property
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
+
+    @property
+    def web_budget_exhausted(self) -> bool:
+        """Whether web tools must be hidden for the rest of this turn."""
+        return self._web_budget_exhausted
+
+    @property
+    def web_budget_denial_count(self) -> int:
+        """Number of post-budget web calls rejected in this turn."""
+        return self._web_budget_denial_count
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
@@ -299,7 +312,7 @@ class ToolCallGuardrailController:
         # These are hard ceilings on how many times a runaway-prone tool may
         # be called within a single agent loop (turn). They apply regardless
         # of hard_stop_enabled (which only governs the per-turn loop detector).
-        # We block BEFORE the call runs once the count is already at the cap,
+        # We deny BEFORE the call runs once the count is already at the cap,
         # then increment for an allowed call so the (cap+1)-th is refused.
         cap_block = self._check_loop_cap(tool_name, _coerce_args(args), signature)
         if cap_block is not None:
@@ -459,25 +472,28 @@ class ToolCallGuardrailController:
         """
         caps = self.config.loop_caps
 
-        if tool_name == "web_search":
+        if tool_name in {"web_search", "web_extract"}:
             cap = caps.max_web_searches
-            if cap and self._turn_web_search_count >= cap:
+            if cap and self._turn_web_request_count >= cap:
+                self._web_budget_exhausted = True
+                self._web_budget_denial_count += 1
                 decision = ToolGuardrailDecision(
-                    action="block",
-                    code="loop_web_search_cap",
+                    action="deny",
+                    code="loop_web_research_cap",
                     message=(
-                        f"Blocked web_search: this turn has already made {cap} "
-                        "web searches, the per-turn limit. This looks like a "
-                        "runaway search loop. Work with the results you already "
-                        "have and give the user your answer."
+                        f"Blocked {tool_name}: this turn has already made {cap} "
+                        "web search/extract requests, the per-turn limit. Do not "
+                        "call web_search or web_extract again in this turn. "
+                        "Synthesize the answer now from the results already "
+                        "collected, explicitly distinguishing verified facts, "
+                        "candidates, and missing evidence."
                     ),
                     tool_name=tool_name,
-                    count=self._turn_web_search_count,
+                    count=self._turn_web_request_count,
                     signature=signature,
                 )
-                self._halt_decision = decision
                 return decision
-            self._turn_web_search_count += 1
+            self._turn_web_request_count += 1
             return None
 
         if tool_name == "delegate_task":
