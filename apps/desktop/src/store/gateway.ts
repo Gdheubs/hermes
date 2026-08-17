@@ -71,6 +71,10 @@ interface GatewayRegistryState {
   activationEpoch: number
   secondaries: Map<string, Secondary>
   $gateway: ReturnType<typeof atom<HermesGateway | null>>
+  // Transport install/reconnect observers keyed by PROFILE name (session
+  // ownership). Surfaces that render a background profile subscribe here to
+  // learn when its socket is ready WITHOUT observing the foreground `activeKey`.
+  profileListeners: Set<(profile: string) => void>
 }
 
 const STATE_KEY = Symbol.for('hermes.desktop.gatewayRegistryState')
@@ -86,7 +90,8 @@ function createRegistryState(): GatewayRegistryState {
     // The active gateway instance, exposed for inline message-stream
     // components (inline ClarifyTool, model overlays) that call gateway
     // methods without the instance threaded down through props.
-    $gateway: atom<HermesGateway | null>(null)
+    $gateway: atom<HermesGateway | null>(null),
+    profileListeners: new Set()
   }
 }
 
@@ -131,8 +136,14 @@ export function emitLocalGatewayEvent(event: GatewayEvent): void {
 }
 
 export function setPrimaryGateway(gateway: HermesGateway | null, profile = 'default'): void {
+  const previousProfile = g.primaryProfile
   g.primaryGateway = gateway
   g.primaryProfile = normKey(profile)
+  g.profileListeners.forEach(listener => listener(previousProfile))
+
+  if (g.primaryProfile !== previousProfile) {
+    g.profileListeners.forEach(listener => listener(g.primaryProfile))
+  }
 }
 
 export function isActivePrimary(): boolean {
@@ -191,6 +202,7 @@ function reportGatewayState(profile: string, state: ConnectionState): void {
 
 export function reportPrimaryGatewayState(state: ConnectionState): void {
   reportGatewayState(g.primaryProfile, state)
+  g.profileListeners.forEach(listener => listener(g.primaryProfile))
 }
 
 function setActive(profile: string): void {
@@ -388,9 +400,12 @@ function createSecondary(profile: string, connectionId: null | string = null): S
     } else if ((state === 'closed' || state === 'error') && entry.wantOpen) {
       scheduleReconnect(entry)
     }
+
+    g.profileListeners.forEach(listener => listener(profile))
   })
 
   g.secondaries.set(scope, entry)
+  g.profileListeners.forEach(listener => listener(profile))
 
   return entry
 }
@@ -579,6 +594,38 @@ export async function openGatewayForProfile(profile: string): Promise<void> {
   await gatewayForProfile(profile)
 }
 
+/** Read a profile's transport connection state WITHOUT changing the foreground
+ * route or opening a socket. Returns the live gateway (primary or pooled
+ * secondary) when dialed, else null. The embedded SessionSurface uses this to
+ * decide adopt-vs-resume without activating the profile. */
+export function profileGatewayState(profile: string): HermesGateway | null {
+  const key = normKey(profile)
+
+  if (key === g.primaryProfile) {
+    return g.primaryGateway
+  }
+
+  return g.secondaries.get(key)?.gateway ?? null
+}
+
+/** Observe profile transport install/reconnect without observing activeKey. */
+export function subscribeProfileGateways(listener: (profile: string) => void): () => void {
+  g.profileListeners.add(listener)
+
+  return () => g.profileListeners.delete(listener)
+}
+
+/** Observe only one profile's transport install/connection changes. */
+export function subscribeProfileGateway(profile: string, listener: () => void): () => void {
+  const key = normKey(profile)
+
+  return subscribeProfileGateways(changedProfile => {
+    if (normKey(changedProfile) === key) {
+      listener()
+    }
+  })
+}
+
 // ── Connection-scoped agents (multi-source roster) ─────────────────────────
 // The (connectionId, profile) analogues of the profile functions above. A
 // null connectionId falls straight through to the profile path. An explicit
@@ -757,6 +804,7 @@ function disposeSecondary(entry: Secondary): void {
   entry.offEvent()
   entry.offState()
   entry.gateway.close()
+  g.profileListeners.forEach(listener => listener(entry.profile))
 }
 
 // Invariant restore for every eviction path: if the active key names a

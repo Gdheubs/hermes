@@ -2,11 +2,20 @@ import { useEffect } from 'react'
 
 import { getLatestSessionMessages, PROMPT_SUBMIT_REQUEST_TIMEOUT_MS } from '@/hermes'
 import { toChatMessages } from '@/lib/chat-messages'
-import { publishSessionState, setSessionTileDelegate } from '@/store/session-states'
+import { requestGatewayForProfile } from '@/store/gateway'
+import { normalizeProfileKey } from '@/store/profile'
+import {
+  publishSessionState,
+  sessionRuntimeStateKey,
+  type SessionSurfaceIdentity,
+  type SessionSurfaceRuntimeIdentity,
+  setSessionTileDelegate,
+  StaleSessionSurfaceRuntimeError
+} from '@/store/session-states'
 import type { SessionResumeResponse } from '@/types/hermes'
 
 import type { usePromptActions } from '../../session/hooks/use-prompt-actions'
-import { markSessionRecentlyInterrupted, withSessionNotFoundResume } from '../../session/hooks/use-prompt-actions/utils'
+import { isSessionNotFoundError, markSessionRecentlyInterrupted, withSessionNotFoundResume } from '../../session/hooks/use-prompt-actions/utils'
 import { resolveSessionProfile } from '../../session/hooks/use-session-actions/utils'
 import type { useSessionStateCache } from '../../session/hooks/use-session-state-cache'
 import type { GatewayRequester } from '../types'
@@ -25,11 +34,13 @@ interface SessionTileDelegateParams {
 }
 
 /**
- * Publishes the session-tile delegate: resume / submit / interrupt / slash for
- * tiled sessions WITHOUT touching the primary view ($activeSessionId /
- * $messages stay the main thread's). Resume reuses a live runtime binding when
- * one exists (incl. the main thread's own session); a cold tile binds +
- * hydrates the cache, which publishSessionState mirrors to the tile.
+ * Publishes the session-tile delegate: resume / adopt / submit / interrupt /
+ * slash for tiled AND embedded surfaces WITHOUT touching the primary view
+ * ($activeSessionId / $messages stay the main thread's). Surface resume and
+ * adopt route through the identity's OWNING profile gateway
+ * (requestGatewayForProfile) so a background-profile surface never detours the
+ * foreground; a cold surface binds + hydrates the cache, which
+ * publishSessionState mirrors to the surface.
  */
 export function useSessionTileDelegate({
   archiveSession,
@@ -42,6 +53,36 @@ export function useSessionTileDelegate({
   updateSessionState
 }: SessionTileDelegateParams): void {
   useEffect(() => {
+    // Durable surface bindings keyed by profile-qualified stored identity. A
+    // runtime id is a cache warm-path hint, never the identity itself.
+    const surfaceRuntimeByIdentity = new Map<string, string>()
+
+    const surfaceKey = ({ profile, storedSessionId }: SessionSurfaceIdentity) =>
+      `${normalizeProfileKey(profile)}\u0000${storedSessionId}`
+
+    const discardSurface = ({ profile, storedSessionId }: SessionSurfaceIdentity): string[] => {
+      const ownerProfile = normalizeProfileKey(profile)
+      const identityKey = surfaceKey({ profile: ownerProfile, storedSessionId })
+      const runtimeId = surfaceRuntimeByIdentity.get(identityKey)
+
+      surfaceRuntimeByIdentity.delete(identityKey)
+      runtimeIdByStoredSessionIdRef.current.delete(storedSessionId)
+
+      if (runtimeId) {
+        sessionStateByRuntimeIdRef.current.delete(sessionRuntimeStateKey(ownerProfile, runtimeId))
+      }
+
+      return runtimeId ? [runtimeId] : []
+    }
+
+    const discardStaleSurfaceRuntime = (identity: SessionSurfaceRuntimeIdentity) => {
+      const key = surfaceKey(identity)
+
+      if (surfaceRuntimeByIdentity.get(key) === identity.runtimeSessionId) {
+        surfaceRuntimeByIdentity.delete(key)
+      }
+    }
+
     // A tile's runtime binding can die the same way the foreground's does
     // (sleep/wake, backend restart). The cache maps stored -> runtime, so walk
     // it backwards to find the durable id this runtime belongs to.
@@ -71,15 +112,118 @@ export function useSessionTileDelegate({
       }
     }
 
+    const resumeSurface = async ({ profile, storedSessionId }: SessionSurfaceIdentity) => {
+      if (!profile.trim()) {
+        throw new Error('SessionSurface requires an explicit profile')
+      }
+
+      const surfaceRuntime = surfaceRuntimeByIdentity.get(surfaceKey({ profile, storedSessionId }))
+
+      const cached = surfaceRuntime
+        ? sessionStateByRuntimeIdRef.current.get(sessionRuntimeStateKey(profile, surfaceRuntime))
+        : undefined
+
+      if (surfaceRuntime && cached?.storedSessionId === storedSessionId) {
+        publishSessionState(surfaceRuntime, cached)
+
+        return surfaceRuntime
+      }
+
+      const [prefetch, resumed] = await Promise.all([
+        getLatestSessionMessages(storedSessionId, profile).catch(() => null),
+        requestGatewayForProfile<SessionResumeResponse>(profile, 'session.resume', {
+          session_id: storedSessionId,
+          cols: 96,
+          omit_messages: true,
+          profile
+        })
+      ])
+
+      const runtimeId = resumed?.session_id
+
+      if (!runtimeId) {
+        throw new Error('resume returned no session id')
+      }
+
+      surfaceRuntimeByIdentity.set(surfaceKey({ profile, storedSessionId }), runtimeId)
+      updateSessionState(
+        runtimeId,
+        state => ({
+          ...state,
+          busy: Boolean(resumed?.info?.running),
+          messages: state.messages.length > 0 ? state.messages : toChatMessages(prefetch?.messages ?? resumed?.messages ?? [])
+        }),
+        storedSessionId
+      )
+
+      return runtimeId
+    }
+
     setSessionTileDelegate({
-      archiveSession: async storedSessionId => {
-        await archiveSession(storedSessionId)
+      adoptSurface: async (identity: SessionSurfaceRuntimeIdentity) => {
+        if (!identity.profile.trim()) {
+          throw new Error('SessionSurface requires an explicit profile')
+        }
+
+        let status: { output?: string }
+
+        try {
+          status = await requestGatewayForProfile<{ output?: string }>(identity.profile, 'session.status', {
+            session_id: identity.runtimeSessionId
+          })
+        } catch (error) {
+          if (isSessionNotFoundError(error)) {
+            discardStaleSurfaceRuntime(identity)
+            throw new StaleSessionSurfaceRuntimeError('Session surface runtime hint was not found')
+          }
+
+          throw error
+        }
+
+        const authoritativeStoredId = status.output
+          ?.split('\n')
+          .find(line => line.startsWith('Session ID: '))
+          ?.slice('Session ID: '.length)
+          .trim()
+
+        if (authoritativeStoredId !== identity.storedSessionId) {
+          discardStaleSurfaceRuntime(identity)
+          throw new StaleSessionSurfaceRuntimeError('Session surface identity mismatch')
+        }
+
+        surfaceRuntimeByIdentity.set(surfaceKey(identity), identity.runtimeSessionId)
+
+        const cached = sessionStateByRuntimeIdRef.current.get(
+          sessionRuntimeStateKey(identity.profile, identity.runtimeSessionId)
+        )
+
+        updateSessionState(
+          identity.runtimeSessionId,
+          state =>
+            cached?.storedSessionId === identity.storedSessionId
+              ? { ...state }
+              : { ...state, messages: [], streamId: null, busy: false, awaitingResponse: false },
+          identity.storedSessionId
+        )
+
+        return identity.runtimeSessionId
       },
-      branchSession: async storedSessionId => {
+      archiveSession: async (storedSessionId, profile) => {
+        await archiveSession(storedSessionId)
+
+        if (profile) {
+          discardSurface({ profile, storedSessionId })
+        }
+      },
+      branchSession: async (storedSessionId) => {
         await branchStoredSession(storedSessionId)
       },
-      deleteSession: async storedSessionId => {
+      deleteSession: async (storedSessionId, profile) => {
         await removeSession(storedSessionId)
+
+        if (profile) {
+          discardSurface({ profile, storedSessionId })
+        }
       },
       executeSlash: async (rawCommand, sessionId) => {
         await executeSlashCommand(rawCommand, { sessionId })
@@ -112,6 +256,7 @@ export function useSessionTileDelegate({
           }
         )
       },
+      resumeSurface,
       resumeTile: async storedSessionId => {
         const existing = runtimeIdByStoredSessionIdRef.current.get(storedSessionId)
         const cached = existing ? sessionStateByRuntimeIdRef.current.get(existing) : undefined
@@ -135,13 +280,17 @@ export function useSessionTileDelegate({
         // the same cross-profile bleed the recovery resumes had (#67603).
         const profile = await resolveSessionProfile(storedSessionId)
 
+        if (!profile) {
+          throw new Error('Session surface profile unavailable')
+        }
+
         const [prefetch, resumed] = await Promise.all([
           getLatestSessionMessages(storedSessionId, profile).catch(() => null),
           requestGateway<SessionResumeResponse>('session.resume', {
             session_id: storedSessionId,
             cols: 96,
             omit_messages: true,
-            ...(profile ? { profile } : {})
+            profile
           })
         ])
 
@@ -156,8 +305,7 @@ export function useSessionTileDelegate({
           state => ({
             ...state,
             busy: Boolean(resumed?.info?.running),
-            messages:
-              state.messages.length > 0 ? state.messages : toChatMessages(prefetch?.messages ?? resumed?.messages ?? [])
+            messages: state.messages.length > 0 ? state.messages : toChatMessages(prefetch?.messages ?? resumed?.messages ?? [])
           }),
           storedSessionId
         )
