@@ -21,7 +21,7 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, restrict_credential_file
 from typing import Any, Dict, List, Optional, Tuple
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
 from agent.secret_scope import get_secret as _get_secret
@@ -1307,6 +1307,27 @@ def _write_claude_code_credentials(
             except OSError:
                 pass
             raise
+        # The 0o600 mode above is authoritative on POSIX but meaningless on
+        # Windows, where the file simply inherits the parent directory's ACL
+        # (commonly granting ``Users`` / sandbox groups read access — see
+        # F1). Enforce a user-only ACL cross-platform; refuse quietly to
+        # write fresh tokens only if the restriction itself fails, since a
+        # token we cannot protect must not silently persist group-readable.
+        if not restrict_credential_file(cred_path):
+            logger.warning(
+                "Wrote refreshed credentials to %s but could not restrict "
+                "the file to the current user; refusing to persist the "
+                "refresh so the token is not left group-readable.",
+                cred_path,
+            )
+            try:
+                cred_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise OSError(
+                f"Refusing to persist refreshed credentials: could not "
+                f"restrict {cred_path} to the current user"
+            )
     except (OSError, IOError) as e:
         logger.debug("Failed to write refreshed credentials: %s", e)
 

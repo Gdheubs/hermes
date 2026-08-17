@@ -1397,6 +1397,23 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
         auth_file.chmod(stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass
+    # The chmod above is a no-op on Windows, where the file inherits the
+    # parent directory's ACL instead (F1). Enforce a user-only ACL via
+    # icacls; on failure warn loudly but do NOT refuse the write — the
+    # Hermes store must stay functional even on exotic filesystems, and
+    # the parent-dir (secure_parent_dir) already narrows most exposure.
+    try:
+        from hermes_constants import restrict_credential_file
+        if not restrict_credential_file(auth_file):
+            logger.warning(
+                "auth: wrote %s but could not restrict it to the current "
+                "user (ACL enforcement failed); check the file's "
+                "permissions on Windows (icacls %s /inheritance:r "
+                '/grant:r "%USERNAME%":(R,W)).',
+                auth_file, auth_file,
+            )
+    except Exception as exc:
+        logger.debug("auth: ACL restriction skipped for %s: %s", auth_file, exc)
     return auth_file
 
 
@@ -4054,12 +4071,39 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
     
     Returns tokens dict if valid and not expired, None otherwise.
     Does NOT write to the shared file.
+
+    Refuses to import when the shared file is readable by accounts other
+    than the current user (group/other read on POSIX; non-benign ACEs on
+    Windows, e.g. ``CodexSandboxUsers:(I)(RX)``). Importing from an
+    already-exposed file would silently bless a credential the operator
+    believes is private — fail closed and tell them to fix the ACL
+    (``chmod 600 ~/.codex/auth.json`` / ``icacls ~/.codex/auth.json
+    /inheritance:r /grant:r \"%USERNAME%\":(R,W)``) instead.
     """
     codex_home = os.getenv("CODEX_HOME", "").strip()
     if not codex_home:
         codex_home = str(Path.home() / ".codex")
     auth_path = Path(codex_home).expanduser() / "auth.json"
     if not auth_path.is_file():
+        return None
+    try:
+        from hermes_constants import credential_file_is_user_restricted
+        if not credential_file_is_user_restricted(auth_path):
+            logger.warning(
+                "Refusing to import tokens from %s: the file is readable "
+                "by accounts other than the current user. Restrict it to "
+                "the current user (POSIX: chmod 600; Windows: icacls %s "
+                "/inheritance:r /grant:r \"%%USERNAME%%\":(R,W)) and retry.",
+                auth_path, auth_path,
+            )
+            return None
+    except Exception as exc:
+        # ACL check itself failed — fail closed rather than importing from
+        # a file whose exposure we could not verify.
+        logger.warning(
+            "Refusing to import tokens from %s: could not verify the file "
+            "is user-restricted (%s).", auth_path, exc,
+        )
         return None
     try:
         payload = json.loads(auth_path.read_text(encoding="utf-8-sig"))
