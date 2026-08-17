@@ -1660,6 +1660,11 @@ BROWSER_ORPHAN_GRACE_SECONDS = max(3600, BROWSER_SESSION_INACTIVITY_TIMEOUT * 20
 
 # Track last activity time per session
 _session_last_activity: Dict[str, float] = {}
+# Background cleanup runs outside the per-turn ContextVar context.  Preserve
+# the credential scope that owned each browser session so cleanup can reinstall
+# that exact scope instead of performing an unscoped (and therefore unsafe)
+# secret read in a multiplexed gateway.
+_session_secret_scopes: Dict[str, Optional[Dict[str, str]]] = {}
 
 # Background cleanup thread state
 _cleanup_thread = None
@@ -1732,6 +1737,7 @@ def _emergency_cleanup_all_sessions():
             with _cleanup_lock:
                 _active_sessions.clear()
                 _session_last_activity.clear()
+                _session_secret_scopes.clear()
                 _recording_sessions.clear()
 
     # Sweep orphans from other crashed hermes processes.  Safe even if we
@@ -1778,8 +1784,8 @@ def _cleanup_inactive_browser_sessions():
             logger.info("Cleaning up inactive session for task: %s (inactive for %ss)", task_id, elapsed)
             cleanup_browser(task_id)
             with _cleanup_lock:
-                if task_id in _session_last_activity:
-                    del _session_last_activity[task_id]
+                _session_last_activity.pop(task_id, None)
+                _session_secret_scopes.pop(task_id, None)
         except Exception as e:
             logger.warning("Error cleaning up inactive session %s: %s", task_id, e)
 
@@ -2135,8 +2141,14 @@ def _stop_browser_cleanup_thread():
 
 def _update_session_activity(task_id: str):
     """Update the last activity timestamp for a session."""
+    from agent.secret_scope import current_secret_scope
+
+    current_scope = current_secret_scope()
     with _cleanup_lock:
         _session_last_activity[task_id] = time.time()
+        _session_secret_scopes[task_id] = (
+            dict(current_scope) if current_scope is not None else None
+        )
 
 
 # Register cleanup thread stop on exit
@@ -4879,6 +4891,19 @@ def _cleanup_old_recordings(max_age_hours=72):
 # Cleanup and Management Functions
 # ============================================================================
 
+def _cleanup_browser_session_in_scope(session_key: str) -> None:
+    """Reap one session under the profile secret scope that created it."""
+    from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+    with _cleanup_lock:
+        session_scope = _session_secret_scopes.get(session_key)
+    scope_token = set_secret_scope(session_scope)
+    try:
+        _cleanup_single_browser_session(session_key)
+    finally:
+        reset_secret_scope(scope_token)
+
+
 def cleanup_browser(task_id: Optional[str] = None) -> None:
     """
     Clean up browser session(s) for a task.
@@ -4912,7 +4937,7 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
         bare_task_id = task_id
 
     for session_key in session_keys:
-        _cleanup_single_browser_session(session_key)
+        _cleanup_browser_session_in_scope(session_key)
 
     # Drop stale last-active ownership. Cleaning a bare task drops its binding;
     # cleaning a sidecar drops the binding only if that sidecar was still the
@@ -4980,6 +5005,7 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         with _cleanup_lock:
             _active_sessions.pop(task_id, None)
             _session_last_activity.pop(task_id, None)
+            _session_secret_scopes.pop(task_id, None)
 
         # Cloud mode: close the cloud browser session via provider API.
         # Local sidecars have bb_session_id=None so this no-ops for them.

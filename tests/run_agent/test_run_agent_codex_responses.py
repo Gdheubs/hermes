@@ -1,4 +1,6 @@
 import sys
+import threading
+import time
 import types
 from types import SimpleNamespace
 
@@ -261,6 +263,24 @@ class _FakeCreateStream:
         self.closed = True
 
 
+class _SilentThenCompletedStream:
+    """Keep the iterator silent long enough to require an out-of-band heartbeat."""
+
+    def __init__(self, response, quiet_seconds=0.08):
+        self.response = response
+        self.quiet_seconds = quiet_seconds
+        self.first_yield_at = None
+        self.closed = False
+
+    def __iter__(self):
+        threading.Event().wait(self.quiet_seconds)
+        self.first_yield_at = time.monotonic()
+        yield SimpleNamespace(type="response.completed", response=self.response)
+
+    def close(self):
+        self.closed = True
+
+
 def _codex_request_kwargs():
     return {
         "model": "gpt-5-codex",
@@ -269,6 +289,63 @@ def _codex_request_kwargs():
         "tools": None,
         "store": False,
     }
+
+
+def test_codex_stream_heartbeats_while_sse_iterator_is_silent(monkeypatch):
+    from agent import codex_runtime
+
+    agent = _build_agent(monkeypatch)
+    stream = _SilentThenCompletedStream(_codex_message_response("done"))
+    touches = []
+    agent._touch_activity = lambda description: touches.append(
+        (description, time.monotonic())
+    )
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **kwargs: stream),
+    )
+    monkeypatch.setattr(
+        codex_runtime, "_CODEX_STREAM_HEARTBEAT_SECONDS", 0.01, raising=False
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert response.status == "completed"
+    assert stream.first_yield_at is not None
+    assert any(
+        description == "waiting for Codex Responses stream"
+        and touched_at < stream.first_yield_at
+        for description, touched_at in touches
+    )
+
+
+def test_codex_stream_sets_a_bounded_read_timeout(monkeypatch):
+    from agent import codex_runtime
+
+    agent = _build_agent(monkeypatch)
+    seen_kwargs = []
+
+    def create(**kwargs):
+        seen_kwargs.append(kwargs)
+        return _FakeCreateStream(
+            [
+                SimpleNamespace(
+                    type="response.completed",
+                    response=_codex_message_response("done"),
+                )
+            ]
+        )
+
+    agent.client = SimpleNamespace(responses=SimpleNamespace(create=create))
+
+    request_kwargs = _codex_request_kwargs()
+    request_kwargs["timeout"] = 1800
+    response = agent._run_codex_stream(request_kwargs)
+
+    assert response.status == "completed"
+    timeout = seen_kwargs[0]["timeout"]
+    assert timeout.read == codex_runtime._CODEX_STREAM_READ_TIMEOUT_SECONDS
+    assert timeout.connect == codex_runtime._CODEX_STREAM_CONNECT_TIMEOUT_SECONDS
+    assert timeout.read * 2 < 900
 
 
 def test_api_mode_uses_explicit_provider_when_codex(monkeypatch):

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
@@ -25,6 +26,18 @@ from typing import Any, Callable, Dict, List
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
+
+# Responses iteration is synchronous and can block inside ``next()`` while the
+# server is legitimately reasoning without emitting SSE frames. Keep the
+# gateway activity clock alive independently of event arrival.
+_CODEX_STREAM_HEARTBEAT_SECONDS = 30.0
+# One retry is allowed below. Two fully silent attempts (2 * 420s), plus retry
+# overhead, still fail before the gateway's default 900s inactivity warning.
+# ``interruptible_api_call`` independently enforces TTFB, SSE-idle, and absolute
+# hard watchdogs from outside this worker; the heartbeat below intentionally
+# does not update ``_codex_stream_last_event_ts`` used by those watchdogs.
+_CODEX_STREAM_READ_TIMEOUT_SECONDS = 420.0
+_CODEX_STREAM_CONNECT_TIMEOUT_SECONDS = 30.0
 
 
 def _codex_request_failure_details(error: BaseException) -> tuple[int | None, str]:
@@ -1349,6 +1362,15 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
             stream_kwargs = dict(next_api_kwargs)
             stream_kwargs["stream"] = True
+            # ``build_api_kwargs`` carries the general API timeout (typically
+            # 1800s). Override it for the physical SSE attempt so the read can
+            # never outlive the gateway's recovery window.
+            stream_kwargs["timeout"] = _httpx.Timeout(
+                connect=_CODEX_STREAM_CONNECT_TIMEOUT_SECONDS,
+                read=_CODEX_STREAM_READ_TIMEOUT_SECONDS,
+                write=_CODEX_STREAM_READ_TIMEOUT_SECONDS,
+                pool=_CODEX_STREAM_CONNECT_TIMEOUT_SECONDS,
+            )
             return active_client.responses.create(**stream_kwargs)
 
         def _codex_stream_created(_raw_stream: Any) -> None:
@@ -1435,6 +1457,24 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
         def _interrupt_or_superseded() -> bool:
             return bool(agent._interrupt_requested)
+
+        heartbeat_stop = threading.Event()
+
+        def _heartbeat_while_stream_is_quiet() -> None:
+            while not heartbeat_stop.wait(_CODEX_STREAM_HEARTBEAT_SECONDS):
+                if agent._interrupt_requested:
+                    return
+                try:
+                    agent._touch_activity("waiting for Codex Responses stream")
+                except Exception:
+                    logger.debug("Codex Responses heartbeat failed", exc_info=True)
+
+        heartbeat_thread = threading.Thread(
+            target=_heartbeat_while_stream_is_quiet,
+            name="codex-responses-heartbeat",
+            daemon=True,
+        )
+        heartbeat_thread.start()
 
         try:
             try:
@@ -1530,6 +1570,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
             return final
         finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1.0)
             close_fn = getattr(event_stream, "close", None)
             if callable(close_fn):
                 try:
