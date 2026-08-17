@@ -2743,6 +2743,7 @@ export const en: Translations = {
         empty: 'No context data yet',
         loading: 'Loading breakdown…',
         percentFull: percent => `${percent}% Full`,
+        staleDuringTurn: 'Estimated before this turn',
         title: 'Context Usage',
         tokenSummary: (used, max) => `${used} / ${max} Tokens`
       },
