@@ -1935,7 +1935,12 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
 from hermes_constants import get_hermes_home, get_hermes_home_override
-from utils import atomic_json_write, base_url_hostname, is_truthy_value
+from utils import (
+    atomic_json_write,
+    is_truthy_value,
+    positive_output_token_cap as _positive_output_token_cap,
+    sanitized_loopback_endpoint,
+)
 _hermes_home = get_hermes_home()
 
 # Load environment variables from ~/.hermes/.env first.
@@ -2667,6 +2672,7 @@ _CONVERSATION_SCOPED_STATE: tuple = (
 _UNSET = object()
 
 
+
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
@@ -2700,32 +2706,24 @@ def _resolve_runtime_agent_kwargs() -> dict:
             logger.warning("Primary provider auth failed: %s — trying fallback", auth_exc)
         fb_config = _try_resolve_fallback_provider()
         if fb_config is not None:
-            return fb_config
-        raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
+            runtime = fb_config
+        else:
+            raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
     model_cfg = _get_model_config()
-    max_tokens = None
-    _env_mt = os.environ.get("HERMES_MAX_TOKENS")
-    if _env_mt:
-        try:
-            max_tokens = int(_env_mt)
-        except (ValueError, TypeError):
-            max_tokens = None
-    elif isinstance(model_cfg, dict):
-        mt = model_cfg.get("max_tokens")
-        if isinstance(mt, int):
-            max_tokens = mt
+    max_tokens = _positive_output_token_cap(os.environ.get("HERMES_MAX_TOKENS"))
+    if max_tokens is None and isinstance(model_cfg, dict):
+        max_tokens = _positive_output_token_cap(model_cfg.get("max_tokens"))
     # Fall back to a per-provider output cap (custom_providers max_output_tokens)
     # only when the documented global model.max_tokens isn't set, so the global
     # key always wins.
     if max_tokens is None:
-        _runtime_mot = runtime.get("max_output_tokens")
-        if isinstance(_runtime_mot, int) and _runtime_mot > 0:
-            max_tokens = _runtime_mot
+        max_tokens = _positive_output_token_cap(runtime.get("max_output_tokens"))
 
     return {
+        "model": runtime.get("model"),
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
@@ -2744,12 +2742,16 @@ class _GatewayModelContext:
 
     model: str
     provider: str
+    requested_provider: str
     base_url: str
     context_length: int
     context_source: str
 
 
-def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModelContext:
+def _resolve_gateway_model_context(
+    model: Optional[str] = None,
+    runtime: Optional[dict] = None,
+) -> _GatewayModelContext:
     """Resolve the configured gateway route and its effective context window.
 
     This is the shared non-resident authority for status/session banners and
@@ -2793,11 +2795,13 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
     except Exception:
         pass
 
+    requested_provider = None
     try:
-        runtime = _resolve_runtime_agent_kwargs()
-        provider = runtime.get("provider") or provider
-        base_url = runtime.get("base_url") or base_url
-        api_key = runtime.get("api_key")
+        effective_runtime = runtime if runtime is not None else _resolve_runtime_agent_kwargs()
+        provider = effective_runtime.get("provider") or provider
+        requested_provider = effective_runtime.get("requested_provider") or provider
+        base_url = effective_runtime.get("base_url") or base_url
+        api_key = effective_runtime.get("api_key")
     except Exception:
         pass
 
@@ -2849,6 +2853,7 @@ def _resolve_gateway_model_context(model: Optional[str] = None) -> _GatewayModel
     return _GatewayModelContext(
         model=resolved_model,
         provider=provider or "",
+        requested_provider=requested_provider or provider or "",
         base_url=base_url or "",
         context_length=context_length,
         context_source=context_source,
@@ -2860,12 +2865,20 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
         format_runtime_provider_error,
+        _get_model_config,
     )
     try:
         runtime = resolve_runtime_provider(requested=provider)
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
+    model_cfg = _get_model_config()
+    max_tokens = _positive_output_token_cap(os.environ.get("HERMES_MAX_TOKENS"))
+    if max_tokens is None and isinstance(model_cfg, dict):
+        max_tokens = _positive_output_token_cap(model_cfg.get("max_tokens"))
+    if max_tokens is None:
+        max_tokens = _positive_output_token_cap(runtime.get("max_output_tokens"))
     return {
+        "model": runtime.get("model"),
         "api_key": runtime.get("api_key"),
         "base_url": runtime.get("base_url"),
         "provider": runtime.get("provider"),
@@ -2874,6 +2887,7 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool"),
+        "max_tokens": max_tokens,
     }
 
 
@@ -2933,6 +2947,7 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "args": list(runtime.get("args") or []),
                     "credential_pool": runtime.get("credential_pool"),
                     "model": entry.get("model"),
+                    "max_output_tokens": runtime.get("max_output_tokens"),
                 }
             except Exception as fb_exc:
                 logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
@@ -20697,19 +20712,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return self._format_session_info()
-        return self._format_session_info()
+                return self._format_session_info(source)
+        return self._format_session_info(source)
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, source: Optional[SessionSource] = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
         users can immediately see if context detection went wrong (e.g.
         local models falling to the 128K default).
         """
-        resolved = _resolve_gateway_model_context()
+        if source is not None:
+            model, runtime = self._resolve_session_agent_runtime(source=source)
+            resolved = _resolve_gateway_model_context(model=model, runtime=runtime)
+        else:
+            resolved = _resolve_gateway_model_context()
         model = resolved.model
         provider = resolved.provider
+        display_provider = resolved.requested_provider
         base_url = resolved.base_url
         context_length = resolved.context_length
 
@@ -20731,13 +20751,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         lines = [
             f"◆ Model: `{model}`",
-            f"◆ Provider: {provider or 'openrouter'}",
+            f"◆ Provider: {display_provider or provider or 'openrouter'}",
             f"◆ Context: {ctx_display} tokens ({ctx_source})",
         ]
 
-        # Show endpoint for local/custom setups
-        if base_url and base_url_hostname(base_url) in ("localhost", "127.0.0.1", "0.0.0.0"):
-            lines.append(f"◆ Endpoint: {base_url}")
+        endpoint = sanitized_loopback_endpoint(base_url)
+        if endpoint:
+            lines.append(f"◆ Endpoint: {endpoint}")
 
         return "\n".join(lines)
 

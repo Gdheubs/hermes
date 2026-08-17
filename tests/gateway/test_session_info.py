@@ -25,6 +25,85 @@ def _patch_info(tmp_path, config_yaml, model, runtime):
 
 
 class TestFormatSessionInfo:
+    def test_channel_named_custom_runtime_displays_sanitized_loopback_endpoint(self, runner):
+        """Cold /new resolves a channel's named-custom route before display."""
+        from gateway.config import ChannelOverride, GatewayConfig, Platform, PlatformConfig
+        from gateway.session import SessionSource
+
+        config = {
+            "model": {
+                "default": "gpt-5.6",
+                "provider": "openai-codex",
+                "max_tokens": 16000,
+            },
+            "providers": {
+                "llamacpp": {
+                    "api": "http://operator:local-secret@127.0.0.1:18080/v1?access_token=secret#fragment",
+                    "api_key": "local",
+                    "default_model": "qwen3.8-27b-q4_k_m-128k",
+                    "max_output_tokens": 12000,
+                },
+            },
+        }
+        runner._session_model_overrides = {}
+        runner.config = GatewayConfig(
+            platforms={
+                Platform.SLACK: PlatformConfig(
+                    enabled=True,
+                    channel_overrides={
+                        "C0BQDHWP3M0": ChannelOverride(provider="llamacpp"),
+                    },
+                ),
+            },
+        )
+        source = SessionSource(platform=Platform.SLACK, chat_id="C0BQDHWP3M0", user_id="u1")
+
+        with patch("gateway.run._resolve_gateway_model", return_value="gpt-5.6"), patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"provider": "openai-codex", "base_url": "", "api_key": ""},
+        ), patch("gateway.run._load_gateway_config", return_value=config), patch(
+            "hermes_cli.runtime_provider.load_config", return_value=config
+        ), patch("agent.model_metadata.get_model_context_length", return_value=131072):
+            model, runtime = runner._resolve_session_agent_runtime(source=source)
+            info = runner._format_session_info(source)
+
+        assert model == "qwen3.8-27b-q4_k_m-128k", runtime
+        assert runtime["provider"] == "custom"
+        assert runtime["requested_provider"] == "llamacpp"
+        assert runtime["max_tokens"] == 16000
+        assert "qwen3.8-27b-q4_k_m-128k" in info
+        assert "◆ Provider: llamacpp" in info
+        assert "◆ Endpoint: http://127.0.0.1:18080/v1" in info
+        assert "operator" not in info
+        assert "local-secret" not in info
+        assert "access_token" not in info
+        assert "fragment" not in info
+
+    def test_channel_runtime_is_shown_in_new_session_info(self, runner):
+        """A /new banner must show the channel override, not the global route."""
+        from gateway.config import Platform
+        from gateway.session import SessionSource
+
+        source = SessionSource(platform=Platform.SLACK, chat_id="C0BQDHWP3M0", user_id="u1")
+        runtime = {
+            "provider": "custom",
+            "requested_provider": "llamacpp",
+            "base_url": "http://127.0.0.1:18080/v1",
+            "api_key": "local",
+        }
+        with patch.object(
+            runner,
+            "_resolve_session_agent_runtime",
+            return_value=("qwen3.8-27b-q4_k_m-128k", runtime),
+        ), patch("gateway.run._load_gateway_config", return_value={"model": {}}), patch(
+            "agent.model_metadata.get_model_context_length", return_value=131072
+        ):
+            info = runner._format_session_info(source)
+
+        assert "qwen3.8-27b-q4_k_m-128k" in info
+        assert "llamacpp" in info
+        assert "127.0.0.1:18080" in info
+
 
     def test_includes_model_name(self, runner, tmp_path):
         p1, p2, p3 = _patch_info(tmp_path, "model:\n  default: anthropic/claude-opus-4.6\n  provider: openrouter\n",

@@ -340,22 +340,14 @@ def _resolve_request_runtime_agent_kwargs(provider: str, target_model: Optional[
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
+    from utils import positive_output_token_cap
+
     model_cfg = _get_model_config()
-    max_tokens = None
-    env_max_tokens = os.environ.get("HERMES_MAX_TOKENS")
-    if env_max_tokens:
-        try:
-            max_tokens = int(env_max_tokens)
-        except (ValueError, TypeError):
-            max_tokens = None
-    elif isinstance(model_cfg, dict):
-        cfg_max_tokens = model_cfg.get("max_tokens")
-        if isinstance(cfg_max_tokens, int):
-            max_tokens = cfg_max_tokens
+    max_tokens = positive_output_token_cap(os.environ.get("HERMES_MAX_TOKENS"))
+    if max_tokens is None and isinstance(model_cfg, dict):
+        max_tokens = positive_output_token_cap(model_cfg.get("max_tokens"))
     if max_tokens is None:
-        runtime_max_tokens = runtime.get("max_output_tokens")
-        if isinstance(runtime_max_tokens, int) and runtime_max_tokens > 0:
-            max_tokens = runtime_max_tokens
+        max_tokens = positive_output_token_cap(runtime.get("max_output_tokens"))
 
     return {
         "api_key": runtime.get("api_key"),

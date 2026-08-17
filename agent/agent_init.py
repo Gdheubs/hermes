@@ -52,7 +52,7 @@ from hermes_cli.config import cfg_get
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
-from utils import base_url_host_matches, is_truthy_value
+from utils import base_url_host_matches, is_truthy_value, positive_output_token_cap
 
 # Use the same logger name as run_agent so tests patching ``run_agent.logger``
 # capture our warnings.  (run_agent.py also does
@@ -65,6 +65,7 @@ logger = logging.getLogger("run_agent")
 # gateway builds a fresh AIAgent per message, so an un-deduped warning would
 # fire on every turn.
 _warned_unavailable_providers: set[str] = set()
+
 
 
 def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
@@ -909,7 +910,8 @@ def init_agent(
     agent.disabled_toolsets = disabled_toolsets
     
     # Model response configuration
-    agent.max_tokens = max_tokens  # None = use model default
+    # None = use model default.
+    agent.max_tokens = positive_output_token_cap(max_tokens)
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
     agent.service_tier = service_tier
     agent.request_overrides = dict(request_overrides or {})
@@ -2250,14 +2252,10 @@ def init_agent(
     if agent.max_tokens is None and isinstance(_model_cfg, dict):
         _config_max_tokens = _model_cfg.get("max_tokens")
         if _config_max_tokens is not None:
-            try:
-                if isinstance(_config_max_tokens, bool):
-                    raise ValueError
-                _parsed_max_tokens = int(_config_max_tokens)
-                if _parsed_max_tokens <= 0:
-                    raise ValueError
+            _parsed_max_tokens = positive_output_token_cap(_config_max_tokens)
+            if _parsed_max_tokens is not None:
                 agent.max_tokens = _parsed_max_tokens
-            except (TypeError, ValueError):
+            else:
                 _ra().logger.warning(
                     "Invalid model.max_tokens in config.yaml: %r — "
                     "must be a positive integer (e.g. 4096). "
@@ -2269,6 +2267,55 @@ def init_agent(
                     f"  Must be a positive integer (e.g. 4096).\n"
                     f"  Falling back to provider default.\n",
                     file=sys.stderr,
+                )
+
+    # Match gateway runtime resolution for OpenAI-compatible custom providers.
+    # A local provider's ``max_output_tokens`` is deliberately a fallback: an
+    # explicit caller value and the documented global ``model.max_tokens`` both
+    # take precedence.  Without this, foreground CLI sessions omit the cap and
+    # llama.cpp falls back to its server-side n_predict default (8192), which
+    # can monopolize a single slot long after a small answer is available.
+    if agent.max_tokens is None:
+        _providers_cfg = _agent_cfg.get("providers", {})
+        # The runtime router normalizes user-defined OpenAI-compatible
+        # providers to ``custom`` while retaining the configured key as
+        # ``requested_provider``.  Prefer that key so a ``llamacpp`` cap is
+        # not lost after normalization; native providers still use
+        # ``agent.provider``.
+        _configured_provider = str(
+            getattr(agent, "requested_provider", None) or agent.provider or ""
+        ).strip()
+        _provider_key = _configured_provider
+        _provider_cfg = {}
+        _requested_ids = _custom_provider_runtime_ids(_configured_provider)
+        if isinstance(_providers_cfg, dict):
+            for _candidate_key, _candidate_cfg in _providers_cfg.items():
+                if not isinstance(_candidate_cfg, dict):
+                    continue
+                _candidate_ids = _custom_provider_runtime_ids(
+                    _candidate_key
+                ) | _custom_provider_runtime_ids(_candidate_cfg.get("name"))
+                if _requested_ids & _candidate_ids:
+                    _provider_key = str(_candidate_key)
+                    _provider_cfg = _candidate_cfg
+                    break
+        _provider_max_tokens = (
+            _provider_cfg.get("max_output_tokens")
+            if isinstance(_provider_cfg, dict)
+            else None
+        )
+        if _provider_max_tokens is not None:
+            _parsed_provider_max_tokens = positive_output_token_cap(
+                _provider_max_tokens
+            )
+            if _parsed_provider_max_tokens is not None:
+                agent.max_tokens = _parsed_provider_max_tokens
+            else:
+                _ra().logger.warning(
+                    "Invalid providers.%s.max_output_tokens in config.yaml: %r — "
+                    "must be a positive integer; falling back to provider default.",
+                    _provider_key,
+                    _provider_max_tokens,
                 )
     agent._session_init_model_config["max_tokens"] = agent.max_tokens
 

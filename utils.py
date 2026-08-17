@@ -10,7 +10,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Union
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit
 
 import yaml
 
@@ -29,6 +29,22 @@ def is_truthy_value(value: Any, default: bool = False) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in TRUTHY_STRINGS
     return bool(value)
+
+
+def positive_output_token_cap(value: Any) -> "int | None":
+    """Return *value* only when it is a positive integral output-token cap."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        cap = value
+    elif isinstance(value, str) and value.strip().isdecimal():
+        try:
+            cap = int(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    return cap if cap > 0 else None
 
 
 def env_var_enabled(name: str, default: str = "") -> bool:
@@ -863,6 +879,38 @@ def base_url_hostname(base_url: str) -> str:
         return ""
     parsed = urlparse(raw if "://" in raw else f"//{raw}")
     return (parsed.hostname or "").lower().rstrip(".")
+
+
+def sanitized_loopback_endpoint(base_url: str) -> str:
+    """Return a credential-free HTTP(S) loopback endpoint, or ``""``.
+
+    Runtime base URLs may contain userinfo, query credentials, or fragments.
+    Status surfaces retain only the scheme, loopback host, port, and a path
+    made entirely of generic API/version components.
+    """
+    try:
+        parsed = urlsplit((base_url or "").strip())
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+        if parsed.scheme not in ("http", "https") or hostname not in (
+            "localhost",
+            "127.0.0.1",
+            "0.0.0.0",
+            "::1",
+        ):
+            return ""
+        display_host = f"[{hostname}]" if ":" in hostname else hostname
+        if parsed.port is not None:
+            display_host = f"{display_host}:{parsed.port}"
+        path_components = [part.lower() for part in parsed.path.split("/") if part]
+        path_is_generic = all(
+            part in {"api", "openai"}
+            or (part.startswith("v") and part[1:].isdecimal())
+            for part in path_components
+        )
+        safe_path = parsed.path if path_is_generic else ""
+        return urlunsplit((parsed.scheme, display_host, safe_path, "", ""))
+    except (TypeError, ValueError):
+        return ""
 
 
 # ─── Model Capability Detection ──────────────────────────────────────────────

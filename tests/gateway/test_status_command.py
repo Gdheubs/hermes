@@ -2,13 +2,14 @@ from hermes_state import AsyncSessionDB, SessionDB
 """Tests for gateway /status behavior and token persistence."""
 
 from datetime import datetime
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import ChannelOverride, GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
@@ -139,6 +140,131 @@ async def test_status_command_includes_live_agent_model_and_context():
     assert "**Model:** `openai/gpt-test` (openai)" in result
     assert "**Context:** 12,345 / 100,000 (12%)" in result
     assert "**Lifetime tokens billed:** 1,250" in result
+
+
+@pytest.mark.asyncio
+async def test_live_status_preserves_named_custom_provider_alias():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    running_agent = SimpleNamespace(
+        model="qwen3.8-27b-q4_k_m-128k",
+        provider="custom",
+        requested_provider="llamacpp",
+        base_url="http://127.0.0.1:18080/v1",
+        context_compressor=None,
+        interrupt=MagicMock(),
+    )
+    runner._running_agents[session_entry.session_key] = running_agent
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "**Model:** `qwen3.8-27b-q4_k_m-128k` (llamacpp)" in result
+    assert running_agent.provider == "custom"
+    assert running_agent.requested_provider == "llamacpp"
+
+
+@pytest.mark.asyncio
+async def test_cold_status_uses_named_custom_alias_and_resolved_local_endpoint(
+    tmp_path, monkeypatch
+):
+    """Cold /status resolves channel overrides without exposing endpoint secrets."""
+    import gateway.run as gateway_run
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "model:\n"
+        "  default: gpt-5.6\n"
+        "  provider: openai-codex\n"
+        "providers:\n"
+        "  llamacpp:\n"
+        "    api: http://operator:local-secret@127.0.0.1:18080/v1?access_token=secret#fragment\n"
+        "    api_key: local\n"
+        "    default_model: qwen3.8-27b-q4_k_m-128k\n"
+        "    max_output_tokens: 12000\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"provider": "openai-codex", "base_url": "", "api_key": ""},
+    )
+    monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: hermes_home)
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: hermes_home)
+
+    source = _make_source(Platform.SLACK)
+    session_entry = SessionEntry(
+        session_key=build_session_key(source),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.SLACK,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry, platform=Platform.SLACK)
+    runner.config.platforms[Platform.SLACK].channel_overrides = {
+        "c1": ChannelOverride(provider="llamacpp")
+    }
+    runner.session_store.get_model_override.return_value = None
+
+    result = await runner._handle_message(_make_event("/status", platform=Platform.SLACK))
+
+    assert "**Model:** `qwen3.8-27b-q4_k_m-128k` (llamacpp)" in result, result
+    assert "**Endpoint:** http://127.0.0.1:18080/v1" in result
+    assert "operator" not in result
+    assert "local-secret" not in result
+    assert "access_token" not in result
+    assert "fragment" not in result
+
+
+@pytest.mark.asyncio
+async def test_cold_status_offloads_session_runtime_resolution(monkeypatch):
+    source = _make_source(Platform.SLACK)
+    session_entry = SessionEntry(
+        session_key=build_session_key(source),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.SLACK,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry, platform=Platform.SLACK)
+    event_loop_thread = threading.get_ident()
+    resolver_call = {}
+    user_config = {"model": {"default": "configured-model"}}
+
+    def _resolve_runtime(**kwargs):
+        resolver_call["thread"] = threading.get_ident()
+        resolver_call["kwargs"] = kwargs
+        return "resolved-model", {
+            "provider": "custom",
+            "requested_provider": "llamacpp",
+            "base_url": "http://127.0.0.1:18080/v1",
+        }
+
+    monkeypatch.setattr(runner, "_resolve_session_agent_runtime", _resolve_runtime)
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: user_config)
+
+    result = await runner._handle_message(
+        _make_event("/status", platform=Platform.SLACK)
+    )
+
+    assert resolver_call["kwargs"] == {
+        "source": source,
+        "session_key": session_entry.session_key,
+        "user_config": user_config,
+    }
+    assert resolver_call["thread"] != event_loop_thread
+    assert "**Model:** `resolved-model` (llamacpp)" in result
+    assert "**Endpoint:** http://127.0.0.1:18080/v1" in result
 
 
 @pytest.mark.asyncio

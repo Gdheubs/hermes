@@ -67,4 +67,22 @@ class TestNormalizeCustomProviderEntry:
         assert result is not None
         assert result["base_url"] == "${PROVIDER_A_BASE_URL}"
 
+    def test_max_output_tokens_is_supported_and_normalized(self, caplog):
+        """A per-provider output cap must survive compatibility normalization.
+
+        The foreground CLI reads this cap to constrain a single-slot local
+        OpenAI-compatible server; treating it as unknown both emits a noisy
+        warning and drops the cap from legacy-compatible provider entries.
+        """
+        entry = {
+            "base_url": "http://127.0.0.1:18080/v1",
+            "max_output_tokens": 1024,
+        }
+        with caplog.at_level(logging.WARNING):
+            result = _normalize_custom_provider_entry(entry, provider_key="llamacpp")
+
+        assert result is not None
+        assert result["max_output_tokens"] == 1024
+        assert "unknown config keys" not in caplog.text
+
 

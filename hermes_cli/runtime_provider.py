@@ -1162,6 +1162,7 @@ def _resolve_named_custom_runtime(
     if pool_result:
         # Propagate the model name even when using pooled credentials —
         # the pool doesn't know about the custom_providers model field.
+        pool_result["requested_provider"] = requested_provider
         model_name = custom_provider.get("model")
         if model_name:
             pool_result["model"] = model_name
@@ -1214,6 +1215,7 @@ def _resolve_named_custom_runtime(
 
     result = {
         "provider": "custom",
+        "requested_provider": requested_provider,
         "api_mode": custom_provider.get("api_mode")
         or _detect_api_mode_for_url(base_url)
         or "chat_completions",

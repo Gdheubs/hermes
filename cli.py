@@ -226,7 +226,12 @@ from hermes_cli.browser_connect import (
     try_launch_chrome_debug,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
-from utils import base_url_host_matches, base_url_hostname, fast_safe_load
+from utils import (
+    base_url_host_matches,
+    base_url_hostname,
+    fast_safe_load,
+    positive_output_token_cap,
+)
 
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
@@ -4776,6 +4781,7 @@ class _VoiceInputMessage:
         return self.text
 
 
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -4962,16 +4968,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _moa_provider_override, self.model = _normalize_moa_model(self.model)
         # Read max_tokens from config (env var override: HERMES_MAX_TOKENS)
         _env_mt = os.environ.get("HERMES_MAX_TOKENS")
-        if _env_mt:
-            try:
-                self.max_tokens = int(_env_mt)
-            except (ValueError, TypeError):
-                self.max_tokens = None
-        elif isinstance(_model_config, dict):
-            _mt = _model_config.get("max_tokens")
-            self.max_tokens = _mt if isinstance(_mt, int) else None
-        else:
-            self.max_tokens = None
+        self.max_tokens = positive_output_token_cap(_env_mt)
+        if self.max_tokens is None and isinstance(_model_config, dict):
+            self.max_tokens = positive_output_token_cap(
+                _model_config.get("max_tokens")
+            )
         # Auto-detect model from local server if still on default
         if self.model == _DEFAULT_CONFIG_MODEL:
             _base_url = (_model_config.get("base_url") or "") if isinstance(_model_config, dict) else ""
