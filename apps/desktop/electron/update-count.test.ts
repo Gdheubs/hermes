@@ -7,10 +7,12 @@ import path from 'node:path'
 import { test } from 'vitest'
 
 import {
+  commitCountRevision,
   compareApiUrl,
   parseCompareBehindCount,
   resolveBehindCount,
   resolveCommitLogSelection,
+  resolveRunningClientSha,
   shouldCountCommits
 } from './update-count'
 
@@ -31,6 +33,44 @@ function createTempGitRepo() {
     throw error
   }
 }
+
+test('packaged clients report the commit recorded in their install stamp', () => {
+  assert.equal(
+    resolveRunningClientSha({
+      checkoutSha: 'a'.repeat(40),
+      installStamp: { commit: 'b'.repeat(40) },
+      isPackaged: true
+    }),
+    'b'.repeat(40)
+  )
+})
+
+test('commit counts start from the running client instead of the update checkout', () => {
+  assert.equal(
+    commitCountRevision({ currentSha: 'b'.repeat(40), branch: 'main' }),
+    `${'b'.repeat(40)}..origin/main`
+  )
+})
+
+test('dev clients keep reporting the live checkout commit', () => {
+  assert.equal(
+    resolveRunningClientSha({
+      checkoutSha: 'a'.repeat(40),
+      installStamp: { commit: 'b'.repeat(40) },
+      isPackaged: false
+    }),
+    'a'.repeat(40)
+  )
+})
+
+test('packaged clients fall back to the checkout when the stamp is unusable', () => {
+  for (const installStamp of [null, {}, { commit: 'not-a-sha' }, { commit: '0'.repeat(40) }]) {
+    assert.equal(
+      resolveRunningClientSha({ checkoutSha: 'a'.repeat(40), installStamp, isPackaged: true }),
+      'a'.repeat(40)
+    )
+  }
+})
 
 // FAIL-BEFORE: pre-fix the function did `Number.parseInt(countStr) || 0`
 // unconditionally, so a shallow checkout with no merge-base surfaced the bogus
@@ -70,7 +110,7 @@ test('shallow local-ahead checkout reports up-to-date when origin is a known anc
       currentSha: 'local-child',
       targetSha: 'origin-parent',
       isShallow: true,
-      targetIsAncestorOfHead: true
+      targetIsAncestorOfCurrent: true
     }),
     0
   )
@@ -98,7 +138,7 @@ test('shallow Git graph proves the remote tip is an ancestor of a local commit',
         currentSha,
         targetSha,
         isShallow: true,
-        targetIsAncestorOfHead: true
+        targetIsAncestorOfCurrent: true
       }),
       0
     )
@@ -163,6 +203,19 @@ test('shallow checkout with a merge-base still uses presence-only status', () =>
       currentSha: 'aaa',
       targetSha: 'bbb',
       isShallow: true
+    }),
+    null
+  )
+})
+
+test('full checkout reports unknown when the packaged commit is absent from its graph', () => {
+  assert.equal(
+    resolveBehindCount({
+      countStr: '',
+      currentSha: 'a'.repeat(40),
+      targetSha: 'b'.repeat(40),
+      isShallow: false,
+      countAvailable: false
     }),
     null
   )
