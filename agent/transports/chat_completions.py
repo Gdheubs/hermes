@@ -666,6 +666,8 @@ class ChatCompletionsTransport(ProviderTransport):
         _qwen_policy = params.get("qwen_context_overflow_policy")
         if _qwen_policy:
             extra_body["context_overflow_policy"] = _qwen_policy
+        if params.get("qwen_preserve_thinking"):
+            extra_body.setdefault("parameters", {})["preserve_thinking"] = True
 
         if extra_body:
             api_kwargs["extra_body"] = extra_body
@@ -810,6 +812,8 @@ class ChatCompletionsTransport(ProviderTransport):
         _qwen_policy = params.get("qwen_context_overflow_policy")
         if _qwen_policy:
             extra_body["context_overflow_policy"] = _qwen_policy
+        if params.get("qwen_preserve_thinking"):
+            extra_body.setdefault("parameters", {})["preserve_thinking"] = True
 
 
 

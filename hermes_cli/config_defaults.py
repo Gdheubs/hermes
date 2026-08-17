@@ -3833,6 +3833,15 @@ OPTIONAL_ENV_VARS = {
         "category": "provider",
         "advanced": True,
     },
+    "HERMES_QWEN_PRESERVE_THINKING": {
+        "description": "Send parameters.preserve_thinking=true on Qwen wires so the "
+        "historical reasoning is always consumed (the quality contract). Default on; "
+        "a false setting makes the reasoning strippable (the strip-gate must align).",
+        "prompt": "Enforce preserve_thinking=true on Qwen requests? (true/false)",
+        "url": None,
+        "password": False,
+        "category": "compression",
+    },
     "HERMES_QWEN_CONTEXT_OVERFLOW_POLICY": {
         "description": "Qwen context-overflow policy injected per request (qwen-family models). "
         "stopAtLimit (default) makes the provider reject at the limit so the agent "

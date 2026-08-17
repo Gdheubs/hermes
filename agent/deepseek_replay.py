@@ -99,10 +99,11 @@ def _plain_turn_strip_allowed(
     use-thinking-models); openclaw/openclaw#92396 backfills Kimi — stripping
     would break the contract (server discards reasoning_content, silent pauses
     per can1357/oh-my-pi).
-    KEPT by default: Qwen max/plus lines — ``preserve_thinking`` is a
-    per-request parameter defaulting to true (the model homepage), and the
-    agent relies on the default; a user setting it false would make the
-    reasoning strippable.
+    KEPT (enforced): Qwen max/plus lines — hermes sends
+    ``parameters.preserve_thinking=true`` on the wire (the quality contract:
+    the historical reasoning is always consumed). The parameter is
+    per-request; a user setting it false would make the reasoning strippable
+    (the strip gate must align before any strip applies).
     """
     if is_deepseek_replay_target(provider, model, base_url):
         return True

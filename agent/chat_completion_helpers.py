@@ -1823,6 +1823,22 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
+def resolve_qwen_preserve_thinking(agent) -> bool:
+    """Send parameters.preserve_thinking=true on Qwen wires (the quality
+    contract): the historical reasoning is always consumed. Default true;
+    a false setting makes the reasoning strippable (the strip gate must
+    align before the strip is applied). Non-Qwen models always return None."""
+    try:
+        from agent.prompt_caching import is_qwen_model
+        from hermes_cli.config import load_config_readonly
+
+        if not is_qwen_model((agent.model or "").lower()):
+            return False
+        return bool(load_config_readonly().get("HERMES_QWEN_PRESERVE_THINKING", True))
+    except Exception:
+        return True
+
+
 def resolve_qwen_context_overflow_policy(agent) -> str | None:
     """Qwen overflow policy injected per request (qwen-family models).
 
@@ -2054,6 +2070,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     # rejects at the limit so the agent self-compresses; rollingWindow /
     # truncateMiddle would silently truncate the compacted wire.
     _qwen_overflow_policy = resolve_qwen_context_overflow_policy(agent)
+    _qwen_preserve_thinking = resolve_qwen_preserve_thinking(agent)
 
     # ── Provider profile path (registered providers) ───────────────────
     # Profiles handle per-provider quirks via hooks. When a profile is
@@ -2096,6 +2113,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             supports_reasoning=agent._supports_reasoning_extra_body(),
             qwen_session_metadata=_qwen_meta,
             qwen_context_overflow_policy=_qwen_overflow_policy,
+            qwen_preserve_thinking=_qwen_preserve_thinking,
         )
 
     # ── Legacy flag path ────────────────────────────────────────────
@@ -2138,6 +2156,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         qwen_prepare_inplace_fn=agent._qwen_prepare_chat_messages_inplace if _is_qwen else None,
         qwen_session_metadata=_qwen_meta,
         qwen_context_overflow_policy=_qwen_overflow_policy,
+        qwen_preserve_thinking=_qwen_preserve_thinking,
         fixed_temperature=_fixed_temp,
         omit_temperature=_omit_temp,
         supports_reasoning=agent._supports_reasoning_extra_body(),
