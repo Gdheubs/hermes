@@ -1292,6 +1292,41 @@ function upsertResolvedSession(session: SessionInfo, storedSessionId: string) {
   ])
 }
 
+function normalizeResolverSource(source: SessionInfo['source']): SessionInfo['source'] {
+  if (typeof source !== 'string') {
+    return source
+  }
+
+  const trimmed = source.trim()
+
+  return trimmed.toLowerCase() === 'unknown' ? 'unknown' : trimmed
+}
+
+function withNormalizedResolverFields(session: SessionInfo): SessionInfo {
+  const source = normalizeResolverSource(session.source)
+  const rawCount = session.message_count as unknown
+  const messageCount = typeof rawCount === 'string' && rawCount.trim() === '0' ? 0 : session.message_count
+  const trimmedProfile = session.profile?.trim()
+  const profile = trimmedProfile ? trimmedProfile : session.profile
+
+  if (source === session.source && messageCount === session.message_count && profile === session.profile) {
+    return session
+  }
+
+  return { ...session, message_count: messageCount, profile, source }
+}
+
+/**
+ * Legacy cross-profile damage can leave the same session id on the active
+ * profile as `source=unknown` with `message_count=0` and a persisted title
+ * while another profile owns the real message-bearing desktop row. Treat only
+ * that exact shape as a deferred fallback so resume can keep probing for a
+ * materialized twin; omitted/undefined counts are not the legacy shadow.
+ */
+function isLegacyEmptyUnknownShadow(session: SessionInfo): boolean {
+  return session.source === 'unknown' && session.message_count === 0 && Boolean(session.title?.trim())
+}
+
 export async function resolveStoredSession(storedSessionId: string): Promise<SessionInfo | undefined> {
   const cached = [...$sessions.get(), ...$cronSessions.get(), ...$messagingSessions.get()].find(session =>
     sessionMatchesStoredId(session, storedSessionId)
@@ -1302,26 +1337,53 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
   // active (#67603 family, cross-profile open asymmetry). Treat such a hit as
   // unresolved and fall through to the by-id lookups, which stamp ownership.
   const multiProfile = $profiles.get().length > 1
+  let deferredEmptyUnknown: SessionInfo | undefined
 
   if (cached && (cached.profile?.trim() || !multiProfile)) {
-    return cached
+    let owned = withNormalizedResolverFields(cached)
+
+    // Defer only under multi-profile — that's the only case a twin on another
+    // profile could exist. Single-profile empty unknowns return immediately.
+    if (multiProfile && isLegacyEmptyUnknownShadow(owned)) {
+      deferredEmptyUnknown = owned
+    } else {
+      // Return a normalized copy to the caller. Do not write source/count/
+      // profile canonicalization back into `$sessions`: upsert prepends, which
+      // would promote an older cached row to most-recent.
+      if (!multiProfile && !owned.profile?.trim()) {
+        owned = { ...owned, profile: normalizeProfileKey($activeGatewayProfile.get()) }
+      }
+
+      return owned
+    }
   }
 
   // Direct by-id on the live backend — one row lookup, no list scan. Covers
   // single-profile users and any id on the active profile (e.g. an old session
   // past the sidebar's recent window). 404 just means it's not on this profile.
   try {
-    const session = await getSession(storedSessionId)
+    const session = withNormalizedResolverFields(await getSession(storedSessionId))
 
     // Older backends omit `profile` on unscoped GETs; the serving backend is
     // the active gateway's, so back-fill that rather than caching an unowned
-    // row. A present stamp is preserved: in app-global remote mode a bare hit
-    // can legitimately carry another profile's row (see the branch tests).
-    session.profile ||= normalizeProfileKey($activeGatewayProfile.get())
+    // row. Whitespace-only is the same as omitted — do not let it fall through
+    // as `undefined` or canonicalize to "default" by accident. A present stamp
+    // is preserved: in app-global remote mode a bare hit can legitimately carry
+    // another profile's row (see the branch tests).
+    session.profile = session.profile?.trim() || normalizeProfileKey($activeGatewayProfile.get())
 
-    upsertResolvedSession(session, storedSessionId)
+    if (multiProfile && isLegacyEmptyUnknownShadow(session)) {
+      deferredEmptyUnknown ??= session
+    } else if (!deferredEmptyUnknown || sessionShouldHaveTranscript(session)) {
+      // Transcript-bearing twins win immediately. A known-source zero-message
+      // draft (desktop/0, tui/0, compression root) is not distinguishable from
+      // a legitimate titled draft on another profile by source alone, so
+      // probing continues and the original cached owner is preserved when no
+      // transcript twin exists.
+      upsertResolvedSession(session, storedSessionId)
 
-    return session
+      return session
+    }
   } catch {
     // Not on the active profile — fall through to the cross-profile probe.
   }
@@ -1338,7 +1400,7 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
 
   for (const profile of otherProfiles) {
     try {
-      const session = await getSession(storedSessionId, profile)
+      const session = withNormalizedResolverFields(await getSession(storedSessionId, profile))
 
       // Same ownership contract: the DESKTOP profile we explicitly probed is
       // authoritative, whatever the scoped backend stamped (older backends
@@ -1346,12 +1408,24 @@ export async function resolveStoredSession(storedSessionId: string): Promise<Ses
       // forwarding, so that backend answers as its own "default").
       session.profile = profile
 
-      upsertResolvedSession(session, storedSessionId)
+      if (multiProfile && isLegacyEmptyUnknownShadow(session)) {
+        deferredEmptyUnknown ??= session
+      } else if (!deferredEmptyUnknown || sessionShouldHaveTranscript(session)) {
+        upsertResolvedSession(session, storedSessionId)
 
-      return session
+        return session
+      }
     } catch {
       // Not on this profile; try the next.
     }
+  }
+
+  const fallback = deferredEmptyUnknown
+
+  if (fallback) {
+    upsertResolvedSession(fallback, storedSessionId)
+
+    return fallback
   }
 
   return undefined
