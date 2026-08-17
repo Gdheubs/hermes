@@ -49,6 +49,14 @@ export interface GridResizer {
 // GridData helpers (verbatim)
 // ---------------------------------------------------------------------------
 
+/**
+ * True for a safe, positive, whole array length. Rejects NaN, Infinity,
+ * fractions and negatives — every value `new Array(n)` throws on.
+ */
+function isPositiveInt(value: unknown): value is number {
+  return Number.isInteger(value) && (value as number) > 0
+}
+
 /** result[k] is the sum of the first k elements of the given list. */
 export function prefixSum(list: number[]): number[] {
   const result: number[] = [0]
@@ -105,11 +113,37 @@ function unique(list: number[]): number[] {
 export function modelToZones(model: GridLayout): GridZone[] | null {
   const { rows, columns: cols, cellChildMap } = model
 
+  // Untrusted input reaches this function from persisted layouts, older schema
+  // versions, and template generators, and `new Array(n)` below throws a hard
+  // `RangeError: Invalid array length` for n that is negative, fractional, NaN
+  // or > 2^32-1. A throw here happens during render and takes the whole shell
+  // down (the error boundary remounts, refetches, and throws again — a crash
+  // loop that reads as "the desktop is frozen"). Every malformed shape must
+  // therefore leave through the `null` return that callers already handle.
+  if (!isPositiveInt(rows) || !isPositiveInt(cols) || !Array.isArray(cellChildMap)) {
+    return null
+  }
+
   let zoneCount = 0
 
   for (let row = 0; row < rows; row++) {
+    const cells = cellChildMap[row]
+
+    // A row shorter than `columns` yields `undefined` -> NaN, which silently
+    // defeats the `zoneCount > rows * cols` bound check below (every NaN
+    // comparison is false) and reaches `new Array(NaN)`.
+    if (!Array.isArray(cells) || cells.length < cols) {
+      return null
+    }
+
     for (let col = 0; col < cols; col++) {
-      zoneCount = Math.max(zoneCount, cellChildMap[row][col])
+      const cell = cells[col]
+
+      if (!Number.isInteger(cell) || cell < 0) {
+        return null
+      }
+
+      zoneCount = Math.max(zoneCount, cell)
     }
   }
 
@@ -590,7 +624,7 @@ export function isGridValid(model: unknown): model is GridLayout {
 
   const m = model as GridLayout
 
-  if (typeof m.rows !== 'number' || typeof m.columns !== 'number' || m.rows <= 0 || m.columns <= 0) {
+  if (!isPositiveInt(m.rows) || !isPositiveInt(m.columns)) {
     return false
   }
 
@@ -599,8 +633,8 @@ export function isGridValid(model: unknown): model is GridLayout {
     !Array.isArray(m.columnPercents) ||
     m.rowPercents.length !== m.rows ||
     m.columnPercents.length !== m.columns ||
-    m.rowPercents.some(x => typeof x !== 'number' || x < 1) ||
-    m.columnPercents.some(x => typeof x !== 'number' || x < 1)
+    m.rowPercents.some(x => !Number.isFinite(x) || x < 1) ||
+    m.columnPercents.some(x => !Number.isFinite(x) || x < 1)
   ) {
     return false
   }
@@ -608,7 +642,11 @@ export function isGridValid(model: unknown): model is GridLayout {
   if (
     !Array.isArray(m.cellChildMap) ||
     m.cellChildMap.length !== m.rows ||
-    m.cellChildMap.some(r => !Array.isArray(r) || r.length !== m.columns || r.some(c => typeof c !== 'number'))
+    // `typeof NaN === 'number'`, so a bare typeof check lets NaN through into
+    // modelToZones. Require a whole, non-negative cell index instead.
+    m.cellChildMap.some(
+      r => !Array.isArray(r) || r.length !== m.columns || r.some(c => !Number.isInteger(c) || c < 0)
+    )
   ) {
     return false
   }
