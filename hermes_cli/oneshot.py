@@ -173,6 +173,7 @@ def run_oneshot(
     provider: Optional[str] = None,
     toolsets: object = None,
     usage_file: Optional[str] = None,
+    skills: object = None,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -187,6 +188,8 @@ def run_oneshot(
             cost, token counts, model, api_calls) is written there after the
             run — even when the run fails — so pipelines can account for
             spend per invocation.
+        skills: Optional comma-separated string or iterable of skills to
+            preload for this run.
 
     Returns the exit code.  The caller owns process termination.
     """
@@ -247,6 +250,7 @@ def run_oneshot(
                     model=model,
                     provider=provider,
                     toolsets=explicit_toolsets,
+                    skills=skills,
                     use_config_toolsets=use_config_toolsets,
                 )
             except BaseException as exc:  # noqa: BLE001
@@ -325,6 +329,7 @@ def _run_agent(
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    skills: object = None,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
@@ -462,6 +467,8 @@ def _run_agent(
             clarify_callback=_oneshot_clarify_callback,
         )
 
+        _apply_preloaded_skills(agent, skills)
+
         # Belt-and-braces: make sure AIAgent doesn't invoke any streaming
         # display callbacks that would bypass our stdout capture.
         agent.suppress_status_output = True
@@ -495,6 +502,46 @@ def _run_agent(
                 session_db.close()
             except Exception:
                 logging.debug("oneshot session store cleanup failed", exc_info=True)
+
+
+def _apply_preloaded_skills(agent, skills: object = None) -> list[str]:
+    """Load explicit ``-s/--skills`` values into a one-shot agent.
+
+    One-shot bypasses ``cli.py``, so it must perform the same explicit skill
+    preload before the first (and only) model call.  The agent already owns a
+    stable session id at this point, which keeps skill template rendering
+    consistent with normal chat sessions.
+    """
+    parsed = _normalize_toolsets(skills) or []
+    parsed = list(dict.fromkeys(parsed))
+    if not parsed:
+        return []
+
+    from agent.skill_commands import build_preloaded_skills_prompt
+
+    skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
+        parsed,
+        task_id=getattr(agent, "session_id", None),
+    )
+    if missing_skills:
+        missing_display = ", ".join(missing_skills)
+        if loaded_skills:
+            logging.getLogger(__name__).warning(
+                "Unknown skill(s) requested, skipping: %s. Continuing with: %s.",
+                missing_display,
+                ", ".join(loaded_skills),
+            )
+        else:
+            raise ValueError(f"Unknown skill(s): {missing_display}")
+
+    if skills_prompt:
+        current = getattr(agent, "ephemeral_system_prompt", None)
+        agent.ephemeral_system_prompt = "\n\n".join(
+            part for part in (current, skills_prompt) if part
+        ).strip()
+        agent.preloaded_skills = loaded_skills
+
+    return loaded_skills
 
 
 def _oneshot_clarify_callback(question: str, choices=None, multi_select=False) -> str:
