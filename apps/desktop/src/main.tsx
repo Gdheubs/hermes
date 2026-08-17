@@ -30,6 +30,10 @@ import { ThemeProvider } from './themes/context'
 
 installClipboardShim()
 
+if (/linux/i.test(navigator.platform)) {
+  document.documentElement.classList.add('platform-linux')
+}
+
 // The perf probe ships in dev, and in a production build ONLY when explicitly
 // opted in (VITE_PERF_PROBE=1) — this lets the perf harness measure a real,
 // minified production renderer for representative absolute numbers. Normal
