@@ -370,7 +370,10 @@ def _(rid, params: dict) -> dict:
         # racing the in-flight child on the same stored session (interleaved
         # transcript, stale fork). After the run completes, submitting is fine:
         # the upgrade resumes the child's transcript as a normal conversation.
-        if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
+        if session.get("lazy") and _child_run_active(
+            str(session.get("session_key") or ""),
+            profile_home=session.get("profile_home"),
+        ):
             return _err(rid, 4009, "subagent still running — wait for it to finish")
         truncate_message_id = params.get("truncate_before_message_id")
         truncate_row_id = params.get("truncate_before_row_id")
@@ -795,7 +798,10 @@ def _(rid, params: dict) -> dict:
                 return
         _run_prompt_submit(rid, sid, session, text)
 
-    run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
+    run_thread = threading.Thread(
+        target=lambda: _run_session_owned(session, run_after_agent_ready),
+        daemon=True,
+    )
     # Keep a handle so session.interrupt can tell a live turn from a stuck
     # `running` flag (a turn that died without clearing it) and recover the latter.
     session["_run_thread"] = run_thread
@@ -1245,12 +1251,14 @@ def _(rid, params: dict) -> dict:
                         else str(result)
                     ),
                 },
+                expected_session=session,
             )
         except Exception as e:
             _emit(
                 "background.complete",
                 parent,
                 {"task_id": task_id, "text": f"error: {e}"},
+                expected_session=session,
             )
         finally:
             _clear_session_context(session_tokens)
@@ -1338,6 +1346,7 @@ def _(rid, params: dict) -> dict:
                 "preview.restart.progress",
                 parent,
                 {"task_id": task_id, "text": f"Starting hidden restart agent{history_note}"},
+                expected_session=session,
             )
             # Bug #50233: ephemeral preview-restart agent threads don't inherit
             # the session's HERMES_HOME override (the ContextVar set on the
@@ -1357,7 +1366,9 @@ def _(rid, params: dict) -> dict:
             try:
                 result = AIAgent(
                     **_ephemeral_preview_agent_kwargs(session["agent"], task_id),
-                    **_preview_restart_callbacks(parent, task_id),
+                    **_preview_restart_callbacks(
+                        parent, task_id, expected_session=session
+                    ),
                 ).run_conversation(
                     user_message=prompt,
                     task_id=task_id,
@@ -1371,12 +1382,18 @@ def _(rid, params: dict) -> dict:
                 if isinstance(result, dict)
                 else str(result)
             )
-            _emit("preview.restart.complete", parent, {"task_id": task_id, "text": text})
+            _emit(
+                "preview.restart.complete",
+                parent,
+                {"task_id": task_id, "text": text},
+                expected_session=session,
+            )
         except Exception as e:
             _emit(
                 "preview.restart.complete",
                 parent,
                 {"task_id": task_id, "text": f"error: {e}"},
+                expected_session=session,
             )
         finally:
             try:

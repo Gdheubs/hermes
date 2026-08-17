@@ -96,7 +96,13 @@ def capture(server):
     """Redirect server's real stdout to a StringIO and return (server, buf)."""
     buf = io.StringIO()
     server._real_stdout = buf
-    return server, buf
+    # Private nonempty-SID frames require a live registered owner.  This is a
+    # real standalone-stdio session, not fallback after ownership disappears.
+    server._sessions["s1"] = {"transport": server._stdio_transport}
+    try:
+        yield server, buf
+    finally:
+        server._sessions.pop("s1", None)
 
 
 # ── JSON-RPC envelope ────────────────────────────────────────────────

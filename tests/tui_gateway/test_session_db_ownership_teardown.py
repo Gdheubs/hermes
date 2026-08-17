@@ -260,7 +260,7 @@ def build_env(monkeypatch, tmp_path):
         ("_emit", lambda *a, **k: None),
         ("_schedule_mcp_late_refresh", lambda *a, **k: None),
         ("_session_source", lambda _current: None),
-        ("_child_run_active", lambda _key: False),
+        ("_child_run_active", lambda _key, *, profile_home: False),
     ]:
         if hasattr(server, name):
             monkeypatch.setattr(server, name, value)

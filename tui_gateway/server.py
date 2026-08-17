@@ -154,7 +154,8 @@ _prompt_lock = threading.Lock()
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
-_session_resume_lock = threading.Lock()
+_session_resume_lock = threading.RLock()
+_ANY_PROFILE_HOME = object()
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -340,6 +341,27 @@ atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
 _current_runtime_session_record: contextvars.ContextVar[dict | None] = (
     contextvars.ContextVar("hermes_gateway_runtime_session_record", default=None)
 )
+
+
+def _run_session_owned(session: dict | None, fn: Callable, *args, **kwargs):
+    """Run a callback with exact session-generation routing authority."""
+    if session is None:
+        return fn(*args, **kwargs)
+    token = _current_runtime_session_record.set(session)
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        _current_runtime_session_record.reset(token)
+
+
+def _runtime_session_for_sid(sid: str) -> dict | None:
+    """Resolve ``sid`` without letting scoped stale callbacks adopt a reuse."""
+    expected = _current_runtime_session_record.get()
+    with _sessions_lock:
+        current = _sessions.get(sid)
+        if expected is not None and current is not expected:
+            return None
+        return current
 
 # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
 # so stray print() from libraries/tools becomes harmless gateway.stderr instead
@@ -1185,14 +1207,26 @@ def _close_sessions_for_transport(
     detached = 0
     for sid, session in owned:
         if session.get("close_on_disconnect"):
-            _close_session_by_id(sid, end_reason=end_reason)
-            reaped += 1
+            # The snapshot can be stale by the time teardown runs. Claim only
+            # if both record generation and old transport still match.
+            if _close_session_by_id(
+                sid,
+                end_reason=end_reason,
+                predicate=lambda current, _session=session: (
+                    current is _session and current.get("transport") is transport
+                ),
+            ):
+                reaped += 1
         else:
             # Point detached sessions at the drop sentinel (NOT real stdio) so
             # _ws_session_is_orphaned recognizes them and the grace-reap can
             # actually fire; a standalone `hermes --tui` keeps real _stdio.
-            session["transport"] = _detached_ws_transport
-            detached += 1
+            with _sessions_lock:
+                current = _sessions.get(sid)
+                if current is not session or current.get("transport") is not transport:
+                    continue
+                current["transport"] = _detached_ws_transport
+                detached += 1
             try:
                 _schedule_ws_orphan_reap(sid)
             except Exception:
@@ -1424,7 +1458,11 @@ def _db_for_profile(profile: str | None = None):
 
     Returns (db, owns_handle). ``db`` is None when unavailable.
     """
-    profile_home = _profile_home(profile)
+    requested = (profile or "").strip()
+    profile_home = _profile_home(requested)
+    if requested and profile_home is None and requested != _current_profile_name():
+        logger.warning("TUI rejected unavailable profile session store: %s", requested)
+        return None, False
     if profile_home is None:
         return _get_db(), False
     try:
@@ -1634,14 +1672,39 @@ def _default_session_cwd() -> str:
     return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
 
 
-def write_json(obj: dict) -> bool:
+def _live_session_transport(
+    sid: str, *, expected_session: dict | None = None
+) -> tuple[dict, Transport] | None:
+    """Return the exact live owner and transport for a private session frame.
+
+    A nonempty sid is never authority by itself.  Missing, finalized, detached,
+    closed, or replaced generations fail closed; callers write the captured
+    transport once and never retry through request/stdin fallback.
+    """
+    if not sid:
+        return None
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        if (
+            session is None
+            or session.get("_finalized")
+            or (expected_session is not None and session is not expected_session)
+        ):
+            return None
+        transport = session.get("transport")
+        if transport is None or _transport_is_dead(transport):
+            return None
+        return session, transport
+
+
+def write_json(obj: dict, *, expected_session: dict | None = None) -> bool:
     """Emit one JSON frame. Routes via the most-specific transport available.
 
     Precedence:
 
-    1. Event frames with a session id → the transport stored on that session,
-       so async events land with the client that owns the session even if
-       the emitting thread has no contextvar binding.
+    1. Event frames with a nonempty session id → only the explicit live
+       transport of that exact non-finalized session generation.  They never
+       fall through to a request transport or stdio.
     2. Otherwise the transport bound on the current context (set by
        :func:`dispatch` for the lifetime of a request).
     3. Otherwise the module-level stdio transport, matching the historical
@@ -1649,8 +1712,20 @@ def write_json(obj: dict) -> bool:
     """
     if obj.get("method") == "event":
         sid = ((obj.get("params") or {}).get("session_id")) or ""
-        if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            return t.write(obj)
+        if sid:
+            effective_expected = (
+                expected_session
+                if expected_session is not None
+                else _current_runtime_session_record.get()
+            )
+            owner = _live_session_transport(sid, expected_session=effective_expected)
+            if owner is None:
+                return False
+            try:
+                return bool(owner[1].write(obj))
+            except Exception:
+                logger.debug("private session event write failed sid=%s", sid, exc_info=True)
+                return False
 
     return (current_transport() or _stdio_transport).write(obj)
 
@@ -1662,8 +1737,80 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
     return {"jsonrpc": "2.0", "method": "event", "params": params}
 
 
-def _emit(event: str, sid: str, payload: dict | None = None):
-    write_json(_event_frame(event, sid, payload))
+def _emit(
+    event: str,
+    sid: str,
+    payload: dict | None = None,
+    *,
+    expected_session: dict | None = None,
+):
+    """Emit an event, optionally fenced to an exact session generation.
+
+    Synchronous callers may omit ``expected_session``: private routing still
+    fails closed for absent/final/dead records and turn threads inherit the
+    exact generation from ``_current_runtime_session_record``.  Async producers
+    that outlive their initiating call must capture and pass the record.
+    """
+    return write_json(
+        _event_frame(event, sid, payload), expected_session=expected_session
+    )
+
+
+def _emit_for_session(
+    session: dict | None, event: str, sid: str, payload: dict | None = None
+) -> bool:
+    """Emit under exact generation context while preserving _emit's call ABI."""
+    return bool(_run_session_owned(session, _emit, event, sid, payload))
+
+
+def _emit_session_owned(
+    event: str | None,
+    sid: str,
+    payload: dict | None = None,
+    *,
+    expected_session: dict | None = None,
+) -> bool:
+    """Write only through ``sid``'s explicit live-session transport.
+
+    Unlike :func:`_emit`, this helper never falls back to the request-bound or
+    stdio transport.  Session removal/finalization, id reuse, and missing
+    transport all fail closed.  ``event=None`` performs the same scoped
+    authorization without writing; this is used for parent-suppressed
+    ``subagent.text`` events before child mirroring.
+    """
+    owner = _live_session_transport(sid, expected_session=expected_session)
+    if owner is None:
+        return False
+    session, transport = owner
+
+    if event is None:
+        return True
+    try:
+        written = bool(transport.write(_event_frame(event, sid, payload)))
+    except Exception:
+        # A failed session-owned write is terminal for this event.  In
+        # particular, never reroute private relay data through current/stdin.
+        logger.debug(
+            "session-owned event write failed type=%s sid=%s",
+            event,
+            sid,
+            exc_info=True,
+        )
+        return False
+    if not written:
+        return False
+
+    # A transport write may synchronously trigger disconnect/finalization.
+    # Treat that as failed authorization for any dependent child mirror work,
+    # while retaining the already-captured direct write (never reroute it).
+    with _sessions_lock:
+        current = _sessions.get(sid)
+        return bool(
+            current is session
+            and not session.get("_finalized")
+            and session.get("transport") is transport
+            and not _transport_is_dead(transport)
+        )
 
 
 # Live client transports, one per connected WS peer (maintained by tui_gateway.ws).
@@ -1714,6 +1861,24 @@ def _broadcast_global_event(event: str, payload: dict | None = None) -> None:
 
 _compute_host_supervisor = None
 _compute_host_supervisor_lock = threading.Lock()
+_compute_host_event_owner_lock = threading.Lock()
+# Independent sessions may overlap in the shared host. Fence each sid to its
+# exact in-memory generation instead of using one process-global owner.
+_compute_host_event_owners: dict[str, dict] = {}
+
+
+def _write_compute_host_rpc(obj: dict) -> bool:
+    """Fence host-reader events to the exact record owning the active turn."""
+    sid = ""
+    if obj.get("method") == "event":
+        sid = str(((obj.get("params") or {}).get("session_id")) or "")
+    with _compute_host_event_owner_lock:
+        owner = _compute_host_event_owners.get(sid)
+    if sid:
+        if owner is None:
+            return False
+        return write_json(obj, expected_session=owner)
+    return write_json(obj)
 
 
 def _inside_compute_host_child() -> bool:
@@ -1746,7 +1911,7 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
             from tui_gateway.host_supervisor import HostSupervisor
 
             _compute_host_supervisor = HostSupervisor(
-                rpc_sink=write_json,
+                rpc_sink=_write_compute_host_rpc,
                 heartbeat_secs=int(isolation_cfg.get("compute_host_heartbeat_secs") or 15),
                 respawn_max=int(isolation_cfg.get("compute_host_respawn_max") or 3),
             )
@@ -1845,14 +2010,22 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         _clear_inflight_turn(session)
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
-        _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
+        _emit_for_session(
+            session,
+            "message.complete",
+            sid,
+            {"text": f"Error: {message}", "status": "error"},
+        )
     _apply_compute_host_metadata_mirror(session, frame)
     try:
         info = _session_info(session.get("agent"), session)
     except TypeError:
         info = _session_info(session.get("agent"))
     if not frame.get("session_info_emitted"):
-        _emit("session.info", sid, info)
+        _emit_for_session(session, "session.info", sid, info)
+    with _compute_host_event_owner_lock:
+        if _compute_host_event_owners.get(sid) is session:
+            _compute_host_event_owners.pop(sid, None)
     _drain_queued_prompt(rid, sid, session)
 
 
@@ -1884,8 +2057,13 @@ def _submit_prompt_to_compute_host(
         _on_compute_host_turn_done(rid, sid, session, done)
 
     try:
+        with _compute_host_event_owner_lock:
+            _compute_host_event_owners[sid] = session
         _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
     except Exception as exc:
+        with _compute_host_event_owner_lock:
+            if _compute_host_event_owners.get(sid) is session:
+                _compute_host_event_owners.pop(sid, None)
         return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
     with session["history_lock"]:
         session["_compute_host_active"] = True
@@ -2278,7 +2456,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
     # to a full agent mid-stream and silently kill the mirror (the mirror bails
     # once agent is set). Once the child completes, the guard lifts and the next
     # prompt/RPC builds the agent normally so the user can talk to the session.
-    if session.get("lazy") and _child_run_active(str(session.get("session_key") or "")):
+    if session.get("lazy") and _child_run_active(
+        str(session.get("session_key") or ""),
+        profile_home=session.get("profile_home"),
+    ):
         return
     lock = session.setdefault("agent_build_lock", threading.Lock())
     with lock:
@@ -2407,7 +2588,10 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 )
 
                 register_gateway_notify(
-                    key, lambda data: _emit_approval_request(sid, data)
+                    key,
+                    lambda data, _session=current: _run_session_owned(
+                        _session, _emit_approval_request, sid, data
+                    ),
                 )
                 notify_registered = True
                 load_permanent_allowlist()
@@ -2422,8 +2606,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # default cold resume) build through here, so without this their
             # review summaries would leak to stdout instead of the chat.
             try:
-                agent.background_review_callback = lambda message, _sid=sid: _emit(
-                    "review.summary", _sid, {"text": str(message)}
+                agent.background_review_callback = lambda message, _sid=sid, _session=current: _emit_for_session(
+                    _session,
+                    "review.summary",
+                    _sid,
+                    {"text": str(message)},
                 )
                 agent.memory_notifications = _load_memory_notifications()
             except Exception:
@@ -2447,7 +2634,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             if cfg_warn:
                 info["config_warning"] = cfg_warn
                 logger.warning(cfg_warn)
-            _emit("session.info", sid, info)
+            _emit_for_session(current, "session.info", sid, info)
             # If MCP discovery is still in flight (a server slower than the
             # bounded wait_for_mcp_discovery join in _make_agent), the agent
             # was built without those tools. Catch up once they land — see
@@ -2455,7 +2642,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
             _schedule_mcp_late_refresh(sid, agent)
         except Exception as e:
             current["agent_error"] = str(e)
-            _emit("error", sid, {"message": f"agent init failed: {e}"})
+            _emit_for_session(
+                current,
+                "error",
+                sid,
+                {"message": f"agent init failed: {e}"},
+            )
         finally:
             if home_token is not None:
                 reset_hermes_home_override(home_token)
@@ -5303,7 +5495,9 @@ def _sync_session_key_after_compress(
         try:
             register_gateway_notify(
                 new_session_id,
-                lambda data: _emit_approval_request(sid, data),
+                lambda data, _session=session: _run_session_owned(
+                    _session, _emit_approval_request, sid, data
+                ),
             )
         except Exception:
             pass
@@ -5807,7 +6001,7 @@ def _tool_summary(name: str, result: str, duration_s: float | None) -> str | Non
 
 
 def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
-    session = _sessions.get(sid)
+    session = _runtime_session_for_sid(sid)
     if session is not None:
         try:
             from agent.display import capture_local_edit_snapshot
@@ -5840,9 +6034,13 @@ def _on_tool_start(sid: str, tool_call_id: str, name: str, args: dict):
         _emit("tool.start", sid, payload)
 
 
+_process_event_owners: dict[str, tuple[str, dict]] = {}
+_process_event_owners_lock = threading.Lock()
+
+
 def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result: str):
     payload = {"tool_id": tool_call_id, "name": name, "args": args}
-    session = _sessions.get(sid)
+    session = _runtime_session_for_sid(sid)
     snapshot = None
     started_at = None
     if session is not None:
@@ -5855,6 +6053,19 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
         payload["result"] = json.loads(result)
     except Exception:
         payload["result"] = result
+    if (
+        session is not None
+        and name in {"terminal", "process"}
+        and isinstance(payload["result"], dict)
+    ):
+        process_id = str(
+            payload["result"].get("session_id")
+            or payload["result"].get("process_id")
+            or ""
+        )
+        if process_id:
+            with _process_event_owners_lock:
+                _process_event_owners[process_id] = (sid, session)
     summary = _tool_summary(name, result, duration_s)
     if summary:
         payload["summary"] = summary
@@ -5977,6 +6188,13 @@ def _on_tool_progress(
         _emit("moa.phase", sid, phase_payload)
         return
     if event_type.startswith("subagent."):
+        # Relay events are authorized by the exact originating live parent
+        # generation.  The scoped writer below revalidates that generation and
+        # writes directly to its captured transport, never through _emit's
+        # current/stdin fallback ladder.
+        parent_session = _runtime_session_for_sid(sid)
+        if parent_session is None or parent_session.get("_finalized"):
+            return
         payload = {
             "goal": str(_kwargs.get("goal") or ""),
             "task_count": int(_kwargs.get("task_count") or 1),
@@ -6036,9 +6254,21 @@ def _on_tool_progress(
         # skip the parent emit — sending hundreds of ignored token frames there
         # is wasted traffic and a trap for any future parent-side subagent
         # catch-all. The mirror keys off the child sid and is unaffected.
-        if event_type != "subagent.text":
-            _emit(event_type, sid, payload)
-        _mirror_subagent_to_child(event_type, payload)
+        if not _emit_session_owned(
+            None if event_type == "subagent.text" else event_type,
+            sid,
+            payload,
+            expected_session=parent_session,
+        ):
+            return
+        # A durable child id is only unique inside its profile. Scope the relay
+        # from the parent live session so cloned/imported profiles with the same
+        # child id cannot steal each other's watch transport or liveness state.
+        _mirror_subagent_to_child(
+            event_type,
+            payload,
+            profile_home=parent_session.get("profile_home"),
+        )
 
 
 # ── Child-session live mirror ────────────────────────────────────────
@@ -6049,68 +6279,99 @@ def _on_tool_progress(
 # open-in-new-window), that window would otherwise sit silent until the run
 # persists. Translate the relayed events into the native stream events the
 # window already renders — emitted on the CHILD sid, routed to its transport
-# by write_json — so the window shows a real midstream turn.
-_child_mirrors: dict[str, dict] = {}
+# directly through that session's explicit transport — so the window shows a
+# real midstream turn without any current/stdin fallback route.
+_child_mirrors: dict[tuple[str | None, str], dict] = {}
 _child_mirrors_lock = threading.Lock()
 # Stored child session ids with a delegation run currently in flight (refreshed
 # on every relayed subagent.* event, popped on subagent.complete). Lets a lazy
 # watch resume report running=true so the window shows a busy indicator even
 # while the child is silent inside a long tool call (no events for 25s+).
-_active_child_runs: dict[str, float] = {}
+_active_child_runs: dict[tuple[str | None, str], float] = {}
 # Staleness bound for the registry: entries refresh on every relayed event, so
 # anything this quiet means the completion event was lost (callback raised,
 # parent crashed) — don't let a leaked entry pin "running" forever.
 _CHILD_RUN_STALE_S = 3600.0
 
 
-def _child_run_active(child_key: str) -> bool:
-    ts = _active_child_runs.get(child_key)
+def _child_runtime_key(profile_home: object, child_key: str) -> tuple[str | None, str]:
+    """Canonical profile-scoped identity for child mirror runtime state."""
+    return (_profile_home_identity(profile_home), str(child_key or ""))
+
+
+def _child_run_active(child_key: str, *, profile_home: object) -> bool:
+    ts = _active_child_runs.get(_child_runtime_key(profile_home, child_key))
     return ts is not None and (time.time() - ts) < _CHILD_RUN_STALE_S
 
 
-def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
+def _mirror_subagent_to_child(
+    event_type: str, payload: dict, *, profile_home: object
+) -> None:
     child_key = str(payload.get("child_session_id") or "")
     if not child_key:
         return
+    runtime_key = _child_runtime_key(profile_home, child_key)
     # Liveness registry first — it must be accurate even when no window is
     # open, so a window opened mid-run can immediately know the child is busy.
     if event_type == "subagent.complete":
-        _active_child_runs.pop(child_key, None)
+        _active_child_runs.pop(runtime_key, None)
     else:
-        _active_child_runs[child_key] = time.time()
+        _active_child_runs[runtime_key] = time.time()
     # Mirror only into a live watch session (keyed by session_key; its live sid
     # differs from the stored id) that has NOT been upgraded to a full agent.
     # No window / closed → nothing to mirror; an upgraded session owns a real
     # native stream and mirroring on top would interleave two turns on one sid.
     # Either way drop state so a reopened window starts a fresh synthetic turn.
-    live = _find_live_session_by_key(child_key)
+    live = _find_live_session_by_key(child_key, profile_home=profile_home)
     if live is None or live[1].get("agent") is not None:
         with _child_mirrors_lock:
-            _child_mirrors.pop(child_key, None)
+            _child_mirrors.pop(runtime_key, None)
         return
     csid = live[0]
     with _child_mirrors_lock:
-        st = _child_mirrors.setdefault(child_key, {"seq": 0, "open_tool": None, "started": False})
+        st = _child_mirrors.setdefault(
+            runtime_key, {"seq": 0, "open_tool": None, "started": False}
+        )
+
+        def child_emit(event: str, body: dict | None = None) -> bool:
+            if _emit_session_owned(
+                event,
+                csid,
+                body,
+                expected_session=live[1],
+            ):
+                return True
+            # The watch disappeared, finalized, lost its explicit transport, or
+            # was replaced between lookup and any synthetic frame.  Preserve
+            # active-run liveness, but never retain stale synthetic turn state.
+            _child_mirrors.pop(runtime_key, None)
+            return False
+
         if not st["started"]:
             st["started"] = True
-            _emit("message.start", csid)
+            if not child_emit("message.start"):
+                return
         if event_type == "subagent.thinking":
             if text := str(payload.get("text") or ""):
-                _emit("reasoning.delta", csid, {"text": text})
+                if not child_emit("reasoning.delta", {"text": text}):
+                    return
         elif event_type == "subagent.text":
             # The child's streamed reply text — the actual "agent talking".
             # Relayed token-by-token from the child's run_conversation
             # stream_callback, so the watch window streams the reply live.
             if text := str(payload.get("text") or ""):
-                _emit("message.delta", csid, {"text": text})
+                if not child_emit("message.delta", {"text": text}):
+                    return
         elif event_type == "subagent.start":
             # One-time header line (the child's goal) so a freshly opened window
             # shows immediate context before the first reply token streams.
             if text := str(payload.get("text") or ""):
-                _emit("message.delta", csid, {"text": f"{text}\n"})
+                if not child_emit("message.delta", {"text": f"{text}\n"}):
+                    return
         elif event_type == "subagent.tool":
             if st["open_tool"]:
-                _emit("tool.complete", csid, st["open_tool"])
+                if not child_emit("tool.complete", st["open_tool"]):
+                    return
             st["seq"] += 1
             tool = {
                 "name": str(payload.get("tool_name") or "tool"),
@@ -6120,44 +6381,55 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
             if preview := str(payload.get("tool_preview") or payload.get("text") or ""):
                 tool["preview"] = preview
             st["open_tool"] = tool
-            _emit("tool.start", csid, tool)
+            if not child_emit("tool.start", tool):
+                return
         elif event_type == "subagent.complete":
             if st["open_tool"]:
-                _emit("tool.complete", csid, st["open_tool"])
+                if not child_emit("tool.complete", st["open_tool"]):
+                    return
             summary = str(payload.get("summary") or payload.get("text") or "")
-            _emit("message.complete", csid, {"text": summary})
-            _child_mirrors.pop(child_key, None)
+            if not child_emit("message.complete", {"text": summary}):
+                return
+            _child_mirrors.pop(runtime_key, None)
 
 
 def _agent_cbs(sid: str) -> dict:
+    # Deferred builds already have a registered record. Capture it so callbacks
+    # that fire after their turn/context ends cannot route into a reused sid.
+    with _sessions_lock:
+        expected_session = _sessions.get(sid)
+
+    def owned(fn: Callable, *args, **kwargs):
+        return _run_session_owned(expected_session, fn, *args, **kwargs)
+
     callbacks = {
-        "tool_start_callback": lambda tc_id, name, args: _on_tool_start(
+        "tool_start_callback": lambda tc_id, name, args: owned(_on_tool_start,
             sid, tc_id, name, args
         ),
-        "tool_complete_callback": lambda tc_id, name, args, result: _on_tool_complete(
+        "tool_complete_callback": lambda tc_id, name, args, result: owned(_on_tool_complete,
             sid, tc_id, name, args, result
         ),
-        "tool_progress_callback": lambda event_type, name=None, preview=None, args=None, **kwargs: _on_tool_progress(
+        "tool_progress_callback": lambda event_type, name=None, preview=None, args=None, **kwargs: owned(_on_tool_progress,
             sid, event_type, name, preview, args, **kwargs
         ),
         "tool_gen_callback": lambda name: _tool_progress_enabled(sid)
-        and _emit("tool.generating", sid, {"name": name}),
-        "thinking_callback": lambda text: _emit("thinking.delta", sid, {"text": text}),
+        and owned(_emit, "tool.generating", sid, {"name": name}),
+        "thinking_callback": lambda text: owned(_emit, "thinking.delta", sid, {"text": text}),
         # Affection reaction (ily / <3 / good bot) → hearts. Core-detected, so
         # the TUI heart and desktop floating hearts share one signal.
-        "reaction_callback": lambda kind: _emit("reaction", sid, {"kind": kind}),
-        "reasoning_callback": lambda text: _emit(
+        "reaction_callback": lambda kind: owned(_emit, "reaction", sid, {"kind": kind}),
+        "reasoning_callback": lambda text: owned(_emit,
             "reasoning.delta",
             sid,
             {"text": text, **({"verbose": True} if _session_verbose(sid) else {})},
         ),
-        "status_callback": lambda kind, text=None: _status_update(
+        "status_callback": lambda kind, text=None: owned(_status_update,
             sid, str(kind), None if text is None else str(text)
         ),
         # Credits/notice spine (L1): an AgentNotice fired by the agent becomes a
         # notification.show WS event; a recovery clear becomes notification.clear.
         # Snake_case payload to match the existing gateway-event convention.
-        "notice_callback": lambda n: _emit(
+        "notice_callback": lambda n: owned(_emit,
             "notification.show",
             sid,
             {
@@ -6169,10 +6441,10 @@ def _agent_cbs(sid: str) -> dict:
                 "id": n.id,
             },
         ),
-        "notice_clear_callback": lambda key: _emit(
+        "notice_clear_callback": lambda key: owned(_emit,
             "notification.clear", sid, {"key": key}
         ),
-        "clarify_callback": lambda q, c, multi_select=False: _block(
+        "clarify_callback": lambda q, c, multi_select=False: owned(_block,
             "clarify.request",
             sid,
             # multi_select is a pass-through hint: renderers with checkbox
@@ -6189,7 +6461,7 @@ def _agent_cbs(sid: str) -> dict:
         ),
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
         # renderer answers terminal.read.respond with the serialized buffer.
-        "read_terminal_callback": lambda start=None, count=None: _block(
+        "read_terminal_callback": lambda start=None, count=None: owned(_block,
             "terminal.read.request",
             sid,
             {k: v for k, v in (("start", start), ("count", count)) if v is not None},
@@ -6199,7 +6471,7 @@ def _agent_cbs(sid: str) -> dict:
         # preview tab (a Browser webview's readable text, a file's identity)
         # and answers preview.read.respond. Longer timeout than the terminal
         # read — a URL tab extracts text from a live page.
-        "read_preview_callback": lambda start=None, count=None: _block(
+        "read_preview_callback": lambda start=None, count=None: owned(_block,
             "preview.read.request",
             sid,
             {k: v for k, v in (("start", start), ("count", count)) if v is not None},
@@ -6209,7 +6481,7 @@ def _agent_cbs(sid: str) -> dict:
         # process (which owns native window enumeration) which OS window sits
         # directly underneath the Hermes window, and answers
         # window.read.respond with the serialized metadata.
-        "read_window_below_callback": lambda: _block(
+        "read_window_below_callback": lambda: owned(_block,
             "window.read.request",
             sid,
             {},
@@ -6236,7 +6508,7 @@ def _agent_cbs(sid: str) -> dict:
     # this, and the finally block clears it so a stale closure can't fire.
     if _load_interim_assistant_messages():
         callbacks["interim_assistant_callback"] = (
-            lambda text, *, already_streamed=False: _emit(
+            lambda text, *, already_streamed=False: owned(_emit,
                 "message.interim",
                 sid,
                 {"text": str(text), "already_streamed": bool(already_streamed)},
@@ -6616,13 +6888,20 @@ def _preview_tool_result_preview(name: str, result: str) -> str:
     return str(data.get("error") or "").strip()[:1200]
 
 
-def _preview_restart_callbacks(parent: str, task_id: str) -> dict:
+def _preview_restart_callbacks(
+    parent: str, task_id: str, *, expected_session: dict | None = None
+) -> dict:
     started_at: dict[str, float] = {}
 
     def progress(message: str, level: str = "info") -> None:
         text = str(message or "").strip()
         if text:
-            _emit("preview.restart.progress", parent, {"task_id": task_id, "level": level, "text": text})
+            _emit_for_session(
+                expected_session,
+                "preview.restart.progress",
+                parent,
+                {"task_id": task_id, "level": level, "text": text},
+            )
 
     def tool_start(tool_call_id: str, name: str, args: dict) -> None:
         started_at[tool_call_id] = time.time()
@@ -6758,8 +7037,8 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
             if not added:
                 return
             info = _session_info(agent, session)
-        # Emit outside the lock — write_json must not block under _sessions_lock.
-        _emit("session.info", sid, info)
+        # Emit outside the lock through the exact generation captured above.
+        _emit_for_session(session, "session.info", sid, info)
     threading.Thread(
         target=_wait_then_refresh,
         name=f"tui-mcp-late-refresh-{sid}",
@@ -7107,7 +7386,12 @@ def _init_session(
     try:
         from tools.approval import register_gateway_notify, load_permanent_allowlist
 
-        register_gateway_notify(key, lambda data: _emit_approval_request(sid, data))
+        register_gateway_notify(
+            key,
+            lambda data, _session=_sessions.get(sid): _run_session_owned(
+                _session, _emit_approval_request, sid, data
+            ),
+        )
         load_permanent_allowlist()
     except Exception:
         pass
@@ -7117,8 +7401,11 @@ def _init_session(
     # prompt_toolkit; the TUI has no equivalent print surface, so without
     # this callback the review would write the skill/memory change silently.
     try:
-        agent.background_review_callback = lambda message, _sid=sid: _emit(
-            "review.summary", _sid, {"text": str(message)}
+        agent.background_review_callback = lambda message, _sid=sid, _session=_sessions.get(sid): _emit_for_session(
+            _session,
+            "review.summary",
+            _sid,
+            {"text": str(message)},
         )
         # Honor display.memory_notifications (off | on | verbose) like the
         # messaging gateway and CLI do — otherwise the review always behaved as
@@ -7133,7 +7420,12 @@ def _init_session(
         if sid in _sessions:
             _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
     _notify_session_boundary("on_session_reset", key, _session_source(_sessions.get(sid, {})))
-    _emit("session.info", sid, _session_info(agent, _sessions.get(sid, {})))
+    _emit_for_session(
+        _sessions.get(sid),
+        "session.info",
+        sid,
+        _session_info(agent, _sessions.get(sid, {})),
+    )
     _schedule_mcp_late_refresh(sid, agent)
 
 
@@ -7866,7 +8158,10 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             with session["history_lock"]:
                 session["running"] = False
 
-    threading.Thread(target=kickoff, daemon=True).start()
+    threading.Thread(
+        target=lambda: _run_session_owned(session, kickoff),
+        daemon=True,
+    ).start()
     logger.info(
         "auto-continue scheduled for session %s (attempt %d, interrupted %.0fs ago)",
         session_key,
@@ -8435,7 +8730,9 @@ def _claim_or_reuse_live(
     resume lock, or — if a concurrent resume already won — release ``lease`` and
     return the winner for the caller to reuse."""
     with _session_resume_lock:
-        live = _find_live_session_by_key(session_key)
+        live = _find_live_session_by_key(
+            session_key, profile_home=record.get("profile_home")
+        )
         if live is not None:
             if lease is not None:
                 lease.release()
@@ -8609,9 +8906,34 @@ def _session_lookup_key(session: dict, *, fallback: str = "") -> str:
     )
 
 
-def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
+def _profile_home_identity(profile_home: object) -> str | None:
+    """Canonical identity for a live session's profile scope."""
+    if profile_home is None:
+        return None
+    value = str(profile_home).strip()
+    if not value:
+        return None
+    try:
+        return str(Path(value).resolve())
+    except Exception:
+        return os.path.abspath(os.path.expanduser(value))
+
+
+def _find_live_session_by_key(
+    session_key: str, *, profile_home: object = _ANY_PROFILE_HOME
+) -> tuple[str, dict] | None:
+    requested_profile = (
+        _ANY_PROFILE_HOME
+        if profile_home is _ANY_PROFILE_HOME
+        else _profile_home_identity(profile_home)
+    )
     for sid, session in list(_sessions.items()):
         if session.get("_finalized"):
+            continue
+        if (
+            requested_profile is not _ANY_PROFILE_HOME
+            and _profile_home_identity(session.get("profile_home")) != requested_profile
+        ):
             continue
         if _session_lookup_key(session, fallback=sid) == session_key:
             return sid, session
@@ -8730,8 +9052,6 @@ def _live_session_payload(
     with session["history_lock"]:
         if cols is not None:
             session["cols"] = cols
-        if transport is not None:
-            session["transport"] = transport
         if touch:
             session["last_active"] = time.time()
         in_memory_history = list(session.get("display_history_prefix") or []) + list(
@@ -8780,6 +9100,26 @@ def _live_session_payload(
     if clarify := _pending_clarify_request_payload(sid):
         payload["pending_clarify"] = clarify
     return payload
+
+
+def _rebind_live_session_transport(
+    sid: str, session: dict, transport: Transport
+) -> bool:
+    """CAS a resume/activate transport without stealing a healthy live owner.
+
+    Callers serialize this with ``_session_resume_lock``. Same-owner resumes
+    are idempotent; only a dead/detached prior owner may be rebound.
+    """
+    with _sessions_lock:
+        if _sessions.get(sid) is not session or session.get("_finalized"):
+            return False
+        current = session.get("transport")
+        if current is transport:
+            return True
+        if current is not None and not _transport_is_dead(current):
+            return False
+        session["transport"] = transport
+        return True
 
 
 def _main_runtime_from_agent(agent) -> dict | None:
@@ -10198,28 +10538,31 @@ def _wire_agent_terminal_output() -> None:
     if has_output_sink and has_close_sink:
         return
 
-    def _owner_sid_for_process(session) -> str:
-        session_key = str(getattr(session, "session_key", "") or "")
-        if not session_key:
-            return ""
-        with _sessions_lock:
-            for sid, tui_session in _sessions.items():
-                if str(tui_session.get("session_key") or "") == session_key:
-                    return sid
-        return ""
+    def _owner_for_process(process_id: str) -> tuple[str, dict | None]:
+        with _process_event_owners_lock:
+            return _process_event_owners.get(process_id, ("", None))
 
     def _emit_agent_terminal_output(session, chunk):
-        _emit(
+        sid, owner = _owner_for_process(str(session.id))
+        _emit_for_session(
+            owner,
             "agent.terminal.output",
-            _owner_sid_for_process(session),
+            sid,
             {"process_id": session.id, "chunk": chunk},
         )
 
     def _emit_agent_terminal_close(session, process_id):
-        # session may be None (process already finished/pruned) — the tab can
-        # still linger and be closed; route to the owning window when we can.
-        sid = _owner_sid_for_process(session) if session is not None else ""
-        _emit("terminal.close", sid, {"process_id": process_id})
+        # session may be None (process already finished/pruned) — use the exact
+        # generation captured when the process-start tool completed.
+        sid, owner = _owner_for_process(str(process_id))
+        _emit_for_session(
+            owner,
+            "terminal.close",
+            sid,
+            {"process_id": process_id},
+        )
+        with _process_event_owners_lock:
+            _process_event_owners.pop(str(process_id), None)
 
     if not has_output_sink:
         process_registry.on_output = _emit_agent_terminal_output
@@ -10245,7 +10588,12 @@ def _wire_desktop_ui() -> None:
     except Exception:
         return
 
-    desktop_ui.set_emitter(lambda sid, event, payload: _emit(event, sid, payload))
+    def emit_owned(sid: str, event: str, payload: dict) -> None:
+        owner = _current_runtime_session_record.get()
+        if owner is not None:
+            _emit_for_session(owner, event, sid, payload)
+
+    desktop_ui.set_emitter(emit_owned)
     _desktop_ui_wired = True
 
 
@@ -10261,8 +10609,8 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     _wire_desktop_ui()
     stop = threading.Event()
     t = threading.Thread(
-        target=_notification_poller_loop,
-        args=(stop, sid, session),
+        target=_run_session_owned,
+        args=(session, _notification_poller_loop, stop, sid, session),
         daemon=True,
         # Stable, greppable name for debuggers and test teardowns.
         name=f"tui-notif-poller-{sid}",
@@ -14873,9 +15221,29 @@ def _(rid, params: dict) -> dict:
             if not _voice_mode_enabled():
                 return _err(rid, 4015, "voice mode is off — enable with /voice on")
 
+            requested_voice_sid = str(params.get("session_id") or "")
             with _voice_sid_lock:
                 global _voice_event_sid, _voice_wake_owner
-                _voice_event_sid = params.get("session_id") or _voice_event_sid
+                voice_sid = requested_voice_sid or _voice_event_sid
+                _voice_event_sid = voice_sid
+            with _sessions_lock:
+                voice_session = _sessions.get(voice_sid) if voice_sid else None
+
+            def _recording_voice_emit(event: str, payload: dict | None = None) -> None:
+                # A recording owns the exact session generation present when it
+                # started. Late audio callbacks must not follow mutable global
+                # voice state into a reused sid or a newer recording owner.
+                # Missing ownership also fails closed: an empty sid is the
+                # intentional global-broadcast route and is never valid for
+                # private recording output.
+                if not voice_sid or voice_session is None:
+                    return
+                _emit_session_owned(
+                    event,
+                    voice_sid,
+                    payload,
+                    expected_session=voice_session,
+                )
 
             from hermes_cli.voice import start_continuous
 
@@ -14926,11 +15294,11 @@ def _(rid, params: dict) -> dict:
                     _voice_wake_owner = transport
 
             def _on_transcript(t):
-                _voice_emit("voice.transcript", {"text": t})
+                _recording_voice_emit("voice.transcript", {"text": t})
                 _resume_voice_wake()
 
             def _on_silent():
-                _voice_emit("voice.transcript", {"no_speech_limit": True})
+                _recording_voice_emit("voice.transcript", {"no_speech_limit": True})
                 _resume_voice_wake()
 
             def _on_stop_phrase(t):
@@ -14947,11 +15315,13 @@ def _(rid, params: dict) -> dict:
                     _tts_stream_stop(user_barge=False)
                 except Exception:
                     pass
-                _voice_emit("voice.transcript", {"stop_phrase": True, "text": t})
+                _recording_voice_emit(
+                    "voice.transcript", {"stop_phrase": True, "text": t}
+                )
                 _resume_voice_wake()
 
             def _on_status(state):
-                _voice_emit("voice.status", {"state": state})
+                _recording_voice_emit("voice.status", {"state": state})
                 if state == "idle":
                     _resume_voice_wake()
 
@@ -14981,6 +15351,9 @@ def _(rid, params: dict) -> dict:
             return _ok(rid, {"status": "recording"})
 
         # action == "stop"
+        # Preserve the process-global UI owner for subsequent non-recording
+        # voice events. Active recording callbacks do not consult this mutable
+        # value: they are fenced to the immutable owner captured at start.
         with _voice_sid_lock:
             _voice_event_sid = params.get("session_id") or _voice_event_sid
 

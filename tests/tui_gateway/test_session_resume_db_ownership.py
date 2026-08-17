@@ -34,6 +34,7 @@ import types
 import pytest
 
 from tui_gateway import server
+from tui_gateway.transport import bind_transport, reset_transport
 
 
 class _RecordingDB:
@@ -98,7 +99,7 @@ def profile_dbs(monkeypatch, tmp_path):
     # The handler builds nothing on the paths under test; keep it hermetic and
     # off the real agent/secret/HERMES_HOME machinery.
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
-    monkeypatch.setattr(server, "_find_live_session_by_key", lambda _key: None)
+    monkeypatch.setattr(server, "_find_live_session_by_key", lambda *a, **k: None)
     monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
     monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda *a, **k: None)
     monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a, **k: None)
@@ -159,17 +160,91 @@ def test_resume_closes_profile_db_on_live_session_fast_path(profile_dbs, monkeyp
         return db
 
     monkeypatch.setattr("hermes_state.SessionDB", _factory)
-    monkeypatch.setattr(server, "_find_live_session_by_key", lambda _key: ("live-sid", {}))
+    record = {"transport": server._stdio_transport}
+    server._sessions["live-sid"] = record
+    monkeypatch.setattr(
+        server, "_find_live_session_by_key", lambda *a, **k: ("live-sid", record)
+    )
     monkeypatch.setattr(
         server,
         "_live_session_payload",
         lambda sid, session, **_kwargs: {"session_id": sid},
     )
-    monkeypatch.setattr(server, "_child_run_active", lambda _key: False)
+    monkeypatch.setattr(
+        server, "_child_run_active", lambda _key, *, profile_home: False
+    )
 
     resp = _resume(session_id="s1", profile="work")
 
     assert resp["result"]["resumed"] == "s1"
+    assert profile_dbs[0].closed == 1
+
+
+@pytest.mark.parametrize(
+    ("prior_kind", "expect_success"),
+    [
+        ("healthy_other", False),
+        ("same", True),
+        ("detached", True),
+        ("closed", True),
+    ],
+)
+def test_resume_live_transport_rebind_policy_is_cas_stable(
+    profile_dbs, monkeypatch, prior_kind, expect_success
+):
+    class _Transport:
+        def __init__(self, *, closed=False):
+            self._closed = closed
+
+        def write(self, _obj):
+            return not self._closed
+
+        def close(self):
+            self._closed = True
+
+    def _factory(db_path=None, **kwargs):
+        db = _RecordingDB(db_path=db_path, **kwargs)
+        db.rows["s1"] = {"id": "s1", "cwd": ""}
+        profile_dbs.append(db)
+        return db
+
+    incoming = _Transport()
+    prior = {
+        "healthy_other": _Transport(),
+        "same": incoming,
+        "detached": server._detached_ws_transport,
+        "closed": _Transport(closed=True),
+    }[prior_kind]
+    record = {"transport": prior, "agent": object()}
+    server._sessions["live-cas"] = record
+    monkeypatch.setattr("hermes_state.SessionDB", _factory)
+    monkeypatch.setattr(
+        server, "_find_live_session_by_key", lambda *a, **k: ("live-cas", record)
+    )
+    monkeypatch.setattr(
+        server,
+        "_live_session_payload",
+        lambda sid, session, **_kwargs: {"session_id": sid},
+    )
+    monkeypatch.setattr(
+        server, "_child_run_active", lambda _key, *, profile_home: False
+    )
+
+    token = bind_transport(incoming)
+    try:
+        resp = _resume(session_id="s1", profile="work")
+    finally:
+        reset_transport(token)
+
+    if expect_success:
+        assert resp["result"]["resumed"] == "s1"
+        assert record["transport"] is incoming
+    else:
+        assert resp["error"] == {
+            "code": 4009,
+            "message": "session is already attached to another live transport",
+        }
+        assert record["transport"] is prior
     assert profile_dbs[0].closed == 1
 
 

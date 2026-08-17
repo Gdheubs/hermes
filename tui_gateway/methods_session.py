@@ -41,6 +41,8 @@ def _(rid, params: dict) -> dict:
     # and each turn re-bind HERMES_HOME. None/own profile → launch (unchanged).
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
+    if profile and profile_home is None and profile != _current_profile_name():
+        return _db_unavailable_error(rid, code=5006)
 
     # The desktop composer owns its model/effort/fast as plain UI state and ships
     # it on every session.create. Honor each as a PER-SESSION override (built into
@@ -317,6 +319,8 @@ def _(rid, params: dict) -> dict:
     # local profile's state.db. None/own profile → the launch profile (unchanged).
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
+    if profile and profile_home is None and profile != _current_profile_name():
+        return _db_unavailable_error(rid, code=5000)
     defer_history = is_truthy_value(params.get("defer_history", False))
     # Desktop hydrates persisted transcripts through the authenticated REST
     # route in parallel. Suppress the duplicate WebSocket transcript only when
@@ -344,7 +348,9 @@ def _(rid, params: dict) -> dict:
             found = db.get_session_by_title(target)
             if found:
                 target = found["id"]
-            elif is_truthy_value(params.get("lazy", False)) and _child_run_active(target):
+            elif is_truthy_value(params.get("lazy", False)) and _child_run_active(
+                target, profile_home=profile_home
+            ):
                 # Race: a watch window opened on a freshly-spawned subagent. The
                 # child relays `subagent.start` (which carries child_session_id and
                 # triggers the window) BEFORE its first run_conversation() flushes
@@ -416,14 +422,21 @@ def _(rid, params: dict) -> dict:
         )
 
         def _reuse_live_payload(sid: str, session: dict) -> dict:
-            payload = _live_session_payload(
-                sid,
-                session,
-                cols=cols,
-                touch=True,
-                transport=current_transport() or _stdio_transport,
-                omit_messages=omit_messages,
-            )
+            transport = current_transport() or _stdio_transport
+            with _session_resume_lock:
+                if not _rebind_live_session_transport(sid, session, transport):
+                    return _err(
+                        rid,
+                        4009,
+                        "session is already attached to another live transport",
+                    )
+                payload = _live_session_payload(
+                    sid,
+                    session,
+                    cols=cols,
+                    touch=True,
+                    omit_messages=omit_messages,
+                )
             payload["resumed"] = target
             if defer_history:
                 payload["messages"] = []
@@ -434,16 +447,19 @@ def _(rid, params: dict) -> dict:
             # A lazy watch session never owns a run loop, so its payload's running
             # flag is always False — overlay the child-run registry so a reconnecting
             # watch window keeps its busy indicator while the child is still mid-run.
-            if session.get("agent") is None and _child_run_active(target):
+            if session.get("agent") is None and _child_run_active(
+                target, profile_home=profile_home
+            ):
                 payload["running"] = True
                 payload["status"] = "streaming"
             return payload
 
         # Fast path: if the session is already live, reuse it under the lock.
         with _session_resume_lock:
-            live = _find_live_session_by_key(target)
+            live = _find_live_session_by_key(target, profile_home=profile_home)
             if live is not None:
-                return _ok(rid, _reuse_live_payload(*live))
+                reused = _reuse_live_payload(*live)
+                return reused if "error" in reused else _ok(rid, reused)
 
         # Lazy/watch resume: register the live session WITHOUT building an agent.
         # Used by the desktop's subagent windows — the child runs inside the
@@ -484,10 +500,11 @@ def _(rid, params: dict) -> dict:
                 lazy=True,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
-                return _ok(rid, _reuse_live_payload(*live))
+                reused = _reuse_live_payload(*live)
+                return reused if "error" in reused else _ok(rid, reused)
             # A delegated child mid-run emits no session events of its own — report
             # its liveness from the relay registry so the window shows a busy turn.
-            child_running = _child_run_active(target)
+            child_running = _child_run_active(target, profile_home=profile_home)
             # User-visible messages use the VERBATIM display projection (child-only,
             # no ancestors — matching the repaired read above), so model-invisible
             # rows persisted by #65919 (verification candidates collapsed by
@@ -648,7 +665,8 @@ def _(rid, params: dict) -> dict:
                 resume_runtime_overrides=overrides or None,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
-                return _ok(rid, _reuse_live_payload(*live))
+                reused = _reuse_live_payload(*live)
+                return reused if "error" in reused else _ok(rid, reused)
 
             _schedule_agent_build(sid)
             _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
@@ -749,7 +767,7 @@ def _(rid, params: dict) -> dict:
         # live session while we were building. Re-check under the lock; if it won,
         # discard our just-built agent and reuse theirs (no worker/poller wired yet).
         with _session_resume_lock:
-            live = _find_live_session_by_key(target)
+            live = _find_live_session_by_key(target, profile_home=profile_home)
             if live is not None:
                 try:
                     if hasattr(agent, "close"):
@@ -759,12 +777,20 @@ def _(rid, params: dict) -> dict:
                 if lease is not None:
                     lease.release()
                 other_sid, other_session = live
+                transport = current_transport() or _stdio_transport
+                if not _rebind_live_session_transport(
+                    other_sid, other_session, transport
+                ):
+                    return _err(
+                        rid,
+                        4009,
+                        "session is already attached to another live transport",
+                    )
                 payload = _live_session_payload(
                     other_sid,
                     other_session,
                     cols=cols,
                     touch=True,
-                    transport=current_transport() or _stdio_transport,
                     omit_messages=omit_messages,
                 )
                 payload["resumed"] = target
@@ -1034,16 +1060,20 @@ def _(rid, params: dict) -> dict:
         return err
     assert session is not None
 
-    return _ok(
-        rid,
-        _live_session_payload(
+    with _session_resume_lock:
+        if not _rebind_live_session_transport(
+            sid, session, current_transport() or _stdio_transport
+        ):
+            return _err(
+                rid, 4009, "session is already attached to another live transport"
+            )
+        payload = _live_session_payload(
             sid,
             session,
             touch=True,
-            transport=current_transport() or _stdio_transport,
             omit_messages=is_truthy_value(params.get("omit_messages", False)),
-        ),
-    )
+        )
+    return _ok(rid, payload)
 
 
 @method("session.delete")

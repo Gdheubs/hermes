@@ -1794,6 +1794,106 @@ def test_voice_record_start_handles_non_dict_voice_cfg(monkeypatch):
         assert captured["auto_restart"] is False
 
 
+def test_voice_record_callbacks_cannot_follow_reused_or_changed_owner(monkeypatch):
+    class CaptureTransport:
+        def __init__(self):
+            self.frames: list[dict] = []
+            self._closed = False
+
+        def write(self, frame):
+            self.frames.append(frame)
+            return True
+
+    captured: dict = {}
+    old_transport = CaptureTransport()
+    replacement_transport = CaptureTransport()
+    old_session = {"transport": old_transport}
+    server._sessions["voice-sid"] = old_session
+
+    def fake_start_continuous(**kwargs):
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.voice",
+        types.SimpleNamespace(
+            start_continuous=fake_start_continuous,
+            stop_continuous=lambda **_kwargs: None,
+            set_voice_busy_probe=lambda _probe: None,
+        ),
+    )
+    monkeypatch.setenv("HERMES_VOICE", "1")
+    monkeypatch.setattr(server, "current_transport", lambda: old_transport)
+    monkeypatch.setattr(server, "_wake_owner_snapshot", lambda: (None, None))
+    monkeypatch.setattr(server, "_resume_voice_wake", lambda: None)
+    monkeypatch.setattr(server, "_tts_stream_stop", lambda **_kwargs: None)
+
+    response = server._methods["voice.record"](
+        "voice-owned", {"action": "start", "session_id": "voice-sid"}
+    )
+    assert response["result"]["status"] == "recording"
+
+    server._sessions["voice-sid"] = {"transport": replacement_transport}
+    with server._voice_sid_lock:
+        server._voice_event_sid = "different-owner"
+
+    captured["on_transcript"]("opaque")
+    captured["on_silent_limit"]()
+    captured["on_status"]("idle")
+    captured["on_stop_phrase"]("opaque")
+
+    assert len(old_transport.frames) == 0
+    assert len(replacement_transport.frames) == 0
+
+
+def test_voice_record_callbacks_without_owner_never_use_fallback(monkeypatch):
+    class CaptureTransport:
+        def __init__(self):
+            self.frames: list[dict] = []
+            self._closed = False
+
+        def write(self, frame):
+            self.frames.append(frame)
+            return True
+
+    captured: dict = {}
+    fallback = CaptureTransport()
+
+    def fake_start_continuous(**kwargs):
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.voice",
+        types.SimpleNamespace(
+            start_continuous=fake_start_continuous,
+            stop_continuous=lambda **_kwargs: None,
+            set_voice_busy_probe=lambda _probe: None,
+        ),
+    )
+    monkeypatch.setenv("HERMES_VOICE", "1")
+    monkeypatch.setattr(server, "_voice_event_sid", "")
+    monkeypatch.setattr(server, "current_transport", lambda: fallback)
+    monkeypatch.setattr(server, "_stdio_transport", fallback)
+    monkeypatch.setattr(server, "_wake_owner_snapshot", lambda: (None, None))
+    monkeypatch.setattr(server, "_resume_voice_wake", lambda: None)
+    monkeypatch.setattr(server, "_tts_stream_stop", lambda **_kwargs: None)
+
+    response = server._methods["voice.record"](
+        "voice-unowned", {"action": "start"}
+    )
+    assert response["result"]["status"] == "recording"
+
+    captured["on_transcript"]("opaque")
+    captured["on_silent_limit"]()
+    captured["on_status"]("idle")
+    captured["on_stop_phrase"]("opaque")
+
+    assert fallback.frames == []
+
+
 def test_prompt_submit_typed_stop_phrase_ends_voice_chat(monkeypatch):
     """Typed bare stop phrase during an active voice chat is consumed at the
     prompt.submit choke point: voice mode flips off, a distinct
@@ -16724,7 +16824,10 @@ def test_close_sessions_for_transport_closes_flagged_repoints_rest(monkeypatch):
     seen = []
     monkeypatch.setattr(
         server, "_close_session_by_id",
-        lambda sid, *, end_reason: bool(seen.append((sid, end_reason))) or True,
+        lambda sid, *, end_reason, **_kwargs: bool(
+            seen.append((sid, end_reason))
+        )
+        or True,
     )
     # Detached session "b" would schedule a real grace-reap threading.Timer that
     # outlives the test; grace=0 short-circuits it so no thread lingers.
