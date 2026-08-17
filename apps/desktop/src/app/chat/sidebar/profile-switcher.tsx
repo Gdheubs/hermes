@@ -46,6 +46,7 @@ import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
 import {
   $activeGatewayProfile,
+  $gatewaySwapTarget,
   $profileColors,
   $profileCreateRequest,
   $profileOrder,
@@ -112,6 +113,7 @@ export function ProfileRail() {
   const profiles = useStore($profiles)
   const scope = useStore($profileScope)
   const gatewayProfile = useStore($activeGatewayProfile)
+  const gatewaySwapTarget = useStore($gatewaySwapTarget)
   const order = useStore($profileOrder)
   const colors = useStore($profileColors)
   const navigate = useNavigate()
@@ -153,7 +155,10 @@ export function ProfileRail() {
   }, [condensed])
 
   const isAll = scope === ALL_PROFILES
-  const activeKey = normalizeProfileKey(gatewayProfile)
+  // The pending target is the foreground identity immediately after a click;
+  // waiting for the backend socket to finish would leave the old bot looking
+  // selected while its session list is being re-homed.
+  const activeKey = normalizeProfileKey(gatewaySwapTarget ?? gatewayProfile)
   const defaultProfile = profiles.find(profile => profile.is_default)
   const onDefault = !isAll && activeKey === 'default'
 
@@ -537,8 +542,9 @@ function ProfilePill({ active, glyph, label, onSelect }: ProfilePillProps) {
         aria-pressed={active}
         className={cn(
           'bg-transparent text-(--ui-text-tertiary) hover:bg-(--ui-control-hover-background) hover:text-foreground',
-          active && 'bg-(--ui-control-active-background) text-foreground'
+          active && 'bg-(--ui-control-active-background) text-foreground ring-1 ring-inset ring-(--theme-primary)'
         )}
+        data-active-profile={active || undefined}
         onClick={onSelect}
         size="icon-xs"
         type="button"
@@ -652,6 +658,7 @@ function ProfileSquare({
                     {...listeners}
                     aria-label={label}
                     aria-pressed={active}
+                    data-active-profile={active || undefined}
                     // Hold-to-recolor rides alongside the dnd pointer listener (call
                     // it first so drag tracking still arms), then a timer opens the
                     // picker and flags the trailing click so it doesn't also select.

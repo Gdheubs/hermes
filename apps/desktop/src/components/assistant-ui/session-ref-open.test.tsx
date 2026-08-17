@@ -30,7 +30,7 @@ describe('session refs open the session', () => {
 
     fireEvent.click(await screen.findByTitle('work/20260101_abc123'))
 
-    await vi.waitFor(() => expect(openSession).toHaveBeenCalledWith('20260101_abc123', expect.any(Function), 'tab'))
+    await vi.waitFor(() => expect(openSession).toHaveBeenCalledWith('20260101_abc123', expect.any(Function), 'tab', 'work'))
   })
 
   it('opens the session from a chip in the user transcript', async () => {
@@ -41,7 +41,7 @@ describe('session refs open the session', () => {
     expect(chip.tagName).toBe('BUTTON')
     fireEvent.click(chip)
 
-    await vi.waitFor(() => expect(openSession).toHaveBeenCalledWith('20260101_abc123', expect.any(Function), 'tab'))
+    await vi.waitFor(() => expect(openSession).toHaveBeenCalledWith('20260101_abc123', expect.any(Function), 'tab', 'work'))
   })
 })
 

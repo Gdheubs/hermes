@@ -29,7 +29,14 @@ import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
 import { $pinnedSessionIds } from '@/store/layout'
 import { $petActive } from '@/store/pet'
 import { $petOverlayActive } from '@/store/pet-overlay'
-import { $activeGatewayProfile, $gatewaySwapTarget, $profiles } from '@/store/profile'
+import {
+  $activeGatewayProfile,
+  $gatewaySwapTarget,
+  $profiles,
+  $profileScope,
+  ALL_PROFILES,
+  normalizeProfileKey
+} from '@/store/profile'
 import {
   $contextSuggestions,
   $freshDraftReady,
@@ -38,8 +45,8 @@ import {
   $introSeed,
   $resumeExhaustedSessionId,
   $sessions,
+  findSessionForProfile,
   resolveComposerSessionKey,
-  sessionMatchesStoredId,
   sessionPinId,
   shouldMigrateComposerScope
 } from '@/store/session'
@@ -121,9 +128,15 @@ function ChatHeader({
   const sessions = useStore($sessions)
   const pinnedSessionIds = useStore($pinnedSessionIds)
   const profiles = useStore($profiles)
+  const profileScope = useStore($profileScope)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
 
-  const activeStoredSession =
-    (selectedSessionId && sessions.find(session => sessionMatchesStoredId(session, selectedSessionId))) || null
+  const foregroundProfile =
+    profileScope === ALL_PROFILES ? normalizeProfileKey(activeGatewayProfile) : profileScope
+
+  const activeStoredSession = selectedSessionId
+    ? (findSessionForProfile(sessions, selectedSessionId, foregroundProfile) ?? null)
+    : null
 
   const title = activeStoredSession ? sessionTitle(activeStoredSession) : NEW_SESSION_TITLE
 
