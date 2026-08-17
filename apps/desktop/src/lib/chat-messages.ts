@@ -156,9 +156,18 @@ export function reasoningPart(text: string, timestamp?: number): ChatMessagePart
   return { type: 'reasoning', text, ...(timestamp !== undefined ? { timestamp } : {}) }
 }
 
-const MEDIA_LINE_RE = /(^|\n)[\t ]*[`"']?MEDIA:\s*(?<line>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)[`"']?[\t ]*(\n|$)/g
+const MEDIA_MARKER_RE = String.raw`(?:\*\*MEDIA:\*\*|MEDIA:)`
+const MEDIA_PATH_RE = String.raw`(?:\x60[^\x60\n]+\x60|"[^"\n]+"|'[^'\n]+'|\S+)`
 
-const MEDIA_TAG_RE = /[`"']?MEDIA:\s*(?<inline>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)[`"']?/g
+const MEDIA_LINE_RE = new RegExp(
+  String.raw`(^|\n)[\t ]*[\x60"']?${MEDIA_MARKER_RE}\s*(?<line>${MEDIA_PATH_RE})[\x60"']?[\t ]*(\n|$)`,
+  'g'
+)
+
+const MEDIA_TAG_RE = new RegExp(
+  String.raw`[\x60"']?${MEDIA_MARKER_RE}\s*(?<inline>${MEDIA_PATH_RE})[\x60"']?`,
+  'g'
+)
 
 function unquoteMediaPath(value: string): string {
   const trimmed = value.trim()

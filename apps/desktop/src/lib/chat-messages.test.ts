@@ -406,6 +406,12 @@ describe('renderMediaTags', () => {
     expect(renderMediaTags('MEDIA:/tmp/demo.mp4')).toBe('[Video: demo.mp4](#media:%2Ftmp%2Fdemo.mp4)')
   })
 
+  it('does not include Markdown emphasis or code delimiters in a MEDIA path', () => {
+    expect(renderMediaTags('**MEDIA:**`C:/Users/qinzi/Desktop/report.md`')).toBe(
+      '[File: report.md](#media:C%3A%2FUsers%2Fqinzi%2FDesktop%2Freport.md)'
+    )
+  })
+
   it('renders streamed assistant media once the tag is complete', () => {
     const parts = appendAssistantTextPart(appendAssistantTextPart([], 'ok\nMEDIA:'), '/tmp/voice.mp3')
     const text = chatMessageText({ id: 'a', role: 'assistant', parts })
