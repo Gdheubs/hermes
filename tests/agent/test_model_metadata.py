@@ -371,6 +371,30 @@ class TestDefaultContextLengths:
                     f"{model_id}: expected {expected_ctx}, got {actual}"
                 )
 
+    def test_glm_53_context_1m(self):
+        """GLM-5.3 ships with a 1M window like 5.2; older GLM stays ~202K.
+
+        Longest-first substring matching must resolve the bare slug and
+        vendor-prefixed forms to 1M, without probing down to the generic
+        ~202K ``glm`` fallback — z.ai /models does not list 5.3 yet, so
+        the hardcoded key is the only correct source today.
+        """
+        from unittest.mock import patch as mock_patch
+
+        assert DEFAULT_CONTEXT_LENGTHS["glm-5.3"] == 1_048_576
+        assert DEFAULT_CONTEXT_LENGTHS["glm-5.2"] == 1_048_576
+        assert DEFAULT_CONTEXT_LENGTHS["glm"] == 202752
+
+        with mock_patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             mock_patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             mock_patch("agent.model_metadata.get_cached_context_length", return_value=None):
+            assert get_model_context_length("glm-5.3") == 1_048_576
+            assert get_model_context_length("zai/glm-5.3") == 1_048_576
+            assert get_model_context_length("z-ai/glm-5.3") == 1_048_576
+            assert get_model_context_length("glm-5.2") == 1_048_576  # unchanged
+            assert get_model_context_length("glm-5") == 202752       # older, unchanged
+            assert get_model_context_length("glm-5.1") == 202752     # older, unchanged
+
 
 
 

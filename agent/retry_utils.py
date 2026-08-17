@@ -6,6 +6,7 @@ rate-limited provider concurrently.
 """
 
 import random
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -18,7 +19,7 @@ from typing import Any, Optional
 _jitter_counter = 0
 _jitter_lock = threading.Lock()
 
-# Z.AI Coding Plan's GLM-5.2 endpoint often returns HTTP 429 code 1305
+# Z.AI Coding Plan's GLM-5.2+ endpoints often return HTTP 429 code 1305
 # ("The service may be temporarily overloaded...") for otherwise valid
 # Hermes requests. Short retries tend to hammer the same overloaded window;
 # after a few normal retries, progressively widen the wait window. Keep the
@@ -146,17 +147,40 @@ def is_zai_coding_overload_error(*, base_url: str | None, model: str | None, err
     and message "The service may be temporarily overloaded...". Treat only
     that narrow shape specially so ordinary quota/billing 429s still fail fast
     through the existing classifier.
+
+    Covers GLM-5.2 and later (5.3, ...) — the graduated-backoff policy is an
+    endpoint property, not a model property, and coding-plan keys that worked
+    with glm-5.2 hit the same overload window on glm-5.3.  Detection is
+    version-aware so glm-5.3 / glm-5-3 / glm-5p3 spellings all match and a
+    future glm-5.4 inherits the policy without another edit.
     """
     base = (base_url or "").lower()
     model_name = (model or "").lower()
     status = getattr(error, "status_code", None)
     text = _error_text(error)
-    return (
-        status == 429
-        and "api.z.ai/api/coding/paas/v4" in base
-        and "glm-5.2" in model_name
-        and ("1305" in text or "temporarily overloaded" in text)
-    )
+    if status != 429:
+        return False
+    if "api.z.ai/api/coding/paas/v4" not in base:
+        return False
+    if not ("1305" in text or "temporarily overloaded" in text):
+        return False
+    return _glm_version_at_least(model_name, (5, 2))
+
+
+def _glm_version_at_least(model_name: str, minimum: tuple[int, int]) -> bool:
+    """True when a GLM model id's version is >= ``minimum``.
+
+    Finds the first ``glm-<major>[.<minor>]`` token in the id (tolerating
+    ``glm-5.3`` / ``glm-5-3`` / ``glm-5p3`` and vendor-prefixed forms like
+    ``z-ai/glm-5.3``); earlier GLM models without a minor (glm-5, glm-4.7)
+    are handled by the minor-optional match.
+    """
+    m = re.search(r"glm-(\d+)(?:[.\-p](\d+))?", model_name)
+    if not m:
+        return False
+    major = int(m.group(1))
+    minor = int(m.group(2) or 0)
+    return (major, minor) >= minimum
 
 
 def adaptive_rate_limit_backoff(

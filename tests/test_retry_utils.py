@@ -2,6 +2,8 @@
 
 import threading
 
+import pytest
+
 import agent.retry_utils as retry_utils
 from types import SimpleNamespace
 
@@ -167,6 +169,77 @@ def test_zai_overload_ceiling_makes_long_tier_reachable(monkeypatch):
 
     assert long_waits, "long-backoff tier never reached within the retry ceiling"
     assert long_waits == [30.0, 60.0, 90.0, 120.0]
+
+
+class TestZaiCodingOverloadModelCoverage:
+    """GLM >= 5.2 on the Coding Plan endpoint gets the overload policy.
+
+    The graduated backoff is an endpoint property, not a model property:
+    coding-plan keys that worked with glm-5.2 hit the same 429/1305
+    overload window on glm-5.3. Version-aware detection (not a substring
+    allowlist) means glm-5.3 / glm-5-3 / glm-5p3 spellings and future
+    glm-5.4+ inherit the policy without another edit, while pre-5.2 GLM
+    models and non-GLM models on the same endpoint stay on the normal
+    classifier.
+    """
+
+    CODING_URL = "https://api.z.ai/api/coding/paas/v4"
+
+    @pytest.mark.parametrize(
+        "model",
+        ["glm-5.2", "glm-5.3", "glm-5-3", "glm-5p3", "z-ai/glm-5.3", "glm-5.4"],
+    )
+    def test_overload_429_1305_matches_glm_5_2_plus(self, model):
+        assert is_zai_coding_overload_error(
+            base_url=self.CODING_URL, model=model, error=_zai_overload_error()
+        )
+
+    @pytest.mark.parametrize(
+        "model",
+        ["glm-5.1", "glm-5", "glm-4.7", "glm-4-9b", "kimi-k3", "deepseek-v4-pro", ""],
+    )
+    def test_other_models_stay_on_normal_classifier(self, model):
+        assert not is_zai_coding_overload_error(
+            base_url=self.CODING_URL, model=model, error=_zai_overload_error()
+        )
+
+    def test_glm_5_3_quota_429_is_not_overload(self):
+        """Quota/billing 429s must still fail fast even on glm-5.3."""
+        quota_err = SimpleNamespace(
+            status_code=429,
+            body={"error": {"code": "1211", "message": "Insufficient balance"}},
+        )
+        assert not is_zai_coding_overload_error(
+            base_url=self.CODING_URL, model="glm-5.3", error=quota_err
+        )
+
+    def test_glm_5_3_overload_on_paas_endpoint_is_not_coding_overload(self):
+        """The policy is scoped to the coding-plan endpoint only."""
+        assert not is_zai_coding_overload_error(
+            base_url="https://api.z.ai/api/paas/v4",
+            model="glm-5.3",
+            error=_zai_overload_error(),
+        )
+
+    def test_glm_5_3_reaches_long_backoff_tier(self, monkeypatch):
+        """End-to-end: glm-5.3 walks the same 30/60/90/120s long-backoff
+        schedule glm-5.2 walks, within the retry ceiling."""
+        monkeypatch.setattr(retry_utils, "jittered_backoff", lambda *a, **kw: kw["base_delay"])
+        from agent.retry_utils import zai_coding_overload_retry_ceiling
+
+        ceiling = zai_coding_overload_retry_ceiling()
+        long_waits = []
+        for attempt in range(1, ceiling):
+            _wait, policy = adaptive_rate_limit_backoff(
+                attempt,
+                base_url=self.CODING_URL,
+                model="glm-5.3",
+                error=_zai_overload_error(),
+                default_wait=1.0,
+            )
+            if policy == "zai_coding_overload_long":
+                long_waits.append(_wait)
+        assert long_waits == [30.0, 60.0, 90.0, 120.0]
 
 
 # ---------------------------------------------------------------------------
