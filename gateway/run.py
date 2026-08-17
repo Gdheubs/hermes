@@ -30246,7 +30246,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 return False
             try:
                 from tools.mcp_tool import shutdown_mcp_servers
-                shutdown_mcp_servers()
+                await asyncio.get_running_loop().run_in_executor(
+                    None, shutdown_mcp_servers
+                )
             except Exception:
                 pass
             if runner.exit_code is not None:
@@ -30254,7 +30256,6 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             return True
         finally:
             _shutdown_gateway_health_export(runner)
-
     # Start the background cron scheduler via the resolved provider so
     # scheduled jobs fire automatically. The built-in provider is the
     # historical in-process 60s ticker; an external provider (e.g. chronos)
@@ -30405,7 +30406,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Close MCP server connections
     try:
         from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
+        await asyncio.get_running_loop().run_in_executor(
+            None, shutdown_mcp_servers
+        )
     except Exception:
         pass
 
