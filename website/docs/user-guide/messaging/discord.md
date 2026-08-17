@@ -781,6 +781,17 @@ Notes:
 - All settings live in `config.yaml` (not `.env`) — they're behavioral, not secrets.
 - When `voice_fx.enabled` is `false`, voice playback uses the original one-shot path and nothing changes.
 
+### Realtime voice in voice channels (xAI S2S)
+
+With `voice.realtime.enabled: true` and `voice.realtime.discord: true` in
+`config.yaml`, voice channels use xAI's realtime backend instead of the
+silence-detection + Whisper pipeline: server-side VAD with streaming
+transcription (`brain: ears`), or a full conversational voice that answers
+instantly in the channel and delegates real work to Hermes
+(`brain: supervisor`). Requires xAI credentials and the gateway. See
+[Voice Mode → Discord voice channels](/user-guide/features/voice-mode) for
+details and the config reference.
+
 
 ## Forum Channels
 

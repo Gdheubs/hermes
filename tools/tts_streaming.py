@@ -438,11 +438,11 @@ class XAIStreamer(StreamingTTSProvider):
         return frames
 
     async def _async_frames(self, text: str):
-        import json as _json
+        from urllib.parse import urlencode
 
         import websockets
 
-        from tools.tts_tool import DEFAULT_XAI_VOICE_ID
+        from tools.tts_tool import DEFAULT_XAI_LANGUAGE, DEFAULT_XAI_VOICE_ID
         from tools.xai_http import resolve_xai_http_credentials
 
         creds = resolve_xai_http_credentials()
@@ -450,39 +450,79 @@ class XAIStreamer(StreamingTTSProvider):
         if not api_key:
             raise RuntimeError("No xAI credentials for streaming TTS")
         voice = str(self.section.get("voice_id", DEFAULT_XAI_VOICE_ID)).strip() or DEFAULT_XAI_VOICE_ID
-        ws_url = str(
+        language = str(
+            self.section.get("language", DEFAULT_XAI_LANGUAGE)
+        ).strip() or DEFAULT_XAI_LANGUAGE
+        base_url = str(
             self.section.get("streaming_url") or "wss://api.x.ai/v1/tts"
         ).strip()
+        # Config travels as query params; language is REQUIRED (HTTP 400
+        # pre-upgrade without it).
+        params = {
+            "language": language,
+            "voice": voice,
+            "codec": "pcm",
+            "sample_rate": str(self.sample_rate),
+        }
+        try:
+            _speed = float(self.section.get("speed", 0) or 0)
+            if _speed:
+                params["speed"] = str(_speed)
+        except (TypeError, ValueError):
+            pass
+        ws_url = f"{base_url}?{urlencode(params)}"
 
-        async with websockets.connect(
-            ws_url, extra_headers={"Authorization": f"Bearer {api_key}"}
-        ) as ws:
-            await ws.send(_json.dumps({
-                "text": text,
-                "voice_id": voice,
-                "response_format": "pcm",
-            }))
-            try:
-                while True:
-                    message = await ws.recv()
-                    if isinstance(message, (bytes, bytearray, memoryview)):
-                        yield bytes(message)
-                        continue
-                    try:
-                        envelope = _json.loads(message)
-                    except (ValueError, TypeError):
-                        if message == "done":
-                            return
-                        continue
-                    etype = envelope.get("type")
-                    if etype == "done":
-                        return
-                    if etype == "error":
-                        logger.warning("xAI WS error envelope: %s",
-                                       envelope.get("error") or envelope.get("message") or envelope)
-                        return
-            except Exception as exc:
-                if exc.__class__.__name__ == "ConnectionClosed":
-                    return
-                logger.warning("xAI WS receive failed: %s", exc)
+        # websockets >= 14 renamed extra_headers= to additional_headers= (the
+        # kwarg only fails at await time, so this was silently broken on the
+        # pinned websockets 15). Keep a fallback for older environments.
+        _headers = {"Authorization": f"Bearer {api_key}"}
+        try:
+            _connect_ctx = websockets.connect(ws_url, additional_headers=_headers)
+            async with _connect_ctx as ws:
+                async for frame in self._ws_tts_frames(ws, text):
+                    yield frame
                 return
+        except TypeError:
+            pass  # pre-14 websockets: retry with the legacy kwarg below
+        async with websockets.connect(ws_url, extra_headers=_headers) as ws:
+            async for frame in self._ws_tts_frames(ws, text):
+                yield frame
+
+    async def _ws_tts_frames(self, ws, text: str):
+        """One utterance over an open streaming-TTS socket: send ``text.delta``
+        + ``text.done``, stream base64 ``audio.delta`` until ``audio.done``
+        (docs.x.ai › text-to-speech › Streaming)."""
+        import base64 as _base64
+        import json as _json
+
+        await ws.send(_json.dumps({"type": "text.delta", "delta": text}))
+        await ws.send(_json.dumps({"type": "text.done"}))
+        try:
+            while True:
+                message = await ws.recv()
+                if isinstance(message, (bytes, bytearray, memoryview)):
+                    yield bytes(message)  # protocol tolerance; spec is JSON
+                    continue
+                try:
+                    envelope = _json.loads(message)
+                except (ValueError, TypeError):
+                    continue
+                etype = envelope.get("type")
+                if etype == "audio.delta":
+                    b64 = envelope.get("delta") or envelope.get("audio") or ""
+                    if b64:
+                        try:
+                            yield _base64.b64decode(b64)
+                        except (ValueError, TypeError) as exc:
+                            logger.warning("xAI WS: bad base64 audio: %s", exc)
+                elif etype in ("audio.done", "done"):
+                    return
+                elif etype == "error":
+                    logger.warning("xAI WS error envelope: %s",
+                                   envelope.get("message") or envelope.get("error") or envelope)
+                    return
+        except Exception as exc:
+            if exc.__class__.__name__ == "ConnectionClosed":
+                return
+            logger.warning("xAI WS receive failed: %s", exc)
+            return

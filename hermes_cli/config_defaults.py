@@ -1724,6 +1724,43 @@ DEFAULT_CONFIG = {
         # voice chat instead of being sent to the agent. Case-insensitive,
         # surrounding punctuation ignored. Set [] to disable.
         "stop_phrases": ["stop"],
+        # Realtime input backend — xAI Grok S2S WebSocket as EARS ONLY:
+        # server VAD + transcription; the agent stays the brain and replies
+        # via the normal TTS pipeline. Needs xAI credentials. When enabled,
+        # /voice on listens continuously (record key pauses/resumes).
+        "realtime": {
+            "enabled": False,
+            "model": "grok-voice-latest",
+            # "ears": every utterance becomes a Hermes turn; replies speak
+            #   via the normal TTS pipeline (grok is muted).
+            # "supervisor": grok-voice chats instantly and delegates real
+            #   work to Hermes via a consult tool (chat-supervisor pattern);
+            #   grok speaks its own replies and the consult summaries.
+            "brain": "ears",
+            "voice": "eve",                 # supervisor speech voice (S2S roster)
+            "narrate_progress": True,       # speak tool-progress lines during consults
+            "instructions": "",             # extra lines appended to the supervisor prompt
+            # Supervisor mic policy while speech plays: false (default) mutes
+            # the mic so open speakers can't feed the assistant its own voice;
+            # true keeps it hot for voice barge-in (wear headphones).
+            "full_duplex": False,
+            # Server VAD tuning; null = server default (0.85 / 333 ms).
+            "vad_threshold": None,          # 0.1-0.9; higher = needs louder speech
+            "vad_silence_ms": None,         # silence that ends the turn
+            "vad_prefix_padding_ms": None,  # audio kept before speech onset
+            "language_hint": "",            # BCP-47 transcription bias; "" = auto
+            "keyterms": [],                 # vocabulary bias (max 100 terms)
+            # Auto-pause after this many silent seconds — a hot mic streams
+            # billable audio. 0 disables.
+            "idle_pause_seconds": 120,
+            # Also use the realtime backend in Discord voice channels (the
+            # gateway must be running and the bot joined via /voice join).
+            # The supervisor brain then converses instantly in the VC and
+            # delegates work to Hermes; the ears brain swaps the classic
+            # silence-detection + Whisper pipeline for server-side VAD +
+            # streaming transcription.
+            "discord": False,
+        },
     },
 
     # "Hey Hermes" hands-free wake word. Always-on, on-device hotword

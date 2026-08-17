@@ -320,6 +320,9 @@ _LONG_HANDLERS = frozenset(
         "shell.exec",
         "skills.manage",
         "slash.exec",
+        # Mints an xAI ephemeral realtime token — one blocking HTTP round
+        # trip to api.x.ai (two on a 401 retry); never on the reader thread.
+        "voice.realtime_token",
     }
 )
 
@@ -15019,6 +15022,96 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5026, "voice module not available")
     except Exception as e:
         return _err(rid, 5026, str(e))
+
+
+@method("voice.realtime_token")
+def _(rid, params: dict) -> dict:
+    """Mint an xAI ephemeral realtime token for browser voice surfaces.
+
+    Desktop/dashboard renderers hold the S2S WebSocket themselves (browser
+    echo cancellation → full duplex); the server mints the short-lived
+    credential and hands over the ready-made ``session.update`` payload so
+    the supervisor prompt/tools/VAD config stays defined in exactly one
+    place (tools.voice_realtime.build_session_update).
+    """
+    import requests
+
+    from tools.voice_realtime import (
+        build_session_update,
+        load_realtime_config,
+        realtime_voice_enabled,
+    )
+    from tools.xai_http import resolve_xai_http_credentials
+
+    try:
+        seconds = int(params.get("expires_seconds") or 300)
+    except (TypeError, ValueError):
+        seconds = 300
+    seconds = max(60, min(seconds, 3600))
+
+    cfg = _load_cfg()
+    _vc = cfg.get("voice")
+    if not realtime_voice_enabled(_vc if isinstance(_vc, dict) else {}):
+        return _err(
+            rid, 4030,
+            "voice.realtime is not enabled (set voice.realtime.enabled: true)",
+        )
+    rt_cfg = load_realtime_config(_vc if isinstance(_vc, dict) else {})
+    # Browser surfaces are conversational by definition — a muted ears
+    # session is meaningless there, so the payload is always supervisor.
+    rt_cfg.brain = "supervisor"
+
+    def _mint(api_key: str):
+        return requests.post(
+            "https://api.x.ai/v1/realtime/client_secrets",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"expires_after": {"seconds": seconds}},
+            timeout=15,
+        )
+
+    try:
+        creds = resolve_xai_http_credentials()
+        api_key = str(creds.get("api_key") or "").strip()
+        if not api_key:
+            return _err(
+                rid, 4030,
+                "no xAI credentials (set XAI_API_KEY or `hermes auth add xai`)",
+            )
+        resp = _mint(api_key)
+        if resp.status_code in (401, 403):
+            creds = resolve_xai_http_credentials(
+                force_refresh=True, api_key_hint=api_key
+            )
+            retry_key = str(creds.get("api_key") or "").strip()
+            if retry_key and retry_key != api_key:
+                resp = _mint(retry_key)
+        if resp.status_code >= 400:
+            return _err(
+                rid, 5030,
+                f"xAI token mint failed: HTTP {resp.status_code}: "
+                f"{resp.text[:200]}",
+            )
+        payload = resp.json()
+    except Exception as e:
+        return _err(rid, 5030, f"xAI token mint failed: {e}")
+
+    if not isinstance(payload, dict):
+        return _err(rid, 5030, "xAI token mint returned a non-object response")
+    secret = payload.get("client_secret")
+    secret = secret if isinstance(secret, dict) else {}
+    token = str(payload.get("value") or secret.get("value") or "").strip()
+    if not token:
+        return _err(rid, 5030, "no token in xAI response")
+    return _ok(rid, {
+        "token": token,
+        "expires_at": payload.get("expires_at") or secret.get("expires_at"),
+        "url": f"{rt_cfg.url}?model={rt_cfg.model}",
+        "model": rt_cfg.model,
+        "session_update": build_session_update(rt_cfg),
+    })
 
 
 # ── Methods: insights ────────────────────────────────────────────────

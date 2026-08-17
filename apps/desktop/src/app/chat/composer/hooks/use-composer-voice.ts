@@ -1,15 +1,18 @@
+import type { RealtimeTokenGrant } from '@hermes/shared'
 import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
 import { chatMessageText, collectUnspokenTurnSpeech } from '@/lib/chat-messages'
+import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { triggerHaptic } from '@/lib/haptics'
+import { isVoiceStopCommand } from '@/lib/voice-stop-word'
 import { clearWakeIndicator, syncWakeIndicatorWithVoice } from '@/lib/wake-indicator'
 import { $voiceConversationStartRequest, takeVoiceConversationStart } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
 import { $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
-import { $autoSpeakReplies, $voiceStopPhrase, setAutoSpeakReplies } from '@/store/voice-prefs'
+import { $autoSpeakReplies, $realtimeVoiceEnabled, $voiceStopPhrase, setAutoSpeakReplies } from '@/store/voice-prefs'
 import { resumeWakeAfterVoice } from '@/store/wake-word'
 
 import type { ComposerTarget } from '../focus'
@@ -18,6 +21,7 @@ import { useComposerScope } from '../scope'
 import type { ChatBarProps } from '../types'
 
 import { useAutoSpeakReplies } from './use-auto-speak-replies'
+import { useRealtimeVoiceConversation } from './use-realtime-voice-conversation'
 import { useVoiceConversation } from './use-voice-conversation'
 import { useVoiceRecorder } from './use-voice-recorder'
 
@@ -65,6 +69,10 @@ export function useComposerVoice({
   const lastSpokenIdRef = useRef<string | null>(null)
   const ownsWakeIndicatorRef = useRef(false)
   const voiceStartRequest = useStore($voiceConversationStartRequest)
+  const realtimeEnabled = useStore($realtimeVoiceEnabled)
+  // Older backends without voice.realtime_token fall back to the classic loop.
+  const [realtimeUnavailable, setRealtimeUnavailable] = useState(false)
+  const realtimeMode = realtimeEnabled && !realtimeUnavailable
 
   const { dictate, voiceActivityState, voiceStatus } = useVoiceRecorder({
     focusInput,
@@ -130,10 +138,10 @@ export function useComposerVoice({
   // fail and the conversation never starts listening.
   const wakePauseBarrierRef = useRef<Promise<void> | null>(null)
 
-  const conversation = useVoiceConversation({
+  const classicConversation = useVoiceConversation({
     busy,
     consumePendingResponse,
-    enabled: voiceConversationActive,
+    enabled: voiceConversationActive && !realtimeMode,
     onFatalError: () => setVoiceConversationActive(false),
     // Speaking over the model mid-generation interrupts the in-flight turn —
     // the same seam as the Stop button — so the interjection becomes the next
@@ -151,6 +159,59 @@ export function useComposerVoice({
     // to finish releasing the capture device (see wakePauseBarrierRef).
     beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined
   })
+
+  // Ephemeral grants are minted fresh per dial and never reused. Resolving
+  // null (older backend without the RPC) makes the hook stand down quietly;
+  // flipping realtimeUnavailable re-renders with the classic loop enabled,
+  // so the conversation continues instead of dying.
+  const requestRealtimeToken = useCallback(async (): Promise<RealtimeTokenGrant | null> => {
+    const gateway = $gateway.get()
+
+    if (!gateway) {
+      throw new Error('gateway not connected')
+    }
+
+    try {
+      return await gateway.request<RealtimeTokenGrant>('voice.realtime_token', {})
+    } catch (error) {
+      if (isMissingRpcMethod(error)) {
+        setRealtimeUnavailable(true)
+
+        return null
+      }
+
+      throw error
+    }
+  }, [])
+
+  // Consult/steer submissions bypass the voice-turn busy gate — the submit
+  // pipeline owns interrupt semantics for turns started while one runs.
+  const submitConsultTask = useCallback(
+    async (text: string) => {
+      triggerHaptic('submit')
+      resetBrowseState(sessionId)
+      clearDraft()
+      await onSubmit(text)
+    },
+    [clearDraft, onSubmit, sessionId]
+  )
+
+  const realtimeConversation = useRealtimeVoiceConversation({
+    busy,
+    enabled: voiceConversationActive && realtimeMode,
+    requestToken: requestRealtimeToken,
+    submitTask: submitConsultTask,
+    onInterrupt,
+    onFatalError: () => setVoiceConversationActive(false),
+    onStopWord: () => setVoiceConversationActive(false),
+    isStopWord: isVoiceStopCommand,
+    pendingResponse: pendingTurnResponse,
+    consumePendingResponse,
+    beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined,
+    failureLabel: t.assistant.thread.readAloudFailed
+  })
+
+  const conversation = realtimeMode ? realtimeConversation : classicConversation
 
   // eslint-disable-next-line no-restricted-syntax -- ownership token used only by unmount cleanup
   useEffect(() => {

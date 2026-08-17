@@ -572,6 +572,29 @@ class TestVoiceChannelCommands:
         assert mock_adapter._voice_sources[111]["chat_id"] == "123"
         assert mock_adapter._voice_sources[111]["chat_type"] == "group"
 
+    @pytest.mark.asyncio
+    async def test_join_announces_active_voice_pipeline(self, runner):
+        """The join reply says which pipeline engaged — the realtime start
+        falls back to classic silently, so users need this to tell."""
+        mock_channel = MagicMock()
+        mock_channel.name = "General"
+        mock_adapter = AsyncMock()
+        mock_adapter.join_voice_channel = AsyncMock(return_value=True)
+        mock_adapter.get_user_voice_channel = AsyncMock(return_value=mock_channel)
+        mock_adapter._voice_text_channels = {}
+        mock_adapter._voice_sources = {}
+        mock_adapter._voice_input_callback = None
+        event = self._make_discord_event()
+        runner.adapters[event.source.platform] = mock_adapter
+
+        mock_adapter.voice_realtime_brain = MagicMock(return_value="supervisor")
+        result = await runner._handle_voice_channel_join(event)
+        assert "realtime supervisor" in result
+
+        mock_adapter.voice_realtime_brain = MagicMock(return_value="")
+        result = await runner._handle_voice_channel_join(event)
+        assert "classic transcription" in result
+
 
     @pytest.mark.asyncio
     async def test_join_missing_voice_dependencies(self, runner):

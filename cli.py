@@ -54,6 +54,7 @@ from hermes_cli.fallback_config import get_fallback_chain
 from hermes_cli.cli_agent_setup_mixin import CLIAgentSetupMixin
 from hermes_cli.cli_commands_mixin import CLICommandsMixin
 from hermes_cli.cli_billing_mixin import CLIBillingMixin
+from hermes_cli.cli_voice_realtime_mixin import CLIVoiceRealtimeMixin, _CLIVoiceTurnRunner  # noqa: F401
 from agent.interrupt_compat import request_hard_interrupt
 
 # prompt_toolkit for fixed input area TUI
@@ -4776,7 +4777,7 @@ class _VoiceInputMessage:
         return self.text
 
 
-class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
+class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin, CLIVoiceRealtimeMixin):
     """
     Interactive CLI for the Hermes Agent.
     
@@ -5353,6 +5354,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._voice_barge_capture = threading.Event()  # barge monitor is capturing the interruption
         self._voice_last_tts_text = ""  # most recently spoken TTS text (echo guard, #75780)
         self._voice_barge_phase = None  # "generation" or "playback" phase of the last barge trip
+        self._init_voice_realtime_state()
 
         # Status bar visibility (toggled via /statusbar)
         self._status_bar_visible = _status_bar_visible_from_display_config(
@@ -13668,6 +13670,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # latches the turn so it ends on a sulk.
         if event_type == "tool.started":
             self._pet_reasoning = False
+            self._voice_realtime_narrate_tool(function_name)
         elif event_type == "tool.completed" and kwargs.get("is_error"):
             self._pet_turn_error = True
         elif event_type and event_type.startswith("reasoning"):
@@ -13811,6 +13814,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """Start capturing audio from the microphone."""
         if getattr(self, '_should_exit', False):
             return
+        # Realtime backend pushes transcripts itself — just (re)arm it; on
+        # failure fall through to the classic recorder below.
+        if self._voice_realtime_config_enabled() and not self._voice_rt_failed:
+            if self._voice_realtime_start():
+                return
         from tools.voice_mode import create_audio_recorder, check_voice_requirements
 
         reqs = check_voice_requirements()
@@ -14238,6 +14246,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return  # one listener owns the mic for this turn
         fd_active.set()
         try:
+            if self._voice_realtime_session_alive():
+                # Realtime session owns the mic; its server VAD drives
+                # barge-in (two input streams on one device is unreliable).
+                return
             from hermes_cli.config import load_config
             voice_cfg = load_config().get("voice") or {}
             if not (isinstance(voice_cfg, dict) and voice_cfg.get("barge_in", True)):
@@ -14394,7 +14406,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return
 
         reqs = check_voice_requirements()
-        if not reqs["available"]:
+        # Realtime transcribes server-side — only audio I/O is required locally.
+        _rt_ready = False
+        if self._voice_realtime_config_enabled():
+            try:
+                from tools.voice_realtime import check_realtime_requirements
+                _rt_ok, _rt_detail = check_realtime_requirements()
+            except Exception as _rt_exc:
+                _rt_ok, _rt_detail = False, str(_rt_exc)
+            if _rt_ok and reqs.get("audio_available"):
+                _rt_ready = True
+            elif not _rt_ok:
+                _cprint(f"\n{_DIM}Realtime voice configured but unavailable: {_rt_detail}{_RST}")
+        if not reqs["available"] and not _rt_ready:
             _cprint(f"\n{_ACCENT}Voice mode requirements not met:{_RST}")
             for line in reqs["details"].split("\n"):
                 _cprint(f"  {_DIM}{line}{_RST}")
@@ -14432,8 +14456,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # here would drift after a mid-session config edit (Copilot
         # round-14 on #19835, same class as round-13).
         _ptt_display = self._voice_record_key_label()
-        _cprint(f"\n{_ACCENT}Voice mode enabled{tts_status}{_RST}")
-        _cprint(f"  {_DIM}{_ptt_display} to start/stop recording{_RST}")
+        if _rt_ready:
+            with self._voice_lock:
+                self._voice_continuous = True
+            threading.Thread(
+                target=self._voice_realtime_start_or_fallback, daemon=True
+            ).start()
+            _cprint(f"\n{_ACCENT}Voice mode enabled{tts_status} — realtime (grok){_RST}")
+            _cprint(f"  {_DIM}Listening starts automatically — just talk{_RST}")
+            _cprint(f"  {_DIM}{_ptt_display} to pause/resume listening{_RST}")
+        else:
+            _cprint(f"\n{_ACCENT}Voice mode enabled{tts_status}{_RST}")
+            _cprint(f"  {_DIM}{_ptt_display} to start/stop recording{_RST}")
         # Spoken-stop hint sourced from voice.stop_phrases (first entry); the
         # helper returns "" when stop phrases are disabled — show no hint then.
         try:
@@ -14475,6 +14509,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     def _disable_voice_mode(self):
         """Disable voice mode, cancel any active recording, and stop TTS."""
+        # Realtime input backend first: it owns the mic when active.
+        try:
+            self._voice_realtime_stop()
+        except Exception:
+            pass
         recorder = None
         with self._voice_lock:
             if self._voice_recording and self._voice_recorder:
@@ -14652,9 +14691,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         # Single-utterance capture (not continuous) via the voice pipeline;
         # VAD auto-stop transcribes and queues the transcript for process_loop.
+        # The realtime backend only listens while continuous, so a wake there
+        # opens a live voice chat instead.
         with self._voice_lock:
             self._voice_mode = True
-        self._voice_continuous = False
+        self._voice_continuous = (
+            self._voice_realtime_config_enabled() and not self._voice_rt_failed
+        )
         try:
             self._voice_start_recording()
         except Exception as e:
@@ -14679,6 +14722,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         self._agent_running
                         or self._voice_recording
                         or getattr(self, "_voice_processing", False)
+                        # A realtime session (even paused) holds the mic.
+                        or self._voice_realtime_session_alive()
                         or not self._pending_input.empty()
                     )
                     if busy:
@@ -14759,6 +14804,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         _cprint(f"  Mode:      {'ON' if self._voice_mode else 'OFF'}")
         _cprint(f"  TTS:       {'ON' if self._voice_tts else 'OFF'}")
         _cprint(f"  Recording: {'YES' if self._voice_recording else 'no'}")
+        if self._voice_realtime_config_enabled():
+            sess = getattr(self, "_voice_rt_session", None)
+            if sess is not None and sess.alive:
+                _rt_state = "connected" if sess.connected else "connecting"
+                _rt_state += ", listening" if sess.armed else ", paused"
+            elif getattr(self, "_voice_rt_failed", False):
+                _rt_state = "failed (classic fallback active)"
+            else:
+                _rt_state = "enabled (not active)"
+            _brain = "supervisor (grok chats, Hermes consults)" if getattr(
+                self, "_voice_rt_supervisor", False
+            ) else "ears (every utterance → Hermes)"
+            _cprint(f"  Realtime:  {_rt_state} — xAI grok S2S, brain: {_brain}")
         # Display the startup-pinned label so /voice status always
         # matches the live prompt_toolkit binding (Copilot round-14 on
         # #19835, same class as round-13). Reading live config here
@@ -14947,6 +15005,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 "response_queue": response_queue,
             }
             self._approval_deadline = _time.monotonic() + timeout
+
+            # Voice supervisor: the user may be away from the screen — say so.
+            _rt_ctrl = getattr(self, "_voice_rt_ctrl", None)
+            if _rt_ctrl is not None and self._voice_realtime_supervisor_active():
+                _rt_ctrl.notify("Hermes needs your approval in the terminal.")
 
             # Modal prompt — paint immediately, bypassing the throttle/resize
             # guard. A throttled paint here can be silently dropped (250ms
@@ -15536,7 +15599,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             stop_event = None
             _tts_normal_exit = False
 
-            if self._voice_tts:
+            # Supervisor brain owns the speaker: grok-voice speaks its own
+            # replies and the consult summaries, so classic TTS stays silent.
+            if self._voice_tts and not self._voice_realtime_supervisor_active():
                 try:
                     from tools.tts_tool import (
                         _import_sounddevice,
@@ -16105,9 +16170,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         f"response may be incomplete{_RST}"
                     )
 
-            # Speak response aloud if voice TTS is enabled
-            # Skip batch TTS when streaming TTS already handled it
-            if self._voice_tts and response and not use_streaming_tts:
+            # Supervisor consult: hand the result to the voice session (grok
+            # speaks the summary); consumed turns never hit local TTS.
+            _consult_handled = False
+            try:
+                _consult_handled = self._voice_realtime_consult_complete(message, response)
+            except Exception as e:
+                logger.debug("consult completion hook failed: %s", e)
+
+            # Speak response aloud if voice TTS is enabled.
+            # Skip batch TTS when streaming TTS already handled it — and skip
+            # entirely while the supervisor brain is live: grok owns the
+            # speaker for EVERY turn (typed input included), or its speech
+            # and classic TTS read the same reply on top of each other.
+            if (
+                self._voice_tts
+                and response
+                and not use_streaming_tts
+                and not _consult_handled
+                and not self._voice_realtime_supervisor_active()
+            ):
                 self._voice_speak_response_async(response)
 
 
@@ -16413,7 +16495,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     def _audio_level_bar(self) -> str:
         """Return a visual audio level indicator based on current RMS."""
         _LEVEL_BARS = " ▁▂▃▄▅▆▇"
-        rec = getattr(self, "_voice_recorder", None)
+        rec = getattr(self, "_voice_rt_session", None)
+        if rec is None or not rec.alive:
+            rec = getattr(self, "_voice_recorder", None)
         if rec is None:
             return ""
         rms = rec.current_rms
@@ -16858,6 +16942,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._voice_barge_capture = threading.Event()  # barge monitor is capturing the interruption
         self._voice_last_tts_text = ""  # most recently spoken TTS text (echo guard, #75780)
         self._voice_barge_phase = None  # "generation" or "playback" phase of the last barge trip
+        self._init_voice_realtime_state()
 
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
             self._install_tool_callbacks()
@@ -17580,6 +17665,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             """
             now = time.time()
 
+            # Realtime voice session: Ctrl+C ends the voice chat, not Hermes.
+            # (The classic branch below can't catch this — realtime has no
+            # AudioRecorder, so _voice_recorder is None and the press used
+            # to fall through to the exit path.)
+            if cli_ref._voice_mode and cli_ref._voice_realtime_session_alive():
+                threading.Thread(
+                    target=cli_ref._disable_voice_mode, daemon=True
+                ).start()
+                event.app.invalidate()
+                return
+
             # Cancel active voice recording.
             # Run cancel() in a background thread to prevent blocking the
             # event loop if AudioRecorder._lock or CoreAudio takes time.
@@ -17865,6 +17961,46 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             entire UI.  All heavy work is dispatched to daemon threads.
             """
             if not cli_ref._voice_mode:
+                return
+            # Realtime: the key toggles pause/resume of the always-on listener.
+            if cli_ref._voice_realtime_session_alive():
+                _sess = cli_ref._voice_rt_session
+                if (
+                    cli_ref._voice_rt_supervisor
+                    and cli_ref._voice_recording
+                    and _sess is not None
+                    and _sess.speaking
+                ):
+                    # Mid-speech: cut the audio, keep listening. A second
+                    # press (once quiet) pauses as usual.
+                    _sess.clear_playout()
+                    event.app.invalidate()
+                    return
+                if cli_ref._voice_recording:
+                    threading.Thread(
+                        target=cli_ref._voice_realtime_pause, daemon=True
+                    ).start()
+                else:
+                    if cli_ref._clarify_state or cli_ref._sudo_state or cli_ref._approval_state or cli_ref._slash_confirm_state:
+                        return
+                    if not cli_ref._voice_tts_done.is_set():
+                        try:
+                            logger.info("TTS CUT: record key handler cutting TTS (realtime)")
+                            from tools.tts_streaming import mark_speech_interrupted
+                            mark_speech_interrupted()
+                            if cli_ref._voice_tts_stop is not None:
+                                cli_ref._voice_tts_stop.set()
+                            from tools.voice_mode import stop_playback
+                            stop_playback()
+                            cli_ref._voice_tts_done.set()
+                        except Exception:
+                            pass
+                    with cli_ref._voice_lock:
+                        cli_ref._voice_continuous = True
+                    threading.Thread(
+                        target=cli_ref._voice_realtime_start_or_fallback, daemon=True
+                    ).start()
+                event.app.invalidate()
                 return
             # Always allow STOPPING a recording (even when agent is running)
             if cli_ref._voice_recording:

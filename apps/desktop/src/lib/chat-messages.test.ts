@@ -1267,6 +1267,32 @@ describe('collectUnspokenTurnSpeech', () => {
     expect(collectUnspokenTurnSpeech([assistant('a1', 'Done.')], 'a1')).toBeNull()
     expect(collectUnspokenTurnSpeech([user('u1', 'hello'), assistant('a1', '')], null)).toBeNull()
   })
+
+  it('attributes the speech to the triggering user submission', () => {
+    const messages = [
+      user('u1', 'check disk usage'),
+      assistant('a1', 'Checking…', { interim: true }),
+      assistant('a2', 'Disk is 42% full.')
+    ]
+
+    expect(collectUnspokenTurnSpeech(messages, null)?.userText).toBe('check disk usage')
+  })
+
+  it('binds userText to the first unspoken bubble and advances with consumption', () => {
+    const messages = [
+      user('u1', 'task one'),
+      assistant('a1', 'Answer one.'),
+      user('u2', 'task two'),
+      assistant('a2', 'Answer two.')
+    ]
+
+    expect(collectUnspokenTurnSpeech(messages, null)?.userText).toBe('task one')
+    expect(collectUnspokenTurnSpeech(messages, 'a1')?.userText).toBe('task two')
+  })
+
+  it('reports null userText when no user message precedes the bubble', () => {
+    expect(collectUnspokenTurnSpeech([assistant('a1', 'Hi.')], null)?.userText).toBeNull()
+  })
 })
 
 describe('sealOpenToolParts', () => {

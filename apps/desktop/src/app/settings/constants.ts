@@ -694,6 +694,9 @@ export const SECTIONS: DesktopConfigSection[] = [
     label: 'Voice',
     icon: Mic,
     keys: [
+      'voice.realtime.enabled',
+      'voice.realtime.brain',
+      'voice.realtime.voice',
       'tts.provider',
       'stt.enabled',
       'stt.echo_transcripts',

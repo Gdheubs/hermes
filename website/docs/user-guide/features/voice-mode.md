@@ -192,6 +192,114 @@ The agent **knows** it was interrupted: the next message carries a short note te
 
 Whisper sometimes generates phantom text from silence or background noise ("Thank you for watching", "Subscribe", etc.). The agent filters these out using a set of 26 known hallucination phrases across multiple languages, plus a regex pattern that catches repetitive variations.
 
+### Realtime Input Backend (xAI Grok S2S)
+
+An alternative **input** pipeline for CLI voice mode, backed by xAI's [Speech to Speech API](https://docs.x.ai/developers/model-capabilities/audio/speech-to-speech) over WebSocket. Instead of record → local VAD → batch Whisper, the mic streams continuously to `grok-voice` and the **server** does the voice-activity detection and transcription — lower latency endpointing, streaming ASR with vocabulary biasing, and natural barge-in.
+
+The architecture stays hybrid: the S2S session is **ears only**. The Hermes agent — full toolset, approvals, memory, prompt cache — remains the brain, and replies are spoken by your normal `tts.provider` (pick `xai` for the same voice roster as S2S so the whole loop is one voice).
+
+```yaml
+# ~/.hermes/config.yaml
+voice:
+  auto_tts: true          # speak replies when voice mode turns on
+  realtime:
+    enabled: true
+    model: "grok-voice-latest"
+    # vad_threshold: 0.85       # optional server VAD tuning
+    # vad_silence_ms: 800
+    # language_hint: "en"       # BCP-47 transcription bias
+    # keyterms: ["Hermes", "Nous Research"]
+    idle_pause_seconds: 120     # auto-pause the hot mic after silence (0 = never)
+
+tts:
+  provider: "xai"          # optional — any TTS provider works
+```
+
+Requires xAI credentials (`XAI_API_KEY` in `~/.hermes/.env`, or xAI OAuth via `hermes auth add xai`). No local STT provider is needed — transcription happens server-side.
+
+Usage differences from classic voice mode:
+
+- `/voice on` **starts listening immediately** — no push-to-talk. Just talk; the server endpoints your utterance and the transcript becomes the agent turn.
+- The record key (Ctrl+B) **pauses/resumes** listening instead of starting a recording.
+- Barge-in uses the server's VAD: speaking during playback cuts TTS; speaking during generation interrupts the agent turn (`voice.barge_in: false` switches to half-duplex — the mic is suppressed while the agent works or speaks).
+- Saying **"stop"** still ends the voice chat; typed stop phrases work too.
+- After `idle_pause_seconds` with no speech, listening auto-pauses (the always-hot mic streams billable audio to xAI; don't leave it running overnight). Press the record key to resume.
+- If the realtime connection fails or dies, voice mode falls back to the classic push-to-talk recorder automatically.
+
+#### Supervisor brain (chat-supervisor pattern)
+
+`voice.realtime.brain` picks who answers your voice:
+
+- **`ears`** (default) — every utterance becomes a Hermes turn; replies speak via your `tts.provider`. Maximum fidelity: you always talk to Hermes itself.
+- **`supervisor`** — grok-voice converses with you **instantly** (greetings, chit-chat, follow-ups) and delegates anything real — facts, files, code, commands, web — to Hermes through a `consult_hermes` tool. Hermes runs the task as a normal turn in the background while you keep talking; tool progress is spoken as short verbatim lines (`narrate_progress`), and when the task finishes grok summarizes the result aloud. The full text always lands in the terminal.
+
+```yaml
+voice:
+  realtime:
+    enabled: true
+    brain: "supervisor"
+    voice: "eve"              # any S2S voice, or a custom voice ID
+    narrate_progress: true    # "Running terminal command." while consults run
+    instructions: ""          # optional extra lines for the voice persona
+```
+
+The supervisor brain is shared across surfaces: the CLI/TUI runs it locally
+(half-duplex mic gating), while the **desktop app** and **web dashboard**
+hold the xAI socket directly in the browser — the backend mints an ephemeral
+token (`voice.realtime_token` RPC) and hands over the same server-built
+session config, and browser echo cancellation gives **full duplex on open
+speakers**. On desktop, the existing voice hotkey starts the realtime
+conversation automatically when `voice.realtime.enabled` + `brain: supervisor`
+are set; the dashboard's chat sidebar gets a **Voice chat** card (which also
+works from a phone browser). Consults run as normal turns through each
+surface's prompt pipeline.
+
+#### Discord voice channels
+
+Set `voice.realtime.discord: true` (alongside `enabled: true`) and the
+gateway's Discord bot uses the realtime backend inside voice channels after
+`/voice join`:
+
+```yaml
+voice:
+  realtime:
+    enabled: true
+    discord: true
+    brain: "supervisor"   # or "ears"
+```
+
+- **`supervisor`** — grok-voice lives in the VC: it answers instantly through
+  the voice connection, delegates real work to Hermes (`consult_hermes`), and
+  speaks the result summary when the turn finishes. The full reply text still
+  lands in the bound text channel, along with `[Voice]` transcript lines for
+  what was said. Tool progress is narrated between sentences, and the bot's
+  speech ducks under you the moment you start talking (server-side barge-in —
+  the receive path never contains the bot's own audio, so it is always full
+  duplex).
+- **`ears`** — keeps the classic flow (each utterance becomes an agent turn,
+  replies play via your `tts.provider`) but swaps the 1.5-second
+  silence-detection + Whisper pipeline for server-side VAD + streaming
+  transcription: faster endpointing and better vocabulary handling
+  (`keyterms`, `language_hint`).
+
+The supervisor voice plays through the same continuous mixer as the
+[voice-channel ambience](../messaging/discord.md) (`discord.voice_fx`), so
+the ambient bed and ducking keep working; `voice_fx` does **not** need to be
+enabled. If the realtime connection dies, the channel falls back to the
+classic transcription pipeline automatically. The VC inactivity timeout
+(`discord.voice_channel_inactivity_timeout_seconds`) still disconnects idle
+sessions, which also bounds the always-streaming mic cost.
+
+Supervisor notes:
+
+- **Half-duplex by default**: the mic is muted while the assistant speaks, so open laptop speakers can't feed it its own voice (the "it talks to itself" loop). You can still interrupt: **talk clearly over it** — speech well above the tracked speaker-bleed level (`voice.barge_in_threshold_multiplier`, default 3×) cuts playback and opens the mic — or tap the record key to cut the speech instantly while staying in the conversation. Set `voice.realtime.full_duplex: true` for effortless talk-over with headphones.
+- grok-voice speaks its own replies (the classic TTS pipeline stays silent while the session is live). What it says is echoed into the terminal as `🎙 …` lines. Your own utterances are **not** echoed: the model hears your audio natively, and the sidecar transcription it would take to display them is approximate — it's kept only to detect the spoken stop phrase.
+- Speaking while Hermes works never interrupts the consult — chat freely, ask for status, or keep going. One consult runs at a time; further requests are queued behind it by the voice model.
+- If Hermes hits a command-approval prompt mid-consult, the voice says so ("Hermes needs your approval in the terminal").
+- The supervisor is instructed to never invent technical results — if it can't answer from the conversation alone, it must consult. Verbatim fidelity still lives in the terminal transcript, not the spoken summary.
+
+Echo note: with barge-in enabled and open speakers, loud TTS playback can trip the server VAD (the default threshold `0.85` is deliberately high). Use headphones, or set `voice.barge_in: false` for half-duplex.
+
 ---
 
 ## Gateway Voice Reply (Telegram & Discord)

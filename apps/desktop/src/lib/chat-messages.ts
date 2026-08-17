@@ -200,6 +200,10 @@ export interface UnspokenTurnSpeech {
   id: string
   /** Whether the newest assistant bubble is still streaming. */
   pending: boolean
+  /** Text of the user message that triggered the first unspoken bubble, or
+   *  null when unknown — lets consumers attribute the speech to a specific
+   *  submission (the realtime consult flow matches it against its task). */
+  userText: string | null
   /** All unspoken assistant text in message order, bubbles joined on a blank line. */
   text: string
 }
@@ -223,9 +227,17 @@ export function collectUnspokenTurnSpeech(
 
   let id: string | null = null
   let pending = false
+  let userText: string | null = null
+  let lastUserText: string | null = null
   const parts: string[] = []
 
   for (const message of messages.slice(spokenIndex + 1)) {
+    if (message.role === 'user' && !message.hidden) {
+      lastUserText = chatMessageText(message).trim() || null
+
+      continue
+    }
+
     if (message.role !== 'assistant' || message.hidden) {
       continue
     }
@@ -237,6 +249,10 @@ export function collectUnspokenTurnSpeech(
       continue
     }
 
+    if (id === null) {
+      userText = lastUserText
+    }
+
     id ??= message.id
     parts.push(text)
   }
@@ -245,7 +261,7 @@ export function collectUnspokenTurnSpeech(
     return null
   }
 
-  return { id, pending, text: parts.join('\n\n') }
+  return { id, pending, text: parts.join('\n\n'), userText }
 }
 
 const normalizeWs = (value: string) => value.replace(/\s+/g, ' ').trim()

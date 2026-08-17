@@ -37,6 +37,18 @@ export function applyVoiceStopPhraseFromConfig(
   $voiceStopPhrase.set(first ?? null)
 }
 
+// `voice.realtime.enabled` + `brain: supervisor` — the xAI realtime voice
+// conversation replaces the classic STT→turn→TTS loop when on.
+export const $realtimeVoiceEnabled = atom<boolean>(false)
+
+/** Seed the realtime-voice gate from a loaded config payload. */
+export function applyRealtimeVoiceFromConfig(
+  config: { voice?: { realtime?: { brain?: unknown; enabled?: unknown } | null } | null } | null | undefined
+) {
+  const realtime = config?.voice?.realtime
+  $realtimeVoiceEnabled.set(Boolean(realtime?.enabled) && realtime?.brain === 'supervisor')
+}
+
 // `voice.thinking_sound` — ambient bubble blips while the agent works during a
 // voice conversation (default on, matching the backend default).
 export const $thinkingSoundEnabled = atom<boolean>(true)

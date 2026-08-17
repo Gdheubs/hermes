@@ -6406,6 +6406,12 @@ class BasePlatformAdapter(ABC):
                         and event.message_type == MessageType.VOICE
                         and text_content
                         and not media_files
+                        # A realtime supervisor consult owns this turn's
+                        # speech (the voice model summarizes it) — reading
+                        # the full reply here talks over that summary and
+                        # can't be interrupted by voice. Stamped by the
+                        # runner when the consult consumed the turn.
+                        and not getattr(event, "_hermes_voice_reply_consumed", False)
                         and not self._streaming_tts_turn_completed(
                             session_key,
                             getattr(interrupt_event, "_hermes_run_generation", None),
