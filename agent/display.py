@@ -1195,20 +1195,32 @@ class KawaiiSpinner:
             return False
 
     def _is_patch_stdout_proxy(self) -> bool:
-        """Return True when stdout is prompt_toolkit's StdoutProxy.
+        """Return True when stdout is prompt_toolkit's StdoutProxy (or any
+        wrapper that queues writes and injects newlines around each flush()).
 
         patch_stdout wraps sys.stdout in a StdoutProxy that queues writes and
         injects newlines around each flush().  The \\r overwrite never lands on
-        the correct line — each spinner frame ends up on its own line.
+        the correct line — each spinner frame ends up on its own line, which is
+        exactly the "repeated status frames" artifact reported in #70031
+        (Windows + interface=cli + streaming=false).  The CLI already drives a
+        TUI widget (_spinner_text) for spinner display, so KawaiiSpinner's \\r
+        animation is redundant under any such wrapper.
 
-        The CLI already drives a TUI widget (_spinner_text) for spinner display,
-        so KawaiiSpinner's \\r-based animation is redundant under StdoutProxy.
+        Detect both the canonical StdoutProxy class and duck-typed wrappers
+        (prompt_toolkit sets ``_patch_stdout`` on the proxy), because some
+        runtimes wrap stdout in a subclass/alias the exact isinstance() check
+        misses — leaving the redundant \\r animation running and stacking frames.
         """
         try:
             from prompt_toolkit.patch_stdout import StdoutProxy
-            return isinstance(self._out, StdoutProxy)
+
+            if isinstance(self._out, StdoutProxy):
+                return True
         except ImportError:
-            return False
+            pass
+        # Duck-type: any stdout proxy that buffers/redirects writes for
+        # prompt_toolkit's patch_stdout will expose this attribute.
+        return bool(getattr(self._out, "_patch_stdout", None) is not None)
 
     def _animate(self):
         # When stdout is not a real terminal (e.g. Docker, systemd, pipe),

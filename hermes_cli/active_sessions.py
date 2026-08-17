@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -19,6 +21,52 @@ from typing import Any, Optional
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
+
+
+def _get_terminal_surface_id() -> str:
+    """Return a best-effort identifier for the current terminal surface.
+
+    Used to prevent multiple Hermes CLI/TUI instances from sharing one TTY,
+    which causes stacked prompt_toolkit status frames on Windows.
+    """
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            title_buf = ctypes.create_unicode_buffer(1024)
+            length = ctypes.windll.kernel32.GetConsoleTitleW(title_buf, 1024)
+            if length:
+                # Windows Terminal tabs share an HWND and console title, so
+                # same-titled tabs collide on the basic key. Prefer the
+                # per-tab WT_SESSION GUID when present, else fall back to the
+                # console window handle, then the bare title. Each tab gets a
+                # distinct key without relying on unstable titles.
+                wt_session = os.environ.get("WT_SESSION")
+                if wt_session:
+                    return f"win32-console:{title_buf.value}:wt:{wt_session}"
+                try:
+                    kernel32 = ctypes.windll.kernel32
+                    kernel32.GetConsoleWindow.restype = ctypes.c_void_p
+                    console_hwnd = kernel32.GetConsoleWindow()
+                    if console_hwnd:
+                        return f"win32-console:{title_buf.value}:hwnd:{console_hwnd}"
+                except Exception:
+                    pass
+                return f"win32-console:{title_buf.value}"
+            logger.warning(
+                "Terminal surface detection failed (empty console title); "
+                "same-surface duplicate-session guard is ineffective this launch"
+            )
+            return f"win32-pid:{os.getpid()}"
+        fd = sys.stdout.fileno()
+        return f"tty:{os.ttyname(fd)}"
+    except Exception:
+        logger.warning(
+            "Terminal surface detection raised; same-surface "
+            "duplicate-session guard is ineffective this launch",
+            exc_info=True,
+        )
+        return f"pid:{os.getpid()}"
 
 
 def coerce_max_concurrent_sessions(value: Any, key: str = "max_concurrent_sessions") -> Optional[int]:
@@ -222,6 +270,23 @@ def _optional_float(value: Any) -> Optional[float]:
         return None
 
 
+def _resolve_pid_exists():
+    """Lazy import of the authoritative cross-platform PID-existence check.
+
+    active_sessions no longer does ``from gateway.status import _pid_exists``
+    per-call.  The binding is resolved once at first use and reused, so the
+    import machinery (and its failure modes: circular import, syntax error,
+    missing transitive dep, scaffold race) is exercised at most once per
+    process instead of on every ``_pid_alive`` call.
+
+    If the import fails, ``_PID_EXISTS`` is never bound and ``_pid_alive``
+    treats the PID as *unknown* — it fails closed (reports alive) so
+    ``_prune_dead`` spares every entry rather than wiping the registry.
+    """
+    global _PID_EXISTS
+    from gateway.status import _pid_exists as _PID_EXISTS  # noqa: WPS436
+
+
 def _pid_alive(pid: Any, process_start_time: Any = None) -> bool:
     try:
         pid_int = int(pid)
@@ -230,9 +295,14 @@ def _pid_alive(pid: Any, process_start_time: Any = None) -> bool:
     if pid_int <= 0:
         return False
     try:
-        from gateway.status import _pid_exists
-
-        exists = bool(_pid_exists(pid_int))
+        _resolve_pid_exists()
+    except Exception:
+        # Checker unavailable: we cannot prove the PID dead. Report alive
+        # so _prune_dead spares entries instead of wiping the registry on
+        # an import failure in gateway.status.
+        return True
+    try:
+        exists = bool(_PID_EXISTS(pid_int))
     except Exception:
         return False
     if not exists:
@@ -276,6 +346,38 @@ class ActiveSessionLease:
         release_active_session(self)
 
 
+def _normalize_surface(terminal_surface: str) -> str:
+    """Strip unstable per-pseudoconsole HWND suffixes for collision checks.
+
+    On Windows ConPTY, older code paths included ``:hwnd:<handle>`` in the
+    surface ID. Each ConPTY instance gets a unique HWND, so two Hermes
+    processes in the same terminal tab compute different surface IDs and
+    bypass the duplicate-session check. Normalizing by removing the HWND
+    suffix makes old and new entries collide correctly.
+
+    Windows Terminal entries carry a ``:wt:<guid>`` per-tab key instead; those
+    are left untouched by :func:`_surfaces_collide` so two same-titled WT tabs
+    (each with its own GUID) never falsely collide.
+    """
+    return re.sub(r":hwnd:[0-9a-fA-F]+$", "", terminal_surface)
+
+
+def _surfaces_collide(a: str, b: str) -> bool:
+    """True when two terminal-surface ids denote the same surface.
+
+    Exact match always collides. Otherwise HWND suffixes are stripped on both
+    sides so legacy ``:hwnd:`` entries still collide with new-format ids — but
+    only when neither side carries a ``:wt:`` tab GUID (a WT GUID is already
+    tab-unique; stripping around it would merge distinct tabs of the same
+    title).
+    """
+    if a == b:
+        return True
+    if ":wt:" in a or ":wt:" in b:
+        return False
+    return _normalize_surface(a) == _normalize_surface(b)
+
+
 def try_acquire_active_session(
     *,
     session_id: str,
@@ -286,23 +388,19 @@ def try_acquire_active_session(
     """Acquire an active-session slot.
 
     Returns ``(lease, None)`` on success.  When the cap is disabled, the lease is
-    a no-op object so callers can unconditionally call ``release()``.
+    a lightweight no-op that still records the surface in the registry so that
+    concurrent CLI/TUI instances on the same terminal surface can be detected
+    and refused (prevents stacked prompt_toolkit status frames).
     """
     max_sessions = resolve_max_concurrent_sessions(config)
     lease_id = uuid.uuid4().hex
-    if max_sessions is None:
-        return ActiveSessionLease(
-            lease_id=lease_id,
-            session_id=session_id,
-            surface=surface,
-            enabled=False,
-        ), None
-
+    terminal_surface = _get_terminal_surface_id()
     now = time.time()
     entry = {
         "lease_id": lease_id,
         "session_id": str(session_id),
         "surface": str(surface),
+        "terminal_surface": terminal_surface,
         "pid": os.getpid(),
         "process_start_time": _process_start_time(os.getpid()),
         "started_at": now,
@@ -320,17 +418,33 @@ def try_acquire_active_session(
         pruned = len(raw_entries) - len(entries)
         if pruned:
             logger.info("Pruned %d stale active session lease(s)", pruned)
-        active_count = len(entries)
-        if active_count >= max_sessions:
+
+        same_surface_holder = next(
+            (
+                e
+                for e in entries
+                if _surfaces_collide(e.get("terminal_surface", ""), terminal_surface)
+                and e.get("pid") != os.getpid()
+            ),
+            None,
+        )
+        if same_surface_holder:
+            _write_entries(state_path, entries)
+            return None, (
+                "Another Hermes session is already using this terminal surface. "
+                "Close the other session first, or switch to a different terminal."
+            )
+
+        if max_sessions is not None and len(entries) >= max_sessions:
             _write_entries(state_path, entries)
             logger.info(
                 "Active session limit reached: active=%d max=%d surface=%s",
-                active_count,
+                len(entries),
                 max_sessions,
                 surface,
             )
             return None, active_session_limit_message(
-                active_count, max_sessions, entries
+                len(entries), max_sessions, entries
             )
         entries.append(entry)
         _write_entries(state_path, entries)
@@ -339,6 +453,7 @@ def try_acquire_active_session(
         lease_id=lease_id,
         session_id=str(session_id),
         surface=str(surface),
+        enabled=max_sessions is not None,
         state_path=state_path,
         lock_path=_lock_path(),
     ), None
@@ -348,9 +463,8 @@ def release_active_session(lease: ActiveSessionLease) -> None:
     # Prefer the registry the lease was acquired against: the caller may be
     # running under a profile HERMES_HOME override (#85431).
     state_path = lease.state_path or _state_path()
-    lock_path = lease.lock_path or _lock_path()
     try:
-        with _FileLock(lock_path):
+        with _FileLock(lease.lock_path or _lock_path()):
             entries = _prune_dead(_read_entries(state_path))
             kept = [
                 entry
@@ -380,8 +494,7 @@ def transfer_active_session(
         return True
 
     state_path = lease.state_path or _state_path()
-    lock_path = lease.lock_path or _lock_path()
-    with _FileLock(lock_path):
+    with _FileLock(lease.lock_path or _lock_path()):
         entries = _prune_dead(_read_entries(state_path))
         updated = False
         for entry in entries:
