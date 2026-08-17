@@ -1488,6 +1488,163 @@ def test_default_config_kanban_block_not_dropped_by_duplicate_key():
     assert "auto_decompose" in kanban
 
 
+def test_migrate_drops_retired_bfl_toolset_from_saved_lists(tmp_path):
+    """One-off cleanup for the retired Nous Portal FLUX 3 ``bfl`` toolset.
+
+    Leaves MCP-style unknown names and other real toolsets alone.
+    """
+    from toolsets import TOOLSETS
+
+    assert "bfl" not in TOOLSETS
+
+    (tmp_path / "config.yaml").write_text(
+        f"_config_version: {DEFAULT_CONFIG['_config_version']}\n"
+        "platform_toolsets:\n"
+        "  cli:\n"
+        "    - web\n"
+        "    - bfl\n"
+        "    - my-mcp-server\n"
+        "known_builtin_toolsets:\n"
+        "  cli:\n"
+        "    - bfl\n"
+        "    - web\n"
+        "agent:\n"
+        "  disabled_toolsets:\n"
+        "    - bfl\n"
+        "    - spotify\n"
+    )
+    with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        migrate_config(interactive=False, quiet=True)
+    raw = yaml.safe_load((tmp_path / "config.yaml").read_text())
+
+    assert raw["platform_toolsets"]["cli"] == ["web", "my-mcp-server"]
+    assert raw["known_builtin_toolsets"]["cli"] == ["web"]
+    assert raw["agent"]["disabled_toolsets"] == ["spotify"]
+
+
+def _write_bfl_config(tmp_path, extra=""):
+    """A saved config carrying ``bfl`` in every list the scrub can reach."""
+    (tmp_path / "config.yaml").write_text(
+        f"_config_version: {DEFAULT_CONFIG['_config_version']}\n"
+        "platform_toolsets:\n"
+        "  cli:\n"
+        "    - web\n"
+        "    - bfl\n"
+        "agent:\n"
+        "  disabled_toolsets:\n"
+        "    - bfl\n" + extra
+    )
+
+
+def _migrate_in(tmp_path):
+    with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+        migrate_config(interactive=False, quiet=True)
+    return yaml.safe_load((tmp_path / "config.yaml").read_text())
+
+
+def test_migrate_keeps_a_bfl_mcp_server_the_user_owns(tmp_path):
+    """``platform_toolsets`` also holds MCP server names, and dropping a
+    platform's only allowlisted server empties the allowlist — which turns
+    EVERY server on rather than merely losing one."""
+    _write_bfl_config(
+        tmp_path,
+        extra=(
+            "known_builtin_toolsets:\n"
+            "  cli:\n"
+            "    - bfl\n"
+            "    - web\n"
+            "mcp_servers:\n"
+            "  bfl:\n"
+            "    url: https://example.invalid/mcp\n"
+        ),
+    )
+
+    raw = _migrate_in(tmp_path)
+
+    assert raw["platform_toolsets"]["cli"] == ["web", "bfl"]
+    assert raw["agent"]["disabled_toolsets"] == ["bfl"]
+
+
+def test_migrate_keeps_a_bfl_plugin_toolset_the_user_owns(tmp_path):
+    """A plugin toolset is recorded in its own ledger, so absence from
+    ``platform_toolsets`` reads as a deliberate decline and silently disables
+    it."""
+    _write_bfl_config(
+        tmp_path,
+        extra=(
+            "known_builtin_toolsets:\n"
+            "  cli:\n"
+            "    - bfl\n"
+            "    - web\n"
+            "known_plugin_toolsets:\n"
+            "  cli:\n"
+            "    - bfl\n"
+        ),
+    )
+
+    raw = _migrate_in(tmp_path)
+
+    assert raw["platform_toolsets"]["cli"] == ["web", "bfl"]
+    assert raw["agent"]["disabled_toolsets"] == ["bfl"]
+
+
+def test_migrate_keeps_bfl_that_our_picker_never_offered(tmp_path):
+    """No ``known_builtin_toolsets`` record means we did not write the name —
+    a hand-edited entry is the user's, so fail closed and leave it."""
+    _write_bfl_config(tmp_path)
+
+    raw = _migrate_in(tmp_path)
+
+    assert raw["platform_toolsets"]["cli"] == ["web", "bfl"]
+    assert raw["agent"]["disabled_toolsets"] == ["bfl"]
+
+
+def test_migrate_only_scrubs_platforms_whose_own_save_recorded_bfl(tmp_path):
+    """``_save_platform_tools`` writes both lists in one call, so the proof is
+    per-platform: another platform's ledger says nothing about this one."""
+    (tmp_path / "config.yaml").write_text(
+        f"_config_version: {DEFAULT_CONFIG['_config_version']}\n"
+        "platform_toolsets:\n"
+        "  cli:\n"
+        "    - web\n"
+        "    - bfl\n"
+        "  telegram:\n"
+        "    - web\n"
+        "    - bfl\n"
+        "known_builtin_toolsets:\n"
+        "  cli:\n"
+        "    - bfl\n"
+        "    - web\n"
+        "  telegram:\n"
+        "    - web\n"
+    )
+
+    raw = _migrate_in(tmp_path)
+
+    assert raw["platform_toolsets"]["cli"] == ["web"]
+    assert raw["platform_toolsets"]["telegram"] == ["web", "bfl"]
+
+
+def test_bfl_scrub_is_one_shot_because_it_consumes_its_own_proof(tmp_path):
+    """The scrub is unconditional and re-runs on every update, so it must not
+    keep deleting a name the user re-adds after the cleanup already ran."""
+    _write_bfl_config(
+        tmp_path,
+        extra=("known_builtin_toolsets:\n  cli:\n    - bfl\n    - web\n"),
+    )
+
+    first = _migrate_in(tmp_path)
+    assert first["platform_toolsets"]["cli"] == ["web"]
+    assert "bfl" not in first["known_builtin_toolsets"]["cli"]
+
+    first["platform_toolsets"]["cli"] = ["web", "bfl"]
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump(first))
+
+    again = _migrate_in(tmp_path)
+
+    assert again["platform_toolsets"]["cli"] == ["web", "bfl"]
+
+
 def test_default_config_has_no_duplicate_top_level_keys():
     """Guard against any duplicate key silently shadowing a default."""
     import ast

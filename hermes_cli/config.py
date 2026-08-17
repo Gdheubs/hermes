@@ -2252,6 +2252,137 @@ def _persist_migration(config: Dict[str, Any]) -> None:
     save_config(config)
 
 
+_RETIRED_BFL_TOOLSET = "bfl"
+
+
+def _bfl_name_has_another_owner(config: Dict[str, Any]) -> bool:
+    """Whether something other than the retired builtin answers to ``bfl``.
+
+    ``platform_toolsets`` is a shared namespace — builtin toolset keys, plugin
+    toolset keys, and MCP server names all sit in one flat list with no type
+    tag — so a user's own ``bfl`` server or plugin is indistinguishable from
+    ours by name alone. Checked in addition to (not instead of) the
+    ``known_builtin_toolsets`` proof, to cover an install that carried both a
+    colliding plugin and our builtin during the promo window.
+    """
+    mcp_servers = config.get("mcp_servers")
+    if isinstance(mcp_servers, dict):
+        if _RETIRED_BFL_TOOLSET in {str(name) for name in mcp_servers}:
+            return True
+
+    # Plugin toolsets are recorded in their OWN ledger, never in
+    # known_builtin_toolsets (_save_platform_tools writes the latter from the
+    # builtin-only CONFIGURABLE_TOOLSETS constant), so this is a clean signal.
+    known_plugin = config.get("known_plugin_toolsets")
+    if isinstance(known_plugin, dict):
+        for names in known_plugin.values():
+            if isinstance(names, list) and _RETIRED_BFL_TOOLSET in {str(n) for n in names}:
+                return True
+
+    try:
+        from toolsets import validate_toolset
+
+        if validate_toolset(_RETIRED_BFL_TOOLSET):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _platforms_offered_builtin_bfl(config: Dict[str, Any]) -> Set[str]:
+    """Platforms whose saved ``known_builtin_toolsets`` proves WE wrote ``bfl``.
+
+    ``_save_platform_tools`` writes ``platform_toolsets[p]`` and
+    ``known_builtin_toolsets[p]`` in the same call, recording the builtin
+    catalog the picker showed. So a platform listing ``bfl`` there saved the
+    picker while our builtin ``bfl`` existed — positive proof of provenance,
+    rather than an inference from the name.
+    """
+    ledger = config.get("known_builtin_toolsets")
+    if not isinstance(ledger, dict):
+        return set()
+    return {
+        str(platform)
+        for platform, names in ledger.items()
+        if isinstance(names, list) and _RETIRED_BFL_TOOLSET in {str(n) for n in names}
+    }
+
+
+def _drop_bfl_toolset_from_saved_lists(quiet: bool = False) -> List[str]:
+    """One-off: strip the retired ``bfl`` toolset name from saved config lists.
+
+    The Nous Portal FLUX 3 promo wrote ``bfl`` into ``platform_toolsets`` /
+    ``known_builtin_toolsets`` / ``agent.disabled_toolsets`` for anyone who
+    saved the picker while it shipped. The toolset is gone; the string is
+    inert but sticks around because ``hermes tools`` preserves unknown entries
+    (MCP server names). Not version-gated — a config already at the latest
+    version still needs this. Delete this helper once the removal release has
+    shipped long enough that leftover names are gone.
+
+    Removal requires PROOF the entry is ours (see
+    :func:`_platforms_offered_builtin_bfl`), never just a name match. Guessing
+    fails silently and in three directions: a user's ``bfl`` MCP server goes
+    dark, or — if it was a platform's only allowlisted server — dropping it
+    empties the allowlist and turns EVERY server on, and clearing ``bfl`` from
+    ``agent.disabled_toolsets`` un-suppresses whatever they were suppressing.
+
+    Scrubbing the ledger last consumes the proof, so this is one-shot per
+    platform: a user who later names something ``bfl`` is not re-scrubbed on
+    the next ``hermes update``.
+    """
+    config = read_raw_config()
+    if _bfl_name_has_another_owner(config):
+        return []
+
+    offered = _platforms_offered_builtin_bfl(config)
+    if not offered:
+        return []
+
+    touched = False
+
+    def _drop(names: object) -> Optional[List[Any]]:
+        if not isinstance(names, list):
+            return None
+        kept = [n for n in names if str(n) != _RETIRED_BFL_TOOLSET]
+        return kept if len(kept) != len(names) else None
+
+    saved = config.get("platform_toolsets")
+    if isinstance(saved, dict):
+        for platform, names in list(saved.items()):
+            if str(platform) not in offered:
+                continue
+            pruned = _drop(names)
+            if pruned is not None:
+                saved[platform] = pruned
+                touched = True
+
+    # Global list, so any platform's proof is enough to know the picker offered
+    # our builtin here — unchecking it is what wrote the name.
+    agent_cfg = config.get("agent")
+    if isinstance(agent_cfg, dict):
+        pruned = _drop(agent_cfg.get("disabled_toolsets"))
+        if pruned is not None:
+            agent_cfg["disabled_toolsets"] = pruned
+            touched = True
+
+    ledger = config.get("known_builtin_toolsets")
+    if isinstance(ledger, dict):
+        for platform, names in list(ledger.items()):
+            pruned = _drop(names)
+            if pruned is not None:
+                ledger[platform] = pruned
+                touched = True
+
+    if not touched:
+        return []
+
+    _persist_migration(config)
+    if not quiet:
+        print("  ✓ Removed retired 'bfl' toolset from saved tool lists")
+    return ["removed retired bfl toolset from saved lists"]
+
+
 def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, Any]:
     """
     Migrate config to latest version, prompting for new required fields.
@@ -2353,6 +2484,17 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
             if mcp_touched:
                 config["mcp_servers"] = raw_mcp_servers
                 _persist_migration(config)
+
+    # ── Always: drop the retired 'bfl' toolset from saved lists ──
+    # One-off cleanup for the Nous Portal FLUX 3 promo. Not version-gated —
+    # configs already at the latest version still carry the name. Runs before
+    # the validation below so it does not warn about a name it is removing.
+    try:
+        results["config_added"].extend(
+            _drop_bfl_toolset_from_saved_lists(quiet=quiet)
+        )
+    except Exception as _bfl_scrub_err:
+        logger.debug("bfl toolset scrub skipped: %s", _bfl_scrub_err)
 
     # ── Always: validate platform_toolsets after migration ──
     # A migration (or hand-edit) that leaves an invalid toolset name in
