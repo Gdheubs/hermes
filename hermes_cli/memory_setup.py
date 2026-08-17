@@ -17,6 +17,13 @@ from hermes_constants import get_hermes_home
 from hermes_cli.secret_prompt import masked_secret_prompt
 
 _CANCELLED = -1
+_DEFAULT_DEPENDENCY_INSTALL_TIMEOUT = 120
+_HEAVY_DEPENDENCY_INSTALL_TIMEOUT = 600
+_EMBEDDED_HINDSIGHT_PACKAGES = {
+    "hindsight-all",
+    "hindsight-all-slim",
+    "hindsight-api-slim",
+}
 
 
 def _provider_pip_dependencies(provider_name: str, declared: list) -> list:
@@ -43,6 +50,27 @@ def _provider_pip_dependencies(provider_name: str, declared: list) -> list:
         except Exception:
             pass
     return deps
+
+
+def _dependency_install_timeout(pip_deps: list[str]) -> int:
+    """Return an install budget appropriate for the provider dependency set.
+
+    Most memory-provider bridges are small SDKs and should fail fast. Embedded
+    Hindsight is different: ``hindsight-all`` pulls the local API, PostgreSQL
+    wrapper, embedding stack, and model dependencies. A clean managed-venv
+    rebuild has exceeded the generic 120-second budget in production, leaving
+    an otherwise successful ``hermes update`` without its configured memory
+    runtime. Give only that heavyweight dependency the same multi-minute
+    budget users already need on first setup; keep all other providers on the
+    existing fast path.
+    """
+    names = {
+        (re.match(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]*", spec) or [spec])[0].lower()
+        for spec in pip_deps
+    }
+    if names & _EMBEDDED_HINDSIGHT_PACKAGES:
+        return _HEAVY_DEPENDENCY_INSTALL_TIMEOUT
+    return _DEFAULT_DEPENDENCY_INSTALL_TIMEOUT
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +198,7 @@ def _install_dependencies(provider_name: str, *, force: bool = False) -> None:
 
     manual_cmd = f"uv pip install {' '.join(missing)}"
     try:
-        outcome = install_specs(missing, timeout=120)
+        outcome = install_specs(missing, timeout=_dependency_install_timeout(missing))
         if outcome.ok:
             print(f"  ✓ Installed {', '.join(missing)}")
         elif outcome.blocked:

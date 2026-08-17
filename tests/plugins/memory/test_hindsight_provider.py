@@ -371,6 +371,52 @@ class TestConfig:
 
 
 class TestPostSetup:
+    def test_cloud_setup_keeps_default_dependency_timeout(self, tmp_path, monkeypatch):
+        import tools.lazy_deps as lazy_deps_mod
+
+        monkeypatch.setattr("hermes_cli.memory_setup._curses_select", lambda *args, **kwargs: 0)
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "")
+        monkeypatch.setattr("getpass.getpass", lambda prompt="": "test-key")
+        monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: None)
+
+        calls = []
+
+        def fake_install_specs(specs, timeout=120):
+            calls.append((list(specs), timeout))
+            return lazy_deps_mod.InstallSpecsResult(ok=True)
+
+        monkeypatch.setattr(lazy_deps_mod, "install_specs", fake_install_specs)
+
+        HindsightMemoryProvider().post_setup(str(tmp_path), {"memory": {}})
+
+        assert calls == [(["hindsight-client>=0.6.1"], 120)]
+
+    def test_local_embedded_setup_uses_heavy_dependency_timeout(self, tmp_path, monkeypatch):
+        import tools.lazy_deps as lazy_deps_mod
+
+        selections = iter([1, 0])  # local_embedded, openai
+        monkeypatch.setattr(
+            "hermes_cli.memory_setup._curses_select",
+            lambda *args, **kwargs: next(selections),
+        )
+        monkeypatch.setattr("builtins.input", lambda prompt="": "")
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("getpass.getpass", lambda prompt="": "test-key")
+        monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: None)
+
+        calls = []
+
+        def fake_install_specs(specs, timeout=120):
+            calls.append((list(specs), timeout))
+            return lazy_deps_mod.InstallSpecsResult(ok=True)
+
+        monkeypatch.setattr(lazy_deps_mod, "install_specs", fake_install_specs)
+
+        HindsightMemoryProvider().post_setup(str(tmp_path), {"memory": {}})
+
+        assert calls == [(["hindsight-all"], 600)]
+
     def test_setup_cancel_at_mode_picker_writes_nothing(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes-home"
         user_home = tmp_path / "user-home"

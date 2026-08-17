@@ -994,9 +994,13 @@ class HindsightMemoryProvider(MemoryProvider):
         print("\n  Checking dependencies...")
         # Environment-aware install: sealed hosted venvs redirect to the durable
         # data-volume target instead of writing to /opt/hermes (NS-605).
+        from hermes_cli.memory_setup import _dependency_install_timeout
         from tools.lazy_deps import install_specs
 
-        outcome = install_specs(deps_to_install, timeout=120)
+        outcome = install_specs(
+            deps_to_install,
+            timeout=_dependency_install_timeout(deps_to_install),
+        )
         if outcome.ok:
             print("  ✓ Dependencies up to date")
         elif outcome.blocked:

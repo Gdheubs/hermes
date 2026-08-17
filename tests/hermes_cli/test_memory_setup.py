@@ -87,7 +87,7 @@ def test_install_dependencies_force_reinstalls_versioned_specs(tmp_path, monkeyp
     installed = []
 
     def fake_install_specs(specs, timeout=120):
-        installed.append(list(specs))
+        installed.append((list(specs), timeout))
         return SimpleNamespace(ok=True, blocked=False, reason="", stderr="")
 
     monkeypatch.setattr("tools.lazy_deps.install_specs", fake_install_specs)
@@ -95,4 +95,46 @@ def test_install_dependencies_force_reinstalls_versioned_specs(tmp_path, monkeyp
     memory_setup._install_dependencies("mem0", force=True)
 
     assert installed, "force=True must reach the install step"
-    assert any("mem0ai>=2.0.10,<3" in specs for specs in installed)
+    assert installed == [(["mem0ai>=2.0.10,<3"], 120)]
+
+
+def test_dependency_install_timeout_only_extends_embedded_hindsight():
+    assert memory_setup._dependency_install_timeout(["hindsight-all"]) == 600
+    assert memory_setup._dependency_install_timeout(
+        ["hindsight-client>=0.6.1", "hindsight-all==0.9.0"]
+    ) == 600
+    assert memory_setup._dependency_install_timeout(
+        ["hindsight-all-slim", "hindsight-api-slim[local-onnx]>=0.9.0"]
+    ) == 600
+    assert memory_setup._dependency_install_timeout(["hindsight-client>=0.6.1"]) == 120
+    assert memory_setup._dependency_install_timeout(["mem0ai>=2.0.10,<3"]) == 120
+
+
+def test_install_dependencies_uses_extended_timeout_for_local_hindsight(tmp_path, monkeypatch):
+    import json
+    import yaml as _yaml
+
+    plugin_dir = tmp_path / "hindsight"
+    plugin_dir.mkdir()
+    (plugin_dir / "plugin.yaml").write_text(
+        _yaml.safe_dump({"pip_dependencies": ["hindsight-client>=0.6.1"]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("plugins.memory.find_provider_dir", lambda name: plugin_dir)
+    hermes_home = tmp_path / "hermes-home"
+    config_path = hermes_home / "hindsight" / "config.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(json.dumps({"mode": "local_embedded"}), encoding="utf-8")
+    monkeypatch.setattr(memory_setup, "get_hermes_home", lambda: hermes_home)
+
+    calls = []
+
+    def fake_install_specs(specs, timeout=120):
+        calls.append((list(specs), timeout))
+        return SimpleNamespace(ok=True, blocked=False, reason="", stderr="")
+
+    monkeypatch.setattr("tools.lazy_deps.install_specs", fake_install_specs)
+
+    memory_setup._install_dependencies("hindsight", force=True)
+
+    assert calls == [(["hindsight-client>=0.6.1", "hindsight-all"], 600)]
