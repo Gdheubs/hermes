@@ -156,6 +156,11 @@ _install_plugin_debug_handler()
 VALID_HOOKS: Set[str] = {
     "pre_tool_call",
     "post_tool_call",
+    # Generic built-in memory governance hooks. Keep policy in standalone
+    # plugins; core only exposes the frozen prompt and durable-write boundaries.
+    "transform_memory_context",
+    "pre_memory_write",
+    "post_memory_write",
     "transform_terminal_output",
     "transform_tool_result",
     # Transform LLM output before it's returned to the user.
@@ -388,6 +393,8 @@ VALID_HOOKS: Set[str] = {
 # have its output silently ignored — registration is refused loudly instead.
 # Support for a shell response shape can lift an event out of this set.
 SHELL_UNSUPPORTED_HOOKS: Set[str] = {
+    "transform_memory_context",
+    "pre_memory_write",
     "transform_api_error_classification",
 }
 
@@ -5068,7 +5075,13 @@ class PluginManager:
         }
         return callback(**accepted_payload)
 
-    def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
+    def invoke_hook(
+        self,
+        hook_name: str,
+        *,
+        _propagate_callback_errors: bool = False,
+        **kwargs: Any,
+    ) -> List[Any]:
         """Call all registered callbacks for *hook_name*.
 
         Hook payloads evolve additively. Callbacks that accept ``**kwargs``
@@ -5111,6 +5124,8 @@ class PluginManager:
                     getattr(cb, "__name__", repr(cb)),
                     exc,
                 )
+                if _propagate_callback_errors:
+                    raise
         return results
 
     def _subscribe_event(
@@ -5838,7 +5853,12 @@ def _delivery_manager() -> PluginManager:
     return manager
 
 
-def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
+def invoke_hook(
+    hook_name: str,
+    *,
+    _propagate_callback_errors: bool = False,
+    **kwargs: Any,
+) -> List[Any]:
     """Invoke a lifecycle hook on loaded plugins.
 
     Ensures plugins are discovered on first invocation so callers in
@@ -5848,7 +5868,11 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
     Returns a list of non-``None`` return values from plugin callbacks.
     """
-    return _delivery_manager().invoke_hook(hook_name, **kwargs)
+    return _delivery_manager().invoke_hook(
+        hook_name,
+        _propagate_callback_errors=_propagate_callback_errors,
+        **kwargs,
+    )
 
 
 def render_system_prompt_sections(
