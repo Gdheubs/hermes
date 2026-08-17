@@ -38,7 +38,7 @@ import re
 import shutil
 import contextvars as _ctxvars
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from hermes_constants import get_hermes_home, display_hermes_home
 from utils import atomic_write_text, is_truthy_value
@@ -54,6 +54,9 @@ logger = logging.getLogger(__name__)
 
 _background_review_read_paths: "_ctxvars.ContextVar[frozenset[str]]" = _ctxvars.ContextVar(
     "background_review_read_paths", default=frozenset()
+)
+_background_review_write_scope: "_ctxvars.ContextVar[Optional[frozenset[tuple[str, str]]]]" = _ctxvars.ContextVar(
+    "background_review_write_scope", default=None
 )
 
 
@@ -93,6 +96,50 @@ def _background_review_has_read(path: Path) -> bool:
 def _reset_background_review_read_marks() -> None:
     """Test helper: clear read-before-write marks for the current context."""
     _background_review_read_paths.set(frozenset())
+
+
+def _set_background_review_write_scope(
+    allowed: Iterable[tuple[str, str]],
+) -> "_ctxvars.Token":
+    """Limit this context to exact ``(action, skill_name)`` capabilities.
+
+    ``None`` means the legacy background-review behavior is unchanged.  The
+    schema-guided review path sets a finite scope only around its apply turn,
+    then resets it with the returned token.
+    """
+    normalized = frozenset(
+        (str(action), str(name)) for action, name in allowed
+    )
+    return _background_review_write_scope.set(normalized)
+
+
+def _reset_background_review_write_scope(token: "_ctxvars.Token") -> None:
+    _background_review_write_scope.reset(token)
+
+
+def _background_review_write_scope_guard(
+    action: str,
+    name: str,
+    file_path: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    allowed = _background_review_write_scope.get()
+    if allowed is None:
+        return None
+    if (action, name) in allowed:
+        # A typed patch target names the skill's primary procedure document,
+        # not an arbitrary supporting file under that skill. Supporting-file
+        # writes require a separately modeled capability and are fail-closed in
+        # the evidence-gated path.
+        if action != "patch" or file_path in (None, "", "SKILL.md"):
+            return None
+    return {
+        "success": False,
+        "error": (
+            f"Refusing out-of-scope background skill write: {action} '{name}'. "
+            "The evidence gate did not authorize this action and target."
+        ),
+        "_write_scope_required": True,
+    }
 
 # Import security scanner — external hub installs always get scanned;
 # agent-created skills only get scanned when skills.guard_agent_created is on.
@@ -1558,6 +1605,10 @@ def skill_manage(
 
     Returns JSON string with results.
     """
+    scope_guard = _background_review_write_scope_guard(action, name, file_path)
+    if scope_guard is not None:
+        return json.dumps(scope_guard, ensure_ascii=False)
+
     preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)

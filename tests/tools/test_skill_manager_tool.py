@@ -58,6 +58,41 @@ description: Updated description.
 Step 1: Do the new thing.
 """
 
+
+def test_background_review_write_scope_is_exact_and_context_local():
+    from tools.skill_manager_tool import (
+        _background_review_write_scope_guard,
+        _reset_background_review_write_scope,
+        _set_background_review_write_scope,
+    )
+
+    token = _set_background_review_write_scope(
+        {("patch", "allowed-skill"), ("create", "new-umbrella")}
+    )
+    try:
+        assert _background_review_write_scope_guard(
+            "patch", "allowed-skill"
+        ) is None
+        assert _background_review_write_scope_guard(
+            "create", "new-umbrella"
+        ) is None
+
+        wrong_action = _background_review_write_scope_guard(
+            "edit", "allowed-skill"
+        )
+        wrong_target = _background_review_write_scope_guard(
+            "patch", "different-skill"
+        )
+        assert wrong_action["success"] is False
+        assert wrong_action["_write_scope_required"] is True
+        assert wrong_target["success"] is False
+        assert "evidence gate" in wrong_target["error"]
+    finally:
+        _reset_background_review_write_scope(token)
+
+    # No scope preserves existing foreground and legacy curator behavior.
+    assert _background_review_write_scope_guard("delete", "any-skill") is None
+
 LONG_DESC_CONTENT = """\
 ---
 name: long-desc
@@ -947,3 +982,72 @@ class TestCuratorConsolidationDeleteGuard:
             assert allowed["success"] is True, allowed
 
         _reset_background_review_read_marks()
+
+    def test_evidence_scope_allows_only_exact_patch_and_target(
+        self, tmp_path, monkeypatch
+    ):
+        from tools.skills_tool import skill_view
+        from tools.skill_manager_tool import (
+            _reset_background_review_read_marks,
+            _reset_background_review_write_scope,
+            _set_background_review_write_scope,
+        )
+
+        _reset_background_review_read_marks()
+        with _curator_pass(tmp_path, monkeypatch=monkeypatch) as skills_root:
+            _create_curator_skill("allowed-skill", _skill_content("allowed-skill"))
+            _create_curator_skill("other-skill", _skill_content("other-skill"))
+            assert json.loads(skill_view("allowed-skill"))["success"] is True
+            assert json.loads(skill_view("other-skill"))["success"] is True
+
+            token = _set_background_review_write_scope(
+                {("patch", "allowed-skill")}
+            )
+            try:
+                allowed = json.loads(
+                    skill_manage(
+                        action="patch",
+                        name="allowed-skill",
+                        old_string="Step 1: Do the thing.",
+                        new_string="Step 1: Use the verified literal-path form.",
+                    )
+                )
+                wrong_target = json.loads(
+                    skill_manage(
+                        action="patch",
+                        name="other-skill",
+                        old_string="Step 1: Do the thing.",
+                        new_string="Step 1: This must not land.",
+                    )
+                )
+                wrong_action = json.loads(
+                    skill_manage(
+                        action="edit",
+                        name="allowed-skill",
+                        content=_skill_content("allowed-skill"),
+                    )
+                )
+                wrong_file = json.loads(
+                    skill_manage(
+                        action="patch",
+                        name="allowed-skill",
+                        file_path="references/workflow.md",
+                        old_string="old",
+                        new_string="new",
+                    )
+                )
+            finally:
+                _reset_background_review_write_scope(token)
+
+            assert allowed["success"] is True, allowed
+            assert wrong_target["_write_scope_required"] is True
+            assert wrong_action["_write_scope_required"] is True
+            assert wrong_file["_write_scope_required"] is True
+            allowed_text = (
+                skills_root / "allowed-skill" / "SKILL.md"
+            ).read_text(encoding="utf-8")
+            other_text = (
+                skills_root / "other-skill" / "SKILL.md"
+            ).read_text(encoding="utf-8")
+            assert "verified literal-path" in allowed_text
+            assert "This must not land" not in other_text

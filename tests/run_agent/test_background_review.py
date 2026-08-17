@@ -432,6 +432,18 @@ def _skill_patch_review():
     ]
 
 
+def _staged_skill_patch_review():
+    messages = _skill_patch_review()
+    messages[-1]["content"] = _json.dumps(
+        {
+            "success": True,
+            "staged": True,
+            "message": "Skill write staged for approval.",
+        }
+    )
+    return messages
+
+
 def test_memory_notifications_off_returns_nothing():
     actions = summarize_background_review_actions(
         _memory_add_review(), [], notification_mode="off"
@@ -457,3 +469,12 @@ def test_skill_patch_off_silent_verbose_shows_diff():
     )
     assert len(verbose) == 1
     assert "demo" in verbose[0] and "→" in verbose[0]
+
+
+def test_staged_skill_patch_is_not_reported_as_applied():
+    for mode in ("on", "verbose"):
+        actions = summarize_background_review_actions(
+            _staged_skill_patch_review(), [], notification_mode=mode
+        )
+        assert actions == ["Skill 'demo' patch staged for approval"]
+        assert "patched:" not in actions[0]

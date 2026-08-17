@@ -145,6 +145,32 @@ _SKILL = (
 )
 
 
+def test_evidence_scoped_skill_write_still_stages_when_approval_is_on(
+    hermes_home,
+):
+    from tools import write_approval as wa
+    from tools.skill_manager_tool import (
+        _reset_background_review_write_scope,
+        _set_background_review_write_scope,
+        skill_manage,
+    )
+
+    _set_approval("skills", True)
+    token = _set_background_review_write_scope({("create", "test-skill")})
+    try:
+        result = json.loads(
+            skill_manage(action="create", name="test-skill", content=_SKILL)
+        )
+    finally:
+        _reset_background_review_write_scope(token)
+
+    assert result["success"] is True
+    assert result["staged"] is True
+    assert result.get("pending_id")
+    assert wa.pending_count("skills") == 1
+    assert not os.path.exists(os.path.join(hermes_home, "skills", "test-skill"))
+
+
 # ---------------------------------------------------------------------------
 # Pending store CRUD
 # ---------------------------------------------------------------------------
