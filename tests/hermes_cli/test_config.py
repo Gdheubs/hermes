@@ -279,6 +279,26 @@ class TestSaveEnvValueSecure:
         env_mode = env_path.stat().st_mode & 0o777
         assert env_mode == 0o640, f"expected 0o640, got {oct(env_mode)}"
 
+    def test_save_env_value_can_leave_process_environment_unchanged(self, tmp_path):
+        """Profile-scoped writes must not expose credentials process-wide."""
+        with patch.dict(
+            os.environ,
+            {"HERMES_HOME": str(tmp_path), "MATRIX_ACCESS_TOKEN": "default-token"},
+        ):
+            assert (
+                save_env_value(
+                    "MATRIX_ACCESS_TOKEN",
+                    "secondary-profile-token",
+                    update_environ=False,
+                )
+                is True
+            )
+
+            assert os.environ["MATRIX_ACCESS_TOKEN"] == "default-token"
+            assert "MATRIX_ACCESS_TOKEN=secondary-profile-token" in (
+                tmp_path / ".env"
+            ).read_text(encoding="utf-8")
+
     def test_save_env_value_quotes_values_containing_hash(self, tmp_path):
         """Regression test for #30355."""
         from dotenv import dotenv_values

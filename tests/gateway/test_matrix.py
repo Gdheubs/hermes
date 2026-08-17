@@ -1,5 +1,6 @@
 """Tests for Matrix platform adapter (mautrix-python backend)."""
 import asyncio
+import os
 import re
 import stat
 import sys
@@ -245,6 +246,50 @@ def _make_fake_mautrix():
         "mautrix.util": mautrix_util,
         "mautrix.util.async_db": mautrix_util_async_db,
     }
+
+
+def _install_fake_http_api(fake_modules, request_handler):
+    """Install an HTTPAPI stub whose requests are handled by one coroutine."""
+    class FakeHTTPAPI:
+        def __init__(self, **kwargs):
+            self.token = kwargs.get("token", "")
+            self.session = kwargs.get("client_session") or MagicMock()
+            self.session.close = AsyncMock()
+
+        async def request(self, method, path, content=None, **kwargs):
+            return await request_handler(self, method, path, content, **kwargs)
+
+    fake_modules["mautrix.api"].HTTPAPI = FakeHTTPAPI
+
+
+def _make_matrix_auth_client(
+    *, user_id="@bot:example.org", device_id="STABLE_DEVICE"
+):
+    """Create a client stub for unencrypted authentication and sync tests."""
+    client = MagicMock()
+    client.mxid = user_id
+    client.device_id = device_id
+    client.state_store = MagicMock()
+    client.sync_store = MagicMock()
+    client.sync_store.get_next_batch = AsyncMock(return_value=None)
+    client.sync_store.put_next_batch = AsyncMock()
+    client.crypto = None
+    client.whoami = AsyncMock(
+        return_value=MagicMock(user_id=user_id, device_id=device_id)
+    )
+    client.sync = AsyncMock(return_value={"rooms": {"join": {}}})
+    client.handle_sync = MagicMock(return_value=[])
+    client.add_event_handler = MagicMock()
+    return client
+
+
+def _install_fake_matrix_client(fake_modules, client):
+    """Return the prepared client while preserving the adapter-created API."""
+    def make_client(**kwargs):
+        client.api = kwargs["api"]
+        return client
+
+    fake_modules["mautrix.client"].Client = MagicMock(side_effect=make_client)
 
 
 # ---------------------------------------------------------------------------
@@ -913,6 +958,204 @@ class TestMatrixRequirements:
 # ---------------------------------------------------------------------------
 
 class TestMatrixAccessTokenAuth:
+    @pytest.mark.parametrize("persistence_succeeds", [True, False])
+    @pytest.mark.asyncio
+    async def test_connect_refreshes_an_expired_access_token(
+        self, monkeypatch, persistence_succeeds
+    ):
+        """An installed gateway should recover when its saved token expires."""
+        from hermes_cli.config import get_env_value, save_env_value
+        import plugins.platforms.matrix.adapter as matrix_mod
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        monkeypatch.setenv("MATRIX_REFRESH_TOKEN", "syt_original_refresh")
+
+        config = PlatformConfig(
+            enabled=True,
+            token="syt_expired_access",
+            extra={
+                "homeserver": "https://matrix.example.org",
+                "user_id": "@bot:example.org",
+                "device_id": "STABLE_DEVICE",
+                "encryption": False,
+            },
+        )
+        adapter = MatrixAdapter(config)
+
+        refresh_requests = []
+
+        async def refresh_request(api, method, path, content, **kwargs):
+            refresh_requests.append((path, content, api.token))
+            return {
+                "access_token": "syt_refreshed_access",
+                "refresh_token": "syt_rotated_refresh",
+            }
+
+        class UnknownTokenError(Exception):
+            errcode = "M_UNKNOWN_TOKEN"
+
+        mock_client = _make_matrix_auth_client()
+        mock_client.whoami = AsyncMock(
+            side_effect=[
+                UnknownTokenError("Token is not active"),
+                MagicMock(user_id="@bot:example.org", device_id="STABLE_DEVICE"),
+            ]
+        )
+
+        fake_mautrix_mods = _make_fake_mautrix()
+        _install_fake_http_api(fake_mautrix_mods, refresh_request)
+        _install_fake_matrix_client(fake_mautrix_mods, mock_client)
+
+        with patch.dict("sys.modules", fake_mautrix_mods):
+            with patch.object(matrix_mod, "_create_matrix_session", return_value=MagicMock()):
+                with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
+                    with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
+                        save = save_env_value if persistence_succeeds else lambda *_: None
+                        with patch(
+                            "hermes_cli.config.save_env_value", side_effect=save
+                        ):
+                            assert await adapter.connect() is persistence_succeeds
+
+        assert refresh_requests == [
+            (
+                "_matrix/client/v3/refresh",
+                {"refresh_token": "syt_original_refresh"},
+                "",
+            )
+        ]
+        if persistence_succeeds:
+            assert mock_client.whoami.await_count == 2
+            assert mock_client.api.token == "syt_refreshed_access"
+            assert get_env_value("MATRIX_ACCESS_TOKEN") == "syt_refreshed_access"
+            assert get_env_value("MATRIX_REFRESH_TOKEN") == "syt_rotated_refresh"
+            await adapter.disconnect()
+        else:
+            assert mock_client.whoami.await_count == 1
+            assert mock_client.api.token == "syt_expired_access"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("returns_error_object", [False, True])
+    async def test_connected_gateway_resumes_sync_after_token_refresh(
+        self, returns_error_object
+    ):
+        """A running gateway should keep syncing after its access token expires."""
+        from hermes_cli.config import get_env_value
+        import plugins.platforms.matrix.adapter as matrix_mod
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        adapter = MatrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="syt_initial_access",
+                extra={
+                    "homeserver": "https://matrix.example.org",
+                    "user_id": "@bot:example.org",
+                    "device_id": "STABLE_DEVICE",
+                    "refresh_token": "syt_initial_refresh",
+                    "encryption": False,
+                },
+            )
+        )
+
+        class UnknownTokenError(Exception):
+            errcode = "M_UNKNOWN_TOKEN"
+
+        async def refresh_request(api, method, path, content, **kwargs):
+            return {
+                "access_token": "syt_live_refreshed_access",
+                "refresh_token": "syt_live_rotated_refresh",
+            }
+
+        resumed = asyncio.Event()
+        sync_calls = 0
+
+        async def sync(**kwargs):
+            nonlocal sync_calls
+            sync_calls += 1
+            if sync_calls == 1:
+                return {"rooms": {"join": {}}, "next_batch": "s1"}
+            if sync_calls == 2:
+                error = UnknownTokenError("Token is not active")
+                error.message = "Token is not active"
+                if returns_error_object:
+                    return error
+                raise error
+            resumed.set()
+            return {"rooms": {"join": {}}, "next_batch": "s2"}
+
+        mock_client = _make_matrix_auth_client()
+        mock_client.sync_store.get_next_batch = AsyncMock(return_value="s1")
+        mock_client.sync = AsyncMock(side_effect=sync)
+
+        fake_mautrix_mods = _make_fake_mautrix()
+        _install_fake_http_api(fake_mautrix_mods, refresh_request)
+        _install_fake_matrix_client(fake_mautrix_mods, mock_client)
+
+        with patch.dict("sys.modules", fake_mautrix_mods):
+            with patch.object(matrix_mod, "_create_matrix_session", return_value=MagicMock()):
+                with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
+                    assert await adapter.connect() is True
+                    try:
+                        await asyncio.wait_for(resumed.wait(), timeout=0.2)
+                    finally:
+                        await adapter.disconnect()
+
+        assert sync_calls == 3
+        assert mock_client.api.token == "syt_live_refreshed_access"
+        assert get_env_value("MATRIX_ACCESS_TOKEN") == "syt_live_refreshed_access"
+        assert get_env_value("MATRIX_REFRESH_TOKEN") == "syt_live_rotated_refresh"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("refresh_token", "error_code", "retryable"),
+        [
+            ("syt_refresh", "matrix_token_refresh_failed", True),
+            ("", "matrix_refresh_token_missing", False),
+        ],
+    )
+    async def test_failed_live_refresh_notifies_gateway_supervisor(
+        self, refresh_token, error_code, retryable
+    ):
+        """An expired token must not leave a connected but deaf adapter."""
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        adapter = MatrixAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="syt_expired_access",
+                extra={
+                    "homeserver": "https://matrix.example.org",
+                    "user_id": "@bot:example.org",
+                    "refresh_token": refresh_token,
+                    "encryption": False,
+                },
+            )
+        )
+        adapter._closing = False
+        adapter._mark_connected()
+        fatal_handler = AsyncMock()
+        adapter.set_fatal_error_handler(fatal_handler)
+
+        class UnknownTokenError(Exception):
+            errcode = "M_UNKNOWN_TOKEN"
+
+        mock_client = _make_matrix_auth_client()
+        mock_client.sync_store.get_next_batch = AsyncMock(return_value="s1")
+        mock_client.sync = AsyncMock(
+            side_effect=UnknownTokenError("Token is not active")
+        )
+        adapter._client = mock_client
+        adapter._refresh_access_token = AsyncMock(
+            side_effect=RuntimeError("refresh unavailable")
+        )
+
+        await adapter._sync_loop()
+
+        assert adapter.is_connected is False
+        assert adapter.fatal_error_code == error_code
+        assert adapter.fatal_error_retryable is retryable
+        fatal_handler.assert_awaited_once_with(adapter)
+
     @pytest.mark.asyncio
     async def test_connect_with_access_token_and_encryption(self):
         """connect() should call whoami, set user_id/device_id, set up crypto."""
@@ -1207,7 +1450,15 @@ class TestMatrixPasswordLoginDeviceId:
     """MATRIX_DEVICE_ID should be passed to mautrix Client even with password login."""
 
     @pytest.mark.asyncio
-    async def test_password_login_uses_device_id(self):
+    async def test_password_login_uses_device_id(self, monkeypatch):
+        """Password login persists a refreshable pair without scope leakage."""
+        from agent.secret_scope import (
+            load_env_file,
+            reset_secret_scope,
+            set_secret_scope,
+        )
+        from hermes_cli.config import get_env_path, save_env_value
+        import plugins.platforms.matrix.adapter as matrix_mod
         from plugins.platforms.matrix.adapter import MatrixAdapter
 
         config = PlatformConfig(
@@ -1217,35 +1468,63 @@ class TestMatrixPasswordLoginDeviceId:
                 "user_id": "@bot:example.org",
                 "password": "secret",
                 "device_id": "STABLE_PW_DEVICE",
+                "encryption": False,
             },
         )
         adapter = MatrixAdapter(config)
 
+        monkeypatch.setenv("MATRIX_ACCESS_TOKEN", "syt_default_access")
+        monkeypatch.setenv("MATRIX_REFRESH_TOKEN", "syt_default_refresh")
+
+        captured_login = {}
+
+        async def login_request(api, method, path, content, **kwargs):
+            captured_login.update(content or {})
+            return {
+                "user_id": "@bot:example.org",
+                "device_id": "STABLE_PW_DEVICE",
+                "access_token": "syt_persisted_access",
+                "refresh_token": "syt_persisted_refresh",
+            }
+
         fake_mautrix_mods = _make_fake_mautrix()
+        _install_fake_http_api(fake_mautrix_mods, login_request)
+        mock_client = _make_matrix_auth_client(device_id=None)
+        _install_fake_matrix_client(fake_mautrix_mods, mock_client)
 
-        mock_client = MagicMock()
-        mock_client.mxid = "@bot:example.org"
-        mock_client.device_id = None
-        mock_client.state_store = MagicMock()
-        mock_client.sync_store = MagicMock()
-        mock_client.crypto = None
-        mock_client.login = AsyncMock(return_value=MagicMock(device_id="STABLE_PW_DEVICE", access_token="tok"))
-        mock_client.sync = AsyncMock(return_value={"rooms": {"join": {}}})
-        mock_client.add_event_handler = MagicMock()
-        mock_client.api = MagicMock()
-        mock_client.api.token = ""
-        mock_client.api.session = MagicMock()
-        mock_client.api.session.close = AsyncMock()
+        update_environ_modes = []
 
-        fake_mautrix_mods["mautrix.client"].Client = MagicMock(return_value=mock_client)
+        def save_scoped_token(key, value, **kwargs):
+            update_environ_modes.append(kwargs.get("update_environ"))
+            return save_env_value(key, value, **kwargs)
 
-        with patch.dict("sys.modules", fake_mautrix_mods):
-            with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
-                with patch.object(adapter, "_sync_loop", AsyncMock(return_value=None)):
-                    assert await adapter.connect() is True
+        scope_token = set_secret_scope({"MATRIX_PASSWORD": "secret"})
+        try:
+            with patch.dict("sys.modules", fake_mautrix_mods):
+                with patch(
+                    "hermes_cli.config.save_env_value",
+                    side_effect=save_scoped_token,
+                ):
+                    with patch.object(
+                        matrix_mod, "_create_matrix_session", return_value=MagicMock()
+                    ):
+                        with patch.object(adapter, "_refresh_dm_cache", AsyncMock()):
+                            with patch.object(
+                                adapter, "_sync_loop", AsyncMock(return_value=None)
+                            ):
+                                assert await adapter.connect() is True
+        finally:
+            reset_secret_scope(scope_token)
 
-        mock_client.login.assert_awaited_once()
+        assert captured_login["device_id"] == "STABLE_PW_DEVICE"
+        assert captured_login["refresh_token"] is True
         assert adapter._device_id == "STABLE_PW_DEVICE"
+        saved = load_env_file(get_env_path())
+        assert saved["MATRIX_ACCESS_TOKEN"] == "syt_persisted_access"
+        assert saved["MATRIX_REFRESH_TOKEN"] == "syt_persisted_refresh"
+        assert update_environ_modes == [False, False]
+        assert os.environ["MATRIX_ACCESS_TOKEN"] == "syt_default_access"
+        assert os.environ["MATRIX_REFRESH_TOKEN"] == "syt_default_refresh"
 
         await adapter.disconnect()
 
