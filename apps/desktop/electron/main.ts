@@ -58,6 +58,7 @@ import {
 } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
+import { wslWindowsOpenUrlArgs } from './wsl-open-url'
 import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
 import {
   apiRequestRegistryConnectionId,
@@ -1487,14 +1488,15 @@ function openExternalUrl(rawUrl) {
   if (IS_WSL) {
     rememberLog(`[link] opening via WSL→Windows: ${url}`)
 
-    const proc = spawn('cmd.exe', ['/c', 'start', '""', url], {
+    const launched = wslWindowsOpenUrlArgs(url)
+    const proc = spawn(launched.command, launched.args, {
       detached: true,
       stdio: 'ignore',
       windowsHide: true
     })
 
     proc.on('error', error => {
-      rememberLog(`[link] cmd.exe start failed: ${error.message}; falling back to xdg-open`)
+      rememberLog(`[link] rundll32 FileProtocolHandler failed: ${error.message}; falling back to xdg-open`)
       shell.openExternal(url).catch(fallback => rememberLog(`[link] xdg-open failed: ${fallback.message}`))
     })
     proc.unref()
