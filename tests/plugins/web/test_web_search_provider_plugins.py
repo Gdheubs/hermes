@@ -2,7 +2,7 @@
 
 Covers:
 
-- All eight bundled plugins (brave-free, ddgs, searxng, exa, parallel,
+- All nine bundled plugins (brave-free, codex, ddgs, searxng, exa, parallel,
   tavily, firecrawl, xai) instantiate and self-report the expected
   capabilities + ABC-derived defaults.
 - Each plugin's ``is_available()`` correctly reflects env-var presence.
@@ -45,6 +45,8 @@ def _clear_web_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "TOOL_GATEWAY_DOMAIN",
         "TOOL_GATEWAY_USER_TOKEN",
         "XAI_API_KEY",
+        "CODEX_ACCESS_TOKEN",
+        "CODEX_ACCOUNT_ID",
     ):
         monkeypatch.delenv(k, raising=False)
 
@@ -70,13 +72,14 @@ def _isolate_env(monkeypatch: pytest.MonkeyPatch) -> None:
 class TestBundledPluginsRegister:
     """All eight bundled web plugins discover and register correctly."""
 
-    def test_all_seven_plugins_present_in_registry(self) -> None:
+    def test_all_bundled_plugins_present_in_registry(self) -> None:
         _ensure_plugins_loaded()
         from agent.web_search_registry import list_providers
 
         names = sorted(p.name for p in list_providers())
         assert names == [
             "brave-free",
+            "codex",
             "ddgs",
             "exa",
             "firecrawl",
@@ -90,6 +93,7 @@ class TestBundledPluginsRegister:
         "plugin_name,expected_search,expected_extract",
         [
             ("brave-free", True, False),
+            ("codex", True, True),
             ("ddgs", True, False),
             ("searxng", True, False),
             ("exa", True, True),
@@ -116,7 +120,7 @@ class TestBundledPluginsRegister:
 
     @pytest.mark.parametrize(
         "plugin_name",
-        ["brave-free", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
+        ["brave-free", "codex", "ddgs", "searxng", "exa", "parallel", "tavily", "firecrawl", "xai"],
     )
     def test_each_plugin_has_name_and_display_name(self, plugin_name: str) -> None:
         _ensure_plugins_loaded()

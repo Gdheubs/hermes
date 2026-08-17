@@ -19,6 +19,7 @@ Both are configured through a single backend selection. Providers are chosen via
 | Provider | Env Var | Search | Extract | Free tier |
 |----------|---------|--------|---------|-----------|
 | **Firecrawl** (default) | `FIRECRAWL_API_KEY` | ✔ | ✔ | 500 credits/mo |
+| **Codex (OpenAI)** | `CODEX_ACCESS_TOKEN` (optional — reuses `~/.codex/auth.json`) | ✔ | ✔ | ✔ Free (reuses `codex login`) |
 | **SearXNG** | `SEARXNG_URL` | ✔ | — | ✔ Free (self-hosted) |
 | **Brave Search (free tier)** | `BRAVE_SEARCH_API_KEY` | ✔ | — | 2 000 queries/mo |
 | **DDGS (DuckDuckGo)** | — (no key) | ✔ | — | ✔ Free |
@@ -86,6 +87,30 @@ FIRECRAWL_API_URL=http://localhost:3002
 ```
 
 When `FIRECRAWL_API_URL` is set, the API key is optional (disable server auth with `USE_DB_AUTHENTICATION=false`).
+
+---
+
+### Codex (OpenAI standalone)
+
+Search and extract through OpenAI Codex's standalone web-retrieval endpoint — the same backend the Codex CLI uses. **Zero GPT inference tokens**: the operation is pure retrieval; the active Hermes model receives the raw results and does all the reasoning.
+
+**No API key required** — Hermes reuses your existing Codex CLI login:
+
+```bash
+codex login   # creates ~/.codex/auth.json
+```
+
+Alternatively, set `CODEX_ACCESS_TOKEN` (and optionally `CODEX_ACCOUNT_ID` for multi-account setups) in `~/.hermes/.env`. When both are present, the env var wins.
+
+```yaml
+# ~/.hermes/config.yaml
+web:
+  backend: "codex"   # search + extract
+```
+
+:::note
+The endpoint is an internal Codex CLI contract and may change without notice. If search returns `{"success": false}` with a 401/403 error, re-run `codex login` to refresh the token. Rate limits (HTTP 429) surface as tool errors the agent can report.
+:::
 
 ---
 
@@ -326,7 +351,7 @@ Set one provider for all web capabilities:
 ```yaml
 # ~/.hermes/config.yaml
 web:
-  backend: "searxng"   # firecrawl | searxng | brave-free | ddgs | tavily | exa | parallel | xai
+  backend: "searxng"   # firecrawl | codex | searxng | brave-free | ddgs | tavily | exa | parallel | xai
 ```
 
 ### Per-capability configuration
@@ -360,6 +385,7 @@ If no backend is explicitly configured, Hermes picks the first available one bas
 | `SEARXNG_URL` | searxng |
 | `BRAVE_SEARCH_API_KEY` | brave-free |
 | `ddgs` package importable | ddgs |
+| `CODEX_ACCESS_TOKEN` or `~/.codex/auth.json` present | codex |
 
 xAI Web Search is **not** in the auto-detection chain — having `XAI_API_KEY` set (or being signed in via xAI Grok OAuth) does not automatically route web traffic through xAI, since those credentials are also used for inference / TTS / image gen and the user may want a different backend for web. Opt in explicitly with `web.backend: "xai"`.
 
