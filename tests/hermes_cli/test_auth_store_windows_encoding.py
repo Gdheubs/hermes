@@ -149,8 +149,10 @@ class TestExplicitEncodingPassed:
         auth_path = hermes_home / "auth.json"
         _write_utf8(auth_path, {"version": auth.AUTH_STORE_VERSION, "providers": {}})
 
+        real_read_text = Path.read_text
+
         with mock.patch.object(
-            Path, "read_text", wraps=Path.read_text
+            Path, "read_text", autospec=True, side_effect=real_read_text
         ) as spy:
             auth._load_auth_store(auth_path)
 

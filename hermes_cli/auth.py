@@ -1299,6 +1299,12 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         raise
     except Exception as exc:
         # Genuine corruption: unparseable JSON, or bytes that are not UTF-8.
+        # F10 (fail closed): DO NOT degrade to an empty store. This module does
+        # read-modify-write in ~15 places, so an empty store here is one
+        # _save_auth_store() away from erasing every stored credential. The
+        # corrupt file is preserved for recovery, then we refuse to continue —
+        # callers surface the error and the operator resolves it explicitly
+        # (restore the .corrupt copy, or clear the file knowing it is empty).
         corrupt_path = auth_file.with_suffix(".json.corrupt")
         preserved = False
         try:
@@ -1311,19 +1317,24 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
                 corrupt_path, exc_info=True,
             )
         if preserved:
-            logger.warning(
-                "auth: failed to parse %s (%s), starting with empty store. "
-                "Corrupt file preserved at %s",
+            logger.error(
+                "auth: failed to parse %s (%s), refusing to continue with an "
+                "empty store (fail closed). Corrupt file preserved at %s",
                 auth_file, exc, corrupt_path,
             )
         else:
             # Do not advertise a backup that was never written.
-            logger.warning(
-                "auth: failed to parse %s (%s), starting with empty store. "
-                "A copy could NOT be preserved at %s",
+            logger.error(
+                "auth: failed to parse %s (%s), refusing to continue with an "
+                "empty store (fail closed). A copy could NOT be preserved at %s",
                 auth_file, exc, corrupt_path,
             )
-        return {"version": AUTH_STORE_VERSION, "providers": {}}
+        raise ValueError(
+            f"auth store {auth_file} is corrupt and was not loaded: {exc}. "
+            f"Refusing to continue with an empty store (fail closed). "
+            f"Restore the preserved copy at {corrupt_path} or fix the file, "
+            f"then retry."
+        ) from exc
 
     if isinstance(raw, dict) and (
         isinstance(raw.get("providers"), dict)
