@@ -24688,6 +24688,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.error("Watch notification injection error: %s", e)
             return False
 
+    def _completion_route_available(self, evt: dict) -> bool:
+        """Return whether this gateway can route a completion event.
+
+        This is a read-only preflight for the same routes used by
+        :meth:`_inject_watch_notification`. Opaque session IDs are routable
+        only when an explicit origin_session_id proves api_server provenance;
+        structured events require a matching platform adapter.
+
+        Durable completions use this before claiming their SQLite row. A
+        gateway that does not own a route must leave the row pending for the
+        CLI, TUI, or api_server consumer that can prove ownership instead of
+        burning one delivery attempt on every gateway restart.
+        """
+        from gateway.wake import adapter_supports_push
+
+        # Mirror _inject_watch_notification's precedence: a persisted/cached
+        # structured source is positive route proof even when the legacy
+        # session key itself is opaque.
+        source = self._build_process_event_source(evt)
+        if source is not None:
+            platform_name = (
+                source.platform.value
+                if hasattr(source.platform, "value")
+                else str(source.platform)
+            )
+            return any(
+                platform.value == platform_name and adapter is not None
+                for platform, adapter in self.adapters.items()
+            )
+
+        # Without a structured source, only an explicit origin_session_id
+        # proves that an opaque session belongs to api_server. A raw
+        # session_key alone may be owned by CLI/TUI (or predate the stamp).
+        raw_sid = str(evt.get("origin_session_id") or "").strip()
+        if not raw_sid:
+            return False
+        adapter = self.adapters.get(Platform.API_SERVER)
+        return adapter is not None and not adapter_supports_push(adapter)
+
     @staticmethod
     def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:
         """Return a producer-stable identity when one is available.
@@ -24792,6 +24831,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         durable_delegation_id = ""
         if evt.get("type") == "async_delegation":
             durable_delegation_id = str(evt.get("delegation_id") or "")
+            route_available = True
+            if durable_delegation_id:
+                try:
+                    route_available = self._completion_route_available(evt)
+                except Exception:
+                    # Preserve the preflight's read-only contract. Unexpected
+                    # resolver failures must fall back to the established
+                    # claim/deliver/release path rather than hot-loop forever
+                    # before the durable retry budget can advance.
+                    logger.exception(
+                        "Async delegation %s route preflight failed; "
+                        "falling back to normal delivery",
+                        durable_delegation_id,
+                    )
+            if durable_delegation_id and not route_available:
+                # This gateway is not the event's owner. Claiming the durable
+                # row would increment delivery_attempts even though delivery
+                # cannot succeed here, eventually terminally dropping the row
+                # after enough restarts. SQLite remains the durable inbox for
+                # the owning CLI/TUI/api_server consumer. Return None rather
+                # than False so the watcher does not hot-loop in memory.
+                logger.info(
+                    "Async delegation %s has no route in this gateway "
+                    "(session_key=%r); leaving it pending for its owner.",
+                    durable_delegation_id,
+                    str(evt.get("session_key") or ""),
+                )
+                return None
             if durable_delegation_id:
                 try:
                     from tools.async_delegation import claim_completion_delivery
