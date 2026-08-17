@@ -49,6 +49,7 @@ from tools.tool_result_storage import (
     maybe_persist_tool_result,
     enforce_turn_budget,
 )
+from tools.tool_result_profiles import apply_tool_result_filter
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
@@ -1757,6 +1758,18 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
         display_function_result = function_result
+
+        # Tool-aware relevance filter: replace the raw blob with the parts
+        # this tool type's profile says the agent needs (see
+        # ``tools/tool_result_profiles.py``). Runs BEFORE the size caps and
+        # persistence thresholds so every result — including ones big
+        # enough to trigger persistence — gets shrunk to its informative
+        # parts first; only results that are still oversized are
+        # spilled/truncated below. The filter is shrink-only and fail-open,
+        # so it can never raise context above what ``tool_output`` allows.
+        if not _is_multimodal_tool_result(function_result):
+            function_result = apply_tool_result_filter(name, function_result)
+
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=name,
@@ -2572,6 +2585,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
         display_function_result = function_result
+
+        # Tool-aware relevance filter — see the concurrent path for
+        # rationale. Runs before the size caps/persistence thresholds.
+        if not _is_multimodal_tool_result(function_result):
+            function_result = apply_tool_result_filter(function_name, function_result)
+
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=function_name,

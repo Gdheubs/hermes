@@ -752,6 +752,7 @@ export const SECTIONS: DesktopConfigSection[] = [
       'tool_output.max_bytes',
       'tool_output.max_lines',
       'tool_output.max_line_length',
+      'tool_result_profiles.enabled',
       'checkpoints.max_snapshots',
       'agent.max_turns',
       'agent.api_max_retries',
