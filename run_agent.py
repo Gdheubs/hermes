@@ -7815,6 +7815,18 @@ class AIAgent:
         from agent.agent_runtime_helpers import copy_reasoning_content_for_api
         return copy_reasoning_content_for_api(self, source_msg, api_msg)
 
+    def _replays_reasoning_content(self) -> bool:
+        """Forwarder — see ``agent.agent_runtime_helpers.replays_reasoning_content_for_agent``.
+
+        Soft-replay classification (accepts-and-attends ``reasoning_content``
+        on replay, no requirement, no pads): loopback-host endpoints such as
+        a local llama.cpp server.  Independent of the require-side
+        ``_needs_thinking_reasoning_pad`` flag so a soft endpoint never
+        triggers pad fabrication and a strict-provider fallback still strips.
+        """
+        from agent.agent_runtime_helpers import replays_reasoning_content_for_agent
+        return replays_reasoning_content_for_agent(self)
+
     def _reapply_reasoning_echo_for_provider(self, api_messages: list) -> int:
         """Forwarder — see ``agent.agent_runtime_helpers.reapply_reasoning_echo_for_provider``."""
         from agent.agent_runtime_helpers import reapply_reasoning_echo_for_provider

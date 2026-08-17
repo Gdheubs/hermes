@@ -19,6 +19,7 @@ from agent.message_sanitization import (
     needs_reasoning_echo,
     reapply_reasoning_echo,
     reasoning_echo_family,
+    replays_reasoning_content,
     uniquify_tool_call_ids,
 )
 
@@ -294,3 +295,160 @@ class TestReapplyReasoningEcho:
         assert reapply_reasoning_echo(msgs, True) == 0
         reapply_reasoning_echo(msgs, False)
         assert reapply_reasoning_echo(msgs, False) == 0
+
+
+# ---------------------------------------------------------------------------
+# soft replay family — loopback endpoints that accept-and-attend
+# reasoning_content without requiring it (local llama.cpp et al.)
+# ---------------------------------------------------------------------------
+
+class TestSoftReplayClassification:
+    @pytest.mark.parametrize("base_url", [
+        "http://localhost:8081/v1",
+        "http://127.0.0.1:8080/v1",
+        "http://127.8.9.10:8080/v1",           # any 127.0.0.0/8
+        "http://[::1]:8080/v1",
+        "http://[::ffff:127.0.0.1]:8080/v1",   # IPv4-mapped loopback
+        "http://0.0.0.0:8080/v1",              # unspecified bind form
+        "localhost:8081",
+    ])
+    def test_loopback_hosts_match(self, base_url):
+        assert replays_reasoning_content("local", "some-model", base_url) is True
+
+    @pytest.mark.parametrize("base_url", [
+        "https://api.openai.com/v1",
+        "https://api.mistral.ai/v1",
+        "https://qwen.example.com/v1",        # model-name-ish host: no match
+        "http://localhost.evil.example/v1",   # loopback as subdomain: no match
+        "https://my-localhost.demo/v1",
+        "http://192.168.1.5:8080/v1",         # LAN address: not loopback
+        None,
+    ])
+    def test_non_loopback_no_match(self, base_url):
+        assert replays_reasoning_content("openai", "qwen3.8-27b", base_url) is False
+
+    def test_disjoint_from_require_side(self):
+        # A require-side host never matches the soft table and vice versa.
+        assert replays_reasoning_content(
+            "custom", None, "https://api.deepseek.com") is False
+        assert reasoning_echo_family(
+            "local", "qwen3.8", "http://localhost:8081/v1") is None
+
+
+class TestApplyPolicySoftReplay:
+    def test_soft_preserves_existing_reasoning(self):
+        api = {"role": "assistant", "content": "x"}
+        apply_reasoning_content_policy(
+            {"role": "assistant", "content": "x", "reasoning_content": "thoughts"},
+            api, needs_thinking_pad=False, soft_replay=True)
+        assert api["reasoning_content"] == "thoughts"
+
+    def test_soft_never_fabricates_pad_on_bare_turn(self):
+        # THE soft-family contract: no field -> no field.  A lone assistant
+        # turn with no reasoning must NOT gain a " " pad (branch 4 stays
+        # require-side-only).
+        api = {"role": "assistant", "content": "x"}
+        apply_reasoning_content_policy(
+            {"role": "assistant", "content": "x"}, api,
+            needs_thinking_pad=False, soft_replay=True)
+        assert "reasoning_content" not in api
+
+    def test_soft_drops_empty_string(self):
+        # "" is upgraded to " " only on require-side; soft omits.
+        api = {"role": "assistant", "content": "x", "reasoning_content": ""}
+        apply_reasoning_content_policy(
+            {"role": "assistant", "content": "x", "reasoning_content": ""}, api,
+            needs_thinking_pad=False, soft_replay=True)
+        assert "reasoning_content" not in api
+
+    def test_soft_does_not_pad_foreign_cot(self):
+        # Branch 2 (foreign CoT -> " " pad) is require-side-only.
+        src = {"role": "assistant", "content": "x", "reasoning": "other CoT",
+               "tool_calls": [{"id": "c", "function": {"name": "t",
+                                                       "arguments": "{}"}}]}
+        api = {"role": "assistant", "content": "x"}
+        apply_reasoning_content_policy(
+            src, api, needs_thinking_pad=False, soft_replay=True)
+        assert "reasoning_content" not in api
+
+    def test_soft_promotes_internal_reasoning_field(self):
+        # Same-provider history where thinking lives under 'reasoning'
+        # (write-time promotion missed it): promote, don't pad.
+        src = {"role": "assistant", "content": "x", "reasoning": "my thoughts"}
+        api = {"role": "assistant", "content": "x"}
+        apply_reasoning_content_policy(
+            src, api, needs_thinking_pad=False, soft_replay=True)
+        assert api["reasoning_content"] == "my thoughts"
+
+    def test_strict_default_unchanged(self):
+        # needs_thinking_pad=False, soft_replay=False -> historical strip.
+        api = {"role": "assistant", "content": "x", "reasoning_content": "t"}
+        apply_reasoning_content_policy(
+            {"role": "assistant", "content": "x", "reasoning_content": "t"},
+            api, needs_thinking_pad=False)
+        assert "reasoning_content" not in api
+
+
+class TestReapplyReasoningEchoSoft:
+    MSGS = [
+        {"role": "assistant", "content": "a1", "reasoning_content": "genuine CoT"},
+        {"role": "assistant", "content": "a2", "reasoning_content": " "},
+        {"role": "assistant", "content": "a3"},
+        {"role": "user", "content": "u"},
+    ]
+
+    def test_soft_keeps_genuine_drops_pads(self):
+        import copy
+        msgs = copy.deepcopy(self.MSGS)
+        assert reapply_reasoning_echo(msgs, False, soft_replay=True) == 1
+        assert msgs[0]["reasoning_content"] == "genuine CoT"
+        assert "reasoning_content" not in msgs[1]  # pad dropped
+        assert "reasoning_content" not in msgs[2]  # nothing added
+
+    def test_soft_idempotent(self):
+        import copy
+        msgs = copy.deepcopy(self.MSGS)
+        reapply_reasoning_echo(msgs, False, soft_replay=True)
+        assert reapply_reasoning_echo(msgs, False, soft_replay=True) == 0
+
+
+class TestSoftToStrictFallbackNoLeak:
+    """The local→strict provider fallback boundary (PR #87123 discussion):
+    history persisted under a soft-replay loopback primary carries
+    reasoning_content on every assistant turn.  When the request falls
+    back to a strict provider (Mistral/Cerebras/Groq reject the field
+    with 400/422), reapply_reasoning_echo must strip every trace —
+    genuine preserved reasoning included — so nothing leaks to the wire."""
+
+    # A soft-replay session's history: genuine CoT preserved verbatim.
+    SOFT_MSGS = [
+        {"role": "assistant", "content": "a1",
+         "reasoning_content": "genuine chain of thought"},
+        {"role": "assistant", "content": "a2", "reasoning_content": " "},
+        {"role": "assistant", "content": "a3"},  # bare turn, nothing to strip
+        {"role": "user", "content": "u"},
+    ]
+
+    def test_fallback_strips_genuine_reasoning_too(self):
+        import copy
+        msgs = copy.deepcopy(self.SOFT_MSGS)
+        changed = reapply_reasoning_echo(msgs, needs_thinking_pad=False)
+        assert changed == 2
+        assert all("reasoning_content" not in m for m in msgs)
+
+    def test_fallback_idempotent(self):
+        import copy
+        msgs = copy.deepcopy(self.SOFT_MSGS)
+        reapply_reasoning_echo(msgs, False)
+        assert reapply_reasoning_echo(msgs, False) == 0
+
+    def test_apply_policy_strict_strips_soft_shaped_history(self):
+        # The rebuild path (apply_reasoning_content_policy) on a message
+        # shaped by a soft primary: strict target must not carry the field.
+        api = {"role": "assistant", "content": "x",
+               "reasoning_content": "genuine CoT"}
+        apply_reasoning_content_policy(
+            {"role": "assistant", "content": "x",
+             "reasoning_content": "genuine CoT"},
+            api, needs_thinking_pad=False, soft_replay=False)
+        assert "reasoning_content" not in api

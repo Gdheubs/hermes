@@ -3886,13 +3886,32 @@ def copy_reasoning_content_for_api(agent, source_msg: dict, api_msg: dict) -> No
 
     Forwarder — the strip-vs-repad POLICY is owned by
     ``agent.message_sanitization.apply_reasoning_content_policy`` (audit F4);
-    this only supplies the agent's cached provider-direction flag.
+    this only supplies the agent's cached provider-direction flags.
     """
     from agent.message_sanitization import apply_reasoning_content_policy
 
     apply_reasoning_content_policy(
-        source_msg, api_msg, agent._needs_thinking_reasoning_pad()
+        source_msg, api_msg, agent._needs_thinking_reasoning_pad(),
+        soft_replay=agent._replays_reasoning_content(),
     )
+
+
+def replays_reasoning_content_for_agent(agent) -> bool:
+    """Cached soft-replay classification for the active provider.
+
+    Companion to the require-side pad cache: ``_replays_reasoning_content``
+    on AIAgent, resolved via ``agent.message_sanitization.
+    replays_reasoning_content`` (loopback-host table).
+    """
+    cached = getattr(agent, "_soft_replay_cache", None)
+    key = (agent.provider, agent.model, getattr(agent, "_base_url_lower", agent.base_url))
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    from agent.message_sanitization import replays_reasoning_content
+
+    result = replays_reasoning_content(agent.provider, agent.model, agent.base_url)
+    agent._soft_replay_cache = (key, result)
+    return result
 
 
 def reapply_reasoning_echo_for_provider(agent, api_messages: list) -> int:
@@ -3927,7 +3946,8 @@ def reapply_reasoning_echo_for_provider(agent, api_messages: list) -> int:
     from agent.message_sanitization import reapply_reasoning_echo
 
     return reapply_reasoning_echo(
-        api_messages, agent._needs_thinking_reasoning_pad()
+        api_messages, agent._needs_thinking_reasoning_pad(),
+        soft_replay=agent._replays_reasoning_content(),
     )
 
 

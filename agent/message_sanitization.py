@@ -663,6 +663,65 @@ _REASONING_ECHO_RULES: tuple = (
      ("api.xiaomimimo.com", "xiaomimimo.com")),
 )
 
+# Soft replay side: endpoints that ACCEPT ``reasoning_content`` on assistant
+# replay messages and ATTEND to it, but do not REQUIRE the field (no HTTP 400
+# when absent).  Replying back the model's own prior thinking measurably
+# improves multi-turn reasoning recall on these endpoints (llama.cpp
+# ``--reasoning-preserve`` serving Qwen3.8: paired A/B, see PR body), but the
+# replay contract is "preserve verbatim or omit" — NEVER fabricate a
+# placeholder, because fabricated pads pollute the preserved sequence these
+# backends serialize back into the context.
+#
+# Host-driven and loopback-only on purpose.  llama-server is a local binary
+# with no canonical public hostname; a model-substring match (e.g. "qwen")
+# would false-positive on every aggregator that re-exports qwen models over
+# an OpenAI-compat wire that drops the field.  Any user pointing Hermes at
+# their own llama.cpp/llama-swap/vLLM-style loopback endpoint gets replay;
+# nothing public changes behavior.
+_SOFT_REASONING_REPLAY_HOSTS = (
+    "localhost",
+    "::1",
+)
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True for loopback host forms: localhost, any 127.0.0.0/8 address,
+    IPv4-mapped loopback (::ffff:127.x.x.x), and unspecified 0.0.0.0 / ::
+    (llama-server binds 0.0.0.0 and clients sometimes address it that way)."""
+    import ipaddress
+
+    if not host:
+        return False
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback or host == "0.0.0.0"
+    except ValueError:
+        return False
+
+
+def replays_reasoning_content(provider: Any, model: Any, base_url: Any) -> bool:
+    """True when the endpoint accepts-and-attends replayed reasoning_content.
+
+    Soft families differ from the require-side table above in both
+    directions: omitting the field is fine (no pad synthesis), and sending
+    the model's OWN prior reasoning is beneficial (cross-turn reasoning
+    continuity).  This classification is disjoint from
+    ``reasoning_echo_family`` by construction: require-side hosts are public
+    API domains, soft-replay hosts are loopback only.
+
+    Boundary: a REMOTE self-hosted endpoint (e.g. a vLLM box on the LAN or
+    a rented GPU box over Tailscale) that accepts-and-attends the field is
+    deliberately classified strict here and gets the strip path — loopback
+    is the only host shape we can auto-detect without false positives on
+    aggregators that silently drop the field.  A config override for
+    non-loopback endpoints can layer on the tri-state introduced by this
+    family (see PR #87123 discussion).
+    """
+    from utils import base_url_hostname
+
+    return _is_loopback_host(base_url_hostname(base_url))
+
 
 def _family_rule(family: str) -> tuple:
     for rule in _REASONING_ECHO_RULES:
@@ -712,13 +771,21 @@ def needs_reasoning_echo(provider: Any, model: Any, base_url: Any) -> bool:
 
 
 def apply_reasoning_content_policy(
-    source_msg: dict, api_msg: dict, needs_thinking_pad: bool
+    source_msg: dict, api_msg: dict, needs_thinking_pad: bool,
+    soft_replay: bool = False,
 ) -> None:
     """Copy provider-facing reasoning fields onto an API replay message.
 
     ``needs_thinking_pad`` is the require-side flag (see
     ``needs_reasoning_echo`` / the agent's cached
-    ``_needs_thinking_reasoning_pad``). Mutates ``api_msg`` in place.
+    ``_needs_thinking_reasoning_pad``).  ``soft_replay`` is the
+    accepts-and-attends flag (see ``replays_reasoning_content``) for
+    endpoints like a local llama.cpp server: preserve the model's own prior
+    reasoning verbatim, but never fabricate pads — omitting the field is
+    valid there.  When both flags could apply, require-side wins (a
+    require-side host never matches the loopback-only soft table, so the
+    combination is unreachable in practice; the guard keeps the policy
+    total).  Mutates ``api_msg`` in place.
     """
     if source_msg.get("role") != "assistant":
         return
@@ -743,10 +810,16 @@ def apply_reasoning_content_policy(
     # already-built api_messages path. Refs #45655.
     existing = source_msg.get("reasoning_content")
     if isinstance(existing, str):
-        if not needs_thinking_pad:
+        if not needs_thinking_pad and not soft_replay:
             api_msg.pop("reasoning_content", None)
         elif existing == "":
-            api_msg["reasoning_content"] = " "
+            # Require-side upgrades "" → " " (#17341).  Soft-replay side
+            # omits instead: an empty preserved block is noise the server
+            # would serialize back into context.
+            if needs_thinking_pad:
+                api_msg["reasoning_content"] = " "
+            else:
+                api_msg.pop("reasoning_content", None)
         else:
             api_msg["reasoning_content"] = existing
         return
@@ -762,24 +835,34 @@ def apply_reasoning_content_policy(
     # provider's chain of thought to DeepSeek/Kimi. Space (not "")
     # because DeepSeek V4 Pro rejects empty-string reasoning_content
     # in thinking mode (refs #17341).
+    #
+    # Soft-replay side strips the same shape instead: the foreign
+    # chain-of-thought is not this model's own output, and the soft
+    # contract is preserve-verbatim-or-omit (no fabrication, no foreign
+    # CoT laundering). Same-provider local history always carries
+    # reasoning_content pinned at write time, so this shape is foreign
+    # there too.
     normalized_reasoning = source_msg.get("reasoning")
     if (
-        needs_thinking_pad
-        and source_msg.get("tool_calls")
+        source_msg.get("tool_calls")
         and isinstance(normalized_reasoning, str)
         and normalized_reasoning
+        and (needs_thinking_pad or soft_replay)
     ):
-        api_msg["reasoning_content"] = " "
+        if needs_thinking_pad:
+            api_msg["reasoning_content"] = " "
+        else:
+            api_msg.pop("reasoning_content", None)
         return
 
     # 3. Healthy session: promote 'reasoning' field to 'reasoning_content'
     # for providers that use the internal 'reasoning' key.
     # This must happen before the unconditional empty-string fallback so
     # genuine reasoning content is not overwritten (#15812 regression in
-    # PR #15478). Only promote for providers that enforce echo-back —
-    # strict providers reject the field (refs #45655).
+    # PR #15478). Only promote for providers that enforce echo-back or
+    # soft-replay it — strict providers reject the field (refs #45655).
     if isinstance(normalized_reasoning, str) and normalized_reasoning:
-        if needs_thinking_pad:
+        if needs_thinking_pad or soft_replay:
             api_msg["reasoning_content"] = normalized_reasoning
         else:
             api_msg.pop("reasoning_content", None)
@@ -802,7 +885,9 @@ def apply_reasoning_content_policy(
     api_msg.pop("reasoning_content", None)
 
 
-def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool) -> int:
+def reapply_reasoning_echo(
+    api_messages: list, needs_thinking_pad: bool, soft_replay: bool = False
+) -> int:
     """Re-pad (or strip) assistant turns' reasoning_content for the active provider.
 
     ``api_messages`` is built once, before the retry loop, while the *primary*
@@ -840,6 +925,17 @@ def reapply_reasoning_echo(api_messages: list, needs_thinking_pad: bool) -> int:
                 continue
             apply_reasoning_content_policy(api_msg, api_msg, needs_thinking_pad)
             if api_msg.get("reasoning_content"):
+                changed += 1
+        elif soft_replay:
+            # Soft replay: keep genuine preserved reasoning (non-empty,
+            # non-whitespace — a lone " " is a require-side pad, not model
+            # output), drop fabricated pads.  Never add anything: omitting
+            # the field is valid on these endpoints.
+            existing = api_msg.get("reasoning_content")
+            if isinstance(existing, str) and existing.strip():
+                continue
+            if "reasoning_content" in api_msg:
+                api_msg.pop("reasoning_content", None)
                 changed += 1
         else:
             # Strict provider — strip any stale reasoning_content pad left
