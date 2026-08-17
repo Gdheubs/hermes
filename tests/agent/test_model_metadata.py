@@ -371,8 +371,43 @@ class TestDefaultContextLengths:
                     f"{model_id}: expected {expected_ctx}, got {actual}"
                 )
 
+    def test_glm_53_resolves_to_1m_like_glm_52(self):
+        """GLM-5.3 is the same base model as GLM-5.2 (Z.ai launch post,
+        2026-08-14) and runs 400K-1M contexts in Z.ai's own evaluations.
+        Without an explicit entry it falls into the generic 202K ``glm``
+        fallback, triggering context compression ~5x too early — which
+        destroys the cached prefix on every compression boundary.
+        """
+        from agent.model_metadata import get_model_context_length
+        from unittest.mock import patch as mock_patch
 
+        expected_keys = {
+            "glm-5.2": 1_048_576,
+            "glm-5.3": 1_048_576,
+        }
+        for key, value in expected_keys.items():
+            assert key in DEFAULT_CONTEXT_LENGTHS, f"{key} missing"
+            assert DEFAULT_CONTEXT_LENGTHS[key] == value, (
+                f"{key} should be {value}, got {DEFAULT_CONTEXT_LENGTHS[key]}"
+            )
 
+        # Longest-first substring matching must resolve 5.2/5.3 to 1M
+        # (native Z.ai, bare slugs) while older variants still fall back
+        # to the ~202K ``glm`` entry.
+        with mock_patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             mock_patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             mock_patch("agent.model_metadata.get_cached_context_length", return_value=None):
+            cases = [
+                ("glm-5.3", 1_048_576),
+                ("glm-5.2", 1_048_576),
+                ("glm-5.1", 202752),
+                ("glm-5", 202752),
+            ]
+            for model_id, expected_ctx in cases:
+                actual = get_model_context_length(model_id, provider="zai")
+                assert actual == expected_ctx, (
+                    f"{model_id}: expected {expected_ctx}, got {actual}"
+                )
 
 
 
