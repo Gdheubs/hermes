@@ -7,11 +7,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
 import {
+  deleteSession,
   getAllSessionMessages,
   getLatestSessionMessages,
   getSession,
   type SessionInfo,
-  type SessionResumeResponse
+  type SessionResumeResponse,
+  setSessionArchived
 } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { clearSessionDraft, stashSessionDraft, takeSessionDraft } from '@/store/composer'
@@ -26,9 +28,11 @@ import {
   $currentProvider,
   $currentReasoningEffort,
   $messages,
+  $messagingSessions,
   $newChatWorkspaceTarget,
   $resumeFailedSessionId,
   $selectedStoredSessionId,
+  $sessions,
   $turnStartedAt,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
@@ -40,6 +44,7 @@ import {
   setCurrentProvider,
   setCurrentReasoningEffort,
   setMessages,
+  setMessagingSessions,
   setNewChatWorkspaceTarget,
   setResumeFailedSessionId,
   setSelectedStoredSessionId,
@@ -91,7 +96,7 @@ function deferred<T>() {
 
 type HarnessHandle = Pick<
   ReturnType<typeof useSessionActions>,
-  'createBackendSessionForSend' | 'selectSidebarItem' | 'startFreshSessionDraft'
+  'archiveSession' | 'createBackendSessionForSend' | 'removeSession' | 'selectSidebarItem' | 'startFreshSessionDraft'
 >
 
 function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
@@ -2548,5 +2553,84 @@ describe('selectSidebarItem', () => {
     expect(navigate).toHaveBeenCalledWith('/skills', undefined)
     expect(noteActiveTreeGroup).toHaveBeenCalledWith(null)
     expect(revealTreePane).toHaveBeenCalledWith('workspace')
+  })
+})
+
+describe('archiveSession / removeSession messaging-slice eviction (#87716)', () => {
+  afterEach(() => {
+    cleanup()
+    setSessions([])
+    setMessagingSessions([])
+    vi.restoreAllMocks()
+  })
+
+  it('drops the row from $messagingSessions optimistically when archiving', async () => {
+    const row = storedSession({ id: 'feishu-1', profile: 'default', source: 'feishu' })
+    setSessions([row])
+    setMessagingSessions([row, storedSession({ id: 'feishu-2', profile: 'default', source: 'feishu' })])
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={vi.fn(async () => ({}) as never)} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.archiveSession('feishu-1')
+    })
+
+    expect($messagingSessions.get().map(s => s.id)).toEqual(['feishu-2'])
+    expect(setSessionArchived).toHaveBeenCalledWith('feishu-1', true, 'default')
+  })
+
+  it('drops the row from $messagingSessions optimistically when deleting', async () => {
+    const row = storedSession({ id: 'discord-1', profile: 'default', source: 'discord' })
+    setSessions([row])
+    setMessagingSessions([row, storedSession({ id: 'discord-2', profile: 'default', source: 'discord' })])
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={vi.fn(async () => ({}) as never)} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.removeSession('discord-1')
+    })
+
+    expect($messagingSessions.get().map(s => s.id)).toEqual(['discord-2'])
+    expect(deleteSession).toHaveBeenCalledWith('discord-1', 'default')
+  })
+
+  it('restores the messaging row when the archive RPC fails', async () => {
+    const row = storedSession({ id: 'telegram-1', profile: 'default', source: 'telegram' })
+    setSessions([row])
+    setMessagingSessions([row, storedSession({ id: 'telegram-2', profile: 'default', source: 'telegram' })])
+    vi.mocked(setSessionArchived).mockRejectedValue(new Error('archive boom'))
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={vi.fn(async () => ({}) as never)} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.archiveSession('telegram-1').catch(() => undefined)
+    })
+
+    expect($messagingSessions.get().map(s => s.id).sort()).toEqual(['telegram-1', 'telegram-2'])
+    expect($sessions.get().map(s => s.id)).toEqual(['telegram-1'])
+  })
+
+  it('restores the messaging row when the delete RPC fails', async () => {
+    const row = storedSession({ id: 'slack-1', profile: 'default', source: 'slack' })
+    setSessions([row])
+    setMessagingSessions([row, storedSession({ id: 'slack-2', profile: 'default', source: 'slack' })])
+    vi.mocked(deleteSession).mockRejectedValue(new Error('delete boom'))
+
+    let handle: HarnessHandle | null = null
+    render(<Harness onReady={value => (handle = value)} requestGateway={vi.fn(async () => ({}) as never)} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    await act(async () => {
+      await handle!.removeSession('slack-1').catch(() => undefined)
+    })
+
+    expect($messagingSessions.get().map(s => s.id).sort()).toEqual(['slack-1', 'slack-2'])
+    expect($sessions.get().map(s => s.id)).toEqual(['slack-1'])
   })
 })
