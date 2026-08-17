@@ -131,6 +131,27 @@ EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
 # the short 401 cooldown above. Provider-supplied reset_at still overrides.
 EXHAUSTED_TTL_SOLE_CREDENTIAL_SECONDS = 60   # 1 minute
 
+# Shared billing/quota-exhaustion signal keywords.
+#
+# Used by both ``error_classifier._429_BILLING_SIGNALS`` (429 path) and
+# ``auxiliary_client._is_payment_error`` (payment-error detection) so the
+# two paths never drift apart.  Keep quota/usage-limit keywords here;
+# 402-specific keywords (``"credits"``, ``"payment required"``, etc.) stay
+# inline in ``_is_payment_error`` because they are never relevant on a 429.
+BILLING_QUOTA_SIGNALS = [
+    "weekly usage limit",
+    "weekly limit",
+    "upgrade for higher limits",
+    "reached your session usage limit",
+    "quota exceeded",
+    "quota_exceeded",
+    "resource exhausted",
+    "too many tokens per day",
+    "daily limit",
+    "tokens per day",
+    "daily quota",
+]
+
 # ``FailoverReason.billing`` as a bare string. The pool stores classified
 # failure semantics as plain text (it persists to JSON and must not import
 # the classifier), so the value is duplicated here rather than referenced.

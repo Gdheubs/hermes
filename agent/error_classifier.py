@@ -16,6 +16,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
+from agent.credential_pool import BILLING_QUOTA_SIGNALS
+
 logger = logging.getLogger(__name__)
 
 # Synthetic error code used when the OpenAI SDK rejects a provider's SSE
@@ -238,6 +240,21 @@ _USAGE_LIMIT_PATTERNS = [
     "limit exceeded",
     "key limit exceeded",
 ]
+
+# Patterns that indicate a 429 is actually billing/quota exhaustion, not a
+# transient rate limit.  Some providers return HTTP 429 for hard quota caps
+# — e.g. "you have reached your weekly usage limit, upgrade for higher
+# limits" — which is semantically billing exhaustion: the account cannot
+# serve requests until the quota window resets (days, not seconds).  Without
+# this check the 429 falls through to ``rate_limit``, which retries the same
+# dead credential once before rotating (wasting an API call) and sizes the
+# cooldown as a transient 1-hour TTL instead of the full billing bench.
+#
+# Mirrors the keywords already recognised by
+# ``auxiliary_client._is_payment_error`` so the classifier and the auxiliary
+# client agree on the verdict.  Both paths import the shared
+# ``BILLING_QUOTA_SIGNALS`` constant from ``credential_pool`` to prevent drift.
+_429_BILLING_SIGNALS = BILLING_QUOTA_SIGNALS
 
 # Patterns confirming usage limit is transient (not billing)
 _USAGE_LIMIT_TRANSIENT_SIGNALS = [
@@ -1284,6 +1301,32 @@ def _classify_by_status(
                 should_rotate_credential=False,
                 should_fallback=True,
                 error_context=ctx,
+            )
+        # Some providers return HTTP 429 for hard quota / billing exhaustion
+        # (e.g. "weekly usage limit", "too many tokens per day",
+        # "resource exhausted").  These are not transient rate limits — the
+        # account cannot serve requests until the quota window resets (hours
+        # or days).  Classify as ``billing`` so the recovery path rotates
+        # immediately instead of retrying the same dead credential, and the
+        # cooldown gets the full billing bench.
+        #
+        # But first check for transient signals — a 429 that says "daily limit,
+        # try again in 5 minutes" is a periodic quota that resets, not billing
+        # exhaustion.  Mirrors the disambiguation already done in
+        # ``_classify_402`` and ``_classify_by_message``.
+        if any(p in error_msg for p in _429_BILLING_SIGNALS):
+            if any(p in error_msg for p in _USAGE_LIMIT_TRANSIENT_SIGNALS):
+                return result_fn(
+                    FailoverReason.rate_limit,
+                    retryable=True,
+                    should_rotate_credential=True,
+                    should_fallback=True,
+                )
+            return result_fn(
+                FailoverReason.billing,
+                retryable=False,
+                should_rotate_credential=True,
+                should_fallback=True,
             )
         return result_fn(
             FailoverReason.rate_limit,

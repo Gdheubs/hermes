@@ -160,7 +160,7 @@ def aux_probe_mode():
     finally:
         _aux_probe_state.active = prev
 
-from agent.credential_pool import load_pool
+from agent.credential_pool import load_pool, BILLING_QUOTA_SIGNALS
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
@@ -4003,10 +4003,31 @@ def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None
     """Mark ``provider`` as recently-402'd, hidden from chain iteration
     until the TTL expires. Called from the payment-fallback branches in
     ``call_llm`` and ``acall_llm`` after a confirmed payment error.
+
+    If the provider has a credential pool with other available entries
+    (e.g. a multi-account pool where one account hit a weekly quota but
+    another is healthy), do NOT mark the provider unhealthy.  The pool
+    rotation will handle the per-credential failure; marking the whole
+    provider unhealthy would block the healthy accounts too.
     """
     label = _normalize_chain_label(provider)
     if not label:
         return
+    # Skip marking if the provider's credential pool still has available
+    # entries — the failure is per-account, not provider-wide.
+    try:
+        pool = load_pool(label)
+        if pool and pool.has_available():
+            logger.info(
+                "Auxiliary: NOT marking %s unhealthy — credential pool "
+                "still has available entries (per-account failure, not "
+                "provider-wide). Pool rotation will handle it.",
+                label,
+            )
+            return
+    except Exception as exc:
+        logger.debug("Auxiliary: pool availability check for %s failed (%s) — falling through to marking unhealthy", label, exc)
+        pass  # No pool or pool check failed — fall through to marking
     expires_at = time.time() + (ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS)
     _aux_unhealthy_until[label] = expires_at
     logger.warning(
@@ -4087,14 +4108,7 @@ def _is_payment_error(exc: Exception) -> bool:
             "model_not_supported_on_free_tier",
             "not available on the free tier",
             "requires a subscription", "upgrade for access",
-            "upgrade for higher limits", "reached your session usage limit",
-            # Daily / monthly / weekly quota exhaustion keywords
-            "quota exceeded", "quota_exceeded",
-            "too many tokens per day", "daily limit",
-            "tokens per day", "daily quota",
-            "resource exhausted",  # Vertex AI / gRPC quota errors
-            "weekly usage limit", "weekly limit",  # OpenCode Go weekly subscription cap
-        )):
+        ) + tuple(BILLING_QUOTA_SIGNALS)):
             return True
     return False
 
@@ -9711,7 +9725,12 @@ def _call_llm_impl(
                     # alternative providers can still serve the request.
                     if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
                             or _is_rate_limit_error(retry2_err)):
-                        _recover_provider_pool(pool_provider, retry2_err)
+                        # Pass the key used for the retry so
+                        # mark_exhausted_and_rotate targets the correct entry.
+                        # Without this, the pool falls back to pool.current()
+                        # which may point at a DIFFERENT healthy entry, marking
+                        # it exhausted with the wrong account's error (#43747).
+                        _recover_provider_pool(pool_provider, retry2_err, failed_api_key=resolved_api_key or "")
                         first_err = retry2_err
                     else:
                         raise
@@ -10407,7 +10426,12 @@ async def _async_call_llm_impl(
                 except Exception as retry2_err:
                     if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
                             or _is_rate_limit_error(retry2_err)):
-                        _recover_provider_pool(pool_provider, retry2_err)
+                        # Pass the key used for the retry so
+                        # mark_exhausted_and_rotate targets the correct entry.
+                        # Without this, the pool falls back to pool.current()
+                        # which may point at a DIFFERENT healthy entry, marking
+                        # it exhausted with the wrong account's error (#43747).
+                        _recover_provider_pool(pool_provider, retry2_err, failed_api_key=resolved_api_key or "")
                         first_err = retry2_err
                     else:
                         raise
