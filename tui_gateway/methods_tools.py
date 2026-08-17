@@ -1124,8 +1124,53 @@ def _(rid, params: dict) -> dict:
     # TUI keeps the pager path.
     _cmd_text = cmd.lstrip("/") if cmd.startswith("/") else cmd
     _cmd_parts = _cmd_text.split(maxsplit=1)
-    _cmd_base = (_cmd_parts[0] if _cmd_parts else "").lower()
+    _cmd_raw = _cmd_parts[0] if _cmd_parts else ""
+    _cmd_base = _cmd_raw.lower()
     _cmd_arg = _cmd_parts[1] if len(_cmd_parts) > 1 else ""
+
+    try:
+        from hermes_cli.commands import resolve_command
+
+        _builtin_command = resolve_command(_cmd_base)
+    except Exception:
+        resolve_command = None
+        _builtin_command = None
+
+    # Built-ins take precedence over quick commands in HermesCLI, so avoid the
+    # config lookup (and its overlay/env-expansion pass) for those names.  Only
+    # project aliases whose target is itself a native command back to the TUI;
+    # aliases targeting skills, shell input, or another quick command retain
+    # the isolated worker path that resolves those extension types.
+    quick_command = None
+    quick_command_name = _cmd_raw
+    if _builtin_command is None:
+        quick_commands = _load_cfg().get("quick_commands", {}) or {}
+        if isinstance(quick_commands, dict):
+            quick_command = quick_commands.get(_cmd_raw)
+            if quick_command is None and _cmd_raw != _cmd_base:
+                quick_command = quick_commands.get(_cmd_base)
+                quick_command_name = _cmd_base
+
+    alias_target = quick_command.get("target", "") if isinstance(quick_command, dict) else ""
+    alias_parts = (
+        alias_target.lstrip("/").split(maxsplit=1)
+        if isinstance(alias_target, str)
+        else []
+    )
+    alias_command = resolve_command(alias_parts[0]) if resolve_command and alias_parts else None
+    if (
+        isinstance(quick_command, dict)
+        and quick_command.get("type") == "alias"
+        and alias_command is not None
+    ):
+        return _methods["command.dispatch"](
+            rid,
+            {
+                "name": quick_command_name,
+                "arg": _cmd_arg,
+                "session_id": params.get("session_id", ""),
+            },
+        )
 
     live_output = _live_slash_command_output(
         params.get("session_id", ""), session, _cmd_base, _cmd_arg

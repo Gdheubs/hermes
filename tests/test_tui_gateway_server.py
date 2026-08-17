@@ -9709,6 +9709,147 @@ def test_file_attach_quotes_ref_with_spaces(monkeypatch, tmp_path):
         server._sessions.pop("sid", None)
 
 
+def test_slash_exec_routes_quick_alias_to_command_dispatch(monkeypatch):
+    class _ExplodingWorker:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("quick aliases must not run in the slash worker")
+
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "quick_commands": {
+                "capture": {
+                    "type": "alias",
+                    "target": "image latest.png",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(server, "_SlashWorker", _ExplodingWorker)
+    server._sessions["sid"] = _session()
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "slash.exec",
+                "params": {
+                    "session_id": "sid",
+                    "command": "capture describe this image",
+                },
+            }
+        )
+
+        assert resp["result"] == {
+            "type": "alias",
+            "target": "image latest.png",
+        }
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_slash_exec_keeps_non_native_quick_alias_in_worker(monkeypatch):
+    class _Worker:
+        def __init__(self):
+            self.commands = []
+
+        def run(self, command):
+            self.commands.append(command)
+            return "handled by worker"
+
+    worker = _Worker()
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "quick_commands": {
+                "capture": {"type": "alias", "target": "other-quick"},
+                "other-quick": {"type": "exec", "command": "printf captured"},
+            }
+        },
+    )
+    server._sessions["sid"] = _session(slash_worker=worker)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "slash.exec",
+                "params": {
+                    "session_id": "sid",
+                    "command": "capture keep worker routing",
+                },
+            }
+        )
+
+        assert resp["result"] == {"output": "handled by worker"}
+        assert worker.commands == ["capture keep worker routing"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_slash_exec_skips_quick_config_lookup_for_builtin(monkeypatch):
+    def _unexpected_load():
+        raise AssertionError("built-in slash commands must not reload quick-command config")
+
+    monkeypatch.setattr(server, "_load_cfg", _unexpected_load)
+    server._sessions["sid"] = _session()
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "slash.exec",
+                "params": {"session_id": "sid", "command": "model"},
+            }
+        )
+
+        assert resp["result"]["output"] == "Current model: (unknown)"
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_slash_exec_matches_mixed_case_quick_alias(monkeypatch):
+    class _ExplodingWorker:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("mixed-case native alias must not run in slash worker")
+
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {
+            "quick_commands": {
+                "CaptureLatest": {
+                    "type": "alias",
+                    "target": "image latest.png",
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(server, "_SlashWorker", _ExplodingWorker)
+    server._sessions["sid"] = _session()
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "slash.exec",
+                "params": {
+                    "session_id": "sid",
+                    "command": "CaptureLatest describe this image",
+                },
+            }
+        )
+
+        assert resp["result"] == {
+            "type": "alias",
+            "target": "image latest.png",
+        }
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_commands_catalog_surfaces_quick_commands(monkeypatch):
     monkeypatch.setattr(
         server,
