@@ -642,6 +642,9 @@ class PlatformConfig:
     token: Optional[str] = None  # Bot token (Telegram, Discord)
     api_key: Optional[str] = None  # API key if different from token
     home_channel: Optional[HomeChannel] = None
+    # Optional operations destination for gateway lifecycle notices. When
+    # unset, notices retain the historical home-channel fallback.
+    gateway_restart_channel: Optional[HomeChannel] = None
 
     # Reply threading mode (Telegram/Slack)
     # - "off": Never thread replies to original message
@@ -696,6 +699,8 @@ class PlatformConfig:
             result["api_key"] = self.api_key
         if self.home_channel:
             result["home_channel"] = self.home_channel.to_dict()
+        if self.gateway_restart_channel:
+            result["gateway_restart_channel"] = self.gateway_restart_channel.to_dict()
         if self.channel_overrides:
             result["channel_overrides"] = {
                 cid: ov.to_dict() for cid, ov in self.channel_overrides.items()
@@ -703,11 +708,51 @@ class PlatformConfig:
         return result
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "PlatformConfig":
+    def from_dict(
+        cls,
+        data: Dict[str, Any],
+        *,
+        expected_platform: Optional[Platform] = None,
+    ) -> "PlatformConfig":
         data = _coerce_dict(data)
         home_channel = None
         if isinstance(data.get("home_channel"), dict):
             home_channel = HomeChannel.from_dict(data["home_channel"])
+
+        gateway_restart_channel = None
+        raw_restart_channel = data.get("gateway_restart_channel")
+        if raw_restart_channel is not None:
+            if isinstance(raw_restart_channel, dict):
+                try:
+                    gateway_restart_channel = HomeChannel.from_dict(
+                        raw_restart_channel
+                    )
+                except (KeyError, TypeError, ValueError) as exc:
+                    logger.warning(
+                        "Ignoring invalid gateway_restart_channel; "
+                        "lifecycle notices will fall back to the home channel: %s",
+                        exc,
+                    )
+            else:
+                logger.warning(
+                    "Ignoring invalid gateway_restart_channel; expected a mapping, "
+                    "got %s",
+                    type(raw_restart_channel).__name__,
+                )
+
+        if (
+            gateway_restart_channel is not None
+            and expected_platform is not None
+            and gateway_restart_channel.platform != expected_platform
+        ):
+            logger.warning(
+                "Ignoring gateway_restart_channel platform mismatch; "
+                "expected %s, got %s; lifecycle notices will fall back "
+                "to the home channel",
+                expected_platform.value,
+                gateway_restart_channel.platform.value,
+            )
+            gateway_restart_channel = None
 
         # gateway_restart_notification may be bridged into extra via the
         # shared-key loop in load_gateway_config(); check both top-level
@@ -743,6 +788,7 @@ class PlatformConfig:
             token=data.get("token"),
             api_key=data.get("api_key"),
             home_channel=home_channel,
+            gateway_restart_channel=gateway_restart_channel,
             reply_to_mode=data.get("reply_to_mode", "first"),
             gateway_restart_notification=_coerce_bool(_grn, True),
             typing_indicator=_coerce_bool(_typing, True),
@@ -1143,7 +1189,9 @@ class GatewayConfig:
                 continue
             try:
                 platform = Platform(platform_name)
-                platforms[platform] = PlatformConfig.from_dict(platform_data)
+                platforms[platform] = PlatformConfig.from_dict(
+                    platform_data, expected_platform=platform
+                )
             except ValueError:
                 pass  # Skip unknown platforms
         
@@ -1664,6 +1712,22 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = channel_prompts
                 if "gateway_restart_notification" in platform_cfg:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
+                has_restart_channel = "gateway_restart_channel" in platform_cfg
+                if has_restart_channel:
+                    raw_restart_channel = platform_cfg.get("gateway_restart_channel")
+                    plat_data, _extra = _ensure_platform_extra_dict(
+                        platforms_data, plat.value
+                    )
+                    # _merge_platform_map already resolved precedence for
+                    # gateway.platforms.* versus platforms.*. Only a direct
+                    # top-level platform block may override that merged value.
+                    # Preserve malformed values too so PlatformConfig can emit
+                    # a warning instead of silently discarding user input.
+                    if (
+                        _cfg_toplevel
+                        or "gateway_restart_channel" not in plat_data
+                    ):
+                        plat_data["gateway_restart_channel"] = raw_restart_channel
                 if "typing_indicator" in platform_cfg:
                     bridged["typing_indicator"] = platform_cfg["typing_indicator"]
                 if "typing_status_text" in platform_cfg:
@@ -1699,7 +1763,12 @@ def load_gateway_config() -> GatewayConfig:
                             if isinstance(ov_data, dict)
                         }
                 enabled_was_explicit = _cfg_toplevel and "enabled" in platform_cfg
-                if not bridged and not enabled_was_explicit and not has_channel_overrides:
+                if (
+                    not bridged
+                    and not enabled_was_explicit
+                    and not has_channel_overrides
+                    and not has_restart_channel
+                ):
                     continue
                 plat_data, extra = _ensure_platform_extra_dict(platforms_data, plat.value)
                 if enabled_was_explicit:
