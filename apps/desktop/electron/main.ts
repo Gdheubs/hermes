@@ -247,7 +247,8 @@ import {
   buildSidebarSessionSliceParams,
   fetchPrimaryProfileSessions,
   fetchRemoteProfileSessions,
-  mergeProfileSessionWindow
+  mergeProfileSessionWindow,
+  remoteProfileSharesGateway
 } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
@@ -12964,11 +12965,12 @@ async function interceptSessionRequestForRemote(request) {
   }
 
   // Per-session read/mutation. Owner is in ?profile= (reads) or request.profile
-  // (mutations). Two remote shapes:
-  //  - per-profile override: route to that profile's own remote, sans profile
-  //    param (it serves its own state.db natively).
-  //  - global remote mode: ONE backend serves every profile via ?profile=, so
-  //    route there and KEEP the profile param so it opens the right state.db.
+  // (mutations). Three remote shapes:
+  //  - dedicated per-profile override: route to that profile's own remote, sans
+  //    profile param (it serves its own state.db natively).
+  //  - shared-gateway override: several Desktop profiles point at one host, so
+  //    KEEP ?profile= or the host opens its default store.
+  //  - global remote mode: ONE backend serves every profile via ?profile=.
   if (/^\/api\/sessions\/[^/]+(\/messages)?$/.test(pathname)) {
     const profile = (searchParams.get('profile') || request.profile || '').trim()
 
@@ -12982,6 +12984,20 @@ async function interceptSessionRequestForRemote(request) {
     const passthroughParams = new URLSearchParams(searchParams)
     passthroughParams.delete('profile')
     const passthroughQuery = passthroughParams.toString()
+    const sharedGateway = remoteProfileSharesGateway(profile, readDesktopConnectionConfig().profiles || {})
+
+    if (profileHasRemoteOverride(profile) && sharedGateway) {
+      passthroughParams.set('profile', profile)
+      const path = `${pathname}?${passthroughParams.toString()}`
+
+      if (method === 'GET') {
+        return fetchJsonForProfile(profile, path)
+      }
+
+      const body = request.body && typeof request.body === 'object' ? { ...request.body, profile } : { profile }
+
+      return requestJsonForProfile(profile, path, method, body)
+    }
 
     if (profileHasRemoteOverride(profile)) {
       if (method === 'GET') {

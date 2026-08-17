@@ -130,16 +130,34 @@ export async function fetchPrimaryProfileSessions(
   }
 }
 
-export async function fetchRemoteProfileSessions(
+function isMissingListEndpointError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '')
+
+  if (
+    message.includes('got HTML') ||
+    message.includes('endpoint is likely missing') ||
+    message.includes('No such API endpoint')
+  ) {
+    return true
+  }
+
+  return /^404:/.test(message) && !/Profile ['"].*['"] does not exist/i.test(message)
+}
+
+// A shared remote gateway hosts many profiles. `/api/sessions` is that host's
+// default store, so a Desktop profile override must read the named profile
+// first. Any 200 from `/api/profiles/sessions` is authoritative. Missing
+// aggregator endpoints fall back to `/api/sessions?profile=` before the
+// unscoped dedicated-remote store.
+
+async function fetchPagedRemoteSessions(
   profile: string,
+  pathname: string,
   searchParams: URLSearchParams,
   fetchJsonForProfile: FetchJsonForProfile
 ): Promise<SessionListResponse> {
-  const params = new URLSearchParams(searchParams)
-  params.delete('profile') // the remote serves its own database
-
-  const requestedLimit = Number(params.get('limit'))
-  const requestedOffset = Number(params.get('offset') || '0')
+  const requestedLimit = Number(searchParams.get('limit'))
+  const requestedOffset = Number(searchParams.get('offset') || '0')
 
   const needsPaging =
     Number.isInteger(requestedLimit) &&
@@ -148,7 +166,7 @@ export async function fetchRemoteProfileSessions(
     requestedOffset >= 0
 
   if (!needsPaging) {
-    return (await fetchJsonForProfile(profile, `/api/sessions?${params}`)) as SessionListResponse
+    return (await fetchJsonForProfile(profile, `${pathname}?${searchParams}`)) as SessionListResponse
   }
 
   const sessions: unknown[] = []
@@ -160,12 +178,12 @@ export async function fetchRemoteProfileSessions(
   let targetOffset = requestedOffset + requestedLimit
 
   while (pageOffset < targetOffset) {
-    const pageParams = new URLSearchParams(params)
+    const pageParams = new URLSearchParams(searchParams)
     const pageLimit = Math.min(REMOTE_SESSION_PAGE_LIMIT, targetOffset - pageOffset)
     pageParams.set('limit', String(pageLimit))
     pageParams.set('offset', String(pageOffset))
 
-    const page = (await fetchJsonForProfile(profile, `/api/sessions?${pageParams}`)) as SessionListResponse
+    const page = (await fetchJsonForProfile(profile, `${pathname}?${pageParams}`)) as SessionListResponse
     firstPage ??= page
 
     const total = nonNegativeNumber(page.total)
@@ -174,7 +192,7 @@ export async function fetchRemoteProfileSessions(
     const windowedCount =
       total !== null ? Math.min(pageLimit, Math.max(0, total - pageOffset)) : Math.min(pageLimit, pageRows.length)
 
-    // /api/sessions appends pinned rows that fall outside the requested
+    // Both list endpoints append pinned rows that fall outside the requested
     // window. Keep those aside until all ordinary pages have been joined so
     // pagination preserves the same order as one larger request.
     for (const row of pageRows.slice(0, windowedCount)) {
@@ -230,4 +248,60 @@ export async function fetchRemoteProfileSessions(
     limit: requestedLimit,
     offset: requestedOffset
   }
+}
+
+export function remoteProfileSharesGateway(
+  profile: string,
+  remotes: Record<string, { url?: null | string } | undefined>
+): boolean {
+  const wanted = String(remotes[profile]?.url || '').replace(/\/+$/, '')
+
+  if (!wanted) {
+    return false
+  }
+
+  return Object.entries(remotes).some(([name, cfg]) => {
+    if (name === profile) {
+      return false
+    }
+
+    return String(cfg?.url || '').replace(/\/+$/, '') === wanted
+  })
+}
+
+export async function fetchRemoteProfileSessions(
+  profile: string,
+  searchParams: URLSearchParams,
+  fetchJsonForProfile: FetchJsonForProfile
+): Promise<SessionListResponse> {
+  const namedParams = new URLSearchParams(searchParams)
+  namedParams.set('profile', profile)
+
+  const defaultParams = new URLSearchParams(searchParams)
+  defaultParams.delete('profile')
+
+  try {
+    return await fetchPagedRemoteSessions(
+      profile,
+      '/api/profiles/sessions',
+      namedParams,
+      fetchJsonForProfile
+    )
+  } catch (error) {
+    // Dedicated remotes may only expose /api/sessions. A 5xx/timeout must not
+    // leak that host's default store.
+    if (!isMissingListEndpointError(error)) {
+      throw error
+    }
+  }
+
+  try {
+    return await fetchPagedRemoteSessions(profile, '/api/sessions', namedParams, fetchJsonForProfile)
+  } catch (error) {
+    if (!isMissingListEndpointError(error)) {
+      throw error
+    }
+  }
+
+  return fetchPagedRemoteSessions(profile, '/api/sessions', defaultParams, fetchJsonForProfile)
 }
