@@ -876,6 +876,26 @@ class SignalAdapter(BasePlatformAdapter):
 
             return self._recipient_uuid_by_number.get(chat_id, chat_id)
 
+    async def _set_direct_recipient_param(
+        self, params: Dict[str, Any], chat_id: str, *, resolve: bool = True
+    ) -> str:
+        """Populate JSON-RPC ``params`` for a single direct (non-group) recipient.
+
+        signal-cli's single-recipient commands (``send``, ``sendTyping``,
+        ``sendReaction``) expect the ``recipient`` field to be a scalar string
+        identifier. Passing a single-element list is not part of that contract
+        and fails on some signal-cli builds (observed:
+        ``ClassCastException`` in ``CommandUtil.getSingleRecipientIdentifiers``
+        on the ``sendTyping`` path). Always send the scalar shape.
+
+        When ``resolve`` is True the chat_id is run through
+        :meth:`_resolve_recipient` (number -> service id); reactions pass the
+        raw chat_id, matching prior behaviour.
+        """
+        recipient = await self._resolve_recipient(chat_id) if resolve else chat_id
+        params["recipient"] = recipient
+        return recipient
+
     # ------------------------------------------------------------------
     # Attachment Handling
     # ------------------------------------------------------------------
@@ -1076,7 +1096,7 @@ class SignalAdapter(BasePlatformAdapter):
         if chat_id.startswith("group:"):
             params["groupId"] = chat_id[6:]
         else:
-            params["recipient"] = [await self._resolve_recipient(chat_id)]
+            await self._set_direct_recipient_param(params, chat_id)
 
         logger.info("[Signal] Sending response (%d chars) to %s", len(plain_text), chat_id)
         result = await self._rpc("send", params)
@@ -1150,7 +1170,7 @@ class SignalAdapter(BasePlatformAdapter):
         if chat_id.startswith("group:"):
             params["groupId"] = chat_id[6:]
         else:
-            params["recipient"] = [await self._resolve_recipient(chat_id)]
+            await self._set_direct_recipient_param(params, chat_id)
 
         fails = self._typing_failures.get(chat_id, 0)
         result = await self._rpc(
@@ -1250,7 +1270,7 @@ class SignalAdapter(BasePlatformAdapter):
         if chat_id.startswith("group:"):
             base_params["groupId"] = chat_id[6:]
         else:
-            base_params["recipient"] = [await self._resolve_recipient(chat_id)]
+            await self._set_direct_recipient_param(base_params, chat_id)
 
         att_batches = [
             attachments[i:i + SIGNAL_MAX_ATTACHMENTS_PER_MSG]
@@ -1402,7 +1422,7 @@ class SignalAdapter(BasePlatformAdapter):
         if chat_id.startswith("group:"):
             params["groupId"] = chat_id[6:]
         else:
-            params["recipient"] = [await self._resolve_recipient(chat_id)]
+            await self._set_direct_recipient_param(params, chat_id)
 
         result = await self._rpc("send", params)
         if result is not None:
@@ -1444,7 +1464,7 @@ class SignalAdapter(BasePlatformAdapter):
         if chat_id.startswith("group:"):
             params["groupId"] = chat_id[6:]
         else:
-            params["recipient"] = [await self._resolve_recipient(chat_id)]
+            await self._set_direct_recipient_param(params, chat_id)
 
         result = await self._rpc("send", params)
         if result is not None:
@@ -1530,7 +1550,7 @@ class SignalAdapter(BasePlatformAdapter):
             if chat_id.startswith("group:"):
                 params["groupId"] = chat_id[6:]
             else:
-                params["recipient"] = [await self._resolve_recipient(chat_id)]
+                await self._set_direct_recipient_param(params, chat_id)
             params["stop"] = True
             await self._rpc(
                 "sendTyping",
@@ -1580,7 +1600,7 @@ class SignalAdapter(BasePlatformAdapter):
         if chat_id.startswith("group:"):
             params["groupId"] = chat_id[6:]
         else:
-            params["recipient"] = [chat_id]
+            await self._set_direct_recipient_param(params, chat_id, resolve=False)
 
         result = await self._rpc("sendReaction", params)
         if result is not None:
@@ -1606,7 +1626,7 @@ class SignalAdapter(BasePlatformAdapter):
         if chat_id.startswith("group:"):
             params["groupId"] = chat_id[6:]
         else:
-            params["recipient"] = [chat_id]
+            await self._set_direct_recipient_param(params, chat_id, resolve=False)
 
         result = await self._rpc("sendReaction", params)
         return result is not None
