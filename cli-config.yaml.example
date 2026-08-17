@@ -907,6 +907,19 @@ streaming:
   # buffer_threshold: 40      # chars before forcing an edit flush
   # cursor: " ▉"              # cursor shown during streaming
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Gateway event hooks (gateway/hooks.py)
+# ─────────────────────────────────────────────────────────────────────────────
+# Event hooks are directories under ~/.hermes/hooks/ containing HOOK.yaml +
+# handler.py. Each handler.py is importlib-exec'd in the gateway process at
+# startup, so a hook can run arbitrary Python with the gateway's full
+# privilege and credentials. Discovery is therefore OFF by default (F2):
+# handlers are only loaded when this flag is explicitly set to true.
+# To enable, uncomment:
+# gateway:
+#   event_hooks_enabled: true
+# See docs for the HOOK.yaml manifest format and supported events.
+
 # =============================================================================
 # Skills Configuration
 # =============================================================================

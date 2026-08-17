@@ -2784,6 +2784,15 @@ DEFAULT_CONFIG = {
         # the historical serve-all behavior; [] serves only the default.
         "multiplex_profile_allowlist": None,
 
+        # Event hooks (gateway/hooks.py): directories under
+        # ~/.hermes/hooks/ containing HOOK.yaml + handler.py are discovered
+        # and importlib-exec'd at gateway startup. A hook handler runs
+        # arbitrary Python in the gateway process, so discovery is gated OFF
+        # by default and only enabled by an explicit opt-in (F2). Built-in
+        # hooks (currently none) are unaffected.
+        "event_hooks_enabled": False,
+
+
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
         # died between finalize and platform ACK redelivers the stored
