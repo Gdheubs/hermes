@@ -12198,7 +12198,12 @@ def _(rid, params: dict) -> dict:
                 # agent.reasoning_effort to the preset default.
                 session["create_reasoning_override"] = parsed
             if session and session.get("agent") is not None:
-                session["agent"].reasoning_config = parsed
+                # Also refreshes the _primary_runtime snapshot (unless a
+                # fallback is currently active), so a later fallback restores
+                # THIS effort rather than the session-start one.
+                from agent.agent_runtime_helpers import apply_live_reasoning_config
+
+                apply_live_reasoning_config(session["agent"], parsed)
                 _persist_live_session_runtime(session)
                 _emit(
                     "session.info",

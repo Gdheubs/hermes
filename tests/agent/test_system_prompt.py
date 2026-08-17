@@ -224,7 +224,8 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         expected_profile,
         "SYSTEM_MESSAGE",
         "CONTEXT_FILES",
-        "Conversation started: Friday, January 02, 2026",
+        "Conversation started: Friday, January 02, 2026\n"
+        "Reasoning effort: provider-default",
     ))
 
     with (
@@ -381,6 +382,151 @@ def _build(builder, **overrides):
         patch("run_agent.build_skills_system_prompt", return_value=_SKILLS),
     ):
         return builder(agent)
+
+
+def test_runtime_tail_exposes_ultra_reasoning_effort():
+    """The model must be able to read its own effective reasoning effort.
+
+    Hermes tracks ``reasoning_config`` on the session and reports it to the
+    desktop through ``session.info``, but the agent-visible runtime tail
+    listed only Model / Provider / Platform.  After a compaction or resume
+    the model therefore had no in-prompt provenance for the tier it was
+    actually running at, and had to go query SQLite to prove it.
+    """
+    agent = _make_agent(
+        model="gpt-5.6-sol",
+        provider="openrouter",
+        platform="cli",
+        reasoning_config={"enabled": True, "effort": "ultra"},
+    )
+    volatile = _prompt_parts(agent)["volatile"]
+    assert [
+        line for line in volatile.splitlines()
+        if line.startswith("Reasoning effort:")
+    ] == ["Reasoning effort: ultra"]
+
+
+class TestReasoningProvenance:
+    """Canonical, truthful, agent-visible reasoning effort.
+
+    The value is what the model reads to answer "what tier am I running at",
+    so it must never be a guess and never an unvalidated echo of config.
+    """
+
+    def _effort_line(self, **overrides):
+        agent = _make_agent(model="m", provider="p", platform="cli", **overrides)
+        lines = [
+            line for line in _prompt_parts(agent)["volatile"].splitlines()
+            if line.startswith("Reasoning effort:")
+        ]
+        assert len(lines) == 1, f"expected exactly one effort line, got {lines}"
+        return lines[0]
+
+    def test_disabled_reasoning_is_named_disabled(self):
+        """Explicitly-off thinking must read as off, not as a default tier."""
+        assert (
+            self._effort_line(reasoning_config={"enabled": False})
+            == "Reasoning effort: disabled"
+        )
+
+    def test_unset_reasoning_says_provider_default(self):
+        """No configured effort → say so; don't invent 'medium'."""
+        assert (
+            self._effort_line(reasoning_config=None)
+            == "Reasoning effort: provider-default"
+        )
+
+    def test_missing_attribute_says_provider_default(self):
+        agent = _make_agent(model="m", provider="p", platform="cli")
+        assert not hasattr(agent, "reasoning_config")
+        assert "Reasoning effort: provider-default" in _prompt_parts(agent)["volatile"]
+
+    def test_unrecognized_effort_is_not_echoed(self):
+        """A malformed/unknown value must not reach the model as fact."""
+        line = self._effort_line(
+            reasoning_config={"enabled": True, "effort": "wildly-invalid"}
+        )
+        assert line == "Reasoning effort: provider-default"
+        assert "wildly-invalid" not in line
+
+    def test_effort_is_normalized_not_raw(self):
+        """Whitespace/case variants collapse to the canonical spelling."""
+        assert (
+            self._effort_line(reasoning_config={"enabled": True, "effort": "  ULTRA "})
+            == "Reasoning effort: ultra"
+        )
+
+    def test_line_rides_the_volatile_tail_not_the_stable_prefix(self):
+        """A per-session value must not sit in the cross-session stable band,
+        or a reasoning change would bust the shared cached prefix."""
+        agent = _make_agent(
+            model="m", provider="p", platform="cli",
+            reasoning_config={"enabled": True, "effort": "high"},
+        )
+        parts = _prompt_parts(agent)
+        assert "Reasoning effort:" not in parts["stable"]
+        assert "Reasoning effort: high" in parts["volatile"]
+
+
+class TestReasoningMetadataBlockAnchoring:
+    """Reads and rewrites are anchored to Hermes' own metadata block, so
+    embedded user content (AGENTS.md, memory, plugin sections) can never
+    masquerade as runtime provenance."""
+
+    HERMES_TAIL = (
+        "Conversation started: Friday, January 02, 2026\n"
+        "Model: gpt-5.6-sol\n"
+        "Provider: openrouter\n"
+        "Reasoning effort: ultra"
+    )
+
+    def _decoy_prompt(self):
+        from agent.system_prompt import REASONING_EFFORT_LABEL
+
+        assert REASONING_EFFORT_LABEL == "Reasoning effort"
+        return (
+            "You are Hermes Agent.\n\n"
+            "# AGENTS.md\n\n"
+            "Conversation started: whenever\n"
+            "Reasoning effort: minimal\n\n"
+            + self.HERMES_TAIL
+        )
+
+    def test_decoy_line_cannot_shadow_real_provenance(self):
+        from agent.system_prompt import read_prompt_reasoning_effort
+
+        assert read_prompt_reasoning_effort(self._decoy_prompt()) == "ultra"
+
+    def test_rewrite_only_touches_the_real_block(self):
+        from agent.system_prompt import rewrite_prompt_reasoning_effort
+
+        rewritten = rewrite_prompt_reasoning_effort(self._decoy_prompt(), "low")
+        assert "Reasoning effort: minimal" in rewritten  # decoy untouched
+        assert rewritten.endswith("Reasoning effort: low")
+
+    def test_absent_line_is_not_invented_by_a_rewrite(self):
+        """Keeps the temporary fallback rewrite reversible: a legacy prompt
+        must come back byte-identical after the primary is restored."""
+        from agent.system_prompt import rewrite_prompt_reasoning_effort
+
+        legacy = "You are Hermes Agent.\n\nConversation started: Friday\nModel: m"
+        assert rewrite_prompt_reasoning_effort(legacy, "high") == legacy
+
+    def test_absent_line_reads_as_none_not_as_default(self):
+        """'Never said' must be distinguishable from 'said provider-default'."""
+        from agent.system_prompt import (
+            has_runtime_metadata_block,
+            read_prompt_reasoning_effort,
+        )
+
+        legacy = "You are Hermes Agent.\n\nConversation started: Friday\nModel: m"
+        assert has_runtime_metadata_block(legacy) is True
+        assert read_prompt_reasoning_effort(legacy) is None
+
+    def test_non_hermes_prompt_has_no_metadata_block(self):
+        from agent.system_prompt import has_runtime_metadata_block
+
+        assert has_runtime_metadata_block("a hand-set system prompt") is False
 
 
 class TestSkillsInVolatileBand:

@@ -248,6 +248,29 @@ def _cached_prompt_reflects_builtin_memory(agent: Any, cached_prompt: str) -> bo
     return True
 
 
+def _cached_prompt_reflects_runtime_reasoning(agent: Any, cached_prompt: str) -> bool:
+    """Whether the cached prompt's reasoning provenance matches the runtime.
+
+    Compaction is one of the few boundaries allowed to rebuild the system
+    prompt, so it is the natural place to heal a prompt whose agent-visible
+    effort has gone stale — a live ``/reasoning`` change deliberately leaves
+    the cached bytes alone to protect the prefix cache, and a resumed legacy
+    prompt carries no provenance at all.  Both must lose the keep-prompt
+    optimization here; an unchanged value keeps its exact bytes.
+    """
+    from agent.system_prompt import (
+        agent_reasoning_effort,
+        has_runtime_metadata_block,
+        read_prompt_reasoning_effort,
+    )
+
+    if not has_runtime_metadata_block(cached_prompt):
+        # Not a Hermes-built prompt (caller-supplied / hand-set) — there is no
+        # provenance to be stale, and rebuilding would discard it.
+        return True
+    return read_prompt_reasoning_effort(cached_prompt) == agent_reasoning_effort(agent)
+
+
 _COMPRESSOR_ATTEMPT_STATE_FIELDS = (
     "_previous_summary",
     "_summary_has_user_turn",
@@ -3336,10 +3359,15 @@ def compress_context(
         # can predate mid-session memory writes the in-memory snapshot has
         # already absorbed. External providers can change their own prompt
         # block during on_pre_compress(), so they retain the rebuild path.
+        # The kept prompt must also still tell the truth about the runtime's
+        # reasoning effort — a mid-session /reasoning change intentionally
+        # leaves the cached bytes alone, and this boundary is where that
+        # divergence gets healed.
         if (
             cached_system_prompt is not None
             and getattr(agent, "_memory_manager", None) is None
             and _cached_prompt_reflects_builtin_memory(agent, cached_system_prompt)
+            and _cached_prompt_reflects_runtime_reasoning(agent, cached_system_prompt)
         ):
             new_system_prompt = cached_system_prompt
             agent._cached_system_prompt = cached_system_prompt

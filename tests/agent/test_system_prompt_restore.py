@@ -36,6 +36,9 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
     # reconstruction is gated on _use_prompt_caching, so default it off
     # for the legacy restore tests (the reconstruction tests enable it).
     agent._use_prompt_caching = False
+    # Explicit: a MagicMock attribute would canonicalize to the same
+    # "provider-default" by accident, which hides what the fixtures assert.
+    agent.reasoning_config = None
     agent._build_system_prompt = MagicMock(return_value=prebuilt_prompt)
     return agent
 
@@ -112,6 +115,113 @@ class TestStoredPromptReuse:
             agent.session_id, agent._cached_system_prompt
         )
         assert any("stale runtime identity" in r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Reasoning provenance across restore
+# ---------------------------------------------------------------------------
+
+
+_TAIL = (
+    "You are Hermes Agent.\n\n"
+    "Conversation started: Tuesday, June 16, 2026\n"
+    "Session ID: test-session-id\n"
+    "Model: test-model\n"
+    "Provider: openrouter\n"
+    "Platform: cli"
+)
+
+
+class TestStoredPromptReasoningProvenance:
+    """A stored prompt is only reusable while it still tells the truth about
+    the reasoning tier the session is running at — the exact failure that sent
+    the agent to SQLite to prove it was on ultra after a resume."""
+
+    def _agent(self, db, effort):
+        agent = _make_agent(session_db=db, prebuilt_prompt=f"{_TAIL}\nReasoning effort: {effort}")
+        agent.reasoning_config = {"enabled": True, "effort": effort}
+        return agent
+
+    def _restore(self, stored, effort):
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": stored}
+        agent = self._agent(db, effort)
+        _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+        return agent, db
+
+    def test_matching_provenance_is_reused_byte_for_byte(self):
+        """The cache invariant: identical runtime → no rebuild, no write."""
+        stored = f"{_TAIL}\nReasoning effort: ultra"
+        agent, db = self._restore(stored, "ultra")
+
+        assert agent._cached_system_prompt == stored
+        agent._build_system_prompt.assert_not_called()
+        db.update_system_prompt.assert_not_called()
+
+    def test_legacy_prompt_without_the_line_is_rebuilt_and_persisted(self, caplog):
+        """Back-compat: a prompt persisted before this metadata existed must
+        not masquerade as current provenance. It is rejected once, rebuilt
+        truthfully, and stored — so the NEXT turn matches byte-for-byte."""
+        with caplog.at_level(logging.INFO, logger="agent.conversation_loop"):
+            agent, db = self._restore(_TAIL, "ultra")
+
+        assert agent._cached_system_prompt == f"{_TAIL}\nReasoning effort: ultra"
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_called_once_with(
+            agent.session_id, agent._cached_system_prompt
+        )
+        # The recovery is visible, and names both sides without leaking config.
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("stale runtime identity" in m for m in msgs)
+        assert any("reasoning=ultra" in m and "reasoning=absent" in m for m in msgs)
+
+    def test_mismatched_effort_cannot_masquerade_as_current(self):
+        """Stored says high, session runs ultra → reject, rebuild, persist."""
+        agent, db = self._restore(f"{_TAIL}\nReasoning effort: high", "ultra")
+
+        assert agent._cached_system_prompt.endswith("Reasoning effort: ultra")
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_called_once()
+
+    def test_disabled_and_provider_default_are_not_interchangeable(self):
+        """'Thinking off' must not be accepted as 'provider decides'."""
+        db = MagicMock()
+        db.get_session.return_value = {"system_prompt": f"{_TAIL}\nReasoning effort: disabled"}
+        agent = _make_agent(session_db=db, prebuilt_prompt="REBUILT")
+        agent.reasoning_config = None  # provider default
+
+        _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+        assert agent._cached_system_prompt == "REBUILT"
+
+    def test_project_context_decoy_cannot_satisfy_the_match(self):
+        """An AGENTS.md line that merely says 'Reasoning effort: ultra' sits in
+        the earlier context tier and must not stand in for real provenance."""
+        stored = (
+            "You are Hermes Agent.\n\n"
+            "# AGENTS.md\n\nReasoning effort: ultra\n\n"
+            "Conversation started: Tuesday, June 16, 2026\n"
+            "Model: test-model\n"
+            "Provider: openrouter\n"
+            "Platform: cli"
+        )
+        agent, db = self._restore(stored, "ultra")
+
+        agent._build_system_prompt.assert_called_once_with(None)
+        db.update_system_prompt.assert_called_once()
+
+    def test_second_turn_after_recovery_reuses_the_rebuilt_bytes(self):
+        """The recovery is one-time: the persisted rebuild matches next turn."""
+        agent, db = self._restore(_TAIL, "ultra")
+        rebuilt = agent._cached_system_prompt
+
+        db2 = MagicMock()
+        db2.get_session.return_value = {"system_prompt": rebuilt}
+        agent2 = self._agent(db2, "ultra")
+        _restore_or_build_system_prompt(agent2, None, [{"role": "user", "content": "hi"}])
+
+        assert agent2._cached_system_prompt == rebuilt
+        agent2._build_system_prompt.assert_not_called()
+        db2.update_system_prompt.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +318,10 @@ class TestPromptStabilityInvariant:
             "\n"
             "Conversation started: Sunday, May 17, 2026\n"
             "Session ID: 20260517_153500_abc123\n"
+            # Provenance matching this agent's runtime (reasoning_config=None
+            # → provider default). Without it the prompt is a legacy one and
+            # the restore path correctly rebuilds instead of reusing.
+            "Reasoning effort: provider-default\n"
         )
         db = MagicMock()
         db.get_session.return_value = {"system_prompt": stored}

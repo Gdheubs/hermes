@@ -2930,6 +2930,18 @@ def init_agent(
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
+        # Fallback activation re-resolves reasoning_config for the fallback
+        # model, so the primary's value has to be snapshotted here or a
+        # restore would leave the agent (and the prompt's reasoning line)
+        # describing the fallback's tier. The key is ALWAYS present, even
+        # when the value is None (provider default) — restore distinguishes
+        # "primary had no explicit effort" from "old snapshot never recorded
+        # one" by key presence, not by the value.
+        "reasoning_config": (
+            dict(agent.reasoning_config)
+            if isinstance(getattr(agent, "reasoning_config", None), dict)
+            else None
+        ),
         # Context engine state that _try_activate_fallback() overwrites.
         # Use getattr for model/base_url/api_key/provider since plugin
         # engines may not have these (they're ContextCompressor-specific).

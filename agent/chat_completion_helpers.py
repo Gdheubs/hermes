@@ -2367,8 +2367,8 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
 
 
 def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
-    """Point the cached system prompt's ``Model:``/``Provider:`` lines at
-    the active runtime after a provider switch.
+    """Point the cached system prompt's ``Model:``/``Provider:``/reasoning
+    lines at the active runtime after a provider switch.
 
     The system prompt is session-stable and replayed verbatim for prefix-cache
     warmth, but after a failover the new backend's cache is cold anyway —
@@ -2381,6 +2381,12 @@ def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
     Only the LAST occurrence of each line is touched — the identity lines
     live in the volatile tail of the prompt, and earlier matches could be
     user content (memory snapshots, context files).
+
+    The reasoning line moves with them: fallback activation re-resolves
+    ``agent.reasoning_config`` for the fallback model before calling this, so
+    reading it live keeps model, provider and effort describing ONE runtime
+    instead of a mix.  It is rewritten in place only — a legacy prompt that
+    carries no such line does not gain one, so the restore stays byte-exact.
     """
     sp = getattr(agent, "_cached_system_prompt", None)
     if not isinstance(sp, str) or not sp:
@@ -2392,6 +2398,12 @@ def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
         if matches:
             last = matches[-1]
             sp = f"{sp[:last.start()]}{label}: {value}{sp[last.end():]}"
+    from agent.system_prompt import (
+        agent_reasoning_effort,
+        rewrite_prompt_reasoning_effort,
+    )
+
+    sp = rewrite_prompt_reasoning_effort(sp, agent_reasoning_effort(agent))
     agent._cached_system_prompt = sp
 
 

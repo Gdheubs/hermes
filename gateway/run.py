@@ -47,6 +47,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
 
+from agent.agent_runtime_helpers import apply_live_reasoning_config
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
     COMPACTION_STATUS,
@@ -5599,7 +5600,11 @@ class TurnRunner:
         agent.notice_callback = _notice_callback_sync
         agent.notice_clear_callback = None
         agent.event_callback = ctx._event_callback_sync
-        agent.reasoning_config = reasoning_config
+        # Also refreshes the _primary_runtime snapshot (unless a fallback is
+        # currently active) — the agent is cached across messages, so without
+        # it a fallback later in the session would restore the effort the
+        # agent was CONSTRUCTED with, not the one /reasoning selected.
+        apply_live_reasoning_config(agent, reasoning_config)
         agent.service_tier = self._runner._service_tier
         agent.request_overrides = turn_route.get("request_overrides") or {}
         # Must-deliver notes for THIS turn ride the current user message
@@ -25647,8 +25652,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime.get("requested_provider", ""),
                 runtime.get("api_mode", ""),
                 sorted(enabled_toolsets) if enabled_toolsets else [],
-                # reasoning_config excluded — it's set per-message on the
-                # cached agent and doesn't affect system prompt or tools.
+                # reasoning_config excluded — deliberately. It IS rendered
+                # into the system prompt now (the agent-visible "Reasoning
+                # effort:" line), but a live change must NOT rebuild the
+                # cached agent: that would drop the frozen prompt and tool
+                # schemas and cold-start the prefix cache for a setting
+                # toggle. The reused agent takes the change per-message via
+                # apply_live_reasoning_config, and the now-stale prompt line
+                # is corrected on the turn by the api_content sidecar note
+                # (build_runtime_reasoning_note) until the next compaction
+                # rebuilds the prompt for real.
                 ephemeral_prompt or "",
                 _cache_keys_sorted,
                 str(user_id or ""),

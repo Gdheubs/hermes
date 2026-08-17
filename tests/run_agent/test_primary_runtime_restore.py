@@ -30,8 +30,14 @@ def _make_tool_defs(*names: str) -> list:
     ]
 
 
-def _make_agent(fallback_model=None, provider="custom", base_url="https://my-llm.example.com/v1"):
+def _make_agent(
+    fallback_model=None,
+    provider="custom",
+    base_url="https://my-llm.example.com/v1",
+    reasoning_config=None,
+):
     """Create a minimal AIAgent with optional fallback config."""
+    extra = {"reasoning_config": reasoning_config} if reasoning_config else {}
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs("web_search")),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -54,6 +60,7 @@ def _make_agent(fallback_model=None, provider="custom", base_url="https://my-llm
             skip_context_files=True,
             skip_memory=True,
             fallback_model=fallback_model,
+            **extra,
         )
         agent.client = MagicMock()
         return agent
@@ -65,6 +72,164 @@ def _mock_resolve(base_url="https://openrouter.ai/api/v1", api_key="fallback-key
     mock_client.api_key = api_key
     mock_client.base_url = base_url
     return mock_client
+
+
+# =============================================================================
+# Live reasoning changes vs the primary snapshot
+# =============================================================================
+
+
+class TestApplyLiveReasoningConfig:
+    """A live ``/reasoning`` change reuses the running agent, so the
+    primary-runtime snapshot has to move with it — otherwise a fallback later
+    in the session restores the effort the session STARTED at, and the agent's
+    prompt then advertises a tier nobody selected.
+
+    The one exception is while a fallback is active: ``agent.reasoning_config``
+    then describes the FALLBACK's tier, and writing it into the snapshot would
+    destroy the only record of what the primary should come back to.
+    """
+
+    def test_live_change_refreshes_the_snapshot(self):
+        from agent.agent_runtime_helpers import apply_live_reasoning_config
+
+        agent = _make_agent(reasoning_config={"enabled": True, "effort": "medium"})
+        apply_live_reasoning_config(agent, {"enabled": True, "effort": "ultra"})
+
+        assert agent.reasoning_config == {"enabled": True, "effort": "ultra"}
+        assert agent._primary_runtime["reasoning_config"] == {
+            "enabled": True, "effort": "ultra",
+        }
+
+    def test_snapshot_stores_a_copy_not_an_alias(self):
+        from agent.agent_runtime_helpers import apply_live_reasoning_config
+
+        agent = _make_agent()
+        live = {"enabled": True, "effort": "ultra"}
+        apply_live_reasoning_config(agent, live)
+        live["effort"] = "low"
+
+        assert agent._primary_runtime["reasoning_config"]["effort"] == "ultra"
+
+    def test_clearing_to_provider_default_is_recorded_as_present_none(self):
+        """``None`` must be stored, not skipped — restore branches on key
+        presence, so a dropped key would silently keep the old effort."""
+        from agent.agent_runtime_helpers import apply_live_reasoning_config
+
+        agent = _make_agent(reasoning_config={"enabled": True, "effort": "ultra"})
+        apply_live_reasoning_config(agent, None)
+
+        assert agent.reasoning_config is None
+        assert "reasoning_config" in agent._primary_runtime
+        assert agent._primary_runtime["reasoning_config"] is None
+
+    def test_change_while_fallback_active_does_not_touch_the_snapshot(self):
+        from agent.agent_runtime_helpers import apply_live_reasoning_config
+
+        agent = _make_agent(reasoning_config={"enabled": True, "effort": "ultra"})
+        agent._fallback_activated = True
+        apply_live_reasoning_config(agent, {"enabled": True, "effort": "low"})
+
+        assert agent.reasoning_config == {"enabled": True, "effort": "low"}
+        assert agent._primary_runtime["reasoning_config"] == {
+            "enabled": True, "effort": "ultra",
+        }, "the primary's saved effort must survive a fallback-time assignment"
+
+    def test_change_during_fallback_is_parked_not_dropped(self):
+        """Both surfaces can take a change in the window between a fallback
+        turn ending and the next turn's restore. Holding the snapshot back is
+        right, but the selection must not be thrown away — restore would
+        otherwise revert the user's brand-new pick on the very next turn."""
+        from agent.agent_runtime_helpers import apply_live_reasoning_config
+
+        agent = _make_agent(
+            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+        mock_client = _mock_resolve()
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
+            agent._try_activate_fallback()
+        assert agent._fallback_activated is True
+
+        # User picks ultra while the fallback still owns the runtime.
+        apply_live_reasoning_config(agent, {"enabled": True, "effort": "ultra"})
+        assert agent._primary_runtime["reasoning_config"] == {
+            "enabled": True, "effort": "medium",
+        }
+
+        with patch("run_agent.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+
+        assert agent.reasoning_config == {"enabled": True, "effort": "ultra"}
+        assert agent._primary_runtime["reasoning_config"] == {
+            "enabled": True, "effort": "ultra",
+        }
+
+    def test_parked_provider_default_is_distinguishable_from_nothing_parked(self):
+        """Parking ``None`` (provider default) must not read as 'no change'."""
+        from agent.agent_runtime_helpers import apply_live_reasoning_config
+
+        agent = _make_agent(
+            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+        mock_client = _mock_resolve()
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
+            agent._try_activate_fallback()
+
+        apply_live_reasoning_config(agent, None)
+        with patch("run_agent.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+
+        assert agent.reasoning_config is None
+        assert agent._primary_runtime["reasoning_config"] is None
+
+    def test_restore_without_a_parked_change_uses_the_snapshot(self):
+        """No live change during the fallback → plain snapshot restore, and
+        nothing stale is left behind to fire on a later turn."""
+        from agent.agent_runtime_helpers import apply_live_reasoning_config
+
+        agent = _make_agent(
+            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+        apply_live_reasoning_config(agent, {"enabled": True, "effort": "ultra"})
+        assert getattr(agent, "_pending_primary_reasoning_config", None) is None
+
+        mock_client = _mock_resolve()
+        with patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)):
+            agent._try_activate_fallback()
+        with patch("run_agent.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+
+        assert agent.reasoning_config == {"enabled": True, "effort": "ultra"}
+        assert getattr(agent, "_pending_primary_reasoning_config", None) is None
+
+    def test_restore_returns_the_latest_live_effort_not_the_original(self):
+        """The whole point, end to end: change effort mid-session, fail over,
+        come back — the primary must resume at the LIVE effort."""
+        from agent.agent_runtime_helpers import apply_live_reasoning_config
+
+        agent = _make_agent(
+            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+        apply_live_reasoning_config(agent, {"enabled": True, "effort": "ultra"})
+
+        mock_client = _mock_resolve()
+        with (
+            patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)),
+            patch(
+                "hermes_constants.resolve_reasoning_config",
+                return_value={"enabled": True, "effort": "xhigh"},
+            ),
+        ):
+            agent._try_activate_fallback()
+        assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
+
+        with patch("run_agent.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+        assert agent.reasoning_config == {"enabled": True, "effort": "ultra"}
 
 
 # =============================================================================
@@ -82,6 +247,26 @@ class TestPrimaryRuntimeSnapshot:
         assert rt["api_mode"] == agent.api_mode
         assert "client_kwargs" in rt
         assert "compressor_context_length" in rt
+
+    def test_snapshot_always_records_reasoning_config(self):
+        """Fallback activation re-resolves reasoning_config for the fallback
+        model, so the primary's value has to be captured at init — and the KEY
+        has to be present even when the value is None, or restore cannot tell
+        "primary had no explicit effort" from "old snapshot never recorded
+        one" and would leave the fallback's tier in place."""
+        agent = _make_agent()
+        assert agent.reasoning_config is None
+        assert "reasoning_config" in agent._primary_runtime
+        assert agent._primary_runtime["reasoning_config"] is None
+
+    def test_snapshot_copies_rather_than_aliases_reasoning_config(self):
+        """A live mutation of agent.reasoning_config must not rewrite history."""
+        agent = _make_agent(reasoning_config={"enabled": True, "effort": "ultra"})
+        assert agent._primary_runtime["reasoning_config"] == {
+            "enabled": True, "effort": "ultra",
+        }
+        agent.reasoning_config["effort"] = "low"
+        assert agent._primary_runtime["reasoning_config"]["effort"] == "ultra"
 
     def test_snapshot_includes_compressor_state(self):
         agent = _make_agent()
@@ -154,6 +339,45 @@ class TestRestorePrimaryRuntime:
         assert agent._fallback_activated is False
         assert agent.model == original_model
         assert agent.provider == original_provider
+
+    def test_restores_provider_default_reasoning_over_a_fallback_override(self):
+        """The primary ran at the provider default; the fallback re-resolved a
+        concrete effort. Restore must put the agent — and therefore the
+        prompt's reasoning line — back on the provider default, not leave the
+        fallback's tier behind under the primary's model name."""
+        agent = _make_agent(
+            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+        )
+        assert agent.reasoning_config is None
+
+        mock_client = _mock_resolve()
+        with (
+            patch("agent.auxiliary_client.resolve_provider_client", return_value=(mock_client, None)),
+            patch(
+                "hermes_constants.resolve_reasoning_config",
+                return_value={"enabled": True, "effort": "xhigh"},
+            ),
+        ):
+            agent._try_activate_fallback()
+        assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
+
+        with patch("run_agent.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+        assert agent.reasoning_config is None
+
+    def test_legacy_snapshot_without_the_key_keeps_current_reasoning(self):
+        """Back-compat: an in-flight snapshot from before the key existed must
+        not be read as 'the primary had no effort'."""
+        agent = _make_agent(
+            fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
+        )
+        agent._primary_runtime.pop("reasoning_config", None)
+        agent._fallback_activated = True
+        agent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+
+        with patch("run_agent.OpenAI", return_value=MagicMock()):
+            assert agent._restore_primary_runtime() is True
+        assert agent.reasoning_config == {"enabled": True, "effort": "xhigh"}
 
     def test_resets_fallback_index(self):
         """After restore, the full fallback chain should be available again."""

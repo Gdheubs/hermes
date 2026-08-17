@@ -885,12 +885,24 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         return
     if stored_prompt:
         stored_state = "stale_runtime"
+        # Name the canonical reasoning tier too — a legacy prompt that
+        # predates the metadata and a prompt whose effort actually drifted
+        # both land here, and the log is what tells them apart. Canonical
+        # values only, so no config contents or credentials leak.
+        from agent.system_prompt import (
+            agent_reasoning_effort,
+            read_prompt_reasoning_effort,
+        )
+
         logger.info(
             "Stored system prompt for session %s has stale runtime identity; "
-            "rebuilding for model=%s provider=%s.",
+            "rebuilding for model=%s provider=%s reasoning=%s (stored "
+            "reasoning=%s).",
             agent.session_id,
             getattr(agent, "model", "") or "",
             getattr(agent, "provider", "") or "",
+            agent_reasoning_effort(agent),
+            read_prompt_reasoning_effort(stored_prompt) or "absent",
         )
 
     if conversation_history and stored_state in ("null", "empty"):
@@ -1025,6 +1037,27 @@ def _stored_prompt_matches_runtime(agent, prompt: str) -> bool:
     current_platform = str(getattr(agent, "platform", "") or "").strip()
     if stored_platform and current_platform and stored_platform != current_platform:
         return False
+
+    # Detect reasoning drift, and require the provenance to be there at all.
+    # Unlike the fields above this check is NOT absence-tolerant: a prompt
+    # that never claimed an effort must not be adopted as this runtime's
+    # provenance, or the agent would keep reading a prompt that simply says
+    # nothing while the session runs at (say) ultra. Rejecting rebuilds once
+    # and persists the truthful bytes, so the next turn matches exactly.
+    #
+    # Read through the canonical helper, which anchors on the prompt's own
+    # metadata block — an AGENTS.md line that merely starts with "Reasoning
+    # effort:" sits in the earlier context tier and cannot satisfy this.
+    from agent.system_prompt import (
+        agent_reasoning_effort,
+        has_runtime_metadata_block,
+        read_prompt_reasoning_effort,
+    )
+
+    if has_runtime_metadata_block(prompt):
+        stored_effort = read_prompt_reasoning_effort(prompt)
+        if stored_effort != agent_reasoning_effort(agent):
+            return False
 
     return True
 

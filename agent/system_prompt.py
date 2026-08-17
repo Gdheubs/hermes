@@ -62,6 +62,145 @@ _PLUGIN_SECTION_FRAME_RE = re.compile(
 )
 
 
+# ── Agent-visible reasoning provenance ──────────────────────────────────────
+# The desktop already learns the session's effective reasoning effort from
+# ``session.info``, but the model running the session could not see it: the
+# runtime metadata tail emitted Model / Provider / Platform only.  After a
+# compaction or a resume the agent therefore had no truthful in-prompt
+# provenance for the tier it was actually running at, and had to query the
+# session DB to prove it.  These helpers are the ONE canonical representation
+# — every surface that writes, reads, or compares that provenance
+# (fresh build, restore matching, compaction, provider fallback, the turn
+# sidecar) goes through them, so the wording can never drift between them.
+REASONING_EFFORT_LABEL = "Reasoning effort"
+# Explicitly turned off (``reasoning_effort: false``/``none``/``off``).
+REASONING_EFFORT_DISABLED = "disabled"
+# Unset, incomplete or unparseable — Hermes is NOT choosing a tier, so the
+# provider's own default applies.  Never fabricate a concrete effort here.
+REASONING_EFFORT_DEFAULT = "provider-default"
+
+# The runtime metadata tail is the LAST block of the volatile tier and always
+# opens with this line, so it anchors both the read and the rewrite. Without
+# the anchor a user's AGENTS.md / memory / plugin section could carry a line
+# that merely starts with ``Reasoning effort:`` and masquerade as Hermes'
+# own provenance.
+_METADATA_BLOCK_ANCHOR = "Conversation started:"
+
+
+def canonical_reasoning_effort(reasoning_config: Any) -> str:
+    """Canonical agent-visible name for an effective reasoning config.
+
+    Reuses :func:`hermes_constants.parse_reasoning_effort` so the accepted
+    spellings match every other Hermes surface, and so an arbitrary
+    unvalidated value can never be echoed into the prompt.  ``ultra`` stays
+    ``ultra``: it is the Hermes session tier, independent of whatever a
+    transport normalises it to on the wire.
+    """
+    from hermes_constants import parse_reasoning_effort
+
+    if not isinstance(reasoning_config, dict):
+        return REASONING_EFFORT_DEFAULT
+    if reasoning_config.get("enabled") is False:
+        return REASONING_EFFORT_DISABLED
+    parsed = parse_reasoning_effort(reasoning_config.get("effort"))
+    if parsed is None:
+        return REASONING_EFFORT_DEFAULT
+    if parsed.get("enabled") is False:
+        return REASONING_EFFORT_DISABLED
+    return str(parsed.get("effort") or REASONING_EFFORT_DEFAULT)
+
+
+def agent_reasoning_effort(agent: Any) -> str:
+    """Canonical effort for the runtime *agent* is actually running at."""
+    return canonical_reasoning_effort(getattr(agent, "reasoning_config", None))
+
+
+def _metadata_block_span(lines: List[str]) -> Optional[tuple]:
+    """``(start, end)`` indices of the metadata block within split *lines*.
+
+    Anchored on the LAST ``Conversation started:`` line (Hermes emits it at
+    the very end of the volatile tier) and bounded by the first blank line
+    after it, so only Hermes-owned bytes are ever read or rewritten.
+    """
+    start = -1
+    for idx, line in enumerate(lines):
+        if line.startswith(_METADATA_BLOCK_ANCHOR):
+            start = idx
+    if start < 0:
+        return None
+    end = start + 1
+    while end < len(lines) and lines[end].strip():
+        end += 1
+    return (start, end)
+
+
+def _metadata_block_lines(prompt: str) -> List[str]:
+    """Lines of the prompt's own final runtime-metadata block."""
+    if not isinstance(prompt, str) or not prompt:
+        return []
+    lines = prompt.splitlines()
+    span = _metadata_block_span(lines)
+    return [] if span is None else lines[span[0]:span[1]]
+
+
+def has_runtime_metadata_block(prompt: str) -> bool:
+    """Whether *prompt* carries Hermes' own runtime-metadata block.
+
+    Every prompt ``build_system_prompt_parts`` produces has one, in every
+    Hermes version — the ``Conversation started:`` line long predates the
+    reasoning metadata.  So a prompt WITHOUT the block is not a Hermes-managed
+    prompt (a caller-supplied stub, a hand-set prompt), and the provenance
+    comparisons below have nothing to compare against; a prompt WITH the block
+    but WITHOUT a reasoning line is exactly the legacy case that must be
+    rebuilt.  Keeping those two apart is what lets the legacy rejection stay
+    strict without also invalidating prompts Hermes never wrote.
+    """
+    return bool(_metadata_block_lines(prompt))
+
+
+def read_prompt_reasoning_effort(prompt: str) -> Optional[str]:
+    """Effort recorded in *prompt*'s runtime-metadata block.
+
+    Returns ``None`` when the block or the line is absent — i.e. a prompt
+    persisted before this metadata existed.  That is deliberately distinct
+    from ``provider-default``: "we never said" must not be readable as
+    "we said the provider decides".
+    """
+    prefix = f"{REASONING_EFFORT_LABEL}:"
+    for line in _metadata_block_lines(prompt):
+        if line.startswith(prefix):
+            return line[len(prefix):].strip()
+    return None
+
+
+def rewrite_prompt_reasoning_effort(prompt: str, canonical: str) -> str:
+    """Point *prompt*'s metadata reasoning line at *canonical*.
+
+    In-place only: a prompt that carries no such line is returned untouched
+    rather than gaining one.  This keeps the temporary fallback rewrite
+    perfectly reversible, so restoring the primary reproduces the stored
+    bytes exactly (see ``rewrite_prompt_model_identity``).
+    """
+    if not isinstance(prompt, str) or not prompt:
+        return prompt
+    # keepends so the rebuilt string is byte-exact everywhere but the one
+    # line we replace — including that line's own terminator. Splitting is
+    # index-identical with or without the terminators, so the span holds.
+    lines = prompt.splitlines(keepends=True)
+    span = _metadata_block_span([ln.rstrip("\r\n") for ln in lines])
+    if span is None:
+        return prompt
+    prefix = f"{REASONING_EFFORT_LABEL}:"
+    for idx in range(span[0], span[1]):
+        raw = lines[idx]
+        if not raw.startswith(prefix):
+            continue
+        terminator = raw[len(raw.rstrip("\r\n")):]
+        lines[idx] = f"{REASONING_EFFORT_LABEL}: {canonical}{terminator}"
+        return "".join(lines)
+    return prompt
+
+
 def _ra():
     """Lazy reference to the ``run_agent`` module.
 
@@ -853,6 +992,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nProvider: {agent.provider}"
     if agent.platform:
         timestamp_line += f"\nPlatform: {agent.platform}"
+    # Reasoning provenance — always emitted, so "no line" unambiguously means
+    # "prompt predates this metadata" rather than "effort unknown". The value
+    # is canonical (never a raw config echo) and says ``disabled`` /
+    # ``provider-default`` instead of inventing a tier Hermes did not pick.
+    timestamp_line += f"\n{REASONING_EFFORT_LABEL}: {agent_reasoning_effort(agent)}"
     volatile_parts.append(timestamp_line)
 
     return {
@@ -982,9 +1126,17 @@ def format_tools_for_system_message(agent: Any) -> str:
 
 
 __all__ = [
+    "REASONING_EFFORT_DEFAULT",
+    "REASONING_EFFORT_DISABLED",
+    "REASONING_EFFORT_LABEL",
+    "agent_reasoning_effort",
     "build_system_prompt_parts",
     "build_system_prompt",
+    "canonical_reasoning_effort",
+    "has_runtime_metadata_block",
     "invalidate_system_prompt",
+    "read_prompt_reasoning_effort",
     "restore_plugin_prompt_sections",
+    "rewrite_prompt_reasoning_effort",
     "format_tools_for_system_message",
 ]

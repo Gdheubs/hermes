@@ -543,6 +543,81 @@ class TestPreflightCompression:
 
 
 
+    def _reasoning_prompt(self, effort=None):
+        """A prompt shaped like a real Hermes build, optionally pre-metadata."""
+        tail = (
+            "cached system prompt\n\n"
+            "Conversation started: Tuesday, June 16, 2026\n"
+            "Model: test/model\n"
+            "Provider: openrouter"
+        )
+        return tail if effort is None else f"{tail}\nReasoning effort: {effort}"
+
+    def _compact(self, agent, cached_prompt, reasoning_config, rebuilt="REBUILT"):
+        agent.compression_enabled = False
+        agent._memory_enabled = False
+        agent._user_profile_enabled = False
+        agent._memory_manager = None
+        agent._memory_store = None
+        agent._cached_system_prompt = cached_prompt
+        agent.reasoning_config = reasoning_config
+
+        with (
+            patch.object(
+                agent.context_compressor,
+                "compress",
+                return_value=[{"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious"}],
+            ),
+            patch.object(
+                agent, "_build_system_prompt", return_value=rebuilt
+            ) as build_prompt,
+        ):
+            _, new_prompt = agent._compress_context(
+                [{"role": "user", "content": "hello"}],
+                "system prompt",
+                approx_tokens=1234,
+            )
+        return new_prompt, build_prompt
+
+    def test_compaction_refreshes_stale_reasoning_metadata(self, agent):
+        """A live /reasoning change deliberately leaves the cached prompt
+        alone; compaction is the sanctioned rebuild boundary that heals it."""
+        new_prompt, build_prompt = self._compact(
+            agent,
+            self._reasoning_prompt("medium"),
+            {"enabled": True, "effort": "ultra"},
+        )
+        assert new_prompt == "REBUILT"
+        build_prompt.assert_called_once_with("system prompt")
+
+    def test_compaction_keeps_exact_bytes_when_reasoning_is_unchanged(self, agent):
+        """The cache optimization survives — an unchanged tier must not
+        trigger a rebuild that would throw away the KV prefix."""
+        cached = self._reasoning_prompt("ultra")
+        new_prompt, build_prompt = self._compact(
+            agent, cached, {"enabled": True, "effort": "ultra"}
+        )
+        assert new_prompt is agent._cached_system_prompt
+        assert new_prompt == cached
+        build_prompt.assert_not_called()
+
+    def test_compaction_rebuilds_a_legacy_prompt_missing_the_line(self, agent):
+        """Resumed pre-metadata prompts gain truthful provenance here too."""
+        new_prompt, build_prompt = self._compact(
+            agent, self._reasoning_prompt(None), {"enabled": True, "effort": "ultra"}
+        )
+        assert new_prompt == "REBUILT"
+        build_prompt.assert_called_once_with("system prompt")
+
+    def test_compaction_keeps_a_non_hermes_prompt(self, agent):
+        """No metadata block → nothing to be stale about; a caller-supplied
+        prompt must not be silently replaced by a rebuilt one."""
+        new_prompt, build_prompt = self._compact(
+            agent, "a hand-set system prompt", {"enabled": True, "effort": "ultra"}
+        )
+        assert new_prompt == "a hand-set system prompt"
+        build_prompt.assert_not_called()
+
     def test_compression_rebuilds_when_prompt_has_leftover_block_for_emptied_memory(self, agent):
         """A prompt still carrying a memory block after all entries were
         removed must be rebuilt — empty current blocks are vacuously

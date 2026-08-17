@@ -30,10 +30,11 @@ _PROMPT = (
 )
 
 
-def _agent(prompt=_PROMPT, ephemeral=None):
+def _agent(prompt=_PROMPT, ephemeral=None, reasoning_config=None):
     return SimpleNamespace(
         _cached_system_prompt=prompt,
         ephemeral_system_prompt=ephemeral,
+        reasoning_config=reasoning_config,
     )
 
 
@@ -92,6 +93,79 @@ class TestRewritePromptModelIdentity:
             agent = _agent(prompt=prompt)
             rewrite_prompt_model_identity(agent, "m", "p")
             assert agent._cached_system_prompt == prompt
+
+
+_REASONING_PROMPT = (
+    "You are a helpful assistant.\n"
+    "\n"
+    "# AGENTS.md\n"
+    "Reasoning effort: decoy-from-project-file\n"
+    "\n"
+    "Conversation started: Wednesday, June 10, 2026\n"
+    "Model: gpt-5.4-mini\n"
+    "Provider: openai-codex\n"
+    "Reasoning effort: ultra"
+)
+
+
+class TestFailoverReasoningIdentity:
+    """Model, Provider and reasoning must describe ONE runtime.
+
+    ``try_activate_fallback`` re-resolves ``reasoning_config`` for the
+    fallback model before rewriting the prompt, so a prompt that kept the
+    primary's tier next to the fallback's model would be a mixed, false
+    identity.
+    """
+
+    def test_reasoning_moves_with_model_and_provider(self):
+        agent = _agent(
+            prompt=_REASONING_PROMPT,
+            reasoning_config={"enabled": True, "effort": "low"},
+        )
+        rewrite_prompt_model_identity(agent, "gemma4:e2b-mlx", "custom")
+        sp = agent._cached_system_prompt
+
+        assert sp.endswith(
+            "Model: gemma4:e2b-mlx\nProvider: custom\nReasoning effort: low"
+        )
+        # A project-file line is not runtime provenance and must survive.
+        assert "Reasoning effort: decoy-from-project-file" in sp
+
+    def test_restoring_the_primary_reproduces_the_stored_bytes(self):
+        """The stored row keeps the primary's labels, so the round trip has to
+        be byte-exact or the primary's prefix cache is gone."""
+        agent = _agent(
+            prompt=_REASONING_PROMPT,
+            reasoning_config={"enabled": True, "effort": "low"},
+        )
+        rewrite_prompt_model_identity(agent, "gemma4:e2b-mlx", "custom")
+        assert agent._cached_system_prompt != _REASONING_PROMPT
+
+        # restore_primary_runtime restores reasoning_config first, then rewrites.
+        agent.reasoning_config = {"enabled": True, "effort": "ultra"}
+        rewrite_prompt_model_identity(agent, "gpt-5.4-mini", "openai-codex")
+        assert agent._cached_system_prompt == _REASONING_PROMPT
+
+    def test_provider_default_primary_restores_to_provider_default(self):
+        """A primary with no explicit effort must not inherit the fallback's."""
+        prompt = _REASONING_PROMPT.replace(
+            "Reasoning effort: ultra", "Reasoning effort: provider-default"
+        )
+        agent = _agent(prompt=prompt, reasoning_config={"enabled": True, "effort": "high"})
+        rewrite_prompt_model_identity(agent, "fb-model", "fb-provider")
+        assert agent._cached_system_prompt.endswith("Reasoning effort: high")
+
+        agent.reasoning_config = None
+        rewrite_prompt_model_identity(agent, "gpt-5.4-mini", "openai-codex")
+        assert agent._cached_system_prompt == prompt
+
+    def test_legacy_prompt_does_not_gain_a_line(self):
+        """No line to rewrite → none is invented, so the restore stays exact."""
+        agent = _agent(
+            prompt=_PROMPT, reasoning_config={"enabled": True, "effort": "high"}
+        )
+        rewrite_prompt_model_identity(agent, "gemma4:e2b-mlx", "custom")
+        assert "Reasoning effort" not in agent._cached_system_prompt
 
 
 
@@ -161,6 +235,29 @@ class TestSyncFailoverPreservesCacheDecoration:
         # The identity refresh still lands, in the volatile tail.
         assert "Model: gemma4:e2b-mlx" in content[1]["text"]
         assert "Provider: custom" in content[1]["text"]
+
+    def test_reasoning_rewrite_stays_inside_the_volatile_tail(self):
+        """A reasoning rewrite can change the tail's LENGTH ('ultra' →
+        'provider-default'). The static prefix must still come back
+        byte-identical, or the cached prefix stops matching mid-turn."""
+        prompt = (
+            self._STATIC
+            + "Conversation started: Wednesday, June 10, 2026\n"
+            "Model: gpt-5.4-mini\nProvider: openai-codex\n"
+            "Reasoning effort: ultra"
+        )
+        agent = _agent(prompt=prompt, reasoning_config=None)  # provider default
+        api_messages = self._decorated(prompt)
+
+        rewrite_prompt_model_identity(agent, "gemma4:e2b-mlx", "custom")
+        _sync_failover_system_message(agent, api_messages, prompt)
+
+        content = api_messages[0]["content"]
+        assert isinstance(content, list) and len(content) == 2
+        assert all(part.get("cache_control") for part in content)
+        assert content[0]["text"] == self._STATIC
+        assert "Reasoning effort: provider-default" in content[1]["text"]
+        assert content[0]["text"] + content[1]["text"] == agent._cached_system_prompt
 
     def test_keeps_single_block_shape(self):
         prompt = "Model: gpt-5.4-mini\nProvider: openai-codex"

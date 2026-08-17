@@ -1485,6 +1485,47 @@ def drop_thinking_only_and_merge_users(
 
 
 
+def apply_live_reasoning_config(agent, reasoning_config) -> None:
+    """Apply a mid-session reasoning change to a running agent.
+
+    Both live surfaces reuse the agent object across turns — the desktop
+    session setter (``config.set key=reasoning``) and the messaging gateway's
+    per-message assignment on a cached agent — so a change has to reach the
+    ``_primary_runtime`` snapshot as well as ``agent.reasoning_config``.  The
+    snapshot is otherwise only written at agent init and ``switch_model``, and
+    ``restore_primary_runtime`` reads it after every fallback: without this the
+    session would silently drop back to the effort it STARTED at, and the
+    prompt's reasoning line would then advertise a tier nobody selected.
+
+    The snapshot is NOT rewritten while a fallback is active — the snapshot is
+    the only record of what the primary must come back to, and
+    ``try_activate_fallback`` has already re-pointed the live runtime at the
+    fallback's own tier.  The change is parked instead of dropped: both
+    surfaces can take a change in the window between a fallback turn ending
+    and the next turn's ``restore_primary_runtime``, and without the parking
+    slot that restore would silently revert the user's brand-new selection.
+    ``restore_primary_runtime`` adopts the parked value when the primary
+    returns.
+
+    The snapshot always gets a *copy*, and always gets the key — including for
+    an explicit ``None`` (provider default), which restore must be able to tell
+    apart from a legacy snapshot that never recorded the key at all.  The
+    parking slot is a 1-tuple for the same reason: ``None`` means "nothing
+    parked", ``(None,)`` means "parked the provider default".
+    """
+    agent.reasoning_config = reasoning_config
+    copied = dict(reasoning_config) if isinstance(reasoning_config, dict) else None
+    if getattr(agent, "_fallback_activated", False):
+        agent._pending_primary_reasoning_config = (copied,)
+        return
+    rt = getattr(agent, "_primary_runtime", None)
+    if not isinstance(rt, dict):
+        return
+    rt["reasoning_config"] = copied
+    # Applied directly — any parked value is superseded.
+    agent._pending_primary_reasoning_config = None
+
+
 def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn.
 
@@ -1739,11 +1780,31 @@ def restore_primary_runtime(agent) -> bool:
                     )
 
         # ── Restore reasoning_config if it was saved ──
-        # switch_model saves reasoning_config in _primary_runtime. If the
-        # snapshot predates that (older sessions), keep the current value.
-        saved_reasoning = rt.get("reasoning_config")
-        if saved_reasoning is not None:
-            agent.reasoning_config = dict(saved_reasoning)
+        # agent init and switch_model both snapshot reasoning_config into
+        # _primary_runtime, ALWAYS writing the key — including when the value
+        # is None (no explicit effort → provider default). Branch on key
+        # presence, not truthiness: a primary running at the provider default
+        # whose fallback re-resolved a concrete effort must come back to the
+        # provider default, or the restored prompt's reasoning line would keep
+        # claiming the fallback's tier. Snapshots predating the key (older
+        # in-flight sessions) keep the current value, as before.
+        if "reasoning_config" in rt:
+            saved_reasoning = rt.get("reasoning_config")
+            agent.reasoning_config = (
+                dict(saved_reasoning) if isinstance(saved_reasoning, dict) else None
+            )
+
+        # A live /reasoning change that landed WHILE the fallback was active
+        # was parked rather than written into the snapshot (see
+        # apply_live_reasoning_config). The primary is back now, so adopt it —
+        # otherwise the restore above would revert the user's selection.
+        parked = getattr(agent, "_pending_primary_reasoning_config", None)
+        if isinstance(parked, tuple) and parked:
+            agent.reasoning_config = dict(parked[0]) if isinstance(parked[0], dict) else None
+            rt["reasoning_config"] = (
+                dict(parked[0]) if isinstance(parked[0], dict) else None
+            )
+            agent._pending_primary_reasoning_config = None
 
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
@@ -4339,6 +4400,7 @@ __all__ = [
     "recover_with_credential_pool",
     "try_recover_primary_transport",
     "drop_thinking_only_and_merge_users",
+    "apply_live_reasoning_config",
     "restore_primary_runtime",
     "extract_reasoning",
     "dump_api_request_debug",

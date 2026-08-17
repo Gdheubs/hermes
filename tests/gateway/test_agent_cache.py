@@ -206,6 +206,42 @@ class TestAgentCacheLifecycle:
         assert cached[0] is agent1  # same instance
 
 
+    def test_per_message_reasoning_update_refreshes_primary_snapshot(self):
+        """``reasoning_config`` is applied per-message to the CACHED agent
+        rather than busting the cache key (rebuilding would cold-start the
+        frozen prompt for a setting toggle). That reuse is exactly why the
+        update has to reach ``_primary_runtime`` too: a fallback later in the
+        session restores from that snapshot, and would otherwise resurrect the
+        effort the agent was constructed with."""
+        from agent.agent_runtime_helpers import apply_live_reasoning_config
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            model="anthropic/claude-sonnet-4", api_key="test",
+            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            max_iterations=5, quiet_mode=True, skip_context_files=True,
+            skip_memory=True, platform="telegram",
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+        assert agent._primary_runtime["reasoning_config"] == {
+            "enabled": True, "effort": "medium",
+        }
+
+        # Message 2 on the same cached agent, after `/reasoning ultra`.
+        apply_live_reasoning_config(agent, {"enabled": True, "effort": "ultra"})
+        assert agent.reasoning_config == {"enabled": True, "effort": "ultra"}
+        assert agent._primary_runtime["reasoning_config"] == {
+            "enabled": True, "effort": "ultra",
+        }
+
+        # Message 3 arrives while a fallback is answering: the per-message
+        # assignment must not overwrite what the primary comes back to.
+        agent._fallback_activated = True
+        apply_live_reasoning_config(agent, {"enabled": True, "effort": "xhigh"})
+        assert agent._primary_runtime["reasoning_config"] == {
+            "enabled": True, "effort": "ultra",
+        }
+
     def test_evict_on_session_reset(self):
         """_evict_cached_agent removes the entry."""
         from run_agent import AIAgent

@@ -18,6 +18,7 @@ import pytest
 
 from agent.turn_context import (
     append_notes_to_multimodal_content,
+    build_runtime_reasoning_note,
     build_turn_context,
     compose_user_api_content,
     consume_gateway_turn_context_notes,
@@ -56,6 +57,7 @@ class _FakeAgent:
             protect_first_n=2, protect_last_n=2
         )
         self._cached_system_prompt = "SYSTEM"
+        self.reasoning_config = None
         self._memory_store = None
         self._memory_manager = None
         self._memory_nudge_interval = 0
@@ -205,3 +207,125 @@ class TestMultimodalFallback:
         assert content[-1] == {"type": "text", "text": "NOTE"}
         assert append_notes_to_multimodal_content("string", "NOTE") is False
         assert append_notes_to_multimodal_content(content, "") is False
+
+
+# ---------------------------------------------------------------------------
+# Reasoning provenance rides the same channel
+# ---------------------------------------------------------------------------
+
+
+def _hermes_prompt(effort: str | None) -> str:
+    """A prompt shaped like a real Hermes build, optionally pre-metadata."""
+    tail = (
+        "You are Hermes Agent.\n\n"
+        "Conversation started: Tuesday, June 16, 2026\n"
+        "Model: test/model\n"
+        "Provider: openrouter\n"
+        "Platform: discord"
+    )
+    return tail if effort is None else f"{tail}\nReasoning effort: {effort}"
+
+
+def _reasoning_agent(prompt_effort, live_effort="ultra"):
+    agent = _FakeAgent()
+    agent._cached_system_prompt = _hermes_prompt(prompt_effort)
+    agent.reasoning_config = (
+        None if live_effort is None else {"enabled": True, "effort": live_effort}
+    )
+    return agent
+
+
+class TestRuntimeReasoningNote:
+    """A live same-model ``/reasoning`` change must not rewrite the cached
+    system prompt (that would burn the whole prefix cache), so the turn
+    carries the truth instead. Never a silently false claim."""
+
+    def test_no_note_when_the_prompt_already_matches(self):
+        """The normal case costs nothing — no note, no tokens."""
+        agent = _reasoning_agent("ultra", "ultra")
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            ctx = _build(agent)
+        assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
+
+    def test_stale_prompt_effort_is_corrected_on_the_turn(self):
+        agent = _reasoning_agent("medium", "ultra")
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            ctx = _build(agent)
+        msg = ctx.messages[ctx.current_turn_user_idx]
+
+        # Stored content stays clean; the sidecar is the exact sent bytes.
+        assert msg["content"] == "hello"
+        assert msg["api_content"] == compose_user_api_content(
+            "hello", ctx.ext_prefetch_cache, ctx.plugin_user_context
+        )
+        note = msg["api_content"]
+        assert "Reasoning effort: ultra" in note
+        assert "Model: test/model" in note and "Provider: openrouter" in note
+        # Scoped to this turn, and honest about what wins after a fallback.
+        assert "for this turn" in note
+        assert "fallback" in note
+        # The cached prompt is untouched — the whole point.
+        assert agent._cached_system_prompt == _hermes_prompt("medium")
+
+    def test_legacy_prompt_without_the_line_also_gets_the_note(self):
+        agent = _reasoning_agent(None, "ultra")
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            ctx = _build(agent)
+        assert "Reasoning effort: ultra" in (
+            ctx.messages[ctx.current_turn_user_idx]["api_content"]
+        )
+
+    def test_note_repeats_on_every_affected_turn(self):
+        """Not one-shot: the claim stays false until compaction rebuilds, so
+        every turn in between must carry the correction."""
+        agent = _reasoning_agent("medium", "ultra")
+        for _ in range(2):
+            with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+                ctx = _build(agent)
+            assert "Reasoning effort: ultra" in (
+                ctx.messages[ctx.current_turn_user_idx]["api_content"]
+            )
+
+    def test_note_lands_after_gateway_notes(self):
+        agent = _reasoning_agent("medium", "ultra")
+        agent._gateway_turn_context_notes = VC_NOTE
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            ctx = _build(agent)
+        api = ctx.messages[ctx.current_turn_user_idx]["api_content"]
+        assert api.index(VC_NOTE) < api.index("[Runtime note for this turn")
+
+    def test_multimodal_turn_gets_a_durable_text_part(self):
+        """List content can't take the string sidecar — the fact must not drop."""
+        agent = _reasoning_agent("medium", "ultra")
+        content = [
+            {"type": "text", "text": "look at this"},
+            {"type": "image_url", "image_url": {"url": "https://x/img.png"}},
+        ]
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            ctx = _build(agent, user_message=content)
+        msg = ctx.messages[ctx.current_turn_user_idx]
+
+        assert msg["content"][-1]["type"] == "text"
+        assert "Reasoning effort: ultra" in msg["content"][-1]["text"]
+        assert "api_content" not in msg
+
+    def test_codex_app_server_is_not_claimed(self):
+        """That surface bypasses Hermes' system prompt AND this assembly, so
+        there is no cached claim to correct and the sidecar never ships."""
+        agent = _reasoning_agent("medium", "ultra")
+        agent.api_mode = "codex_app_server"
+        with patch("hermes_cli.plugins.invoke_hook", return_value=[]):
+            ctx = _build(agent)
+        assert "api_content" not in ctx.messages[ctx.current_turn_user_idx]
+
+    def test_non_hermes_prompt_gets_no_note(self):
+        """Nothing to supersede → the note's own wording would be untrue."""
+        agent = _reasoning_agent("medium", "ultra")
+        agent._cached_system_prompt = "a hand-set system prompt"
+        assert build_runtime_reasoning_note(agent, agent._cached_system_prompt) == ""
+
+    def test_disabled_reasoning_is_reported_as_disabled(self):
+        agent = _reasoning_agent("ultra", None)
+        agent.reasoning_config = {"enabled": False}
+        note = build_runtime_reasoning_note(agent, agent._cached_system_prompt)
+        assert "Reasoning effort: disabled" in note

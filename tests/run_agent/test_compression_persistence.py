@@ -471,6 +471,58 @@ class TestStoredPromptCwdDrift:
                 "rebuild every turn and break the prefix cache"
             )
 
+    def test_reasoning_decoy_in_project_text_cannot_satisfy_the_match(self):
+        """The reasoning check is anchored to Hermes' own metadata block, so a
+        project file that merely names an effort can neither satisfy nor
+        invalidate it — the same trap the cwd check already guards against."""
+        from unittest.mock import patch
+        from agent.conversation_loop import _stored_prompt_matches_runtime
+
+        agent = self._make_agent()
+        agent.reasoning_config = {"enabled": True, "effort": "ultra"}
+        current_cwd = "/project/current"
+        stored_prompt = (
+            self._host_block(current_cwd)
+            + "\n# AGENTS.md\n\n"
+            "Run at Reasoning effort: high for this repo.\n"
+            "Reasoning effort: high\n\n"
+            "Conversation started: Tuesday, June 16, 2026\n"
+            "Model: test/model\n"
+            "Provider: openrouter\n"
+            "Reasoning effort: ultra"
+        )
+
+        with patch("os.getcwd", return_value=current_cwd):
+            assert _stored_prompt_matches_runtime(agent, stored_prompt) is True, (
+                "The prompt's own metadata block says ultra and the runtime is "
+                "ultra — an earlier project-file line must not force a rebuild"
+            )
+
+    def test_reasoning_decoy_cannot_mask_real_drift(self):
+        """The inverse: project prose naming the live tier must not stand in
+        for the real metadata block's stale value."""
+        from unittest.mock import patch
+        from agent.conversation_loop import _stored_prompt_matches_runtime
+
+        agent = self._make_agent()
+        agent.reasoning_config = {"enabled": True, "effort": "ultra"}
+        current_cwd = "/project/current"
+        stored_prompt = (
+            self._host_block(current_cwd)
+            + "\n# AGENTS.md\n\n"
+            "Reasoning effort: ultra\n\n"
+            "Conversation started: Tuesday, June 16, 2026\n"
+            "Model: test/model\n"
+            "Provider: openrouter\n"
+            "Reasoning effort: low"
+        )
+
+        with patch("os.getcwd", return_value=current_cwd):
+            assert _stored_prompt_matches_runtime(agent, stored_prompt) is False, (
+                "Embedded project text naming the live tier must not mask a "
+                "stale value in the real metadata block"
+            )
+
     def test_project_context_cannot_mask_real_drift(self):
         """The inverse: project text must not fake a match either.
 

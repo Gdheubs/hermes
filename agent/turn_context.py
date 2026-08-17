@@ -151,6 +151,53 @@ def consume_gateway_turn_context_notes(agent: Any) -> str:
     return notes if isinstance(notes, str) else ""
 
 
+def build_runtime_reasoning_note(agent: Any, active_system_prompt: Any) -> str:
+    """A current-turn note when the cached prompt's effort line is stale.
+
+    A same-agent ``/reasoning`` change updates ``agent.reasoning_config``,
+    the persisted runtime state and ``session.info`` — but deliberately does
+    NOT touch ``_cached_system_prompt``: the system prompt is byte-stable for
+    a conversation and only compaction may rebuild it, and mutating it
+    mid-session would throw away the whole prefix cache on a setting change.
+    So between the change and the next compaction the prompt's reasoning line
+    is out of date, and leaving it at that would be a silently false claim.
+
+    Rather than mutate the cached prompt, say it on the turn: this is the
+    same must-deliver channel the gateway already uses for per-turn facts
+    (``consume_gateway_turn_context_notes``), so the note is persisted as the
+    exact bytes sent and replayed verbatim on later turns.
+
+    Returns ``""`` — no note, no tokens — when the active prompt's provenance
+    already matches the live runtime, which is the normal case, or when the
+    prompt carries no Hermes metadata block at all (nothing to supersede, so
+    the note's own wording would not be true).
+    """
+    from agent.system_prompt import (
+        REASONING_EFFORT_LABEL,
+        agent_reasoning_effort,
+        has_runtime_metadata_block,
+        read_prompt_reasoning_effort,
+    )
+
+    live = agent_reasoning_effort(agent)
+    prompt = active_system_prompt if isinstance(active_system_prompt, str) else ""
+    if not has_runtime_metadata_block(prompt):
+        return ""
+    if read_prompt_reasoning_effort(prompt) == live:
+        return ""
+    model = str(getattr(agent, "model", "") or "").strip() or "unknown"
+    provider = str(getattr(agent, "provider", "") or "").strip() or "unknown"
+    return (
+        f"[Runtime note for this turn — Model: {model}; Provider: {provider}; "
+        f"{REASONING_EFFORT_LABEL}: {live}. This is the runtime answering this "
+        f"turn, and it supersedes the system prompt's "
+        f"'{REASONING_EFFORT_LABEL}:' line (kept byte-stable for the prompt "
+        f"cache) for as long as this model/provider stays active. If a "
+        f"provider fallback activates, the system prompt's rewritten runtime "
+        f"metadata is authoritative instead.]"
+    )
+
+
 def append_notes_to_multimodal_content(content: Any, notes: str) -> bool:
     """Deliver must-deliver notes on a multimodal (list) user message.
 
@@ -1229,6 +1276,27 @@ def build_turn_context(
     # Multimodal (list) content can't take the string sidecar — append a
     # durable text part instead of dropping the fact.
     _gateway_notes = consume_gateway_turn_context_notes(agent)
+
+    # Reasoning provenance for THIS turn. Runs after any preflight compaction
+    # has settled `active_system_prompt`, so a compaction that already
+    # refreshed the prompt's reasoning line costs nothing here. When the
+    # cached prompt is stale (a live same-model /reasoning change leaves it
+    # untouched on purpose) or predates the metadata entirely, the truth
+    # rides this turn instead of rewriting the cached prompt. Not staged on
+    # the agent: it is recomputed per turn, so it can never replay stale.
+    #
+    # Skipped on codex_app_server: that surface bypasses Hermes' system
+    # prompt AND this message assembly, so there is no cached claim to
+    # correct and a string sidecar would never reach the wire.
+    if getattr(agent, "api_mode", None) != "codex_app_server":
+        _reasoning_note = build_runtime_reasoning_note(agent, active_system_prompt)
+        if _reasoning_note:
+            _gateway_notes = (
+                _gateway_notes + "\n\n" + _reasoning_note
+                if _gateway_notes
+                else _reasoning_note
+            )
+
     if _gateway_notes:
         _gw_turn_content = (
             messages[current_turn_user_idx].get("content")
