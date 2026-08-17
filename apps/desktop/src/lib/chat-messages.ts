@@ -14,6 +14,9 @@ export interface TimelinePartMetadata {
   timestamp?: number
   /** Unix seconds when this segment stopped or handed off to the next one. */
   completedAt?: number
+  /** Undecorated source for a trailing MEDIA directive that may receive more
+   * streamed path characters. Live-only and removed when the segment closes. */
+  provisionalMediaSource?: string
 }
 
 export type ChatMessagePart = Exclude<ThreadMessageLike['content'], string>[number] & TimelinePartMetadata
@@ -156,9 +159,10 @@ export function reasoningPart(text: string, timestamp?: number): ChatMessagePart
   return { type: 'reasoning', text, ...(timestamp !== undefined ? { timestamp } : {}) }
 }
 
-const MEDIA_LINE_RE = /(^|\n)[\t ]*[`"']?MEDIA:\s*(?<line>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)[`"']?[\t ]*(\n|$)/g
+const MEDIA_LINE_RE =
+  /(^|\n)[\t ]*[`"']?MEDIA:[\t ]*(?<line>`[^`\r\n]+`|"[^"\r\n]+"|'[^'\r\n]+'|[^\r\n]*?\S)[`"']?[\t ]*(?=\r?\n|$)/g
 
-const MEDIA_TAG_RE = /[`"']?MEDIA:\s*(?<inline>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)[`"']?/g
+const MEDIA_TAG_RE = /[`"']?MEDIA:[\t ]*(?<inline>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|\S+)[`"']?/g
 
 function unquoteMediaPath(value: string): string {
   const trimmed = value.trim()
@@ -173,15 +177,96 @@ function mediaLink(value: string): string {
   return `[${mediaDisplayLabel(path)}](${mediaMarkdownHref(path)})`
 }
 
-export function renderMediaTags(text: string): string {
-  return text
-    .replace(
-      MEDIA_LINE_RE,
-      (_match, lead: string, value: string, trailer: string) => `${lead}${mediaLink(value)}${trailer}`
-    )
-    .replace(MEDIA_TAG_RE, (_match, value: string) => mediaLink(value))
-    .replace(/[ \t]+\n/g, '\n')
+function isExplicitlyQuotedMediaPath(value: string): boolean {
+  const trimmed = value.trim()
+  const quote = trimmed[0]
+
+  return Boolean(quote && quote === trimmed.at(-1) && ['"', "'", '`'].includes(quote))
+}
+
+function isClosedQuotedMediaDirective(match: string, lead: string): boolean {
+  return isExplicitlyQuotedMediaPath(match.slice(lead.length))
+}
+
+function isPathShapedMediaValue(value: string): boolean {
+  return (
+    /^(?:file:|https?:|data:|\/|~[\\/]|\.{1,2}[\\/]|[a-z]:[\\/]|\\\\)/i.test(value) ||
+    /\.[a-z0-9]{1,16}(?:[?#].*)?$/i.test(value)
+  )
+}
+
+type StandaloneMediaIntent = 'inline' | 'path' | 'prose'
+
+function standaloneMediaIntent(value: string): StandaloneMediaIntent {
+  const trimmed = value.trim()
+
+  if (isExplicitlyQuotedMediaPath(trimmed) || !/\s/.test(trimmed)) {
+    return 'path'
+  }
+
+  if (/\bMEDIA:/.test(trimmed)) {
+    return 'inline'
+  }
+
+  const firstToken = trimmed.match(/^\S+/)?.[0]
+  const suffix = firstToken ? trimmed.slice(firstToken.length).trim() : ''
+
+  if (
+    firstToken &&
+    (/^(?:file:|https?:|data:)/i.test(firstToken) ||
+      (isPathShapedMediaValue(firstToken) &&
+        /\.[a-z0-9]{1,16}(?:[?#].*)?$/i.test(firstToken) &&
+        !isPathShapedMediaValue(suffix)))
+  ) {
+    return 'inline'
+  }
+
+  return isPathShapedMediaValue(trimmed) ? 'path' : 'prose'
+}
+
+function lineLeadingMediaIntent(source: string, offset: number): StandaloneMediaIntent | undefined {
+  const lineStart = source.lastIndexOf('\n', Math.max(0, offset - 1)) + 1
+
+  if (!/^[\t ]*$/.test(source.slice(lineStart, offset))) {
+    return undefined
+  }
+
+  const lineEnd = source.indexOf('\n', offset)
+  const line = source.slice(offset, lineEnd === -1 ? source.length : lineEnd)
+  const marker = line.indexOf('MEDIA:')
+
+  return marker === -1 ? undefined : standaloneMediaIntent(line.slice(marker + 'MEDIA:'.length))
+}
+
+function renderMediaText(text: string): { provisional: boolean; text: string } {
+  let provisional = false
+
+  const rendered = text
+    .replace(MEDIA_LINE_RE, (match, lead: string, value: string, offset: number, source: string) => {
+      if (standaloneMediaIntent(value) !== 'path') {
+        return match
+      }
+
+      provisional ||=
+        !isExplicitlyQuotedMediaPath(value) &&
+        !isClosedQuotedMediaDirective(match, lead) &&
+        offset + match.length === source.length
+
+      return `${lead}${mediaLink(value)}`
+    })
+    .replace(MEDIA_TAG_RE, (match, value: string, offset: number, source: string) => {
+      const lineIntent = lineLeadingMediaIntent(source, offset)
+
+      return lineIntent === 'prose' ? match : mediaLink(value)
+    })
+    .replace(/[ \t]+(?=\r?\n)/g, '')
     .replace(/\n{3,}/g, '\n\n')
+
+  return { provisional, text: rendered }
+}
+
+export function renderMediaTags(text: string): string {
+  return renderMediaText(text).text
 }
 
 export function assistantTextPart(text: string, timestamp?: number): ChatMessagePart {
@@ -266,6 +351,7 @@ export function mergeFinalAssistantText(
   finalText: string,
   fallbackTimestamp?: number
 ): ChatMessagePart[] {
+  parts = clearProvisionalMediaSources(parts)
   const dedupeReference = normalizeWs(finalText)
 
   const streamedText = normalizeWs(
@@ -458,21 +544,65 @@ const STREAM_PART: Record<'reasoning' | 'text', (text: string, timestamp?: numbe
   text: textPart
 }
 
+function clearProvisionalMediaSource(part: ChatMessagePart): ChatMessagePart {
+  if (part.provisionalMediaSource === undefined) {
+    return part
+  }
+
+  const { provisionalMediaSource: _source, ...settled } = part
+
+  return settled as ChatMessagePart
+}
+
+function clearProvisionalMediaSources(parts: ChatMessagePart[]): ChatMessagePart[] {
+  let changed = false
+
+  const settled = parts.map(part => {
+    const next = clearProvisionalMediaSource(part)
+
+    changed ||= next !== part
+
+    return next
+  })
+
+  return changed ? settled : parts
+}
+
+function restoreOpenProvisionalMediaSource(parts: ChatMessagePart[]): ChatMessagePart[] {
+  const tailIndex = parts.length - 1
+  const tail = parts[tailIndex]
+
+  if (tail?.type !== 'text' || tail.completedAt !== undefined || tail.provisionalMediaSource === undefined) {
+    return parts
+  }
+
+  const next = [...parts]
+  const settled = clearProvisionalMediaSource(tail)
+
+  next[tailIndex] = { ...settled, text: tail.provisionalMediaSource } as ChatMessagePart
+
+  return next
+}
+
 function completeOpenStreamParts(parts: ChatMessagePart[], completedAt: number): ChatMessagePart[] {
-  return parts.map(part =>
-    (part.type === 'text' || part.type === 'reasoning') && part.completedAt === undefined
-      ? ({ ...part, completedAt } as ChatMessagePart)
-      : part
-  )
+  return parts.map(part => {
+    const settled = clearProvisionalMediaSource(part)
+
+    return (settled.type === 'text' || settled.type === 'reasoning') && settled.completedAt === undefined
+      ? ({ ...settled, completedAt } as ChatMessagePart)
+      : settled
+  })
 }
 
 /** Seal every still-open visible activity when the assistant turn stops. */
 export function completeOpenTimelineParts(parts: ChatMessagePart[], completedAt: number): ChatMessagePart[] {
-  return parts.map(part =>
-    part.timestamp !== undefined && part.completedAt === undefined
-      ? ({ ...part, completedAt } as ChatMessagePart)
-      : part
-  )
+  return parts.map(part => {
+    const settled = clearProvisionalMediaSource(part)
+
+    return settled.timestamp !== undefined && settled.completedAt === undefined
+      ? ({ ...settled, completedAt } as ChatMessagePart)
+      : settled
+  })
 }
 
 // Coalesce only adjacent deltas of the same channel. Switching between text
@@ -495,12 +625,13 @@ function appendStreamPart(
     return { index: tailIndex, parts: next }
   }
 
-  if (
-    timestamp !== undefined &&
-    (tail?.type === 'text' || tail?.type === 'reasoning') &&
-    tail.completedAt === undefined
-  ) {
-    next[tailIndex] = { ...tail, completedAt: timestamp } as ChatMessagePart
+  if ((tail?.type === 'text' || tail?.type === 'reasoning') && tail.completedAt === undefined) {
+    const settled = clearProvisionalMediaSource(tail)
+
+    next[tailIndex] = {
+      ...settled,
+      ...(timestamp !== undefined ? { completedAt: timestamp } : {})
+    } as ChatMessagePart
   }
 
   next.push(STREAM_PART[type](delta, timestamp))
@@ -521,7 +652,7 @@ export function appendAssistantTextPart(
   delta: string,
   timestamp?: number
 ): ChatMessagePart[] {
-  const { index, parts: next } = appendStreamPart(parts, 'text', delta, timestamp)
+  const { index, parts: next } = appendStreamPart(restoreOpenProvisionalMediaSource(parts), 'text', delta, timestamp)
   const part = next[index]
 
   if (part?.type !== 'text') {
@@ -532,10 +663,16 @@ export function appendAssistantTextPart(
     delta.includes('MEDIA:') || delta.includes('DIA:') || delta.includes('EDIA:') || delta.includes('IA:')
 
   if (mayContainMedia || part.text.includes('MEDIA:')) {
-    const rendered = renderMediaTags(part.text)
+    const rendered = renderMediaText(part.text)
 
-    if (rendered !== part.text) {
-      next[index] = { ...part, text: rendered }
+    if (rendered.text !== part.text || rendered.provisional) {
+      const settled = clearProvisionalMediaSource(part)
+
+      next[index] = {
+        ...settled,
+        text: rendered.text,
+        ...(rendered.provisional ? { provisionalMediaSource: part.text } : {})
+      } as ChatMessagePart
     }
   }
 

@@ -406,11 +406,167 @@ describe('renderMediaTags', () => {
     expect(renderMediaTags('MEDIA:/tmp/demo.mp4')).toBe('[Video: demo.mp4](#media:%2Ftmp%2Fdemo.mp4)')
   })
 
+  it('keeps a line-leading inline MEDIA tag separate from trailing prose', () => {
+    expect(renderMediaTags('MEDIA:/tmp/voice.mp3 done')).toBe('[Audio: voice.mp3](#media:%2Ftmp%2Fvoice.mp3) done')
+  })
+
+  it('keeps an extensionless inline MEDIA URL separate from trailing prose', () => {
+    expect(renderMediaTags('MEDIA:https://example.com/download done')).toBe(
+      '[File: download](#media:https%3A%2F%2Fexample.com%2Fdownload) done'
+    )
+  })
+
+  it('renders consecutive inline MEDIA tags at the start of a line independently', () => {
+    expect(renderMediaTags('MEDIA:/tmp/a.png MEDIA:/tmp/b.png')).toBe(
+      '[Image: a.png](#media:%2Ftmp%2Fa.png) [Image: b.png](#media:%2Ftmp%2Fb.png)'
+    )
+  })
+
+  it('leaves ordinary standalone MEDIA prose unchanged', () => {
+    expect(renderMediaTags('before\nMEDIA: the report is ready\nafter')).toBe(
+      'before\nMEDIA: the report is ready\nafter'
+    )
+  })
+
+  it('keeps an unquoted standalone MEDIA path with spaces intact', () => {
+    const path = '/Users/zora/Documents/ZORA/hermes/operations/B17-B Value Extraction and Retirement Receipt.md'
+
+    expect(renderMediaTags(`ready\nMEDIA:${path}`)).toBe(
+      `ready\n[File: B17-B Value Extraction and Retirement Receipt.md](#media:${encodeURIComponent(path)})`
+    )
+  })
+
+  it.each([
+    ['/tmp/foo.txt bar.pdf', 'foo.txt bar.pdf'],
+    ['/Users/me/v1.0 Final/report.md', 'report.md']
+  ])('does not truncate an unquoted path after an extension-like component: %s', (path, label) => {
+    expect(renderMediaTags(`MEDIA:${path}`)).toBe(`[File: ${label}](#media:${encodeURIComponent(path)})`)
+  })
+
+  it.each([
+    ['LF', '\n'],
+    ['CRLF', '\r\n']
+  ])('keeps spaces in consecutive Windows and UNC MEDIA paths with %s line endings', (_label, newline) => {
+    const drivePath = 'C:\\Users\\ADMIN\\My Files\\first report.pdf'
+    const uncPath = '\\\\server\\Shared Files\\second report.pdf'
+
+    expect(renderMediaTags(`MEDIA:${drivePath}${newline}MEDIA:${uncPath}`)).toBe(
+      `[File: first report.pdf](#media:${encodeURIComponent(drivePath)})${newline}` +
+        `[File: second report.pdf](#media:${encodeURIComponent(uncPath)})`
+    )
+  })
+
+  it.each([
+    ['LF', '\n'],
+    ['CRLF', '\r\n']
+  ])('does not consume the following line when a MEDIA path is blank with %s', (_label, newline) => {
+    expect(renderMediaTags(`before${newline}MEDIA:   ${newline}not-a-path`)).toBe(
+      `before${newline}MEDIA:${newline}not-a-path`
+    )
+  })
+
+  it.each(['`', '"', "'"])('keeps spaces in a standalone path quoted with %s', quote => {
+    const path = 'reports/the final report.pdf'
+
+    expect(renderMediaTags(`MEDIA:${quote}${path}${quote}`)).toBe(
+      `[File: the final report.pdf](#media:${encodeURIComponent(path)})`
+    )
+  })
+
   it('renders streamed assistant media once the tag is complete', () => {
     const parts = appendAssistantTextPart(appendAssistantTextPart([], 'ok\nMEDIA:'), '/tmp/voice.mp3')
     const text = chatMessageText({ id: 'a', role: 'assistant', parts })
 
     expect(text).toBe('ok\n[Audio: voice.mp3](#media:%2Ftmp%2Fvoice.mp3)')
+  })
+
+  it('does not reinterpret a legitimate trailing media link when more text streams in', () => {
+    const link = '[File: report.md](#media:%2Ftmp%2Freport.md)'
+    let parts = appendAssistantTextPart([], link, 1)
+
+    parts = appendAssistantTextPart(parts, ' continued', 2)
+
+    expect(chatMessageText({ id: 'a', role: 'assistant', parts })).toBe(`${link} continued`)
+    expect(parts).toHaveLength(1)
+    expect(parts[0]).toMatchObject({ timestamp: 1, type: 'text' })
+  })
+
+  it('treats a closing quote as the end of a streamed standalone MEDIA path', () => {
+    let parts = appendAssistantTextPart([], 'MEDIA:"/tmp/the report.pdf"', 1)
+
+    expect(parts[0]).not.toHaveProperty('provisionalMediaSource')
+    parts = appendAssistantTextPart(parts, ' continued', 2)
+
+    expect(chatMessageText({ id: 'a', role: 'assistant', parts })).toBe(
+      '[File: the report.pdf](#media:%2Ftmp%2Fthe%20report.pdf) continued'
+    )
+  })
+
+  it('treats a quote around the whole streamed MEDIA directive as closed', () => {
+    let parts = appendAssistantTextPart([], '"MEDIA:/tmp/the report.pdf"', 1)
+
+    expect(parts[0]).not.toHaveProperty('provisionalMediaSource')
+    parts = appendAssistantTextPart(parts, ' continued', 2)
+
+    expect(chatMessageText({ id: 'a', role: 'assistant', parts })).toBe(
+      '[File: the report.pdf](#media:%2Ftmp%2Fthe%20report.pdf) continued'
+    )
+  })
+
+  it('does not freeze the B17-B streamed path before later space-separated chunks arrive', () => {
+    const path = '/Users/zora/Documents/ZORA/hermes/operations/B17-B Value Extraction and Retirement Receipt.md'
+    let parts = appendAssistantTextPart([], 'ready\nMEDIA:/Users/zora/Documents/ZORA/hermes/operations/B17-B', 10.125)
+
+    parts = appendAssistantTextPart(parts, ' Value Ex', 10.5)
+    parts = appendAssistantTextPart(parts, 'traction and Retirement Receipt.md\n', 11)
+
+    expect(chatMessageText({ id: 'a', role: 'assistant', parts })).toBe(
+      `ready\n[File: B17-B Value Extraction and Retirement Receipt.md](#media:${encodeURIComponent(path)})\n`
+    )
+    expect(parts).toHaveLength(1)
+    expect(parts[0]).toMatchObject({ timestamp: 10.125, type: 'text' })
+    expect(parts[0].completedAt).toBeUndefined()
+    expect(parts[0]).not.toHaveProperty('provisionalMediaSource')
+  })
+
+  it('does not carry provisional MEDIA state across a reasoning boundary', () => {
+    let parts: ChatMessagePart[] = appendAssistantTextPart([], 'MEDIA:/tmp/partial', 1)
+
+    expect(parts[0]).toHaveProperty('provisionalMediaSource', 'MEDIA:/tmp/partial')
+    parts = appendReasoningPart(parts, 'thinking', 2)
+    parts = appendAssistantTextPart(parts, ' filename.pdf', 3)
+
+    expect(parts.map(part => part.type)).toEqual(['text', 'reasoning', 'text'])
+    expect(parts.map(part => part.timestamp)).toEqual([1, 2, 3])
+    expect(parts.map(part => part.completedAt)).toEqual([2, 3, undefined])
+    expect(parts[0]).not.toHaveProperty('provisionalMediaSource')
+    expect((parts[0] as { text: string }).text).toBe('[File: partial](#media:%2Ftmp%2Fpartial)')
+    expect((parts[2] as { text: string }).text).toBe(' filename.pdf')
+  })
+
+  it('clears provisional MEDIA state when the timeline part completes', () => {
+    const parts = appendAssistantTextPart([], 'MEDIA:/tmp/partial', 1)
+
+    expect(parts[0]).toHaveProperty('provisionalMediaSource')
+    const completed = completeOpenTimelineParts(parts, 2)
+
+    expect(completed[0]).not.toHaveProperty('provisionalMediaSource')
+    expect(completed[0]).toMatchObject({ completedAt: 2, timestamp: 1, type: 'text' })
+  })
+
+  it('clears provisional MEDIA state during final-response reconciliation', () => {
+    const parts = appendAssistantTextPart([], 'MEDIA:/tmp/partial', 1)
+
+    expect(parts[0]).toHaveProperty('provisionalMediaSource')
+    const settled = mergeFinalAssistantText(parts, 'MEDIA:/tmp/partial', 2)
+
+    expect(settled).toHaveLength(1)
+    expect(settled[0]).not.toHaveProperty('provisionalMediaSource')
+    expect(settled[0]).toMatchObject({
+      text: '[File: partial](#media:%2Ftmp%2Fpartial)',
+      timestamp: 1,
+      type: 'text'
+    })
   })
 })
 
