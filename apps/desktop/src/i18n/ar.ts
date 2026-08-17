@@ -661,7 +661,8 @@ export const ar = defineLocale({
       couldNotSave: 'تعذّر حفظ بيانات الاعتماد.',
       remove: 'إزالة',
       getKey: 'احصل على مفتاح',
-      saving: 'جار الحفظ'
+      saving: 'جار الحفظ',
+      useThisAccount: 'استخدام هذا الحساب'
     },
     envActions: {
       actions: 'إجراءات',

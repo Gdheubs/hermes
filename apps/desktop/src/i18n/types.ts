@@ -526,6 +526,7 @@ export interface Translations {
       remove: string
       getKey: string
       saving: string
+      useThisAccount: string
     }
     envActions: {
       actions: string
