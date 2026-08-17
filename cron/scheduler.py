@@ -2426,7 +2426,10 @@ def _delivery_chat_is_operator_owned(
     except Exception:
         pass
 
-    if "*" in allowed or str(chat_id) in allowed:
+    # F9/P2: a wildcard is inbound-anyone authorization, NOT outbound
+    # ownership — one star must not bless delivery to every chat on the
+    # platform. Only an exact operator-owned / allowlisted chat id passes.
+    if str(chat_id) in allowed:
         return True
     return False
 
@@ -3781,6 +3784,19 @@ def _run_job_script(
         # mtime-keyed approval-policy cache can never observe a flipped
         # config from the script lane.
         tamper_message = _restore_config_yaml_if_tampered(config_snapshot)
+
+        # F4/P2 (Purple round 2): a script may have detached a child
+        # (nohup / double-fork) that re-flips config.yaml AFTER this
+        # completion revert. When tampering was detected, settle-check the
+        # config for a few seconds and re-revert any re-flip so a lingering
+        # child cannot win. Clean runs add no delay.
+        if tamper_message:
+            for _delay in (1.0, 2.0, 4.0):
+                time.sleep(_delay)
+                _later = _restore_config_yaml_if_tampered(config_snapshot)
+                if _later is None:
+                    break
+                tamper_message = _later
 
         if early_error:
             return False, early_error

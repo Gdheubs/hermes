@@ -163,6 +163,19 @@ class TestColonFormDeliveryTargetOwnership:
         assert result["success"] is False
         assert "not a chat you own" in result.get("error", "")
 
+    def test_wildcard_allowlist_does_not_authorize_unknown_chat(
+        self, temp_cron_home, monkeypatch
+    ):
+        """F9/P2: a wildcard in the INBOUND allowlist must NOT authorize
+        OUTBOUND colon-form delivery to an arbitrary chat — one star must
+        not bless exfil to every chat on the platform."""
+        monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "*")
+        monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("TELEGRAM_GROUP_ALLOWED_CHATS", raising=False)
+        result = _create(deliver="telegram:-1001234567890")
+        assert result["success"] is False
+        assert "not a chat you own" in result.get("error", "")
+
     def test_origin_chat_target_accepted(self, temp_cron_home):
         """The creating session's own chat is operator-owned by definition."""
         tokens, extra = _enter_cron_context("telegram", "-100123456", "17")
