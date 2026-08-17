@@ -346,6 +346,10 @@ _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 # to a different Python version overwrites it and breaks the gateway). The
 # Hermes venv stays reachable via PATH (its bin dir is first), so stripping
 # these markers is safe and only prevents the cross-project clobber (#23473).
+#
+# PYTHONPATH is NOT included here — it's handled by
+# _strip_mismatched_site_packages() which surgically removes only site-packages
+# paths that don't match the current Python ABI, preserving user-set entries.
 _ACTIVE_VENV_MARKER_VARS = ("VIRTUAL_ENV", "CONDA_PREFIX")
 
 
@@ -456,9 +460,13 @@ def _inject_session_context_env(env: dict) -> None:
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
-        from tools.env_passthrough import is_env_passthrough as _is_passthrough
+        from tools.env_passthrough import (
+            is_env_passthrough as _is_passthrough,
+            resolve_passthrough_value as _resolve_passthrough_value,
+        )
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
+        _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
     sanitized: dict[str, str] = {}
 
@@ -467,8 +475,12 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             continue
         if _is_hermes_internal_secret(key):
             continue
-        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
-            sanitized[key] = value
+        passthrough = _is_passthrough(key)
+        if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+            continue
+        resolved = _resolve_passthrough_value(key, value) if passthrough else value
+        if resolved is not None:
+            sanitized[key] = resolved
 
     for key, value in (extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
@@ -478,8 +490,13 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
             sanitized[real_key] = value
         elif _is_hermes_internal_secret(key):
             continue
-        elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
-            sanitized[key] = value
+        else:
+            passthrough = _is_passthrough(key)
+            if key in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+                continue
+            resolved = _resolve_passthrough_value(key, value) if passthrough else value
+            if resolved is not None:
+                sanitized[key] = resolved
 
     _inject_context_hermes_home(sanitized)
 
@@ -492,6 +509,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
+
+    _strip_mismatched_site_packages(sanitized)
 
     _apply_windows_msys_bash_env_defaults(sanitized)
 
@@ -621,6 +640,8 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # Active-venv markers must not clobber another project's environment.
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         env.pop(_marker, None)
+
+    _strip_mismatched_site_packages(env)
 
     _apply_windows_msys_bash_env_defaults(env)
 
@@ -1127,6 +1148,34 @@ def _prepend_hermes_bin_dir(existing_path: str) -> str:
     return sep.join([bin_dir, *entries])
 
 
+def _managed_runtime_path_entries() -> list[str]:
+    """Return existing Hermes-managed runtime dirs for the terminal subshell PATH.
+
+    The terminal tool spawns a subshell whose PATH is the agent process's PATH
+    plus ``_SANE_PATH``. Neither carries the runtimes Hermes installs for
+    itself, so on a machine where Hermes provisioned its own toolchain a
+    command the agent runs resolves a system copy instead — or nothing at all:
+
+    - ``$HERMES_HOME/node`` (+ ``/bin``) — installed to satisfy the desktop and
+      browser toolchain. ``tools/browser_tool.py`` already does this for its own
+      subprocesses; the agent's shell deserves the same.
+    - ``$HERMES_HOME/bin`` — the managed ``uv``. ``install.sh`` writes it there
+      and nothing has ever put that directory on PATH, so an install whose only
+      uv is the managed one looks uv-less to both the agent and the model.
+
+    Resolved per call rather than cached in a module constant because
+    ``get_hermes_home()`` is profile-scoped and a managed tree can appear
+    mid-process (``heal_hermes_managed_node``, a first browser install).
+    """
+    try:
+        from hermes_constants import get_hermes_home, iter_hermes_node_dirs
+
+        candidates = [*iter_hermes_node_dirs(), get_hermes_home() / "bin"]
+        return [str(d) for d in candidates if d.is_dir()]
+    except Exception:
+        return []
+
+
 def _append_missing_sane_path_entries(existing_path: str) -> str:
     """Return a normalised POSIX PATH with missing sane entries appended.
 
@@ -1144,6 +1193,11 @@ def _append_missing_sane_path_entries(existing_path: str) -> str:
     - **Duplicates are collapsed** (first occurrence wins), so a caller PATH
       that already contains repeats is not propagated verbatim.
 
+    Hermes-managed runtime dirs are appended alongside the sane entries, not
+    prepended: a tool the user deliberately put on their own PATH still wins,
+    and the managed one only fills the gap where there would otherwise be
+    nothing.
+
     For a well-formed PATH (no empties, no duplicates) the leading segment is
     byte-identical to the input and ordering is preserved; only the missing
     sane entries are appended. On Windows this is a no-op passthrough (the
@@ -1153,6 +1207,9 @@ def _append_missing_sane_path_entries(existing_path: str) -> str:
         return existing_path
 
     sane_entries = [entry for entry in _SANE_PATH.split(":") if entry]
+    sane_entries.extend(
+        entry for entry in _managed_runtime_path_entries() if entry not in sane_entries
+    )
     if not existing_path:
         return ":".join(sane_entries)
 
@@ -1219,9 +1276,13 @@ def _path_env_key(run_env: dict) -> str | None:
 def _make_run_env(env: dict) -> dict:
     """Build a run environment with a sane PATH and provider-var stripping."""
     try:
-        from tools.env_passthrough import is_env_passthrough as _is_passthrough
+        from tools.env_passthrough import (
+            is_env_passthrough as _is_passthrough,
+            resolve_passthrough_value as _resolve_passthrough_value,
+        )
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
+        _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
     merged = dict(os.environ | env)
     run_env = {}
@@ -1233,8 +1294,13 @@ def _make_run_env(env: dict) -> dict:
             run_env[real_key] = v
         elif _is_hermes_internal_secret(k):
             continue
-        elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):
-            run_env[k] = v
+        else:
+            passthrough = _is_passthrough(k)
+            if k in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
+                continue
+            value = _resolve_passthrough_value(k, v) if passthrough else v
+            if value is not None:
+                run_env[k] = value
     path_key = _path_env_key(run_env)
     if path_key is not None:
         new_path = _append_missing_sane_path_entries(run_env.get(path_key, ""))
@@ -1263,11 +1329,230 @@ def _make_run_env(env: dict) -> dict:
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)
 
+    _strip_mismatched_site_packages(run_env)
+
     _apply_windows_msys_bash_env_defaults(run_env)
 
     run_env = _scrub_delegated_child_kanban_env(run_env)
 
     return run_env
+
+
+def _is_path_under(child: Path, parent: Path) -> bool:
+    """Return True if *child* is the same as or under *parent*.
+
+    Uses ``os.path.normcase`` so the comparison is case-insensitive on
+    Windows (NTFS is case-insensitive by default) and case-sensitive on
+    POSIX, matching filesystem semantics.  Paths are NOT resolved against
+    disk (no ``.resolve()``) so non-existent paths - common in test mocks
+    and in PYTHONPATH entries pointing at yet-to-be-created dirs - work
+    correctly.  ``Path.resolve(strict=False)`` would also touch the
+    filesystem to resolve symlinks, which we deliberately avoid.
+    """
+    c_parts = [os.path.normcase(p) for p in child.parts]
+    p_parts = [os.path.normcase(p) for p in parent.parts]
+    if len(c_parts) < len(p_parts):
+        return False
+    return c_parts[: len(p_parts)] == p_parts
+
+
+# --- Hermes venv / repo-root detection (module-level, computed once) ---
+
+#: The running interpreter's own venv root.  On a venv Python ``sys.prefix``
+#: points at the venv root (e.g. ``.../venv``); on a system Python it points
+#: at ``/usr`` or similar.  We only strip site-packages under this path when
+#: the interpreter is actually inside a venv (``sys.prefix != sys.base_prefix``).
+_hermes_venv_root: Path = Path(sys.prefix)
+
+#: The Hermes repository root - three levels up from this file
+#: (``tools/environments/local.py`` -> ``tools/environments`` -> ``tools``
+#: -> repo root).  This is the directory the Electron app prepends to
+#: PYTHONPATH so the backend can do ``import tools``, ``import hermes_cli``,
+#: etc.  Subprocesses that are NOT the Hermes backend don't need it and it
+#: can shadow local packages.
+_hermes_repo_root: Path = Path(__file__).resolve().parents[2]
+
+#: Whether the current interpreter is running inside a venv.  On Python 3.3+
+#: ``sys.base_prefix != sys.prefix`` indicates a venv (or virtualenv).
+#: ``sys.real_prefix`` is the old virtualenv (<20) marker.
+_in_venv: bool = (
+    getattr(sys, "base_prefix", sys.prefix) != sys.prefix
+    or hasattr(sys, "real_prefix")
+)
+
+#: Cached set of site-packages directories that belong to the running
+#: interpreter's own venv.  Computed lazily (once) because ``site`` import
+#: and path construction are not free and this function is called on every
+#: subprocess spawn.
+_hermes_site_packages: list[Path] | None = None
+
+
+def _get_hermes_site_packages() -> list[Path]:
+    """Return the site-packages dirs of the running interpreter's venv.
+
+    Uses ``site.getsitepackages()`` when available for robustness (it respects
+    ``.pth`` rewrites and platform conventions), with a manual fallback that
+    constructs the canonical path from ``sys.prefix`` for POSIX and Windows.
+    """
+    global _hermes_site_packages
+    if _hermes_site_packages is not None:
+        return _hermes_site_packages
+
+    result: list[Path] = []
+    try:
+        import site
+        for sp in site.getsitepackages():
+            result.append(Path(sp))
+    except Exception:
+        pass
+
+    # Fallback: construct manually.  On POSIX:
+    #   sys.prefix / lib / python{X.Y} / site-packages
+    # On Windows:
+    #   sys.prefix / Lib / site-packages
+    if not result:
+        if _IS_WINDOWS:
+            result.append(Path(sys.prefix) / "Lib" / "site-packages")
+        else:
+            pyver = f"python{sys.version_info[0]}.{sys.version_info[1]}"
+            result.append(Path(sys.prefix) / "lib" / pyver / "site-packages")
+
+    _hermes_site_packages = result
+    return result
+
+
+# Regex to extract a Python version marker (e.g. ``python3.11``) from a path.
+# Matches ``python3.11``, ``python3.13``, etc. as a path component - i.e.
+# preceded by a path separator (``/`` or ``\``) or string start, and followed
+# by a separator or string end.  This is cross-platform: it works with both
+# POSIX forward-slash paths and Windows backslash paths regardless of the
+# host OS, so a POSIX host correctly detects version markers in Windows-style
+# paths (important for testing and for edge cases like WSL).
+_PYVER_IN_PATH_RE = re.compile(r"(?:^|[\\/])python(\d+)\.(\d+)(?:[\\/]|$)")
+
+# Regex to detect ``site-packages`` as a path component (not a substring of
+# a longer directory name).  Same cross-platform separator handling.
+_SITE_PACKAGES_RE = re.compile(r"(?:^|[\\/])site-packages(?:[\\/]|$)")
+
+
+def _strip_mismatched_site_packages(env: dict) -> None:
+    """Remove mismatched site-packages paths from PYTHONPATH.
+
+    The Desktop Electron process (and systemd units, gateway VBS launchers,
+    etc.) inject the Hermes venv's site-packages path (e.g.
+    ``.../venv/lib/python3.11/site-packages``) into ``PYTHONPATH`` so the
+    Hermes backend can import its packages.  When this ``PYTHONPATH`` leaks
+    into subprocesses running a **different** Python version (e.g. 3.13),
+    the 3.11 C extensions appear on ``sys.path`` ahead of the correct 3.13
+    versions and crash with ``ImportError`` (``PIL._imaging``,
+    ``cryptography``, etc.).
+
+    Rather than stripping ``PYTHONPATH`` entirely - which would discard
+    legitimate user entries (Nix uses ``PYTHONPATH`` for plugin discovery,
+    users set it for custom library paths) - this function surgically
+    removes only the dangerous entries:
+
+    1. **Cross-version site-packages** - any entry whose path contains a
+       ``python{X.Y}/site-packages`` component where ``{X.Y}`` differs from
+       the running interpreter's version.  This catches ALL leak sources
+       (Electron, systemd, gateway scripts) with a single version check,
+       regardless of the venv path.
+
+    2. **Hermes venv site-packages** (no version marker or same-version) -
+       entries that live under the running interpreter's own venv
+       site-packages directory.  These are redundant for subprocesses: the
+       Hermes backend discovers its packages via ``sys.path``, not via an
+       inherited env var.  Only checked when running inside a venv.
+
+    3. **Hermes repo root** - the Electron app prepends the repo root
+       (parent of ``tools/``) to ``PYTHONPATH``.  Subprocesses don't need
+       it and it can shadow local packages.
+
+    User ``PYTHONPATH`` entries (``/opt/my-lib``, Nix plugin paths, etc.)
+    are always preserved.
+    """
+    pp = env.get("PYTHONPATH")
+    if not pp:
+        return
+
+    hermes_site_packages = _get_hermes_site_packages() if _in_venv else []
+    running_major = sys.version_info[0]
+    running_minor = sys.version_info[1]
+
+    kept: list[str] = []
+    stripped: list[str] = []
+
+    for entry in pp.split(os.pathsep):
+        entry = entry.strip()
+        if not entry:
+            continue
+
+        entry_path = Path(entry)
+        should_strip = False
+
+        # --- Check 1: cross-version site-packages ---
+        # Look for a ``python{X.Y}`` path component and compare its version
+        # against the running interpreter.  If they differ, the entry's
+        # C extensions are ABI-incompatible - strip unconditionally.
+        # We search the full entry string (not ``entry_path.parts``) because
+        # ``Path.parts`` only splits on the host OS separator, so a Windows
+        # backslash path on a POSIX host would be a single un-split part.
+        m = _PYVER_IN_PATH_RE.search(entry)
+        if m:
+            entry_major = int(m.group(1))
+            entry_minor = int(m.group(2))
+            if (entry_major, entry_minor) != (running_major, running_minor):
+                should_strip = True
+        if should_strip:
+            stripped.append(entry)
+            continue
+
+        # --- Check 2: under Hermes venv site-packages ---
+        # The entry lives under the running interpreter's own venv
+        # site-packages.  Redundant for subprocesses (they get their packages
+        # via sys.path, not PYTHONPATH) and a common leak vector.
+        # Use the regex (not ``entry_path.parts``) for cross-platform detection
+        # so Windows backslash paths are caught on a POSIX host.
+        if not should_strip and _SITE_PACKAGES_RE.search(entry):
+            for sp in hermes_site_packages:
+                if _is_path_under(entry_path, sp):
+                    should_strip = True
+                    break
+        if should_strip:
+            stripped.append(entry)
+            continue
+
+        # --- Check 3: Hermes repo root ---
+        # The Electron app prepends the repo root so ``import tools`` works
+        # in the backend.  Subprocesses don't need it and it can shadow
+        # local packages of the same name.
+        if not should_strip and _is_path_under(entry_path, _hermes_repo_root):
+            # Only strip if the entry IS the repo root or a direct package
+            # dir under it (e.g. ``.../hermes-agent/tools``).  Don't strip
+            # arbitrary user paths that happen to be nested deeper.
+            rel = entry_path.resolve() if entry_path.exists() else entry_path
+            try:
+                depth = len(rel.relative_to(_hermes_repo_root).parts)
+            except (ValueError, OSError):
+                depth = -1
+            if depth <= 1:
+                should_strip = True
+
+        if should_strip:
+            stripped.append(entry)
+        else:
+            kept.append(entry)
+
+    if kept:
+        env["PYTHONPATH"] = os.pathsep.join(kept)
+    else:
+        env.pop("PYTHONPATH", None)
+
+    if stripped:
+        logger.debug(
+            "Stripped mismatched/Hermes-venv site-packages from PYTHONPATH: %s",
+            stripped,
+        )
 
 
 def _read_terminal_shell_init_config() -> tuple[list[str], bool]:
@@ -1360,6 +1645,8 @@ class LocalEnvironment(BaseEnvironment):
     Session snapshot preserves env vars across calls.
     CWD persists via file-based read after each command.
     """
+
+    _profile_scoped_passthrough = True
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):
         cwd = _resolve_local_initial_cwd(cwd)
@@ -1605,7 +1892,10 @@ class LocalEnvironment(BaseEnvironment):
             else:
                 # Stale / non-existent path — keep previous cwd; _run_bash
                 # will resolve a safe fallback on the next call if needed.
+                # The rollback restores a value this command did not observe,
+                # so it is not attributable to this command's session either.
                 self.cwd = prev_cwd
+                result.pop("cwd_observed", None)
 
     def cleanup(self):
         """Clean up temp files."""
