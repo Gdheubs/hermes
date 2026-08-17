@@ -497,9 +497,18 @@ def _prepare_cron_failure_alert(job: dict, error: str | None) -> str | None:
     if not isinstance(previous, dict):
         previous = {}
     same = previous.get("signature") == signature
-    consecutive = int(previous.get("consecutive", 0) or 0) + 1 if same else 1
-    suppressed = int(previous.get("suppressed", 0) or 0) if same else 0
-    last_notified = float(previous.get("last_notified", 0) or 0) if same else 0
+    try:
+        consecutive = int(previous.get("consecutive", 0) or 0) + 1 if same else 1
+    except (TypeError, ValueError):
+        consecutive = 1
+    try:
+        suppressed = int(previous.get("suppressed", 0) or 0) if same else 0
+    except (TypeError, ValueError):
+        suppressed = 0
+    try:
+        last_notified = float(previous.get("last_notified", 0) or 0) if same else 0
+    except (TypeError, ValueError):
+        last_notified = 0
     should_notify = not same or not last_notified or now - last_notified >= _CRON_FAILURE_ALERT_INTERVAL_SECONDS
     if not should_notify:
         suppressed += 1
@@ -509,7 +518,12 @@ def _prepare_cron_failure_alert(job: dict, error: str | None) -> str | None:
         "suppressed": suppressed,
         "last_notified": now if should_notify else last_notified,
     }
-    update_job(job["id"], {"failure_alert": state})
+    try:
+        update_job(job["id"], {"failure_alert": state})
+    except Exception:
+        # Alert bookkeeping must never turn the original cron failure into a
+        # scheduler failure. The next run can retry the state write.
+        logger.debug("Could not persist failure-alert state for %s", job.get("id"), exc_info=True)
     if not should_notify:
         return None
     message = _summarize_cron_failure_for_delivery(job, error)
