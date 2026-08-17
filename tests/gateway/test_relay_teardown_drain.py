@@ -68,7 +68,12 @@ async def test_disconnect_still_bounded_when_connector_silent():
     await t.disconnect()
     elapsed = asyncio.get_running_loop().time() - started
 
-    assert fut.done() and fut.exception() is not None
+    assert fut.done(), "pending outbound left unresolved after the drain gave up"
+    # Settled with a failure RESULT rather than an exception: send_outbound() is
+    # documented to return {success, error?} and RelayAdapter.send consumes it
+    # with no try. `.result()` re-raises if an exception was set, so this also
+    # pins that the waiter is answered rather than thrown at.
+    assert fut.result() == {"success": False, "error": "relay transport closed"}
     assert elapsed < 10.0, f"teardown took {elapsed:.1f}s — grace must be bounded"
 
 

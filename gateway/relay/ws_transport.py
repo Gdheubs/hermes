@@ -561,7 +561,7 @@ class WebSocketRelayTransport:
                 if _grace > 0:
                     try:
                         # asyncio.wait (not wait_for+gather): on timeout it must NOT
-                        # cancel the futures — the fail-any-remaining loop below owns
+                        # cancel the futures — the _fail_pending() pass below owns
                         # their terminal state.
                         await asyncio.wait(pending, timeout=_grace)
                     except Exception:  # noqa: BLE001 - grace is best-effort
@@ -590,17 +590,17 @@ class WebSocketRelayTransport:
                 finally:
                     self._ws = None
         finally:
-            # Fail any in-flight outbound waiters so callers don't hang.
+            # Answer any in-flight outbound waiters so callers don't hang. A
+            # RESULT, not an exception: send_outbound()'s contract is a result
+            # dict and RelayAdapter consumes it without a try (see
+            # _fail_pending).
             # Runs in a finally so a cancellation landing anywhere in the
             # drain/teardown above (the runner's wait_for budget, an outer
             # cleanup deadline) can NEVER leave a registered future
             # unresolved — a stranded waiter would otherwise block until
             # _OUTBOUND_TIMEOUT_S (30s). Idempotent: done futures are
             # skipped, so a second disconnect() pass is safe.
-            for fut in self._pending.values():
-                if not fut.done():
-                    fut.set_exception(RuntimeError("relay transport closed"))
-            self._pending.clear()
+            self._fail_pending("relay transport closed")
             if self._going_idle_ack is not None and not self._going_idle_ack.done():
                 self._going_idle_ack.set_exception(RuntimeError("relay transport closed"))
 
@@ -736,16 +736,24 @@ class WebSocketRelayTransport:
         if self._ws is None:
             return False
         acked = await self.go_idle(timeout_s=timeout_s)
+        ws = self._ws
         # Mark dormant BEFORE closing so the supervisor (armed by the reader's
         # fall-through) takes the dormant cadence, and a racing live event can't
         # flip us back to a fast reconnect.
         self._dormant = True
         try:
             await asyncio.wait_for(
-                self._ws.close(), timeout=_TEARDOWN_AWAIT_TIMEOUT_S
+                ws.close(), timeout=_TEARDOWN_AWAIT_TIMEOUT_S
             )
         except (asyncio.TimeoutError, Exception):  # noqa: BLE001 - best-effort; the reader still ends + arms reconnect
             logger.debug("relay go_dormant: ws.close() raised or timed out", exc_info=True)
+        # Drop the handle so the dormant window is DETERMINISTICALLY "not
+        # connected" for every `self._ws is None` guard, instead of depending on
+        # the reader's fall-through winning the race against the next send.
+        # Guarded on identity so a re-dial that already landed during the close
+        # await (the dormant poll cadence is short) is never clobbered.
+        if self._ws is ws:
+            self._ws = None
         return acked
 
     async def _send_inbound_ack(self, buffer_id: str) -> None:
@@ -759,6 +767,22 @@ class WebSocketRelayTransport:
             await self._send({"type": "inbound_ack", "bufferId": buffer_id})
         except Exception:  # noqa: BLE001 - a failed ack just redelivers the entry next time
             logger.debug("relay: inbound_ack send failed for %s", buffer_id)
+
+    def _fail_pending(self, error: str) -> None:
+        """Settle every in-flight outbound waiter with a structured failure.
+
+        ``send_outbound`` / ``send_follow_up`` are documented (RelayTransport)
+        to RETURN ``{success, message_id?, error?}``, and ``RelayAdapter.send``
+        / ``send_for_platform`` / ``edit_message`` consume that dict with no
+        ``try`` — only the cosmetic typing lanes wrap the call. So a waiter that
+        can no longer be answered gets a result, never an exception: the caller
+        sees ``SendResult(success=False, error=...)`` and can fall back, exactly
+        as it already does for the no-transport case.
+        """
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_result({"success": False, "error": error})
+        self._pending.clear()
 
     async def _request_response(
         self,
@@ -796,6 +820,21 @@ class WebSocketRelayTransport:
             return await asyncio.wait_for(fut, timeout=self._outbound_timeout_s)
         except asyncio.TimeoutError:
             return {"success": False, "error": "relay outbound timed out"}
+        except Exception as exc:  # noqa: BLE001 - a dead socket is a failed send, not a raise
+            # No `is None` check can close the window where the peer closes
+            # BETWEEN the guard above and the send, so _send can still raise
+            # ConnectionClosed. Report it the same way as the not-connected
+            # case three lines up. CancelledError is a BaseException, so
+            # cancellation still propagates.
+            #
+            # Record the traceback before returning. The returned string carries
+            # the exception's text but nothing about where it came from, so
+            # without this an ordinary dead socket and a genuine defect in the
+            # frame-building above it are the same line in the log. Same debug
+            # level and exc_info the other best-effort catches in this module
+            # use (go_dormant's close, the inbound ack).
+            logger.debug("relay %s send failed", frame_type, exc_info=True)
+            return {"success": False, "error": f"relay send failed: {exc}"}
         finally:
             self._pending.pop(request_id, None)
 
@@ -815,7 +854,25 @@ class WebSocketRelayTransport:
                 *lines, buf = buf.split("\n")
                 for line in lines:
                     if line.strip():
-                        await self._handle_frame(line)
+                        try:
+                            await self._handle_frame(line)
+                        except Exception:  # noqa: BLE001 - one frame must not end the read loop
+                            # Unguarded, the FIRST raising frame ended the
+                            # `async for` outright — taking with it every frame
+                            # already parsed behind it in `lines` AND the
+                            # trailing partial in `buf`, which is reassigned
+                            # above before any of them dispatch. An
+                            # `outbound_result` batched behind a bad `inbound`
+                            # then never reached `_pending`, so an unrelated
+                            # send was answered by the connection-lost path
+                            # instead of by its own result. Skip the frame and
+                            # keep the rest of the chunk — the same disposition
+                            # `_handle_frame`'s own decode guard already takes.
+                            # `CancelledError` is a `BaseException`, so a
+                            # cancelled reader still unwinds.
+                            logger.warning(
+                                "relay: frame handler failed; skipping frame", exc_info=True
+                            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - log + let the task end; reconnection handled below
@@ -833,6 +890,18 @@ class WebSocketRelayTransport:
                     )
             elif not self._closing:
                 logger.warning("relay ws read loop ended: %s", exc)
+        # The socket is gone. Drop the handle FIRST — it is this transport's only
+        # liveness test, and until now NOTHING reset it outside disconnect(), so
+        # every `self._ws is None` guard (send / _request_response / go_idle /
+        # go_dormant) kept reporting "connected" for the whole outage while the
+        # supervisor re-dialed, and _send raised ConnectionClosed into callers
+        # that expect a result dict.
+        self._ws = None
+        # Then answer anything already in flight. Without this a waiter has no
+        # settler outside disconnect(), so it burns the FULL outbound budget
+        # (30s in production) and reports a bogus timeout for a socket that died
+        # immediately.
+        self._fail_pending("relay connection lost")
         # Phase 5 §5.3: the socket closed. If reconnect is enabled and this was
         # NOT a deliberate disconnect(), kick the reconnect supervisor so the
         # gateway re-dials + re-handshakes (which triggers the connector's
@@ -901,6 +970,14 @@ class WebSocketRelayTransport:
         try:
             frame = json.loads(line)
         except json.JSONDecodeError:
+            frame = None
+        # `json.loads` also succeeds on a bare array/string/number/null, so a
+        # frame that is well-formed JSON but not an OBJECT walked past the decode
+        # guard above and reached `frame.get(...)` as an `AttributeError` — out of
+        # the one function whose stated contract is that a bad frame is skipped,
+        # never fatal. Both cases mean the same thing: the connector sent
+        # something this protocol has no reading for.
+        if not isinstance(frame, dict):
             logger.warning("relay: skipping malformed frame")
             return
         ftype = frame.get("type")

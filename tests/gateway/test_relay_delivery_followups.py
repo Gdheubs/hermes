@@ -359,8 +359,11 @@ async def test_disconnect_cancellation_still_fails_pending_futures():
     assert fut.done(), (
         "pending outbound future left unresolved after cancelled disconnect"
     )
-    with pytest.raises(RuntimeError, match="relay transport closed"):
-        fut.result()
+    # Settled with a failure RESULT rather than an exception: send_outbound() is
+    # documented to return {success, error?} and RelayAdapter.send consumes it
+    # with no try. `.result()` re-raises if an exception was set, so this still
+    # proves the finally ran — and additionally pins the shape callers get.
+    assert fut.result() == {"success": False, "error": "relay transport closed"}
     assert not t._pending
 
 
