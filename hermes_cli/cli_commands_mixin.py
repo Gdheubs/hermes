@@ -787,9 +787,48 @@ class CLICommandsMixin:
         self.new_session()
         _cprint(f"{_DIM}Session reset. New tool configuration is active.{_RST}")
 
-    def _handle_profile_command(self):
-        """Display active profile name and home directory."""
+    def _handle_profile_command(self, command: str = "/profile") -> bool:
+        """Display the active profile or relaunch chat under another profile.
+
+        Status output stays on the shared ``execute_command("profile")`` path
+        so CLI/gateway/TUI keep status-output parity. Switching is a process
+        boundary (sticky selection + deferred relaunch) — not an in-place
+        HERMES_HOME mutation — and is terminal-CLI only.
+        """
+        from hermes_cli.profiles import get_active_profile_name, set_active_profile
         from hermes_cli.slash_exec import CommandContext, execute_command
+
+        parts = command.strip().split(maxsplit=1)
+        target = parts[1].strip() if len(parts) > 1 else ""
+
+        if target:
+            from hermes_cli.profiles import (
+                build_profile_switch_relaunch_argv,
+                normalize_profile_name,
+            )
+
+            try:
+                set_active_profile(target)
+            except (FileNotFoundError, ValueError) as exc:
+                print(f"  Error: {exc}")
+                return False
+
+            current = get_active_profile_name()
+            selected = normalize_profile_name(target)
+            if selected == current:
+                print(f"  Profile '{current}' is already active.")
+                return False
+
+            relaunch_argv = build_profile_switch_relaunch_argv(selected, ui="cli")
+            if "--resume" in relaunch_argv:
+                print(
+                    f"  Switching to profile '{selected}' "
+                    f"(resuming last session)..."
+                )
+            else:
+                print(f"  Switching to profile '{selected}'...")
+            self._pending_relaunch = relaunch_argv
+            return True
 
         reply = execute_command("profile", CommandContext(surface="cli"))
         profile_name = reply.data["profile"]
@@ -799,6 +838,7 @@ class CLICommandsMixin:
         print(f"  Profile: {profile_name}")
         print(f"  Home:    {display}")
         print()
+        return False
 
     def _handle_handoff_command(self, cmd_original: str) -> bool:
         """Handle ``/handoff <platform>`` — transfer this CLI session to a gateway platform.

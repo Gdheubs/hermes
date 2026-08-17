@@ -367,6 +367,9 @@ class GatewaySlashCommandsMixin:
         ``_run_agent`` and ``_reset_notice_session_info`` — and the command
         reports the active profile and default home, byte-identical to before.
         """
+        if event.get_command_args().strip():
+            return "Profile switching is only available in terminal chat."
+
         from hermes_constants import display_hermes_home
         from hermes_cli.slash_exec import CommandContext, execute_command
 

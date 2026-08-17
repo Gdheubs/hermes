@@ -387,6 +387,90 @@ def profile_exists(name: str) -> bool:
     return get_profile_dir(canon).is_dir()
 
 
+def _current_workspace_key() -> Optional[str]:
+    """Workspace identity for cwd-scoped resume (git root, else cwd)."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=5,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return os.path.abspath(result.stdout.strip())
+    except Exception:
+        pass
+    try:
+        return os.getcwd()
+    except Exception:
+        return None
+
+
+def resolve_profile_last_session(
+    name: str,
+    *,
+    source: str = "cli",
+    workspace_key: Optional[str] = None,
+) -> Optional[str]:
+    """Most recent session id in a profile's ``state.db`` (read-only).
+
+    Mirrors ``hermes -c`` resolution for that profile home: workspace-scoped
+    MRU first when *workspace_key* is set, then global MRU for *source*.
+    Returns ``None`` when the profile has no matching session (or no DB).
+    """
+    try:
+        from hermes_state import SessionDB
+
+        db_path = get_profile_dir(name) / "state.db"
+        if not db_path.exists():
+            return None
+        db = SessionDB(db_path=db_path, read_only=True)
+        try:
+            if workspace_key:
+                sessions = db.search_sessions(
+                    source=source, limit=1, workspace_key=workspace_key
+                )
+                if sessions:
+                    return sessions[0]["id"]
+            sessions = db.search_sessions(source=source, limit=1)
+            return sessions[0]["id"] if sessions else None
+        finally:
+            db.close()
+    except Exception:
+        return None
+
+
+def build_profile_switch_relaunch_argv(name: str, *, ui: str = "cli") -> list[str]:
+    """Build argv for a clean chat relaunch under *name*, resuming when possible.
+
+    Always includes ``--profile`` + chat UI flags. When the target profile has
+    a prior session for this UI (TUI falls back to CLI sessions), appends
+    ``--resume <id>`` so the relaunch lands on that conversation instead of a
+    blank chat. Fresh profiles with no sessions get a normal new chat.
+    """
+    selected = normalize_profile_name(name)
+    if ui == "tui":
+        argv = ["--profile", selected, "--tui", "chat"]
+        sources = ("tui", "cli")
+    else:
+        argv = ["--profile", selected, "--cli", "chat"]
+        sources = ("cli",)
+
+    ws_key = _current_workspace_key()
+    session_id: Optional[str] = None
+    for source in sources:
+        session_id = resolve_profile_last_session(
+            selected, source=source, workspace_key=ws_key
+        )
+        if session_id:
+            break
+    if session_id:
+        argv.extend(["--resume", session_id])
+    return argv
+
+
 # ---------------------------------------------------------------------------
 # Alias / wrapper script management
 # ---------------------------------------------------------------------------

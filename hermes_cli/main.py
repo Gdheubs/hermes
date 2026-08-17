@@ -2826,6 +2826,25 @@ def _launch_tui(
         print()
         relaunch(["update"], preserve_inherited=False)
 
+    # Exit code 43 = standalone TUI selected a profile. The RPC validated and
+    # persisted the target before the child exited, so relaunch a TUI process
+    # under that profile (resuming its last session when one exists) instead
+    # of mutating HERMES_HOME in place.
+    if code == 43:
+        from hermes_cli.profiles import (
+            build_profile_switch_relaunch_argv,
+            get_active_profile,
+        )
+        from hermes_cli.relaunch import relaunch
+
+        profile = get_active_profile()
+        relaunch_argv = build_profile_switch_relaunch_argv(profile, ui="tui")
+        if "--resume" in relaunch_argv:
+            print(f"\nSwitching to profile '{profile}' (resuming last session)...\n")
+        else:
+            print(f"\nSwitching to profile '{profile}'...\n")
+        relaunch(relaunch_argv, preserve_inherited=False)
+
     sys.exit(code)
 
 

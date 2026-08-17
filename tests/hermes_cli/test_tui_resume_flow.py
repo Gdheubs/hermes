@@ -254,6 +254,68 @@ def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):
     assert env["NODE_ENV"] == "production"
 
 
+def test_launch_tui_exit_code_43_relaunches_selected_profile(monkeypatch, main_mod):
+    from unittest.mock import patch
+
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    monkeypatch.setattr(main_mod.subprocess, "call", lambda *args, **kwargs: 43)
+
+    with (
+        patch("hermes_cli.profiles.get_active_profile", return_value="coder"),
+        patch(
+            "hermes_cli.profiles.build_profile_switch_relaunch_argv",
+            return_value=["--profile", "coder", "--tui", "chat"],
+        ) as build_argv,
+        patch("hermes_cli.relaunch.relaunch") as mock_relaunch,
+    ):
+        with pytest.raises(SystemExit) as exc:
+            main_mod._launch_tui()
+
+    assert exc.value.code == 43
+    build_argv.assert_called_once_with("coder", ui="tui")
+    mock_relaunch.assert_called_once_with(
+        ["--profile", "coder", "--tui", "chat"],
+        preserve_inherited=False,
+    )
+
+
+def test_launch_tui_exit_code_43_relaunches_with_resume(monkeypatch, main_mod):
+    from unittest.mock import patch
+
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    monkeypatch.setattr(main_mod.subprocess, "call", lambda *args, **kwargs: 43)
+    relaunch = [
+        "--profile",
+        "coder",
+        "--tui",
+        "chat",
+        "--resume",
+        "20260811_120000_abcdef",
+    ]
+
+    with (
+        patch("hermes_cli.profiles.get_active_profile", return_value="coder"),
+        patch(
+            "hermes_cli.profiles.build_profile_switch_relaunch_argv",
+            return_value=relaunch,
+        ),
+        patch("hermes_cli.relaunch.relaunch") as mock_relaunch,
+    ):
+        with pytest.raises(SystemExit) as exc:
+            main_mod._launch_tui()
+
+    assert exc.value.code == 43
+    mock_relaunch.assert_called_once_with(relaunch, preserve_inherited=False)
+
+
 
 
 def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path):

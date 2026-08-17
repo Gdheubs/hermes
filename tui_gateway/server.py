@@ -11725,6 +11725,7 @@ def _respond(rid, params, key, *, allow_expired=False):
 # NOTE: config.set intentionally stays in server.py for now — the in-flight
 # opt/model-resolution-core PR touches its body; move it to methods_config.py
 # in a follow-up once that PR lands.
+# profile.switch lives in methods_config.py (split handler modules).
 @method("config.set")
 def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")

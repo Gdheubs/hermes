@@ -421,6 +421,65 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, {"ok": False, "error": str(e)})
 
 
+@method("profile.switch")
+def _(rid, params: dict) -> dict:
+    """Show the runtime profile or select one for a clean chat relaunch.
+
+    Status (no name) reuses the shared ``execute_command("profile")`` executor
+    so CLI/gateway/TUI status text stays on one path. Selection is sticky +
+    process-boundary only and is restricted to standalone stdio terminal chat.
+    """
+    from hermes_cli.profiles import get_active_profile_name, set_active_profile
+    from hermes_cli.slash_exec import CommandContext, execute_command
+
+    target = str(params.get("name") or "").strip()
+    if not target:
+        reply = execute_command("profile", CommandContext(surface="tui"))
+        return _ok(
+            rid,
+            {
+                "profile": reply.data["profile"],
+                "home": reply.data["home"],
+                "relaunch": False,
+            },
+        )
+
+    transport = current_transport()
+    if transport is not None and transport is not _stdio_transport:
+        return _err(
+            rid,
+            4003,
+            "profile switching is only available in standalone terminal chat",
+        )
+
+    session = _sessions.get(str(params.get("session_id") or ""))
+    if session and session.get("running"):
+        return _err(
+            rid,
+            4009,
+            "session busy — /interrupt the current turn before switching profiles",
+        )
+
+    try:
+        set_active_profile(target)
+    except (FileNotFoundError, ValueError) as exc:
+        return _err(rid, 4002, str(exc))
+
+    current = get_active_profile_name()
+    selected = target.lower()
+    # Home after sticky write still reflects the *current* process HERMES_HOME
+    # until the parent relaunches with --profile; report the shared status home.
+    reply = execute_command("profile", CommandContext(surface="tui"))
+    return _ok(
+        rid,
+        {
+            "profile": selected,
+            "home": reply.data["home"],
+            "relaunch": selected != current,
+        },
+    )
+
+
 def register(server) -> None:
     """Bind this module's handlers onto ``server``'s globals and registry."""
     _registry.install(server)
