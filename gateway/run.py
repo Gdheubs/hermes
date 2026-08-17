@@ -20925,6 +20925,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if watch:
             watch.pop(quick_key, None)
 
+    async def _poll_heartbeat_watches_once(self) -> None:
+        """Dispatch one due heartbeat per idle watched session."""
+        watch = getattr(self, "_heartbeat_watch", None)
+        if not watch:
+            return
+
+        from hermes_cli.heartbeat import HeartbeatManager
+
+        for quick_key, (source, session_id) in list(watch.items()):
+            try:
+                adapter = self._adapter_for_source(source)
+                if adapter is None:
+                    continue
+
+                # Do not claim the due tick while any turn or follow-up owns
+                # the session. Re-checking on the next poll coalesces all
+                # missed intervals into one delivery after the session idles.
+                if (
+                    self._is_session_running(quick_key)
+                    or quick_key in getattr(adapter, "_active_sessions", {})
+                    or self._queue_depth(quick_key, adapter=adapter) > 0
+                ):
+                    continue
+
+                mgr = HeartbeatManager(session_id=session_id)
+                if not mgr.has_heartbeat():
+                    watch.pop(quick_key, None)
+                    continue
+                prompt = mgr.due_prompt()
+                if not prompt:
+                    continue
+
+                hb_event = MessageEvent(
+                    text=prompt,
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    message_id=None,
+                    channel_prompt=None,
+                )
+                # FIFO enqueueing alone cannot wake an idle session; it is
+                # drained only by an already-running adapter task. Enter via
+                # the adapter so it atomically claims the session and starts
+                # the proactive turn, while preserving normal auth/delivery.
+                await adapter.handle_message(hb_event)
+            except Exception as exc:
+                logger.debug("heartbeat poll for %s failed: %s", quick_key, exc)
+
     def _start_heartbeat_poller(self) -> None:
         """Start the single gateway-wide heartbeat poll task (idempotent)."""
         existing = getattr(self, "_heartbeat_poll_task", None)
@@ -20936,36 +20983,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         async def _poll_loop():
             while True:
                 await asyncio.sleep(POLL_SECONDS)
-                watch = getattr(self, "_heartbeat_watch", None)
-                if not watch:
-                    continue
-                for quick_key, (source, session_id) in list(watch.items()):
-                    try:
-                        # Busy sessions coalesce their tick to the next idle poll.
-                        if quick_key in self._running_agents:
-                            continue
-                        from hermes_cli.heartbeat import HeartbeatManager
-
-                        mgr = HeartbeatManager(session_id=session_id)
-                        if not mgr.has_heartbeat():
-                            watch.pop(quick_key, None)
-                            continue
-                        prompt = mgr.due_prompt()
-                        if not prompt:
-                            continue
-                        adapter = self._adapter_for_source(source)
-                        if adapter is None:
-                            continue
-                        hb_event = MessageEvent(
-                            text=prompt,
-                            message_type=MessageType.TEXT,
-                            source=source,
-                            message_id=None,
-                            channel_prompt=None,
-                        )
-                        self._enqueue_fifo(quick_key, hb_event, adapter)
-                    except Exception as exc:
-                        logger.debug("heartbeat poll for %s failed: %s", quick_key, exc)
+                await self._poll_heartbeat_watches_once()
 
         try:
             task = asyncio.create_task(_poll_loop())
