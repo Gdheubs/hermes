@@ -501,13 +501,19 @@ DEFAULT_CONTEXT_LENGTHS = {
     # https://platform.minimax.io/docs/api-reference/text-chat-openai
     "minimax-m3": 1000000,
     "minimax": 204800,
-    # GLM — GLM-5.2 ships with a 1M context window (verified empirically:
-    # needle-in-a-haystack retrieval at 789K prompt tokens succeeded with
-    # zero errors on api.z.ai/api/coding/paas/v4).  Older GLM models
-    # (5, 5.1, 5-turbo) are ~202K.  Longest-key-first substring matching
-    # ensures "glm-5.2" resolves to 1M while older variants still hit the
-    # generic 202K fallback.
+    # GLM — GLM-5.2 and GLM-5.3 ship with a 1M context window.
+    # GLM-5.2 verified empirically: needle-in-a-haystack retrieval at 789K
+    # prompt tokens succeeded with zero errors on api.z.ai/api/coding/paas/v4.
+    # GLM-5.3 verified empirically (2026-08-16): a 1,020,024-token prompt was
+    # accepted and answered via open.bigmodel.cn/api/anthropic with the bare
+    # model id (no [1m] suffix — that suffix is a Claude Code client-side
+    # marker, not part of the API model id; requests with the suffix are
+    # rejected with error 1214 "model not found").
+    # Older GLM models (5, 5.1, 5-turbo) are ~202K.  Longest-key-first
+    # substring matching ensures "glm-5.2"/"glm-5.3" resolve to 1M while
+    # older variants still hit the generic 202K fallback.
     "glm-5.2": 1_048_576,
+    "glm-5.3": 1_048_576,
     "glm": 202752,
     # xAI Grok — xAI /v1/models does not return context_length metadata,
     # so these hardcoded fallbacks prevent Hermes from probing-down to

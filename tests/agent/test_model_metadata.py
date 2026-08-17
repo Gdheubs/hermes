@@ -936,6 +936,39 @@ class TestGetModelContextLength:
         )
         assert result == 202752  # "glm" entry in DEFAULT_CONTEXT_LENGTHS
 
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    def test_glm_5_3_resolves_to_1m_not_generic_fallback(self, mock_endpoint_fetch, mock_fetch):
+        """GLM-5.3 must resolve to the 1M entry, not the generic ~202K "glm"
+        fallback.
+
+        Before the "glm-5.3" key was added to DEFAULT_CONTEXT_LENGTHS,
+        longest-key-first substring matching fell through to "glm" (202752),
+        under-reporting the real context window by ~5x and firing context
+        compression five times earlier than necessary on Zhipu endpoints
+        (verified empirically: a 1,020,024-token prompt is accepted by
+        open.bigmodel.cn/api/anthropic with the bare "glm-5.3" model id).
+        """
+        mock_fetch.return_value = {}
+        mock_endpoint_fetch.return_value = {}
+
+        result = get_model_context_length(
+            "glm-5.3",
+            base_url="https://open.bigmodel.cn/api/anthropic",
+            api_key="test-key",
+        )
+        assert result == 1_048_576
+
+        # Config override still wins over the catalog entry (resolution
+        # step 0), so users on restricted endpoints keep full control.
+        result_override = get_model_context_length(
+            "glm-5.3",
+            base_url="https://open.bigmodel.cn/api/anthropic",
+            api_key="test-key",
+            config_context_length=123_456,
+        )
+        assert result_override == 123_456
+
 
 
 
