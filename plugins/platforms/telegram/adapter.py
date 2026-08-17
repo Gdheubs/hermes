@@ -5374,8 +5374,31 @@ class TelegramAdapter(BasePlatformAdapter):
                     except Exception as send_err:
                         retry_after = getattr(send_err, "retry_after", None)
                         if retry_after is not None or "retry after" in str(send_err).lower():
+                            wait = float(retry_after) if retry_after is not None else 1.0
+                            # Long flood waits (RetryAfter) block this send path —
+                            # and with it message processing — for tens of
+                            # seconds. The edit path treats wait > 5s as a hard
+                            # failure so streaming can fall back to a normal
+                            # final send; mirror that here instead of sleeping on
+                            # a multi-minute RetryAfter. Short waits are still
+                            # retried inline.
+                            if wait > 5.0:
+                                safe_send_error = _redact_telegram_error_text(send_err)
+                                logger.warning(
+                                    "[%s] Telegram flood control on send (attempt %d/3) requires %.1fs wait — failing fast: %s",
+                                    self.name,
+                                    _send_attempt + 1,
+                                    wait,
+                                    safe_send_error,
+                                )
+                                return SendResult(
+                                    success=False,
+                                    error=safe_send_error,
+                                    retryable=False,
+                                    retry_after=wait,
+                                    error_kind="rate_limited",
+                                )
                             if _send_attempt < 2:
-                                wait = float(retry_after) if retry_after is not None else 1.0
                                 safe_send_error = _redact_telegram_error_text(send_err)
                                 logger.warning(
                                     "[%s] Telegram flood control on send (attempt %d/3), retrying in %.1fs: %s",
