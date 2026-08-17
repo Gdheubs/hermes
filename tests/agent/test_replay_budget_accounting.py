@@ -156,3 +156,43 @@ class TestTailCutBehavior:
         # index = more messages in the tail), and strictly more here because
         # the stale thinking dominates each message's old-cost.
         assert cut < old_cut
+
+    def test_codex_responses_charges_stale_thinking_in_tail(self):
+        """Codex Responses must find a middle window when stale reasoning is
+        what pushed the full request over the compaction threshold (#84371)."""
+        from agent.context_compressor import ContextCompressor
+
+        msgs = [{"role": "system", "content": "sys"}]
+        for i in range(30):
+            msgs.append({"role": "user", "content": f"question {i}"})
+            msgs.append(
+                {
+                    "role": "assistant",
+                    "content": f"answer {i}",
+                    "reasoning": BIG_THINKING,
+                    "reasoning_content": BIG_THINKING,
+                }
+            )
+
+        non_codex = ContextCompressor(
+            model="test-model",
+            api_mode="chat_completions",
+            quiet_mode=True,
+            config_context_length=200_000,
+        )
+        codex = ContextCompressor(
+            model="test-model",
+            api_mode="codex_responses",
+            quiet_mode=True,
+            config_context_length=200_000,
+        )
+
+        budget = 3_000
+        non_codex_cut = non_codex._find_tail_cut_by_tokens(msgs, 1, token_budget=budget)
+        codex_cut = codex._find_tail_cut_by_tokens(msgs, 1, token_budget=budget)
+
+        # Non-Codex keeps #73624's larger tail because stale thinking is not
+        # sent. Codex charges the replayed reasoning and leaves a real middle
+        # region for compaction instead of protecting the whole transcript.
+        assert codex_cut > non_codex_cut
+        assert 1 < codex_cut < len(msgs) - 3
