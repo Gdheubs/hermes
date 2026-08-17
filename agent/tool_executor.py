@@ -87,7 +87,18 @@ def _budget_for_agent(agent) -> BudgetConfig:
     """
     try:
         ctx = getattr(getattr(agent, "context_compressor", None), "context_length", None)
-        return budget_for_context_window(int(ctx)) if ctx else DEFAULT_BUDGET
+        try:
+            from hermes_cli.config import load_config
+
+            root_config = load_config() or {}
+            tools_config = root_config.get("tools") or {}
+            result_budget_config = tools_config.get("result_budget") or {}
+        except Exception:
+            result_budget_config = None
+        return budget_for_context_window(
+            int(ctx) if ctx else None,
+            result_budget_config=result_budget_config,
+        )
     except Exception:
         return DEFAULT_BUDGET
 

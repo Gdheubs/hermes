@@ -2602,6 +2602,11 @@ DEFAULT_CONFIG = {
             # estimate), regardless of context size. Range 200..60000.
             "listing_max_tokens": 4000,
         },
+        "result_budget": {
+            # Optional cap for tools deferred behind tool_search. ``null``
+            # preserves the registry/context-scaled threshold.
+            "deferred_result_size_chars": None,
+        },
     },
 
     # Logging — controls file logging to ~/.hermes/logs/.

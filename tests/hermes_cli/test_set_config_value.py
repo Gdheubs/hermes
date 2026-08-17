@@ -111,6 +111,17 @@ class TestConfigYamlRouting:
         assert "not a recognized config key" not in capsys.readouterr().out
         assert "script_timeout_seconds: 600" in _read_config(_isolated_hermes_home)
 
+    def test_deferred_result_budget_is_recognized(
+        self, _isolated_hermes_home, capsys
+    ):
+        set_config_value("tools.result_budget.deferred_result_size_chars", "20000")
+
+        import yaml
+
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert saved["tools"]["result_budget"]["deferred_result_size_chars"] == 20_000
+        assert "not a recognized config key" not in capsys.readouterr().out
+
     def test_terminal_docker_cwd_mount_flag_goes_to_config_and_env(self, _isolated_hermes_home):
         set_config_value("terminal.docker_mount_cwd_to_workspace", "true")
         config = _read_config(_isolated_hermes_home)

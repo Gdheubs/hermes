@@ -1,10 +1,10 @@
 """Configurable budget constants for tool result persistence.
 
-Per-tool resolution: pinned > config overrides > registry > default.
+Per-tool resolution: pinned > exact overrides > deferred cap > registry > default.
 """
 
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Any, Dict, Mapping
 
 # Tools whose thresholds must never be overridden.
 # read_file=inf prevents infinite persist->read->persist loops.
@@ -32,12 +32,14 @@ class BudgetConfig:
     default_result_size: int = DEFAULT_RESULT_SIZE_CHARS
     turn_budget: int = DEFAULT_TURN_BUDGET_CHARS
     preview_size: int = DEFAULT_PREVIEW_SIZE_CHARS
+    deferred_result_size: int | None = None
     tool_overrides: Dict[str, int] = field(default_factory=dict)
 
     def resolve_threshold(self, tool_name: str) -> int | float:
         """Resolve the persistence threshold for a tool.
 
-        Priority: pinned -> tool_overrides -> registry per-tool -> default.
+        Priority: pinned -> tool_overrides -> deferred-tool cap -> registry
+        per-tool/default.
 
         The registry per-tool value is capped at ``default_result_size`` so a
         context-scaled budget (small model) actually constrains tools that
@@ -52,9 +54,22 @@ class BudgetConfig:
             return self.tool_overrides[tool_name]
         from tools.registry import registry
         registry_value = registry.get_max_result_size(tool_name, default=self.default_result_size)
-        if registry_value == float("inf"):
-            return registry_value
-        return min(registry_value, self.default_result_size)
+        threshold = (
+            registry_value
+            if registry_value == float("inf")
+            else min(registry_value, self.default_result_size)
+        )
+        if self.deferred_result_size is not None:
+            try:
+                from tools.tool_search import is_deferrable_tool_name
+
+                if is_deferrable_tool_name(tool_name):
+                    threshold = min(threshold, self.deferred_result_size)
+            except Exception:
+                # Classification is best effort. Retain the normal cap rather
+                # than accidentally constraining an unknown core tool.
+                pass
+        return threshold
 
 
 # Default config -- matches current hardcoded behavior exactly.
@@ -81,7 +96,35 @@ _MIN_RESULT_SIZE_CHARS: int = 8_000
 _MIN_TURN_BUDGET_CHARS: int = 16_000
 
 
-def budget_for_context_window(context_length: int | None) -> BudgetConfig:
+def _with_result_budget_config(
+    base: BudgetConfig,
+    result_budget_config: Mapping[str, Any] | None,
+) -> BudgetConfig:
+    """Apply validated user-facing result-budget overrides to *base*."""
+    if not isinstance(result_budget_config, Mapping):
+        return base
+    raw_cap = result_budget_config.get("deferred_result_size_chars")
+    if raw_cap is None or isinstance(raw_cap, bool):
+        return base
+    try:
+        deferred_cap = int(raw_cap)
+    except (TypeError, ValueError, OverflowError):
+        return base
+    if deferred_cap <= 0:
+        return base
+    return BudgetConfig(
+        default_result_size=base.default_result_size,
+        turn_budget=base.turn_budget,
+        preview_size=base.preview_size,
+        deferred_result_size=deferred_cap,
+        tool_overrides=base.tool_overrides,
+    )
+
+
+def budget_for_context_window(
+    context_length: int | None,
+    result_budget_config: Mapping[str, Any] | None = None,
+) -> BudgetConfig:
     """Return a BudgetConfig scaled to the active model's context window.
 
     The fixed defaults (100K result / 200K turn chars) are correct for large
@@ -96,7 +139,7 @@ def budget_for_context_window(context_length: int | None) -> BudgetConfig:
     always survives.
     """
     if not context_length or context_length <= 0:
-        return DEFAULT_BUDGET
+        return _with_result_budget_config(DEFAULT_BUDGET, result_budget_config)
 
     window_chars = context_length * _CHARS_PER_TOKEN
     per_result = int(window_chars * _PER_RESULT_WINDOW_FRACTION)
@@ -107,8 +150,9 @@ def budget_for_context_window(context_length: int | None) -> BudgetConfig:
     per_result = max(_MIN_RESULT_SIZE_CHARS, min(per_result, DEFAULT_RESULT_SIZE_CHARS))
     per_turn = max(_MIN_TURN_BUDGET_CHARS, min(per_turn, DEFAULT_TURN_BUDGET_CHARS))
 
-    return BudgetConfig(
+    base = BudgetConfig(
         default_result_size=per_result,
         turn_budget=per_turn,
         preview_size=DEFAULT_PREVIEW_SIZE_CHARS,
     )
+    return _with_result_budget_config(base, result_budget_config)

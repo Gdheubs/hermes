@@ -745,6 +745,23 @@ tool_output:
   max_lines: 500
 ```
 
+### Deferred Tool Result Persistence
+
+Plugin and MCP tools loaded through `tool_search` can return provider-native
+payloads much larger than the active task needs. Set an opt-in cap to persist
+those oversized results to disk earlier while returning a compact preview and
+file handle to the agent:
+
+```yaml
+tools:
+  result_budget:
+    deferred_result_size_chars: 20000
+```
+
+The cap applies only to deferred/plugin tool names. Core tools keep their
+normal context-scaled thresholds, and exact per-tool overrides still take
+precedence. Omit the key to preserve the default behavior.
+
 ## Global Toolset Disable
 
 To suppress specific toolsets across the CLI and every gateway platform in one
