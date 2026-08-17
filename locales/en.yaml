@@ -13,9 +13,9 @@
 approval:
   # CLI approval prompt -- shown when a dangerous command needs user review.
   dangerous_header: "⚠️  DANGEROUS COMMAND: {description}"
-  choose_long:     "      [o]nce  |  [s]ession  |  [a]lways  |  [d]eny"
+  choose_long:     "      [o]nce  |  [s]ession  |  [a]lways  |  [c]hanges  |  [d]eny"
   choose_short:    "      [o]nce  |  [s]ession  |  [d]eny"
-  prompt_long:     "      Choice [o/s/a/D]: "
+  prompt_long:     "      Choice [o/s/a/c/D]: "
   prompt_short:    "      Choice [o/s/D]: "
   choose_smart_deny: "      [o]nce  |  [d]eny"
   prompt_smart_deny: "      Choice [o/D]: "
@@ -28,6 +28,17 @@ approval:
   denied:          "      ✗ Denied"
   cancelled:       "      ✗ Cancelled"
   blocklist_message: "This command is on the unconditional blocklist and cannot be approved."
+  changes_prompt: "      📝 Describe the changes needed (empty cancels): "
+  changes_empty: "      ✗ No feedback given – command denied"
+  changes_received: "      ✓ Feedback captured – agent will revise the command"
+  button_once: "✅ Allow Once"
+  button_session: "✅ Session"
+  button_always: "✅ Always"
+  button_changes: "📝 Request Changes"
+  button_deny: "❌ Deny"
+  changes_telegram_prompt: "📝 Reply to this message with the changes you want (or \"cancel\" to deny)."
+  changes_resolved: "📝 Changes requested by {user}"
+  changes_resolved_short: "📝 Request Changes"
 
 gateway:
   # Messenger replies to slash commands and implicit state changes.

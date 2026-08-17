@@ -8,9 +8,9 @@
 
 approval:
   dangerous_header: "⚠️  أمر خطير: {description}"
-  choose_long:     "      [o] مرة  |  [s] الجلسة  |  [a] دائمًا  |  [d] رفض"
+  choose_long:     "      [o] مرة  |  [s] الجلسة  |  [a] دائمًا  |  [c] تعديلات  |  [d] رفض"
   choose_short:    "      [o] مرة  |  [s] الجلسة  |  [d] رفض"
-  prompt_long:     "      الاختيار [o/s/a/D]: "
+  prompt_long:     "      الاختيار [o/s/a/c/D]: "
   prompt_short:    "      الاختيار [o/s/D]: "
   choose_smart_deny: "      [o] مرة  |  [d] رفض"
   prompt_smart_deny: "      الاختيار [o/D]: "
@@ -23,6 +23,17 @@ approval:
   denied:          "      ✗ مرفوض"
   cancelled:       "      ✗ أُلغي"
   blocklist_message: "هذا الأمر مدرج في قائمة الحظر غير المشروطة ولا يمكن الموافقة عليه."
+  changes_prompt: "      📝 صف التعديلات المطلوبة (فارغ يلغي): "
+  changes_empty: "      ✗ لم يُقدَّم ملاحظات – تم رفض الأمر"
+  changes_received: "      ✓ تم التقاط الملاحظات – سيعيد الوكيل صياغة الأمر"
+  button_once: "✅ السماح مرة"
+  button_session: "✅ الجلسة"
+  button_always: "✅ دائمًا"
+  button_changes: "📝 طلب تعديلات"
+  button_deny: "❌ رفض"
+  changes_telegram_prompt: "📝 ارد على هذه الرسالة بالتعديلات المطلوبة (أو \"cancel\" للرفض)."
+  changes_resolved: "📝 طلب {user} تعديلات"
+  changes_resolved_short: "📝 طلب تعديلات"
 
 gateway:
   context:

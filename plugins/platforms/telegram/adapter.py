@@ -886,7 +886,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}
         self._choice_picker_state: Dict[str, dict] = {}
         # Approval button state: message_id → session_key
-        self._approval_state: Dict[int, str] = {}
+        self._approval_state: Dict[int, Any] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
         # and any other slash-confirm prompts; see GatewayRunner._request_slash_confirm).
         self._slash_confirm_state: Dict[str, str] = {}
@@ -6171,22 +6171,53 @@ class TelegramAdapter(BasePlatformAdapter):
                 self._approval_counter = itertools.count(1)
             approval_id = next(self._approval_counter)
 
-            buttons = [
-                InlineKeyboardButton("✅ Allow Once", callback_data=f"ea:once:{approval_id}")
-            ]
-            if not smart_denied and allow_session:
-                buttons.append(
-                    InlineKeyboardButton("✅ Session", callback_data=f"ea:session:{approval_id}")
-                )
-                if allow_permanent:
-                    buttons.append(
-                        InlineKeyboardButton("✅ Always", callback_data=f"ea:always:{approval_id}")
+            # Issue #25693: "Request Changes" sits between Always and Deny as
+            # the collaboration option. Order matters -- the destructive
+            # choice (Deny) stays last so it never gets clicked by reflex.
+            try:
+                from agent.i18n import t as _t_btn
+                _btn_once = _t_btn("approval.button_once")
+                _btn_session = _t_btn("approval.button_session")
+                _btn_always = _t_btn("approval.button_always")
+                _btn_changes = _t_btn("approval.button_changes")
+                _btn_deny = _t_btn("approval.button_deny")
+            except Exception:
+                _btn_once = "✅ Allow Once"
+                _btn_session = "✅ Session"
+                _btn_always = "✅ Always"
+                _btn_changes = "📝 Request Changes"
+                _btn_deny = "❌ Deny"
+
+            if smart_denied:
+                keyboard = InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton(_btn_once, callback_data=f"ea:once:{approval_id}"),
+                        InlineKeyboardButton(_btn_deny, callback_data=f"ea:deny:{approval_id}"),
+                    ],
+                ])
+            else:
+                row1 = [
+                    InlineKeyboardButton(_btn_once, callback_data=f"ea:once:{approval_id}"),
+                ]
+                if allow_session:
+                    row1.append(
+                        InlineKeyboardButton(_btn_session, callback_data=f"ea:session:{approval_id}")
                     )
-            buttons.append(InlineKeyboardButton("❌ Deny", callback_data=f"ea:deny:{approval_id}"))
-            # Pair into rows (2x2 for the full set) so labels stay readable on
-            # mobile — a single 4-button row truncates to "Allo… / Ses… / …".
-            rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-            keyboard = InlineKeyboardMarkup(rows)
+                row2 = []
+                if allow_permanent:
+                    row2.append(
+                        InlineKeyboardButton(_btn_always, callback_data=f"ea:always:{approval_id}")
+                    )
+                row2.append(
+                    InlineKeyboardButton(_btn_changes, callback_data=f"ea:changes:{approval_id}")
+                )
+                keyboard = InlineKeyboardMarkup([
+                    row1,
+                    row2,
+                    [
+                        InlineKeyboardButton(_btn_deny, callback_data=f"ea:deny:{approval_id}"),
+                    ],
+                ])
 
             kwargs: Dict[str, Any] = {
                 "chat_id": normalize_telegram_chat_id(chat_id),
@@ -6210,7 +6241,10 @@ class TelegramAdapter(BasePlatformAdapter):
             msg = await self._send_message_with_thread_fallback(**kwargs)
 
             # Store session_key keyed by approval_id for the callback handler
-            self._approval_state[approval_id] = session_key
+            self._approval_state[approval_id] = {
+                "session_key": session_key,
+                "status": "pending",
+            }
 
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
@@ -7009,6 +7043,194 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             pass
 
+    async def _begin_approval_changes_capture(
+        self,
+        *,
+        query,
+        approval_id: int,
+        session_key: str,
+        user_display: str,
+    ) -> None:
+        """Issue #25693: "Request Changes" flow.
+
+        When the user clicks 📝 Request Changes on an approval prompt we:
+
+          1. Edit the approval message to show "awaiting feedback" state
+             (no buttons -- prevents double-clicks and races).
+          2. Register a ``clarify_gateway`` entry in ``awaiting_text`` mode
+             so the existing gateway intercept resolves the user's next
+             typed reply as the feedback.
+          3. Spawn a background task that bridges the clarify resolution
+             into ``resolve_gateway_approval(session_key, "changes",
+             feedback=...)`` -- this unblocks the agent thread waiting in
+             ``check_dangerous_command`` and carries the feedback inline.
+
+        The approval entry stays in ``_approval_state`` with
+        ``status="capturing"`` for the whole capture window so a duplicate
+        click on the original message is rejected up front (before a second
+        clarify bridge can race). We pop it only after the bridge resolves
+        (or on timeout / cancel / setup failure).
+        """
+        # Build clarify entry. ID format mirrors the existing convention
+        # used by send_clarify so logs are easy to grep across both paths.
+        clarify_id = f"approval-changes-{approval_id}"
+
+        try:
+            from tools import clarify_gateway as _clarify_mod
+        except Exception as exc:
+            logger.error(
+                "[%s] cannot start request-changes capture: clarify_gateway "
+                "import failed: %s", self.name, exc,
+            )
+            # Fall back gracefully: treat as deny so the agent thread
+            # never hangs.
+            try:
+                from tools.approval import resolve_gateway_approval
+                resolve_gateway_approval(session_key, "deny")
+            finally:
+                self._approval_state.pop(approval_id, None)
+            await query.answer(text="⚠️ Could not start feedback capture; denied instead.")
+            return
+
+        entry = _clarify_mod.register(
+            clarify_id=clarify_id,
+            session_key=session_key,
+            question="What changes would you like to the command?",
+            choices=None,  # open-ended → awaiting_text=True
+        )
+
+        # Acknowledge click + edit the original approval message so it's
+        # clear we're waiting on the user.
+        try:
+            from agent.i18n import t
+            short = t("approval.changes_resolved_short")
+            prompt = t("approval.changes_telegram_prompt")
+        except Exception:
+            short = "📝 Request changes"
+            prompt = (
+                "📝 Reply to this message with the changes you'd like "
+                "(or \"cancel\" to deny instead)."
+            )
+
+        await query.answer(text=short)
+        try:
+            await query.edit_message_text(
+                text=(
+                    f"{_html.escape(query.message.text or '')}\n\n"
+                    f"<i>{_html.escape(prompt)}</i>\n"
+                    f"<i>Awaiting feedback from {_html.escape(user_display)}…</i>"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=None,
+            )
+        except Exception:
+            # Non-fatal -- the message edit is cosmetic. The bridge below
+            # is what actually delivers the feedback to the agent.
+            pass
+
+        # Bridge: wait for the clarify to resolve, then forward the
+        # feedback into the approval resolver. Runs on the event loop so
+        # it doesn't block the callback handler. Uses a long-but-bounded
+        # timeout (default 10 min) -- on timeout we treat it as a deny so
+        # the agent never hangs.
+        timeout = float(_clarify_mod.get_clarify_timeout() or 600)
+        loop = asyncio.get_running_loop()
+        original_text = query.message.text or ""
+        original_chat_id = query.message.chat_id if query.message else None
+        original_message_id = query.message.message_id if query.message else None
+
+        async def _bridge() -> None:
+            try:
+                # wait_for_response is sync (blocks on threading.Event) so
+                # run it in an executor to keep the loop alive for other
+                # gateway traffic.
+                response: Optional[str] = await loop.run_in_executor(
+                    None,
+                    _clarify_mod.wait_for_response,
+                    clarify_id,
+                    timeout,
+                )
+            except Exception as exc:
+                logger.error(
+                    "[%s] approval-changes bridge wait failed (session=%s, id=%s): %s",
+                    self.name, session_key, approval_id, exc,
+                )
+                response = None
+
+            # Always clean up our approval state, regardless of outcome.
+            self._approval_state.pop(approval_id, None)
+
+            feedback = (response or "").strip()
+            # "cancel" is a documented escape hatch (matches the prompt
+            # text). Treat case-insensitively but require an exact word so
+            # legitimate feedback containing the word elsewhere still
+            # flows through ("cancel this DELETE and use UPSERT instead").
+            if feedback.lower() == "cancel":
+                feedback = ""
+
+            try:
+                from tools.approval import resolve_gateway_approval
+                if feedback:
+                    resolve_gateway_approval(
+                        session_key, "changes", feedback=feedback,
+                    )
+                    final_label = (
+                        f"📝 Changes requested by {user_display}"
+                    )
+                    final_body = (
+                        f"{_html.escape(original_text)}\n\n"
+                        f"<b>{_html.escape(user_display)} requested changes:</b>\n"
+                        f"<pre>{_html.escape(feedback)}</pre>"
+                    )
+                else:
+                    resolve_gateway_approval(session_key, "deny")
+                    final_label = (
+                        f"❌ Denied by {user_display} (no feedback / cancelled)"
+                    )
+                    final_body = (
+                        f"{_html.escape(original_text)}\n\n"
+                        f"<i>{_html.escape(final_label)}</i>"
+                    )
+            except Exception as exc:
+                logger.error(
+                    "[%s] approval-changes bridge resolver failed "
+                    "(session=%s, id=%s): %s",
+                    self.name, session_key, approval_id, exc,
+                )
+                return
+
+            # Edit the original approval message to its terminal state so
+            # the chat history shows what actually happened.
+            if original_chat_id is not None and original_message_id is not None and self._bot:
+                try:
+                    await self._bot.edit_message_text(
+                        chat_id=original_chat_id,
+                        message_id=original_message_id,
+                        text=final_body,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    # Already edited / message gone / no permission -- fine.
+                    pass
+
+            logger.info(
+                "[%s] approval-changes resolved (session=%s, id=%s, feedback=%r, user=%s)",
+                self.name,
+                session_key,
+                approval_id,
+                feedback[:80] if feedback else "",
+                user_display,
+            )
+
+        # Fire-and-forget; the loop owns the lifecycle.
+        asyncio.create_task(_bridge())
+        logger.info(
+            "[%s] approval-changes capture started (session=%s, approval_id=%s, "
+            "clarify_id=%s, user=%s, timeout=%ss)",
+            self.name, session_key, approval_id, clarify_id,
+            user_display, int(timeout),
+        )
+
     async def _handle_callback_query(
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
@@ -7054,7 +7276,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if data.startswith("ea:"):
             parts = data.split(":", 2)
             if len(parts) == 3:
-                choice = parts[1]  # once, session, always, deny
+                choice = parts[1]  # once, session, always, changes, deny
                 try:
                     approval_id = int(parts[2])
                 except (ValueError, IndexError):
@@ -7073,7 +7295,55 @@ class TelegramAdapter(BasePlatformAdapter):
                     await query.answer(text="⛔ You are not authorized to approve commands.")
                     return
 
-                session_key = self._approval_state.pop(approval_id, None)
+                # "Request changes" needs the approval entry to stay pending
+                # while we collect free-text feedback. Peek (don't pop) so
+                # the entry survives across the user's typed reply. Every
+                # other choice still uses the pop-on-resolve flow because
+                # those terminate the approval immediately.
+                user_display = getattr(query.from_user, "first_name", "User")
+                if choice == "changes":
+                    state = self._approval_state.get(approval_id)
+                    if not state:
+                        await query.answer(text="This approval has already been resolved.")
+                        return
+                    # Normalize legacy str entries and reject duplicate capture clicks.
+                    if isinstance(state, str):
+                        state = {"session_key": state, "status": "pending"}
+                        self._approval_state[approval_id] = state
+                    if not isinstance(state, dict):
+                        await query.answer(text="This approval has already been resolved.")
+                        return
+                    if state.get("status") == "capturing":
+                        await query.answer(text="Already collecting feedback for this approval.")
+                        return
+                    session_key = state.get("session_key")
+                    if not session_key:
+                        await query.answer(text="This approval has already been resolved.")
+                        return
+                    # Mark capturing BEFORE starting the bridge so a second
+                    # click cannot spawn a parallel capture on the same id.
+                    state["status"] = "capturing"
+                    await self._begin_approval_changes_capture(
+                        query=query,
+                        approval_id=approval_id,
+                        session_key=session_key,
+                        user_display=user_display,
+                    )
+                    return
+
+                state = self._approval_state.pop(approval_id, None)
+                if not state:
+                    await query.answer(text="This approval has already been resolved.")
+                    return
+                if isinstance(state, dict):
+                    if state.get("status") == "capturing":
+                        # Feedback capture in flight — ignore competing choices.
+                        self._approval_state[approval_id] = state
+                        await query.answer(text="Already collecting feedback for this approval.")
+                        return
+                    session_key = state.get("session_key")
+                else:
+                    session_key = state
                 if not session_key:
                     await query.answer(text="This approval has already been resolved.")
                     return

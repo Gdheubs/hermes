@@ -2346,6 +2346,27 @@ def detect_dangerous_command(command: str) -> tuple:
 # =========================================================================
 
 _lock = threading.Lock()
+
+
+# Accepted CLI tokens for the Request Changes path (issue #25693).
+# Exposed as a module constant so tests can assert the alias set without
+# reading source text.
+CLI_CHANGES_CHOICE_ALIASES = frozenset({'c', 'changes', 'change', 'request', 'feedback'})
+
+def _changes_message(feedback: str) -> str:
+    """Format the BLOCKED-with-feedback message returned to the agent.
+
+    Issue #25693: when the user requests changes, the agent needs a clear
+    signal that the command did NOT run, plus the free-text feedback so it
+    can revise. Keep this wording stable — tests assert on the prefix.
+    """
+    feedback = (feedback or "").strip()
+    return (
+        "BLOCKED: User requested changes to this command. The command did "
+        "NOT run. Revise the command according to the feedback below and "
+        "try again.\n"
+        f"[Approval feedback]: {feedback}"
+    )
 _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
@@ -2634,7 +2655,8 @@ def unregister_gateway_notify(session_key: str) -> None:
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
                              reason: Optional[str] = None,
-                             request_id: Optional[str] = None) -> int:
+                             request_id: Optional[str] = None,
+                             feedback: str | None = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
@@ -2645,6 +2667,11 @@ def resolve_gateway_approval(session_key: str, choice: str,
     *reason* is an optional free-text explanation attached to an explicit
     deny (``/deny <reason>``).  It is relayed back to the agent in the
     BLOCKED message so it can adapt instead of only hearing "denied".
+
+    ``feedback`` carries free-form text when ``choice == "changes"`` (issue
+    #25693). It is ignored for every other choice; this keeps the public
+    signature additive and back-compat-safe with adapters / tests that
+    pre-date the feature.
 
     Returns the number of approvals resolved (0 means nothing was pending).
     """
@@ -2666,7 +2693,18 @@ def resolve_gateway_approval(session_key: str, choice: str,
             _gateway_queues.pop(session_key, None)
 
     for entry in targets:
-        entry.result = choice
+        if choice == "changes":
+            # Carry the feedback inline on the result so the agent thread
+            # can pick it up without a second lookup. An empty/whitespace
+            # feedback degrades to a plain deny -- never want to inject
+            # an empty user-feedback turn into the conversation.
+            text_fb = (feedback or "").strip()
+            if not text_fb:
+                entry.result = "deny"
+            else:
+                entry.result = {"choice": "changes", "feedback": text_fb}
+        else:
+            entry.result = choice
         if reason:
             entry.reason = reason
         entry.event.set()
@@ -3125,6 +3163,37 @@ def _prompt_dangerous_approval_inner(command: str, description: str,
                     return "session"
                 print(t("approval.allowed_always"))
                 return "always"
+            elif choice in CLI_CHANGES_CHOICE_ALIASES:
+                # Capture free-text feedback so the agent can revise the
+                # command instead of just being denied. An empty response
+                # falls through to deny so we never re-prompt the agent
+                # with a useless empty hint.
+                feedback_result = {"text": ""}
+
+                def get_feedback():
+                    try:
+                        feedback_result["text"] = input(
+                            t("approval.changes_prompt")
+                        ).strip()
+                    except (EOFError, OSError):
+                        feedback_result["text"] = ""
+
+                feedback_thread = threading.Thread(
+                    target=get_feedback, daemon=True
+                )
+                feedback_thread.start()
+                # Use the same overall budget for the feedback capture so the
+                # user cannot deadlock the agent thread by walking away mid-flow.
+                feedback_thread.join(timeout=timeout_seconds)
+                if feedback_thread.is_alive():
+                    print("\n" + t("approval.timeout"))
+                    return "deny"
+                feedback = feedback_result["text"]
+                if not feedback:
+                    print(t("approval.changes_empty"))
+                    return "deny"
+                print(t("approval.changes_received"))
+                return {"choice": "changes", "feedback": feedback}
             else:
                 print(t("approval.denied"))
                 return "deny"
@@ -3580,6 +3649,22 @@ def _run_approval_gate(
             resolved = decision["resolved"]
             choice = decision["choice"]
             deny_reason = decision.get("reason")
+            # Unwrap structured "changes" payload so downstream branches
+            # can keep treating ``choice`` as a string. Issue #25693.
+            feedback_text: Optional[str] = None
+            if isinstance(choice, dict) and choice.get("choice") == "changes":
+                feedback_text = str(choice.get("feedback") or "").strip() or None
+                choice = "changes" if feedback_text else "deny"
+
+            if choice == "changes" and feedback_text:
+                return {
+                    "approved": False,
+                    "changes_requested": True,
+                    "feedback": feedback_text,
+                    "message": _changes_message(feedback_text),
+                    "pattern_key": pattern_key,
+                    "description": description,
+                }
 
             if not resolved or choice is None or choice == "deny":
                 if not resolved:
@@ -3660,6 +3745,23 @@ def _run_approval_gate(
         surface="cli",
         choice=choice,
     )
+
+    # Unwrap structured "changes" payload so downstream branches
+    # can keep treating ``choice`` as a string. Issue #25693.
+    feedback_text: Optional[str] = None
+    if isinstance(choice, dict) and choice.get("choice") == "changes":
+        feedback_text = str(choice.get("feedback") or "").strip() or None
+        choice = "changes" if feedback_text else "deny"
+
+    if choice == "changes" and feedback_text:
+        return {
+            "approved": False,
+            "changes_requested": True,
+            "feedback": feedback_text,
+            "message": _changes_message(feedback_text),
+            "pattern_key": pattern_key,
+            "description": description,
+        }
 
     if choice == "timeout":
         return {
@@ -4322,6 +4424,21 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     _drop_entry()
 
     choice = entry.result
+    # Unwrap structured "changes" payload so downstream branches
+    # can stay string-keyed.
+    feedback_text: Optional[str] = None
+    if isinstance(choice, dict) and choice.get("choice") == "changes":
+        feedback_text = str(choice.get("feedback") or "").strip() or None
+        choice = "changes" if feedback_text else "deny"
+
+    if choice == "changes" and feedback_text:
+        return {
+            "approved": False,
+            "changes_requested": True,
+            "feedback": feedback_text,
+            "message": _changes_message(feedback_text),
+        }
+
     # Normalize outcome for the post hook. Unresolved (timeout) and None both
     # mean the user never responded; report that explicitly so plugins can
     # distinguish timeout from explicit deny.
@@ -4800,6 +4917,22 @@ def check_all_command_guards(command: str, env_type: str,
             resolved = decision["resolved"]
             choice = decision["choice"]
             deny_reason = decision.get("reason")
+            # Unwrap structured "changes" payload so downstream branches
+            # can keep treating ``choice`` as a string. Issue #25693.
+            feedback_text: Optional[str] = None
+            if isinstance(choice, dict) and choice.get("choice") == "changes":
+                feedback_text = str(choice.get("feedback") or "").strip() or None
+                choice = "changes" if feedback_text else "deny"
+
+            if choice == "changes" and feedback_text:
+                return {
+                    "approved": False,
+                    "changes_requested": True,
+                    "feedback": feedback_text,
+                    "message": _changes_message(feedback_text),
+                    "pattern_key": primary_key,
+                    "description": combined_desc,
+                }
 
             if not resolved or choice is None or choice == "deny":
                 # Consent contract: silence is NOT consent, and an explicit
@@ -5257,6 +5390,22 @@ def check_execute_code_guard(code: str, env_type: str,
     resolved = decision["resolved"]
     choice = decision["choice"]
     deny_reason = decision.get("reason")
+    # Unwrap structured "changes" payload so downstream branches
+    # can keep treating ``choice`` as a string. Issue #25693.
+    feedback_text: Optional[str] = None
+    if isinstance(choice, dict) and choice.get("choice") == "changes":
+        feedback_text = str(choice.get("feedback") or "").strip() or None
+        choice = "changes" if feedback_text else "deny"
+
+    if choice == "changes" and feedback_text:
+        return {
+            "approved": False,
+            "changes_requested": True,
+            "feedback": feedback_text,
+            "message": _changes_message(feedback_text),
+            "pattern_key": pattern_key,
+            "description": description,
+        }
 
     if not resolved or choice is None or choice == "deny":
         reason = "timed out without user response" if not resolved else "denied by user"
