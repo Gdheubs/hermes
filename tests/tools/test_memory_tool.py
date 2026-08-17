@@ -7,6 +7,7 @@ from pathlib import Path
 from tools.memory_tool import (
     MemoryStore,
     memory_tool,
+    check_memory_requirements,
     _scan_memory_content,
 )
 
@@ -18,6 +19,47 @@ def _blocked(content, pattern_id=None):
     assert "Blocked" in result
     if pattern_id:
         assert pattern_id in result, f"expected {pattern_id} in {result!r}"
+
+
+# =========================================================================
+# Config gate: check_memory_requirements respects memory_enabled flags
+# =========================================================================
+
+class TestMemoryToolConfigGate:
+    """Regression: a Honcho-primary profile (memory_enabled=False,
+    user_profile_enabled=False) must not advertise the built-in memory tool.
+    The gate reads hermes_cli.config.load_config lazily; we patch that."""
+
+    def _patch_cfg(self, monkeypatch, mem_cfg):
+        import hermes_cli.config as hc
+        monkeypatch.setattr(hc, "load_config", lambda: {"memory": mem_cfg})
+
+    def test_visible_when_both_enabled(self, monkeypatch):
+        self._patch_cfg(monkeypatch, {"memory_enabled": True, "user_profile_enabled": True})
+        assert check_memory_requirements() is True
+
+    def test_visible_when_only_memory_enabled(self, monkeypatch):
+        self._patch_cfg(monkeypatch, {"memory_enabled": True, "user_profile_enabled": False})
+        assert check_memory_requirements() is True
+
+    def test_visible_when_only_user_enabled(self, monkeypatch):
+        self._patch_cfg(monkeypatch, {"memory_enabled": False, "user_profile_enabled": True})
+        assert check_memory_requirements() is True
+
+    def test_hidden_when_both_disabled(self, monkeypatch):
+        self._patch_cfg(monkeypatch, {"memory_enabled": False, "user_profile_enabled": False})
+        assert check_memory_requirements() is False
+
+    def test_fails_open_when_no_memory_section(self, monkeypatch):
+        self._patch_cfg(monkeypatch, {})
+        assert check_memory_requirements() is True
+
+    def test_fails_open_on_config_error(self, monkeypatch):
+        import hermes_cli.config as hc
+        def _boom():
+            raise RuntimeError("config unreadable")
+        monkeypatch.setattr(hc, "load_config", _boom)
+        assert check_memory_requirements() is True
 
 
 # =========================================================================

@@ -1144,8 +1144,24 @@ def memory_tool(
 
 
 def check_memory_requirements() -> bool:
-    """Memory tool has no external requirements -- always available."""
-    return True
+    """Gate the built-in memory tool on the active profile's config.
+
+    Hidden when BOTH built-in stores are disabled (external-provider-only
+    setups, e.g. Honcho-primary). Fails open: DEFAULT_CONFIG enables both
+    stores, and any config-read error keeps the tool available so normal
+    installs are unaffected. load_config() is imported lazily (and at call
+    time) so tests can monkeypatch hermes_cli.config.load_config.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        mem_cfg = (load_config() or {}).get("memory", {}) or {}
+        return bool(
+            mem_cfg.get("memory_enabled", True)
+            or mem_cfg.get("user_profile_enabled", True)
+        )
+    except Exception:
+        return True
 
 
 def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[str, Any]:
