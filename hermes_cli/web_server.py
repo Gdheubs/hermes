@@ -529,6 +529,37 @@ _DASHBOARD_EMBEDDED_CHAT_ENABLED = True
 # overhead.
 _DESKTOP_ATTACHMENT_WS_MAX_BYTES = 384 * 1024 * 1024
 
+# ws keepalive for non-loopback binds (see _ws_keepalive_policy): short
+# enough to detect a half-open tunnel (Cloudflare ~100s idle) before it
+# drops the connection silently.
+_WS_KEEPALIVE_INTERVAL_S = 20.0
+_WS_KEEPALIVE_TIMEOUT_S = 20.0
+
+
+def _ws_keepalive_policy(host: str) -> "tuple[Optional[float], Optional[float]]":
+    """uvicorn ws ping (interval, timeout) for a dashboard bind host.
+
+    Loopback binds disable the protocol ping entirely (see the long comment
+    at the uvicorn.Config call site): the keepalive's only job is detecting
+    half-open network paths, which cannot happen locally, while a stalled
+    client/server event loop turns the 20s ping deadline into false
+    disconnects (#53773/#48445/#50005). Non-loopback binds keep the 20/20
+    ping for half-open detection behind tunnels and proxies.
+
+    HERMES_DASHBOARD_WS_PING_OFF=1 is the escape hatch for deployments that
+    must bind 0.0.0.0 (e.g. reachable through a docker bridge reverse
+    proxy) yet serve only local clients: same false-disconnect exposure as
+    loopback, same lack of a real tunnel to detect, so the ping is disabled
+    (#88617). Defaults to off — public-tunnel deployments keep 20/20.
+    """
+    from utils import env_var_enabled
+
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return (None, None)
+    if env_var_enabled("HERMES_DASHBOARD_WS_PING_OFF"):
+        return (None, None)
+    return (_WS_KEEPALIVE_INTERVAL_S, _WS_KEEPALIVE_TIMEOUT_S)
+
 # Simple rate limiter for the reveal endpoint
 _reveal_timestamps: List[float] = []
 _REVEAL_MAX_PER_WINDOW = 5
@@ -18812,8 +18843,8 @@ def start_server(
     # disable it entirely. Non-loopback binds sit behind a Cloudflare Tunnel
     # (idle timeout ~100s) where half-open IS a real failure mode, so keep the
     # ping at 20/20 to detect it promptly and stay under the tunnel's idle
-    # window.
-    _is_loopback = host in ("127.0.0.1", "localhost", "::1")
+    # window. The loopback/env decision lives in _ws_keepalive_policy.
+    ws_keepalive = _ws_keepalive_policy(host)
     config = uvicorn.Config(
         app, host=host, port=port, log_level="warning",
         # proxy_headers defaults to False so _ws_client_is_allowed sees
@@ -18828,8 +18859,8 @@ def start_server(
         # disables the protocol ping (None) so an event-loop stall can never
         # trigger a false disconnect; a genuinely dead local client is still
         # reaped via the WebSocketDisconnect → disconnect/reap path.
-        ws_ping_interval=None if _is_loopback else 20.0,
-        ws_ping_timeout=None if _is_loopback else 20.0,
+        ws_ping_interval=ws_keepalive[0],
+        ws_ping_timeout=ws_keepalive[1],
         ws_max_size=_DESKTOP_ATTACHMENT_WS_MAX_BYTES,
     )
     server = uvicorn.Server(config)
