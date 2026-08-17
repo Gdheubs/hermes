@@ -274,7 +274,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     setMessages
   })
 
-  const { connectionRef, gateway, gatewayRef, requestGateway } = useGatewayRequest()
+  const { bindGatewayRequest, connectionRef, gateway, gatewayRef, requestGateway } = useGatewayRequest()
 
   const { loadMoreMessagingForPlatform, loadMoreSessions, refreshCronJobs, refreshMessagingSessions, refreshSessions } =
     useSessionListActions({ profileScope })
@@ -456,9 +456,11 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   } = useSessionActions({
     activeSessionId,
     activeSessionIdRef,
+    bindGatewayRequest,
     busyRef,
     creatingSessionRef,
     ensureSessionState,
+    gatewayRef,
     getRouteToken,
     getRoutedStoredSessionId,
     navigate,
@@ -558,8 +560,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const composer = useComposerActions({ activeSessionId, currentCwd, requestGateway })
 
   const branchInNewChat = useCallback(
-    async (messageId?: string) => {
-      const branched = await branchCurrentSession(messageId)
+    async (messageId?: string, targetSessionId?: string) => {
+      const branched = await branchCurrentSession(messageId, targetSessionId)
 
       if (branched) {
         await refreshSessions().catch(() => undefined)
