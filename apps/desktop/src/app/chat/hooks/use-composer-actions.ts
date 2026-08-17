@@ -95,6 +95,12 @@ export interface DroppedFile {
  * Payload is JSON `{ path; isDirectory?; line?; lineEnd? }[]`. */
 export const HERMES_PATHS_MIME = 'application/x-hermes-paths'
 
+/** MIME emitted by message-bubble drag sources (drag selected text into the
+ * composer). Payload is the quoted text block. The composer accepts text
+ * drops ONLY when this MIME is present, so foreign text/plain drags
+ * (kanban cards, external apps) keep their existing behavior untouched. */
+export const HERMES_QUOTE_MIME = 'application/x-hermes-quote'
+
 /**
  * Eagerly resolve files from a drop event into [File?, path, isDirectory?]
  * triples. Internal Hermes sources (e.g. the project tree) ride on a custom

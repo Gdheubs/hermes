@@ -1,16 +1,25 @@
 import { type DragEvent as ReactDragEvent, useRef, useState } from 'react'
 
+import { type ComposerTarget, requestComposerInsert } from '@/app/chat/composer/focus'
 import { triggerHaptic } from '@/lib/haptics'
 
-import { extractDroppedFiles, HERMES_PATHS_MIME, partitionDroppedFiles } from '../../hooks/use-composer-actions'
+import { extractDroppedFiles, HERMES_PATHS_MIME, HERMES_QUOTE_MIME, partitionDroppedFiles } from '../../hooks/use-composer-actions'
 import { dragHasAttachments, droppedFileInlineRefs, type InlineRefInput } from '../inline-refs'
 import type { ChatBarProps } from '../types'
+
+/** True when the drag carries a message-bubble quote (HERMES_QUOTE_MIME).
+ * Deliberately NOT keyed on `text/plain`: foreign text/plain drags (kanban
+ * cards, external apps) must keep their existing behavior untouched. */
+const hasQuoteData = (transfer: DataTransfer) => Array.from(transfer.types || []).includes(HERMES_QUOTE_MIME)
 
 interface UseComposerDropArgs {
   cwd: ChatBarProps['cwd']
   insertInlineRefs: (refs: InlineRefInput[]) => boolean
   onAttachDroppedItems: ChatBarProps['onAttachDroppedItems']
   requestMainFocus: () => void
+  /** Focus-bus routing key of THIS composer — quote drops land here, never in
+   * whatever composer happens to be `'active'` (e.g. an open edit composer). */
+  target: ComposerTarget
 }
 
 /**
@@ -24,7 +33,8 @@ export function useComposerDrop({
   cwd,
   insertInlineRefs,
   onAttachDroppedItems,
-  requestMainFocus
+  requestMainFocus,
+  target
 }: UseComposerDropArgs) {
   const [dragActive, setDragActive] = useState(false)
   const dragDepthRef = useRef(0)
@@ -35,7 +45,11 @@ export function useComposerDrop({
   }
 
   const handleDragEnter = (event: ReactDragEvent<HTMLFormElement>) => {
-    if (!onAttachDroppedItems || !dragHasAttachments(event.dataTransfer, HERMES_PATHS_MIME)) {
+    if (!onAttachDroppedItems && !hasQuoteData(event.dataTransfer)) {
+      return
+    }
+
+    if (!dragHasAttachments(event.dataTransfer, HERMES_PATHS_MIME) && !hasQuoteData(event.dataTransfer)) {
       return
     }
 
@@ -48,7 +62,11 @@ export function useComposerDrop({
   }
 
   const handleDragOver = (event: ReactDragEvent<HTMLFormElement>) => {
-    if (!onAttachDroppedItems || !dragHasAttachments(event.dataTransfer, HERMES_PATHS_MIME)) {
+    if (!onAttachDroppedItems && !hasQuoteData(event.dataTransfer)) {
+      return
+    }
+
+    if (!dragHasAttachments(event.dataTransfer, HERMES_PATHS_MIME) && !hasQuoteData(event.dataTransfer)) {
       return
     }
 
@@ -57,10 +75,6 @@ export function useComposerDrop({
   }
 
   const handleDragLeave = (event: ReactDragEvent<HTMLFormElement>) => {
-    if (!onAttachDroppedItems) {
-      return
-    }
-
     event.preventDefault()
     dragDepthRef.current = Math.max(0, dragDepthRef.current - 1)
 
@@ -70,7 +84,7 @@ export function useComposerDrop({
   }
 
   const handleDrop = (event: ReactDragEvent<HTMLFormElement>) => {
-    if (!onAttachDroppedItems) {
+    if (!onAttachDroppedItems && !hasQuoteData(event.dataTransfer)) {
       return
     }
 
@@ -79,33 +93,43 @@ export function useComposerDrop({
 
     const candidates = extractDroppedFiles(event.dataTransfer)
 
-    if (candidates.length === 0) {
+    if (candidates.length > 0) {
+      // In-app drags (project tree / gutter) are workspace-relative paths the
+      // gateway resolves directly, so they stay inline @file:/@line: refs. OS
+      // drops are absolute local paths a remote gateway can't read (and images
+      // need byte upload for vision), so route them through the upload pipeline.
+      const { inAppRefs, osDrops } = partitionDroppedFiles(candidates)
+      const refs = droppedFileInlineRefs(inAppRefs, cwd)
+
+      if (refs.length && insertInlineRefs(refs)) {
+        triggerHaptic('selection')
+      }
+
+      if (osDrops.length && onAttachDroppedItems) {
+        void Promise.resolve(onAttachDroppedItems(osDrops)).then(attached => {
+          if (attached) {
+            triggerHaptic('selection')
+            requestMainFocus()
+          }
+        })
+      }
+
       return
     }
 
-    // In-app drags (project tree / gutter) are workspace-relative paths the
-    // gateway resolves directly, so they stay inline @file:/@line: refs. OS
-    // drops are absolute local paths a remote gateway can't read (and images
-    // need byte upload for vision), so route them through the upload pipeline.
-    const { inAppRefs, osDrops } = partitionDroppedFiles(candidates)
-    const refs = droppedFileInlineRefs(inAppRefs, cwd)
+    // Quote drop: selected message text dragged into the composer.
+    // Insert as a quoted block (same format as "Paste as text"), routed to
+    // THIS composer's scope — never to whatever composer is 'active'.
+    const text = event.dataTransfer.getData(HERMES_QUOTE_MIME).trim()
 
-    if (refs.length && insertInlineRefs(refs)) {
+    if (text) {
+      requestComposerInsert(text, { target })
       triggerHaptic('selection')
-    }
-
-    if (osDrops.length) {
-      void Promise.resolve(onAttachDroppedItems(osDrops)).then(attached => {
-        if (attached) {
-          triggerHaptic('selection')
-          requestMainFocus()
-        }
-      })
     }
   }
 
   const handleInputDragOver = (event: ReactDragEvent<HTMLDivElement>) => {
-    if (!dragHasAttachments(event.dataTransfer, HERMES_PATHS_MIME)) {
+    if (!dragHasAttachments(event.dataTransfer, HERMES_PATHS_MIME) && !hasQuoteData(event.dataTransfer)) {
       return
     }
 
@@ -115,40 +139,51 @@ export function useComposerDrop({
   }
 
   const handleInputDrop = (event: ReactDragEvent<HTMLDivElement>) => {
-    if (!dragHasAttachments(event.dataTransfer, HERMES_PATHS_MIME)) {
+    if (!dragHasAttachments(event.dataTransfer, HERMES_PATHS_MIME) && !hasQuoteData(event.dataTransfer)) {
       return
     }
 
     const candidates = extractDroppedFiles(event.dataTransfer)
 
-    if (!candidates.length) {
+    if (candidates.length > 0) {
+      event.preventDefault()
+      event.stopPropagation()
+      resetDragState()
+
+      // Dropping straight onto the text box used to inline-ref *every* file —
+      // including OS/Finder drops, whose absolute local path a remote gateway
+      // can't read and whose image bytes never reached vision. Split by origin:
+      // in-app drags stay inline refs; OS drops go through the upload pipeline.
+      // (When no upload handler is wired, fall back to inline refs for all.)
+      const attach = onAttachDroppedItems
+      const { inAppRefs, osDrops } = partitionDroppedFiles(candidates)
+      const refs = droppedFileInlineRefs(attach ? inAppRefs : candidates, cwd)
+
+      if (refs.length && insertInlineRefs(refs)) {
+        triggerHaptic('selection')
+      }
+
+      if (attach && osDrops.length) {
+        void Promise.resolve(attach(osDrops)).then(attached => {
+          if (attached) {
+            triggerHaptic('selection')
+            requestMainFocus()
+          }
+        })
+      }
+
       return
     }
 
-    event.preventDefault()
-    event.stopPropagation()
-    resetDragState()
+    // Quote drop onto the input area, routed to THIS composer's scope.
+    const text = event.dataTransfer.getData(HERMES_QUOTE_MIME).trim()
 
-    // Dropping straight onto the text box used to inline-ref *every* file —
-    // including OS/Finder drops, whose absolute local path a remote gateway
-    // can't read and whose image bytes never reached vision. Split by origin:
-    // in-app drags stay inline refs; OS drops go through the upload pipeline.
-    // (When no upload handler is wired, fall back to inline refs for all.)
-    const attach = onAttachDroppedItems
-    const { inAppRefs, osDrops } = partitionDroppedFiles(candidates)
-    const refs = droppedFileInlineRefs(attach ? inAppRefs : candidates, cwd)
-
-    if (refs.length && insertInlineRefs(refs)) {
+    if (text) {
+      event.preventDefault()
+      event.stopPropagation()
+      resetDragState()
+      requestComposerInsert(text, { target })
       triggerHaptic('selection')
-    }
-
-    if (attach && osDrops.length) {
-      void Promise.resolve(attach(osDrops)).then(attached => {
-        if (attached) {
-          triggerHaptic('selection')
-          requestMainFocus()
-        }
-      })
     }
   }
 

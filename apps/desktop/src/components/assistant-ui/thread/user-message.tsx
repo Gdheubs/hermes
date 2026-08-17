@@ -4,8 +4,10 @@ import { type FC, type ReactNode, useCallback, useEffect, useRef, useState } fro
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
 import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
+import { hasTextSelection } from '@/components/assistant-ui/thread/selection'
 import { MessageTimelineTimestamp } from '@/components/assistant-ui/thread/timeline-timestamp'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
+import { useDragTextToComposer } from '@/components/assistant-ui/thread/use-drag-text-to-composer'
 import { useMessageReactions } from '@/components/assistant-ui/thread/use-message-reactions'
 import { UserMessageText } from '@/components/assistant-ui/thread/user-message-text'
 import { Codicon } from '@/components/ui/codicon'
@@ -18,12 +20,8 @@ import { $gateway } from '@/store/gateway'
 import { notifyThreadEditOpen } from '@/store/thread-scroll'
 import { isWatchWindow } from '@/store/windows'
 
-/** True when the user has a live text highlight (drag-select / triple-click). */
-export function hasTextSelection(): boolean {
-  const selection = window.getSelection()
-
-  return Boolean(selection && !selection.isCollapsed && selection.toString().length > 0)
-}
+// Re-export for consumers that historically imported it from this module.
+export { hasTextSelection } from '@/components/assistant-ui/thread/selection'
 
 export function StickyHumanMessageContainer({
   attachments,
@@ -309,6 +307,7 @@ export const UserMessage: FC<{
 
   const [pickerOpen, setPickerOpen] = useState(false)
   const { enabled: reactionsEnabled, react, reactions: shownReactions } = useMessageReactions(messageId, 'user')
+  const { onDragEnd, onDragStart } = useDragTextToComposer()
 
   const pickEmoji = useCallback(
     (emoji: null | string) => {
@@ -485,6 +484,8 @@ export const UserMessage: FC<{
                       triggerHaptic('selection')
                       setExpanded(value => !value)
                     }}
+                    onDragEnd={onDragEnd}
+                    onDragStart={onDragStart}
                     title={bodyClamped ? (expanded ? t.common.collapse : copy.expandMessage) : undefined}
                     type="button"
                   >
@@ -509,6 +510,8 @@ export const UserMessage: FC<{
 
                         triggerHaptic('selection')
                       }}
+                      onDragEnd={onDragEnd}
+                      onDragStart={onDragStart}
                       onPointerDown={() => {
                         if (hasTextSelection()) {
                           return
