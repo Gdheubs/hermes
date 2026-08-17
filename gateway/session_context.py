@@ -376,6 +376,17 @@ def reset_session_vars() -> None:
         pass
 
 
+def get_session_var(name: str, default: str = "") -> str:
+    """Read a session ContextVar without falling back to process environment."""
+    var = _VAR_MAP.get(name)
+    if var is None:
+        return default
+    value = var.get()
+    if value is _UNSET:
+        return default
+    return value
+
+
 def get_session_env(name: str, default: str = "") -> str:
     """Read a session context variable by its legacy ``HERMES_SESSION_*`` name.
 

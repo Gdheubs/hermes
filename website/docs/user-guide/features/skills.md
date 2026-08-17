@@ -557,7 +557,25 @@ reviewed with the same familiar approve/deny flow as dangerous commands:
 
 The review surface works in the interactive CLI and on messaging platforms
 (diff output is truncated for chat bubbles — read the full diff on the CLI or
-in the pending JSON file). Memory writes have the same gate under
+in the pending JSON file). New skill proposals use pending schema v2: the
+record binds a canonical payload hash plus an integrity hash covering the full
+record, the target skill-tree pre-image (including selected target identity),
+and the requesting profile/session/surface/tool-call context. On POSIX systems
+the pending directories are owner-only (`0700`) and records are `0600`; reads
+and writes stay anchored to held no-follow directory descriptors. Skill
+approval is serialized with other Hermes skill mutations and revalidates the
+bound pre-image inside a descriptor-anchored mutation path. Target-tree hashing
+is capped at 64 MiB and 16,384 entries; pending records are capped at 8 MiB and
+listing fails closed above 4,096 directory entries. Platforms where Hermes
+cannot enforce an owner-only pending store fail closed instead of staging or
+applying records. Hermes claims a record into a non-replayable quarantine before
+apply and refuses to list, approve, or reject legacy, tampered, linked,
+non-owner-only, oversized, or otherwise invalid records. Approved skill deletes
+fail closed without mutating the target because portable POSIX APIs cannot unlink
+a directory by held inode/descriptor; reject the record or perform a separate
+explicit delete. Approval fails closed if the target tree changed after staging.
+Restage the proposal against the current target instead of repairing an unsafe
+record in place. Memory writes have the same gate under
 `memory.write_approval` — see [Controlling memory writes](/user-guide/features/memory#controlling-memory-writes-write_approval).
 
 > The separate `skills.guard_agent_created` setting is a content scanner
