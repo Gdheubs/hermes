@@ -1795,6 +1795,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    allow_unready_skills: bool = False,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -1841,6 +1842,9 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        allow_unready_skills: When True, let the agent run even if an attached
+                skill reports incomplete setup. Use only when the prompt has an
+                explicit fallback that does not require that setup.
         monitor_script: Optional path to a cheap monitor source script (same
                 resolution/containment rules as ``script``: relative to
                 ~/.hermes/scripts/, .sh/.bash via bash, else Python). Each
@@ -1886,6 +1890,7 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_allow_unready_skills = bool(allow_unready_skills)
     normalized_monitor_script = str(monitor_script).strip() if isinstance(monitor_script, str) else None
     normalized_monitor_script = normalized_monitor_script or None
     normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
@@ -1995,6 +2000,8 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if normalized_allow_unready_skills:
+        job["allow_unready_skills"] = True
 
     with _jobs_lock():
         jobs = load_jobs()

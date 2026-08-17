@@ -4257,6 +4257,9 @@ def _preflight_check_skills(job: dict) -> Optional[str]:
     the skill exists but its required environment is missing — a run that
     is guaranteed to misfire.
     """
+    if job.get("allow_unready_skills"):
+        return None
+
     skills = job.get("skills")
     if skills is None:
         legacy = job.get("skill")

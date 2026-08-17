@@ -246,6 +246,22 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_create_persists_explicit_unready_skill_fallback(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Use the integration when ready; otherwise use the fallback.",
+                schedule="every 1h",
+                skills=["optional-integration"],
+                allow_unready_skills=True,
+            )
+        )
+
+        assert created["success"] is True
+        assert created["job"]["allow_unready_skills"] is True
+        listing = json.loads(cronjob(action="list"))
+        assert listing["jobs"][0]["allow_unready_skills"] is True
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 

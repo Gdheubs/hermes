@@ -655,6 +655,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["monitor_state"] = job["monitor_state"]
     if job.get("no_agent"):
         result["no_agent"] = True
+    if job.get("allow_unready_skills"):
+        result["allow_unready_skills"] = True
     if job.get("enabled_toolsets"):
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
@@ -1199,6 +1201,7 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    allow_unready_skills: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
     task_id: str = None,
@@ -1299,6 +1302,7 @@ def cronjob(
                     workdir=_normalize_optional_job_value(workdir),
                     no_agent=_no_agent,
                     attach_to_session=attach_to_session,
+                    allow_unready_skills=bool(allow_unready_skills),
                     monitor_script=_normalize_optional_job_value(monitor_script),
                     monitor_url=_normalize_optional_job_value(monitor_url),
                 )
@@ -1567,6 +1571,8 @@ def cronjob(
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
+            if allow_unready_skills is not None:
+                updates["allow_unready_skills"] = bool(allow_unready_skills)
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
@@ -1667,6 +1673,10 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Optional ordered list of skill names to load before executing the cron prompt. On update, pass an empty array to clear attached skills."
+            },
+            "allow_unready_skills": {
+                "type": "boolean",
+                "description": "Default: False. When True, an attached skill that still needs setup does not block the run. Use only when the prompt explicitly defines a useful fallback that does not require that setup."
             },
             "script": {
                 "type": "string",
@@ -1795,6 +1805,7 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        allow_unready_skills=args.get("allow_unready_skills"),
         monitor_script=args.get("monitor_script"),
         monitor_url=args.get("monitor_url"),
         task_id=kw.get("task_id"),

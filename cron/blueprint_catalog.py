@@ -96,6 +96,9 @@ class AutomationBlueprint:
     slots: List[BlueprintSlot] = field(default_factory=list)
     deliver_default: str = "origin"
     skills: tuple = ()        # skills the job loads before running
+    # Let a prompt with an explicit no-source path run even when an attached
+    # integration skill still needs setup. Ordinary jobs stay fail-before-run.
+    allow_unready_skills: bool = False
     tags: tuple = ()
 
 
@@ -136,6 +139,7 @@ CATALOG: List[AutomationBlueprint] = [
         ),
         slots=[_TIME("08:00"), _DELIVER],
         skills=("google-workspace",),
+        allow_unready_skills=True,
         tags=("daily", "briefing"),
     ),
     AutomationBlueprint(
@@ -794,6 +798,8 @@ def fill_blueprint(
     }
     if blueprint.skills:
         spec["skills"] = list(blueprint.skills)
+    if blueprint.allow_unready_skills:
+        spec["allow_unready_skills"] = True
     if origin is not None:
         spec["origin"] = origin
     return spec

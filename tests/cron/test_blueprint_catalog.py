@@ -168,6 +168,8 @@ class TestCommandHandler:
         assert res.agent_seed is not None
         assert "morning-brief" in res.agent_seed
         assert "cronjob tool" in res.agent_seed
+        assert "skills=['google-workspace']" in res.agent_seed
+        assert "allow_unready_skills=True" in res.agent_seed
         # the schedule template is handed to the agent to build the cron expr
         assert "* * *" in res.agent_seed
 
@@ -182,6 +184,8 @@ class TestCommandHandler:
         assert len(jobs) == 1
         assert (jobs[0].get("schedule_display") or jobs[0].get("schedule")) == "30 7 * * *"
         assert jobs[0].get("deliver") == "telegram"
+        assert jobs[0].get("skills") == ["google-workspace"]
+        assert jobs[0].get("allow_unready_skills") is True
 
 
 class TestDocsGenerator:

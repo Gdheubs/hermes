@@ -313,6 +313,34 @@ class TestSkillReadiness:
         assert success is True
         assert agent_constructed is True
 
+    def test_explicit_fallback_allows_unready_skill_to_run(self, tmp_path):
+        """A useful no-source fallback may opt out of readiness blocking."""
+        payload = json.dumps(
+            {
+                "success": True,
+                "content": "# optional integration\nUse it when configured.",
+                "readiness_status": "setup_needed",
+                "setup_needed": True,
+                "missing_credential_files": ["integration_token.json"],
+            }
+        )
+
+        def fake_skill_view(name, *args, **kwargs):
+            return payload
+
+        job = _job(
+            skills=["optional-integration"],
+            allow_unready_skills=True,
+            prompt="Use the integration when ready; otherwise provide the fallback.",
+        )
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.save_jobs([job])
+            success, output, final_response, error, agent_constructed = \
+                _run_job_patched(job, tmp_path, skill_view=fake_skill_view)
+
+        assert success is True
+        assert agent_constructed is True
+
 
 class TestDeliveryPlatform:
     def test_unknown_delivery_platform_blocks(self, tmp_path):
