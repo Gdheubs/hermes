@@ -38,6 +38,7 @@ from agent.tool_dispatch_helpers import (
     _is_multimodal_tool_result,
     _multimodal_text_summary,
     _append_subdir_hint_to_multimodal,
+    _context_pruned_argument_paths,
     _plan_tool_batch_segments,
     make_tool_result_message,
 )
@@ -110,6 +111,13 @@ _START_ORDER_GATE_TIMEOUT_S = 120.0
 # answering an approval prompt, which self-terminates at approvals.timeout —
 # so a holder that overstays it is wedged and must not starve the batch.
 _AUTHORIZATION_GATE_LOCK_TIMEOUT_S = 360.0
+_PRUNED_TOOL_ARGUMENTS_ERROR = "suspected_pruned_tool_arguments"
+_PRUNED_TOOL_ARGUMENTS_MESSAGE = (
+    "Tool was not executed because effect-capable arguments contain a Hermes "
+    "context-pruning marker. Recover the exact content from its durable source "
+    "or ask the user, then issue a complete new call; do not retry these "
+    "arguments."
+)
 
 
 def _authorization_gate_lock_timeout() -> float:
@@ -156,6 +164,20 @@ def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
         },
         ensure_ascii=False,
     )
+
+
+def _pruned_tool_arguments_block(
+    function_name: str,
+    function_args: dict[str, Any],
+) -> dict[str, Any] | None:
+    paths = _context_pruned_argument_paths(function_name, function_args)
+    if not paths:
+        return None
+    return {
+        "error": _PRUNED_TOOL_ARGUMENTS_ERROR,
+        "message": _PRUNED_TOOL_ARGUMENTS_MESSAGE,
+        "argument_paths": paths,
+    }
 
 
 def _resolve_concurrent_tool_timeout() -> float | None:
@@ -596,6 +618,15 @@ def _run_agent_tool_execution_middleware(
 
         block_message = scope_block
         block_error_type = "tool_scope_block"
+        block_payload: dict[str, Any] | None = None
+        if block_message is None:
+            block_payload = _pruned_tool_arguments_block(
+                function_name,
+                final_args,
+            )
+            if block_payload is not None:
+                block_error_type = _PRUNED_TOOL_ARGUMENTS_ERROR
+                block_message = _PRUNED_TOOL_ARGUMENTS_MESSAGE
         if block_message is None:
             block_error_type = "plugin_block"
 
@@ -628,6 +659,15 @@ def _run_agent_tool_execution_middleware(
                 else authorization_gate.run(_resolve_pre_tool_block)
             )
 
+        if block_message is None:
+            block_payload = _pruned_tool_arguments_block(
+                function_name,
+                final_args,
+            )
+            if block_payload is not None:
+                block_error_type = _PRUNED_TOOL_ARGUMENTS_ERROR
+                block_message = _PRUNED_TOOL_ARGUMENTS_MESSAGE
+
         guardrail_decision = None
         if block_message is None:
             guardrail_decision = agent._tool_guardrails.before_call(
@@ -640,7 +680,10 @@ def _run_agent_tool_execution_middleware(
             _advance_start_order()
             state["blocked"] = True
             if block_message is not None:
-                result = json.dumps({"error": block_message}, ensure_ascii=False)
+                result = json.dumps(
+                    block_payload or {"error": block_message},
+                    ensure_ascii=False,
+                )
                 error_type = block_error_type
                 error_message = block_message
             else:
