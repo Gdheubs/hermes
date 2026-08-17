@@ -2674,4 +2674,41 @@ describe('archive/delete of a messaging-platform row (issue #87716)', () => {
     expect(idsIn($sessions.get())).toEqual([row.id])
     expect(idsIn($messagingSessions.get())).toEqual([])
   })
+
+  it('rolls a failed delete back into the messaging slice, not into recents', async () => {
+    // Delete rolls back through the same helper as archive but from a
+    // different catch, so the routing has to be pinned separately: an archive
+    // that restores correctly proves nothing about the delete path.
+    const row = feishuRow()
+
+    setMessagingSessions([row])
+    vi.mocked(deleteSession).mockRejectedValue(new Error('gateway unreachable'))
+
+    const actions = await mountSidebarActions()
+
+    await act(async () => {
+      await actions.removeSession(row.id)
+    })
+
+    expect(idsIn($messagingSessions.get())).toEqual([row.id])
+    // Into recents it would be filtered out by SIDEBAR_EXCLUDED_SOURCES on the
+    // next refresh, so the row that survived the failed delete disappears anyway.
+    expect(idsIn($sessions.get())).toEqual([])
+  })
+
+  it('still rolls a failed delete of a local row back into recents', async () => {
+    const row = storedSession({ id: 'stored-desktop-2', source: 'desktop' })
+
+    setSessions([row])
+    vi.mocked(deleteSession).mockRejectedValue(new Error('gateway unreachable'))
+
+    const actions = await mountSidebarActions()
+
+    await act(async () => {
+      await actions.removeSession(row.id)
+    })
+
+    expect(idsIn($sessions.get())).toEqual([row.id])
+    expect(idsIn($messagingSessions.get())).toEqual([])
+  })
 })
