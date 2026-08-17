@@ -2386,6 +2386,29 @@ class TestAuxiliaryTaskExtraBody:
             "thinking": {"type": "disabled"}, "metadata": {"user_id": "u1"},
         }
 
+    def test_anthropic_aux_drops_response_format(self):
+        """response_format is Chat Completions only; Messages rejects the request.
+
+        Forwarding it does not degrade structured output, it 400s the whole
+        call with "response_format: Extra inputs are not permitted" — which
+        took out title generation on every run against a native Anthropic
+        provider. Callers asking for JSON this way already parse defensively.
+        """
+        api_kwargs = self._run_anthropic_adapter(
+            call_extra_body={
+                "response_format": {"type": "json_schema", "json_schema": {"name": "t"}},
+                "metadata": {"user_id": "u1"},
+            },
+        )
+        assert api_kwargs.get("extra_body") == {"metadata": {"user_id": "u1"}}
+
+    def test_anthropic_aux_response_format_only_leaves_no_extra_body(self):
+        """Stripping the sole key must not leave an empty extra_body behind."""
+        api_kwargs = self._run_anthropic_adapter(
+            call_extra_body={"response_format": {"type": "json_object"}},
+        )
+        assert not api_kwargs.get("extra_body")
+
 
 
 
