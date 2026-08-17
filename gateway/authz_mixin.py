@@ -28,6 +28,21 @@ from gateway.whatsapp_identity import (
 )
 
 
+def _normalize_bluebubbles_handle(value: str) -> str:
+    """Normalize a BlueBubbles (iMessage) handle for allowlist matching.
+
+    iMessage handles are phone numbers or Apple ID email addresses. Emails are
+    lowercased as-is; phone numbers are reduced to digits only, so any human
+    formatting (``+1 (555) 123-0001``, ``+15551230001``, ``1-555-123-0001``)
+    compares equal. Returns ``""`` for empty/whitespace input (callers must
+    not match on the empty string).
+    """
+    v = (value or "").strip().lower()
+    if "@" in v:
+        return v
+    return "".join(ch for ch in v if ch.isdigit())
+
+
 def _auth_env(name: str, default: str = "") -> str:
     """Read allowlist/auth env; prefer profile secret_scope under multiplex."""
     if not name:
@@ -774,6 +789,27 @@ class GatewayAuthorizationMixin:
 
             check_ids.update(_expand_whatsapp_auth_aliases(user_id))
             normalized_user_id = _normalize_whatsapp_identifier(user_id)
+            if normalized_user_id:
+                check_ids.add(normalized_user_id)
+
+        # BlueBubbles (iMessage): handles are phone numbers or Apple ID email
+        # addresses, and operators naturally write phone numbers with human
+        # formatting (``+1 (555) 123-0001``) while the wire form differs in
+        # punctuation (``+15551230001``). Raw string equality then never
+        # matches, silently denying allowlisted senders and pushing operators
+        # toward BLUEBUBBLES_ALLOW_ALL_USERS — the opposite of the SECURITY.md
+        # §2.6 rule that every network-exposed adapter be gated by an
+        # allowlist. Compare digits-only phone forms (emails lowercased)
+        # alongside the original strings so no exact-match setup regresses.
+        if source.platform == Platform.BLUEBUBBLES:
+            normalized_allowed_ids = set()
+            for allowed_id in allowed_ids:
+                normalized_allowed_id = _normalize_bluebubbles_handle(allowed_id)
+                if normalized_allowed_id:
+                    normalized_allowed_ids.add(normalized_allowed_id)
+            allowed_ids |= normalized_allowed_ids
+
+            normalized_user_id = _normalize_bluebubbles_handle(user_id)
             if normalized_user_id:
                 check_ids.add(normalized_user_id)
 
