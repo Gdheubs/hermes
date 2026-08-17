@@ -292,7 +292,8 @@ interface ChatSidebarProps extends React.ComponentProps<typeof Sidebar> {
   /** Create a brand-new session and open it as a tile on `dir`. */
   onNewSessionSplit: (dir: SplitDir) => void
   onManageCronJob: (jobId: string) => void
-  onTriggerCronJob: (jobId: string) => Promise<void>
+  onOpenCronRun: (jobId: string, outputId: string, profile?: string) => void
+  onTriggerCronJob: (jobId: string) => void
 }
 
 export function ChatSidebar({
@@ -307,6 +308,7 @@ export function ChatSidebar({
   onNewSessionInWorkspace,
   onNewSessionSplit,
   onManageCronJob,
+  onOpenCronRun,
   onTriggerCronJob
 }: ChatSidebarProps) {
   const { t } = useI18n()
@@ -1853,7 +1855,7 @@ export function ChatSidebar({
                 jobs={cronJobs}
                 label={s.cronJobs}
                 onManageJob={onManageCronJob}
-                onOpenRun={onResumeSession}
+                onOpenRun={onOpenCronRun}
                 onToggle={() => setSidebarCronOpen(!cronOpen)}
                 onTriggerJob={onTriggerCronJob}
                 open={cronOpen}
