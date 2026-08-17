@@ -100,8 +100,19 @@ async function verifyIntegrity(source: string, integrity: string): Promise<boole
 }
 
 export function unloadRuntimePlugin(id: string): void {
-  loaded.get(id)?.forEach(dispose => dispose())
+  const disposers = loaded.get(id) ?? []
+
+  // Release loader ownership before invoking plugin code. A broken cleanup
+  // must not keep this incarnation live or prevent the remaining cleanup.
   loaded.delete(id)
+
+  for (const dispose of disposers) {
+    try {
+      dispose()
+    } catch (error) {
+      console.error(`[plugins] runtime unload failed (${id})`, error)
+    }
+  }
 }
 
 /** Evaluate + register one runtime plugin. Returns its id, or null on failure. */
@@ -185,7 +196,10 @@ export async function loadRuntimePlugin(
     console.error(`[plugins] runtime load failed (${origin})`, error)
     notifyError(error, `Plugin "${origin}" failed to load`)
     publishPlugin({
-      id: origin,
+      // A disk entry's file path is unique across every supported root. The
+      // folder/origin is only a display label and can equal another plugin's
+      // logical id, so keying failures by it would overwrite the healthy row.
+      id: options.file ?? origin,
       name: origin,
       kind: options.kind ?? 'disk',
       file: options.file,
@@ -273,19 +287,6 @@ const disk = new Map<string, DiskPlugin>()
 let watching = false
 let scanning = false
 
-/** Drop a folder-named error record — unless that name is the live plugin id
- *  of ANOTHER disk entry (two roots can carry same-named folders; a broken one
- *  must not clobber its healthy namesake's inventory row). */
-function dropOriginRecord(origin: string, except: DiskPlugin): void {
-  for (const other of disk.values()) {
-    if (other !== except && other.id === origin) {
-      return
-    }
-  }
-
-  dropPlugin(origin)
-}
-
 async function loadDiskPlugin(entry: DiskPlugin): Promise<void> {
   const desktop = window.hermesDesktop!
   const prevId = entry.id
@@ -308,10 +309,10 @@ async function loadDiskPlugin(entry: DiskPlugin): Promise<void> {
 
     entry.id = id ?? entry.id
 
-    // A fixing save under a different plugin id — drop the folder-named
-    // error record so the inventory shows one row, not a ghost.
-    if (id && id !== entry.origin) {
-      dropOriginRecord(entry.origin, entry)
+    // A fixing save replaces this entry's path-keyed error row with the
+    // plugin's logical-id row.
+    if (id && id !== entry.file) {
+      dropPlugin(entry.file)
     }
   } catch {
     // File vanished mid-read — the next scan reconciles.
@@ -392,7 +393,7 @@ async function scanDiskPlugins(): Promise<void> {
         dropPlugin(record.id)
       }
 
-      dropOriginRecord(record.origin, record)
+      dropPlugin(record.file)
 
       if (record.watchId) {
         void desktop.stopPreviewFileWatch(record.watchId)

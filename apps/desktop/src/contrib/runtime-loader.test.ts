@@ -4,7 +4,7 @@ import type { HermesReadDirResult } from '@/global'
 import type * as HermesModule from '@/hermes'
 
 import { $pluginRecords, setPluginEnabled } from './plugins-store'
-import { discoverRuntimePlugins, watchRuntimePlugins } from './runtime-loader'
+import { discoverRuntimePlugins, loadRuntimePlugin, unloadRuntimePlugin, watchRuntimePlugins } from './runtime-loader'
 
 // getStatus would supply the connected backend's hermes_home — a REMOTE path in
 // remote mode. The disk scanner must NOT derive the plugin root from it (#66899).
@@ -21,7 +21,39 @@ const readDir = vi.fn<(path: string) => Promise<HermesReadDirResult>>()
 const readFileText = vi.fn<(path: string) => Promise<{ text: string }>>()
 const watchDirectory = vi.fn<(path: string) => Promise<{ id: string }>>()
 const watchPreviewFile = vi.fn<(path: string) => Promise<{ id: string }>>()
+const stopPreviewFileWatch = vi.fn<(id: string) => Promise<void>>()
 const onPreviewFileChanged = vi.fn()
+
+function installRuntimeImportShim(): () => void {
+  // The loader evaluates plugins via blob-URL import(), which vite's module
+  // runner can't resolve in tests — reroute to a data: URL, which node's
+  // native ESM loader handles.
+  const createObjectURL = vi
+    .spyOn(URL, 'createObjectURL')
+    .mockImplementation(
+      blob =>
+        `data:text/javascript;base64,${Buffer.from((blob as unknown as { parts: string[] }).parts.join('')).toString('base64')}`
+    )
+
+  const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
+  const RealBlob = globalThis.Blob
+
+  vi.stubGlobal(
+    'Blob',
+    class {
+      parts: string[]
+      constructor(parts: string[]) {
+        this.parts = parts
+      }
+    }
+  )
+
+  return () => {
+    createObjectURL.mockRestore()
+    revokeObjectURL.mockRestore()
+    vi.stubGlobal('Blob', RealBlob)
+  }
+}
 
 beforeEach(() => {
   desktopPluginsRoot.mockReset()
@@ -30,6 +62,7 @@ beforeEach(() => {
   readFileText.mockReset()
   watchDirectory.mockReset()
   watchPreviewFile.mockReset()
+  stopPreviewFileWatch.mockReset()
   onPreviewFileChanged.mockReset()
   getStatus.mockClear()
   ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = {
@@ -38,6 +71,7 @@ beforeEach(() => {
     onPreviewFileChanged,
     readDir,
     readFileText,
+    stopPreviewFileWatch,
     watchDirectory,
     watchPreviewFile
   }
@@ -118,27 +152,7 @@ describe('scanDiskPlugins (#66899)', () => {
     })
     watchPreviewFile.mockResolvedValue({ id: 'w-uni' })
 
-    // The loader evaluates plugins via blob-URL import(), which vite's module
-    // runner can't resolve in tests — reroute to a data: URL, which node's
-    // native ESM loader handles.
-    const createObjectURL = vi
-      .spyOn(URL, 'createObjectURL')
-      .mockImplementation(
-        blob =>
-          `data:text/javascript;base64,${Buffer.from((blob as unknown as { parts: string[] }).parts.join('')).toString('base64')}`
-      )
-
-    const revokeObjectURL = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined)
-    const RealBlob = globalThis.Blob
-    vi.stubGlobal(
-      'Blob',
-      class {
-        parts: string[]
-        constructor(parts: string[]) {
-          this.parts = parts
-        }
-      }
-    )
+    const restoreRuntimeImport = installRuntimeImportShim()
 
     try {
       await discoverRuntimePlugins()
@@ -153,10 +167,84 @@ describe('scanDiskPlugins (#66899)', () => {
       expect(register).toHaveBeenCalledTimes(1)
       expect($pluginRecords.get().uni.status).toBe('loaded')
     } finally {
-      createObjectURL.mockRestore()
-      revokeObjectURL.mockRestore()
-      vi.stubGlobal('Blob', RealBlob)
+      restoreRuntimeImport()
       delete (globalThis as unknown as { __uniRegister?: unknown }).__uniRegister
+    }
+  })
+
+  it('keeps colliding healthy and malformed cross-root plugins independently visible', async () => {
+    const name = 'inventory-collision'
+    const standaloneFile = `/local/.hermes/desktop-plugins/${name}/plugin.js`
+    const unifiedFile = `/local/.hermes/plugins/${name}/desktop/plugin.js`
+
+    desktopPluginsRoot.mockResolvedValue('/local/.hermes/desktop-plugins')
+    agentPluginsRoot.mockResolvedValue('/local/.hermes/plugins')
+    readDir.mockImplementation(async root => ({
+      entries: [
+        {
+          isDirectory: true,
+          name,
+          path:
+            root === '/local/.hermes/desktop-plugins'
+              ? `/local/.hermes/desktop-plugins/${name}`
+              : `/local/.hermes/plugins/${name}`
+        }
+      ]
+    }))
+    readFileText.mockImplementation(async file => ({
+      text: file === standaloneFile ? `export default { id: '${name}', register() {} }` : 'export default {}'
+    }))
+    watchPreviewFile.mockImplementation(async file => ({ id: `watch:${file}` }))
+
+    const restoreRuntimeImport = installRuntimeImportShim()
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    try {
+      await discoverRuntimePlugins()
+
+      expect($pluginRecords.get()[name]).toMatchObject({ file: standaloneFile, status: 'loaded' })
+      expect(Object.values($pluginRecords.get()).find(record => record.file === unifiedFile)).toMatchObject({
+        name,
+        status: 'error'
+      })
+    } finally {
+      consoleError.mockRestore()
+      restoreRuntimeImport()
+    }
+  })
+})
+
+describe('runtime plugin unload isolation', () => {
+  it('runs every disposer and does not let one failure escape', async () => {
+    const laterDispose = vi.fn()
+
+    const register = (ctx: { onDispose: (dispose: () => void) => void }) => {
+      ctx.onDispose(() => {
+        throw new Error('broken disposer')
+      })
+      ctx.onDispose(laterDispose)
+    }
+
+    ;(globalThis as unknown as { __disposerIsolationRegister: unknown }).__disposerIsolationRegister = register
+    const restoreRuntimeImport = installRuntimeImportShim()
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+
+    try {
+      expect(
+        await loadRuntimePlugin(
+          `export default { id: 'disposer-isolation', register: globalThis.__disposerIsolationRegister }`,
+          'disposer-isolation'
+        )
+      ).toBe('disposer-isolation')
+
+      expect(() => unloadRuntimePlugin('disposer-isolation')).not.toThrow()
+      expect(laterDispose).toHaveBeenCalledOnce()
+      unloadRuntimePlugin('disposer-isolation')
+      expect(laterDispose).toHaveBeenCalledOnce()
+    } finally {
+      consoleError.mockRestore()
+      restoreRuntimeImport()
+      delete (globalThis as unknown as { __disposerIsolationRegister?: unknown }).__disposerIsolationRegister
     }
   })
 })
