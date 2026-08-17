@@ -20,6 +20,7 @@ import {
   endSessionMutation,
   enterProject,
   exitProjectScope,
+  fetchProjectSessions,
   openProjectCreate,
   pickProjectFolder,
   projectIdForCwd,
@@ -449,6 +450,7 @@ describe('repository discovery policy', () => {
     expect(scanRepos).not.toHaveBeenCalled()
     expect(request).toHaveBeenCalledWith('projects.record_repos', {
       discovery_policy: { enabled: false, exclude_paths: [], roots: [] },
+      profile: 'default',
       repos: []
     })
   })
@@ -484,6 +486,7 @@ describe('repository discovery policy', () => {
         exclude_paths: ['/work/vendor'],
         roots: ['/work']
       },
+      profile: 'default',
       repos: [{ label: 'repo', root: '/work/repo' }]
     })
   })
@@ -536,6 +539,40 @@ describe('project tree profile isolation', () => {
     await pendingA
 
     expect($projectTree.get().map(project => project.id)).toEqual(['profile-b'])
+  })
+})
+
+describe('projects RPC profile stamping', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    $activeGatewayProfile.set('ray')
+  })
+
+  it('stamps the active profile on projects.list', async () => {
+    const request = vi.fn().mockResolvedValue({ active_id: null, projects: [] })
+    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+
+    await refreshProjects()
+
+    expect(request).toHaveBeenCalledWith('projects.list', { profile: 'ray' })
+  })
+
+  it('stamps the active profile on projects.tree', async () => {
+    const request = vi.fn().mockResolvedValue({ active_id: null, projects: [], scoped_session_ids: [] })
+    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+
+    await refreshProjectTree()
+
+    expect(request).toHaveBeenCalledWith('projects.tree', { preview_limit: 3, profile: 'ray' })
+  })
+
+  it('stamps the active profile on projects.project_sessions', async () => {
+    const request = vi.fn().mockResolvedValue({ project: null })
+    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+
+    await fetchProjectSessions('p_123')
+
+    expect(request).toHaveBeenCalledWith('projects.project_sessions', { project_id: 'p_123', profile: 'ray' })
   })
 })
 

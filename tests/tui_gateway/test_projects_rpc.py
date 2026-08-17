@@ -214,6 +214,53 @@ def test_create_list_roundtrip(tmp_path):
     assert listing["active_id"] == created["project"]["id"]
 
 
+def test_projects_rpc_is_profile_scoped(monkeypatch, tmp_path):
+    """A named profile's projects.* RPC must read THAT profile's projects.db.
+
+    In app-global remote mode one backend serves every profile. Without the
+    ``profile`` stamp, a Ray request silently fell back to the launch (default)
+    profile's Projects — the desktop then grouped Ray sessions under default
+    Projects like RSS Dashboard / Emma General.
+    """
+    from hermes_cli import profiles as profiles_mod
+    from hermes_constants import get_default_hermes_root
+
+    default_home = tmp_path / "default"
+    default_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+    # The named profile lives under <root>/profiles/<name>.
+    root = get_default_hermes_root()
+    ray_home = root / "profiles" / "ray"
+    ray_home.mkdir(parents=True)
+
+    # Seed a project in the RAY profile's projects.db.
+    from hermes_cli import projects_db as pdb
+
+    with pdb.connect_closing(db_path=ray_home / "projects.db") as conn:
+        pdb.create_project(conn, name="Ray Project", folders=[str(tmp_path / "ray-ws")])
+
+    # The launch (default) profile has no projects.
+    assert _call("projects.list")["projects"] == []
+
+    # A profile-scoped call sees only the ray profile's project.
+    listing = _call("projects.list", {"profile": "ray"})
+    assert [p["slug"] for p in listing["projects"]] == ["ray-project"]
+
+    # The launch profile is untouched by the scoped call.
+    assert _call("projects.list")["projects"] == []
+
+    # A scoped call never writes into the launch profile's DB: create with the
+    # ray stamp lands in ray's projects.db only.
+    created = _call("projects.create", {"name": "Ray Two", "folders": [str(tmp_path / "ray-ws-2")], "profile": "ray"})
+    assert created["project"]["slug"] == "ray-two"
+    assert _call("projects.list")["projects"] == []
+    assert [p["slug"] for p in _call("projects.list", {"profile": "ray"})["projects"]] == [
+        "ray-project",
+        "ray-two",
+    ]
+
+
 def test_add_folder_and_for_cwd(tmp_path):
     folder = tmp_path / "repo"
     folder.mkdir()

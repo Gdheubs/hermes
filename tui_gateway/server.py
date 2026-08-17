@@ -12453,6 +12453,13 @@ def _projects_method(name: str):
     Every project CRUD handler opened the per-profile DB, mapped a missing id to
     5062, bad args to 5063, and everything else to 5061. This collapses that
     boilerplate so each handler is just its one meaningful operation.
+
+    Profile-scoped: in app-global remote mode the desktop serves every profile
+    from one backend, so ``params['profile']`` must select the owning profile's
+    ``projects.db`` — otherwise a Ray request silently reads the launch
+    (default) profile's Projects and the sidebar groups Ray sessions under
+    default Projects (RSS Dashboard / Emma General). The launch/own profile
+    keeps the existing unscoped path (no override, same DB).
     """
 
     def decorator(fn):
@@ -12461,7 +12468,10 @@ def _projects_method(name: str):
             try:
                 from hermes_cli import projects_db as pdb
 
-                with pdb.connect_closing() as conn:
+                profile = (params.get("profile") or "").strip() or None
+                home = _profile_home(profile)
+                db_path = Path(home) / "projects.db" if home is not None else None
+                with pdb.connect_closing(db_path=db_path) as conn:
                     return fn(rid, params, pdb, conn)
             except _NoProject:
                 return _err(rid, _E_NO_PROJECT, "no such project")

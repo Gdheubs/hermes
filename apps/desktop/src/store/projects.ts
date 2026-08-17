@@ -16,7 +16,7 @@ import { persistentAtom } from '@/lib/persisted'
 import { $gateway, activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
 import { setSidebarAgentsGrouped } from '@/store/layout'
 import { notify } from '@/store/notifications'
-import { $activeGatewayProfile, $profileScope, ALL_PROFILES, requestFreshSession } from '@/store/profile'
+import { $activeGatewayProfile, $profileScope, ALL_PROFILES, normalizeProfileKey, requestFreshSession } from '@/store/profile'
 import {
   $selectedStoredSessionId,
   $sessions,
@@ -349,6 +349,34 @@ async function gatewayRequestOn<T>(
   return gateway.request<T>(method, params)
 }
 
+// The profile the live gateway is currently connected to. Projects are
+// per-profile (each profile owns its own projects.db), so every projects.* RPC
+// must carry it — in app-global remote mode one backend serves every profile,
+// and an omitted profile silently falls back to the launch (default) profile's
+// Projects, grouping Ray sessions under default Projects like RSS Dashboard /
+// Emma General. The backend no-ops the stamp for the launch profile.
+function projectRpcProfile(): string {
+  return normalizeProfileKey($activeGatewayProfile.get())
+}
+
+// Stamp the active profile onto a projects.* request. One chokepoint so no call
+// site can forget it (mirrors the pet RPCs' petRpc helper).
+function projectRpcParams(params: Record<string, unknown> = {}): Record<string, unknown> {
+  return { ...params, profile: projectRpcProfile() }
+}
+
+async function projectRpc<T>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+  return gatewayRequest<T>(method, projectRpcParams(params))
+}
+
+async function projectRpcOn<T>(
+  gateway: HermesGateway,
+  method: string,
+  params: Record<string, unknown> = {}
+): Promise<T> {
+  return gatewayRequestOn<T>(gateway, method, projectRpcParams(params))
+}
+
 interface ActiveProjectsContext {
   gateway: HermesGateway
   profile: string
@@ -378,7 +406,7 @@ function applyPayload(payload: ProjectsPayload): void {
 // not up yet) leaves the cached atoms intact so the sidebar doesn't flicker.
 export async function refreshProjects(): Promise<void> {
   try {
-    applyPayload(await gatewayRequest<ProjectsPayload>('projects.list'))
+    applyPayload(await projectRpc<ProjectsPayload>('projects.list'))
     markProjectsRpcSuccess()
   } catch (err) {
     markProjectsRpcFailure(err)
@@ -427,7 +455,7 @@ async function refreshProjectTreeOn(gateway: HermesGateway): Promise<void> {
   }
 
   try {
-    const res = await gatewayRequestOn<ProjectTreePayload>(gateway, 'projects.tree', {
+    const res = await projectRpcOn<ProjectTreePayload>(gateway, 'projects.tree', {
       preview_limit: PROJECT_TREE_PREVIEW_LIMIT
     })
 
@@ -502,7 +530,7 @@ async function refreshProjectTreeAcrossProfiles(): Promise<void> {
 // membership match exactly.
 export async function fetchProjectSessions(projectId: string): Promise<SidebarProjectTree | null> {
   try {
-    const res = await gatewayRequest<{ project: SidebarProjectTree | null }>('projects.project_sessions', {
+    const res = await projectRpc<{ project: SidebarProjectTree | null }>('projects.project_sessions', {
       project_id: projectId
     })
 
@@ -534,7 +562,7 @@ export async function moveSessionToProject(
     throw new Error(translateNow('sidebar.projects.moveNoFolder'))
   }
 
-  const res = await gatewayRequest<WorkspaceMovePayload>('session.workspace.move', {
+  const res = await projectRpc<WorkspaceMovePayload>('session.workspace.move', {
     cwd,
     session_key: sessionId,
     ...(profile ? { profile } : {})
@@ -635,7 +663,7 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
     state.runningSignature = signature
 
     if (!policy.enabled) {
-      await gatewayRequestOn(context.gateway, 'projects.record_repos', {
+      await projectRpcOn(context.gateway, 'projects.record_repos', {
         discovery_policy: policy,
         repos: []
       })
@@ -652,7 +680,7 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
         return
       }
 
-      await gatewayRequestOn(context.gateway, 'projects.record_repos', {
+      await projectRpcOn(context.gateway, 'projects.record_repos', {
         discovery_policy: policy,
         repos
       })
@@ -794,7 +822,7 @@ export async function createProject(input: CreateProjectInput): Promise<ProjectI
   let res: { project: ProjectInfo | null }
 
   try {
-    res = await gatewayRequest<{ project: ProjectInfo | null }>('projects.create', {
+    res = await projectRpc<{ project: ProjectInfo | null }>('projects.create', {
       name: input.name,
       folders: input.folders ?? [],
       primary_path: input.primaryPath,
@@ -877,7 +905,7 @@ export async function updateProject(
   // Backend treats null/undefined as "leave unchanged"; "" clears (stores NULL).
   // Map explicit null → "" so "no color"/"no icon" actually clear.
   await persistOrRollback(snap, () =>
-    gatewayRequest('projects.update', {
+    projectRpc('projects.update', {
       id,
       ...patch,
       ...(patch.color === null && { color: '' }),
@@ -953,7 +981,7 @@ export async function addProjectFolder(
   }
 
   await persistOrRollback(snap, () =>
-    gatewayRequest('projects.add_folder', { id, path, label: opts.label, is_primary: opts.isPrimary ?? false })
+    projectRpc('projects.add_folder', { id, path, label: opts.label, is_primary: opts.isPrimary ?? false })
   )
   reconcileProjects()
 }
@@ -996,13 +1024,13 @@ export async function deleteProject(id: string): Promise<void> {
   }
 
   await persistOrRollback(snap, async () => {
-    applyPayload(await gatewayRequest<ProjectsPayload>('projects.delete', { id }))
+    applyPayload(await projectRpc<ProjectsPayload>('projects.delete', { id }))
   })
   void refreshProjectTree()
 }
 
 export async function setActiveProject(id: null | string): Promise<void> {
-  const res = await gatewayRequest<{ active_id: null | string }>('projects.set_active', { id })
+  const res = await projectRpc<{ active_id: null | string }>('projects.set_active', { id })
   $activeProjectId.set(res.active_id ?? null)
 }
 
