@@ -22,6 +22,7 @@ You need at least one way to connect to an LLM. Use `hermes model` to switch pro
 | **OpenRouter** | `OPENROUTER_API_KEY` in `~/.hermes/.env` |
 | **Fireworks AI** | `FIREWORKS_API_KEY` in `~/.hermes/.env` (provider: `fireworks`; aliases: `fireworks-ai`, `fw`) |
 | **NovitaAI** | `NOVITA_API_KEY` in `~/.hermes/.env` (provider: `novita`, 200+ models, Model API, Agent Sandbox, GPU Cloud) |
+| **NEAR AI** | `NEAR_AI_API_KEY` in `~/.hermes/.env` (provider: `nearai`; aliases: `near-ai`, `near`) |
 | **AI Gateway** | `AI_GATEWAY_API_KEY` in `~/.hermes/.env` (provider: `ai-gateway`) |
 | **z.ai / GLM** | `GLM_API_KEY` in `~/.hermes/.env` (provider: `zai`) |
 | **Kimi / Moonshot** | `KIMI_API_KEY` in `~/.hermes/.env` (provider: `kimi-coding`) |
@@ -360,6 +361,29 @@ model:
 ```
 
 Get your API key at [novita.ai/settings/key-management](https://novita.ai/settings/key-management). The base URL can be overridden with `NOVITA_BASE_URL`.
+
+### NEAR AI
+
+[NEAR AI Cloud](https://cloud.near.ai) is an OpenAI-compatible gateway that runs inference inside TEEs, so each response comes with a hardware attestation. One key reaches both frontier models (Anthropic, OpenAI, Gemini) and open ones (Qwen, GLM, DeepSeek, Kimi).
+
+```bash
+# Use any available model
+hermes chat --provider nearai --model anthropic/claude-sonnet-5
+# Requires: NEAR_AI_API_KEY in ~/.hermes/.env
+
+# Short aliases
+hermes chat --provider near-ai --model qwen/qwen3.7-max
+```
+
+Or set it permanently in `config.yaml`:
+```yaml
+model:
+  provider: "nearai"
+  default: "anthropic/claude-sonnet-5"
+  base_url: "https://cloud-api.near.ai/v1"
+```
+
+Get your API key at [cloud.near.ai](https://cloud.near.ai). The base URL can be overridden with `NEAR_AI_BASE_URL`. The model catalog is discovered live from `https://cloud-api.near.ai/v1/models`.
 
 ### Ollama Cloud — Managed Ollama Models, OAuth + API Key
 
@@ -1584,7 +1608,7 @@ fallback_model:
 
 When activated, the fallback swaps the model and provider mid-session without losing your conversation. The chain is tried entry-by-entry; activation is one-shot per session.
 
-Supported providers: `openrouter`, `nous`, `novita`, `openai-codex`, `copilot`, `copilot-acp`, `anthropic`, `gemini`, `qwen-oauth`, `huggingface`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `minimax-oauth`, `deepseek`, `nvidia`, `xai`, `xai-oauth`, `ollama-cloud`, `bedrock`, `ai-gateway`, `azure-foundry`, `opencode-zen`, `opencode-go`, `commandcode`, `commandcode-anthropic`, `kilocode`, `xiaomi`, `arcee`, `gmi`, `actual`, `stepfun`, `lmstudio`, `alibaba`, `alibaba-coding-plan`, `tencent-tokenhub`, `custom`.
+Supported providers: `openrouter`, `nous`, `novita`, `openai-codex`, `copilot`, `copilot-acp`, `anthropic`, `gemini`, `qwen-oauth`, `huggingface`, `zai`, `kimi-coding`, `kimi-coding-cn`, `minimax`, `minimax-cn`, `minimax-oauth`, `deepseek`, `nvidia`, `xai`, `xai-oauth`, `ollama-cloud`, `bedrock`, `ai-gateway`, `azure-foundry`, `opencode-zen`, `opencode-go`, `commandcode`, `commandcode-anthropic`, `kilocode`, `xiaomi`, `arcee`, `gmi`, `nearai`, `actual`, `stepfun`, `lmstudio`, `alibaba`, `alibaba-coding-plan`, `tencent-tokenhub`, `custom`.
 
 :::tip
 Fallback is configured exclusively through `config.yaml` — or interactively via `hermes fallback`. For full details on when it triggers, how the chain advances, and how it interacts with auxiliary tasks and delegation, see [Fallback Providers](/user-guide/features/fallback-providers).

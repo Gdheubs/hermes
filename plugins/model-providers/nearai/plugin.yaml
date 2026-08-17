@@ -1,0 +1,5 @@
+name: nearai-provider
+kind: model-provider
+version: 1.0.0
+description: NEAR AI Cloud — verifiable private inference (TEE), frontier + open models
+author: Matias Benary

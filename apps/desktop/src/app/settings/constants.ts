@@ -212,6 +212,13 @@ export const PROVIDER_GROUPS: ProviderPrefix[] = [
     priority: 21
   },
   {
+    prefix: 'NEAR_AI_',
+    name: 'NEAR AI',
+    description: 'Verifiable private inference (TEE), frontier + open models',
+    docsUrl: 'https://cloud.near.ai',
+    priority: 21
+  },
+  {
     prefix: 'AZURE_FOUNDRY_',
     name: 'Azure Foundry',
     description: 'Azure AI Foundry custom endpoints (OpenAI / Anthropic-compatible)',
