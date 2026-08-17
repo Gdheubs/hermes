@@ -113,6 +113,7 @@ import {
 } from './connection-registry'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
+import { formatDesktopLogChunk } from './desktop-log-redact'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
 import { formatDesktopLogLine } from './desktop-log-line'
 import {
@@ -1394,7 +1395,7 @@ function scheduleDesktopLogFlush() {
 }
 
 function rememberLog(chunk) {
-  const text = String(chunk || '').trim()
+  const text = formatDesktopLogChunk(chunk)
 
   if (!text) {
     return
