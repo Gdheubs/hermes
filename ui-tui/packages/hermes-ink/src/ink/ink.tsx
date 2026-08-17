@@ -610,14 +610,23 @@ export default class Ink {
     // if we continue with the pre-blur virtual cursor/backbuffer, only the
     // next small dirty region may repaint and stale status/progress rows can
     // remain visible. Defer one tick so TerminalFocusProvider subscribers
-    // observe the new focus state first, then do the same recovery as /redraw.
+    // observe the new focus state first, then repaint from a blank virtual
+    // frame. Do not clear the physical screen or re-assert terminal modes:
+    // focus reporting is already active, and those writes cause visible
+    // flicker while resending unnecessary DECRESET sequences.
     queueMicrotask(() => {
       if (this.isUnmounted || this.isPaused || !this.options.stdout.isTTY || this.currentNode === null) {
         return
       }
 
-      this.reassertTerminalModes(false)
-      this.forceRedraw()
+      if (this.altScreenActive) {
+        this.resetFramesForAltScreen()
+      } else {
+        this.repaint()
+        this.invalidatePrevFrame()
+      }
+
+      this.onRender()
     })
   }
 
