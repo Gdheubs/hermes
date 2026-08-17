@@ -5263,13 +5263,11 @@ class TurnRunner:
 
         # Isolation contract: --ignore-rules / --safe-mode (normalized to
         # HERMES_IGNORE_RULES / HERMES_SAFE_MODE at CLI startup) must behave
-        # like the CLI and TUI entries. It composes with the per-platform
-        # latency opt-out: either one skips context-file discovery, while
-        # memory skipping follows isolation alone.
-        from agent.isolation import resolve_agent_isolation
-
-        isolation_skip_context, skip_memory = resolve_agent_isolation()
-        skip_context_files = isolation_skip_context or platform_skip_context
+        # like the CLI and TUI entries, composing with the per-platform
+        # latency opt-out (see _resolve_gateway_isolation_skip_flags).
+        skip_context_files, skip_memory = _resolve_gateway_isolation_skip_flags(
+            platform_skip_context
+        )
 
         # Check agent cache — reuse the AIAgent from the previous message
         # in this session to preserve the frozen system prompt and tool
@@ -6418,6 +6416,24 @@ class TurnRunner:
             "agent_persisted": (ctx.result_holder[0].get("agent_persisted", True) if ctx.result_holder[0] else True),
         }
 
+
+
+def _resolve_gateway_isolation_skip_flags(
+    platform_skip_context: bool,
+) -> tuple[bool, bool]:
+    """Resolve isolation skip flags for a gateway session.
+
+    Combines the shared isolation contract (``--ignore-rules`` /
+    ``--safe-mode`` via ``HERMES_IGNORE_RULES`` / ``HERMES_SAFE_MODE``) with
+    the per-platform latency opt-out: either one skips context-file
+    discovery, while memory skipping follows isolation alone.
+
+    Returns ``(skip_context_files, skip_memory)``.
+    """
+    from agent.isolation import resolve_agent_isolation
+
+    isolation_skip_context, skip_memory = resolve_agent_isolation()
+    return isolation_skip_context or bool(platform_skip_context), skip_memory
 
 
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
@@ -22014,6 +22030,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
 
+            # Isolation contract: background gateway tasks honor the same
+            # --ignore-rules / --safe-mode policy as foreground turns.
+            skip_context_files, skip_memory = _resolve_gateway_isolation_skip_flags(
+                False
+            )
+
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
             enriched_prompt = prompt
@@ -22039,6 +22061,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     max_iterations=max_iterations,
                     quiet_mode=True,
                     verbose_logging=False,
+                    skip_context_files=skip_context_files,
+                    skip_memory=skip_memory,
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
                     reasoning_config=reasoning_config,
