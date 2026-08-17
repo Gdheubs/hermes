@@ -56,26 +56,84 @@ install, needs no server, and is the more thoroughly exercised path.
   If the connecting role may not create extensions, Hermes logs a warning and
   continues — search still works, because the `ILIKE` path is plain SQL and the
   full-text path uses core PostgreSQL `tsvector`. Only the trigram acceleration
-  is lost, which matters on large tables. Hermes retries on every connect, so
-  allow-listing the extension later picks it up automatically with no
-  intervention.
-
-  Managed providers often gate this. On Azure Database for PostgreSQL Flexible
-  Server, for example, extensions must be allow-listed in the
-  `azure.extensions` server parameter (empty by default) before a non-superuser
-  can create them:
-
-  ```bash
-  az postgres flexible-server parameter set \
-    --resource-group <rg> --server-name <server> \
-    --name azure.extensions --value pg_trgm
-  ```
+  is lost, which matters once the message table is large. Hermes re-attempts the
+  extension on every connect, so enabling it later is picked up automatically
+  with no migration to run by hand.
 
   On self-managed PostgreSQL, a superuser can install it once per database:
   `CREATE EXTENSION IF NOT EXISTS pg_trgm;`
 
+  See [Enabling `pg_trgm` on managed PostgreSQL](#enabling-pg_trgm-on-managed-postgresql)
+  below when the provider restricts extensions.
+
 The database user needs `CREATE` on the target database — Hermes manages its own
 tables, indexes, and migrations.
+
+### Enabling `pg_trgm` on managed PostgreSQL
+
+Hosted providers only let non-superusers create extensions from an allow-list.
+Hermes runs fine without `pg_trgm`, but enabling it is recommended before the
+message table grows, because it is what keeps substring search off a sequential
+scan.
+
+**Azure Database for PostgreSQL — Flexible Server.** The `azure.extensions`
+server parameter is empty by default, and `CREATE EXTENSION` fails with:
+
+```
+ERROR: extension "pg_trgm" is not allow-listed for users in
+       Azure Database for PostgreSQL
+```
+
+Add it to the allow-list, preserving any extensions already listed — the value
+is a comma-separated list and setting it replaces the whole thing:
+
+```bash
+# Inspect the current value first so you don't drop existing entries.
+az postgres flexible-server parameter show \
+  --resource-group <rg> --server-name <server> \
+  --name azure.extensions --query value -o tsv
+
+az postgres flexible-server parameter set \
+  --resource-group <rg> --server-name <server> \
+  --name azure.extensions --value pg_trgm
+```
+
+In the portal the parameter is under **Server parameters**; search for
+`azure.extensions` and pick `pg_trgm` from the dropdown rather than the "All"
+tab, where it is not listed.
+
+`azure.extensions` is a dynamic parameter, so the change generally applies
+without a restart — confirm with:
+
+```bash
+az postgres flexible-server parameter show \
+  --resource-group <rg> --server-name <server> \
+  --name azure.extensions \
+  --query "{value:value,dynamic:isDynamicConfig,restartPending:isConfigPendingRestart}"
+```
+
+If `restartPending` is true, or `CREATE EXTENSION` still reports the extension
+as not allow-listed, restart the server and retry:
+
+```bash
+az postgres flexible-server restart --resource-group <rg> --name <server>
+```
+
+Allow-listing makes the extension *available*; it does not install it.
+Extensions are per-database, so each database needs its own `CREATE EXTENSION`.
+Hermes does this itself on the next connect — restart the agent, or just let it
+reconnect, and it will install `pg_trgm` and build the trigram indexes with no
+further action. To confirm:
+
+```sql
+SELECT count(*) FROM pg_extension WHERE extname = 'pg_trgm';   -- expect 1
+SELECT count(*) FROM pg_indexes WHERE indexname LIKE '%\_trgm';  -- expect 3
+```
+
+**Other managed providers.** Amazon RDS and Aurora ship `pg_trgm` in the
+default `rds.allowed_extensions`, so `CREATE EXTENSION` normally just works.
+Google Cloud SQL supports it without an allow-list. In both cases the role
+still needs sufficient privilege on the target database.
 
 ## Enabling it
 
@@ -246,9 +304,20 @@ is overriding it.
 installed and the automatic install did not succeed. Install it explicitly:
 `pip install 'hermes-agent[postgres]'`.
 
-**`permission denied to create extension "pg_trgm"`** — the connecting role
-cannot create extensions. Have a superuser run
-`CREATE EXTENSION IF NOT EXISTS pg_trgm;` once against the target database.
+**`permission denied to create extension "pg_trgm"`** or **`extension "pg_trgm"
+is not allow-listed`** — the connecting role cannot create extensions. This is
+**not fatal**: Hermes logs a warning, skips the extension and its trigram
+indexes, and runs with search intact but unaccelerated. Fix it at your leisure —
+on self-managed PostgreSQL have a superuser run
+`CREATE EXTENSION IF NOT EXISTS pg_trgm;` against the target database; on a
+managed provider see
+[Enabling `pg_trgm` on managed PostgreSQL](#enabling-pg_trgm-on-managed-postgresql).
+Hermes retries on the next connect and installs it once permitted.
+
+**Search feels slow on a large database** — check whether the trigram indexes
+exist (`SELECT count(*) FROM pg_indexes WHERE indexname LIKE '%\_trgm';`,
+expect 3). Zero means `pg_trgm` was never installed, so substring search is
+sequential-scanning. Enable the extension as above.
 
 **Turn errors mentioning connection failures** — a managed server restarting for
 maintenance surfaces as transient contention and is reported as a retryable
