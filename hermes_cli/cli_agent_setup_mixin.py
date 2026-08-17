@@ -531,7 +531,12 @@ class CLIAgentSetupMixin:
                 checkpoint_max_file_size_mb=self.checkpoint_max_file_size_mb,
                 pass_session_id=self.pass_session_id,
                 skip_context_files=self.ignore_rules,
-                skip_memory=self.ignore_rules,
+                # Built-in memory (MEMORY.md/USER.md) and the external memory
+                # provider are durable user state, not injected rules — keep
+                # them alive under --ignore-rules. Only context rule files
+                # (AGENTS.md/SOUL.md/.cursorrules) are skipped, via
+                # skip_context_files above.
+                skip_memory=False,
                 tool_progress_callback=self._on_tool_progress,
                 tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
                 tool_complete_callback=self._on_tool_complete if self._inline_diffs_enabled else None,

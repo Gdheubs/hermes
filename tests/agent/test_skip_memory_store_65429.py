@@ -24,10 +24,31 @@ class _FakeOpenAI:
         pass
 
 
-def _make_agent(monkeypatch, enabled_toolsets=None, skip_memory=True):
+def _make_agent(
+    monkeypatch,
+    enabled_toolsets=None,
+    skip_memory=True,
+    memory_enabled=None,
+    user_profile_enabled=None,
+):
     monkeypatch.setattr("run_agent.get_tool_definitions", lambda **kw: [])
     monkeypatch.setattr("run_agent.check_toolset_requirements", lambda: {})
     monkeypatch.setattr("run_agent.OpenAI", _FakeOpenAI)
+    # Deterministic memory config for the agent-under-test. The CLI now passes
+    # skip_memory=False under --ignore-rules, so memory enablement comes purely
+    # from config (memory.memory_enabled / user_profile_enabled). Leave the
+    # real config untouched when neither flag is given (repo default enables
+    # memory), so pre-existing tests keep their original behavior.
+    if memory_enabled is not None or user_profile_enabled is not None:
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {
+                "memory": {
+                    "memory_enabled": bool(memory_enabled),
+                    "user_profile_enabled": bool(user_profile_enabled),
+                }
+            },
+        )
     return AIAgent(
         api_key="test-key",
         base_url="http://test",
@@ -96,3 +117,39 @@ def test_skip_memory_memory_tool_handler_works_and_provider_skipped(
     memory_md = tmp_path / "hm" / "memories" / "MEMORY.md"
     assert memory_md.exists()
     assert "User prefers concise answers." in memory_md.read_text()
+
+
+def test_ignore_rules_keeps_builtin_store_when_memory_enabled(monkeypatch, tmp_path):
+    """--ignore-rules must NOT disable the built-in memory store.
+
+    Regression: ``cli_agent_setup_mixin.py`` passed ``skip_memory=self.ignore_rules``,
+    so ``hermes chat --ignore-rules`` silently dropped MEMORY.md/USER.md — the
+    user's durable state — even though built-in memory is not an injected rule
+    file (AGENTS.md/SOUL.md/.cursorrules are the rules that --ignore-rules
+    skips, via skip_context_files). The CLI now passes skip_memory=False.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hm"))
+    agent = _make_agent(
+        monkeypatch,
+        skip_memory=False,
+        memory_enabled=True,
+        user_profile_enabled=True,
+    )
+    assert agent._memory_store is not None, (
+        "--ignore-rules must keep the built-in memory store when "
+        "memory_enabled/user_profile_enabled are set in config"
+    )
+
+
+def test_ignore_rules_memory_disabled_leaves_no_store(monkeypatch, tmp_path):
+    """Behavior preservation: with memory disabled in config the store stays
+    None regardless of skip_memory — --ignore-rules must not *enable* memory
+    that the user explicitly disabled."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hm"))
+    agent = _make_agent(
+        monkeypatch,
+        skip_memory=False,
+        memory_enabled=False,
+        user_profile_enabled=False,
+    )
+    assert agent._memory_store is None

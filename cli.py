@@ -5087,8 +5087,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.pass_session_id = pass_session_id
         # --ignore-rules: honor either the constructor flag or the env var set
         # by `hermes chat --ignore-rules` in hermes_cli/main.py. When true we
-        # pass skip_context_files=True and skip_memory=True to AIAgent so
-        # AGENTS.md/SOUL.md/.cursorrules and persistent memory are not loaded.
+        # pass skip_context_files=True to AIAgent so AGENTS.md/SOUL.md/.cursorrules
+        # are not loaded. Built-in memory (MEMORY.md/USER.md) and the external
+        # memory provider are durable user state, not injected rules, so they
+        # stay enabled under --ignore-rules.
         self.ignore_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
         
         # Ephemeral system prompt: env var takes precedence, then
