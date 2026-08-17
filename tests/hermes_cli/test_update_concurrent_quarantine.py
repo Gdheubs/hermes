@@ -1,5 +1,4 @@
-"""Tests for issue #26670 — concurrent hermes.exe detection and improved
-quarantine retry / reboot-deferred fallback during `hermes update` on Windows.
+"""Tests for Windows hermes.exe concurrency and update quarantine behavior.
 
 These tests force ``_is_windows`` to return ``True`` via patching so the
 Windows-specific code paths can be exercised on any host.
@@ -139,7 +138,7 @@ def test_detect_concurrent_parents_call_robust_to_one_bad_hop(_winp, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# _quarantine_running_hermes_exe — retry + reboot-deferred fallback
+# _quarantine_running_hermes_exe — retry without unsafe reboot fallback
 # ---------------------------------------------------------------------------
 
 
@@ -160,36 +159,49 @@ def test_quarantine_succeeds_first_attempt(_winp, tmp_path):
 
 
 @patch.object(cli_main, "_is_windows", return_value=True)
-def test_quarantine_falls_back_to_reboot_schedule(_winp, tmp_path, capsys, monkeypatch):
-    """When every retry fails, we schedule via MoveFileEx and warn helpfully."""
+def test_quarantine_does_not_schedule_locked_shim_for_reboot(
+    _winp, tmp_path, capsys, monkeypatch
+):
+    """A persistent lock fails without creating a stale reboot operation."""
     shim = tmp_path / "hermes.exe"
     shim.write_bytes(b"locked")
 
     def always_fails(self, target):
         raise OSError(32, "The process cannot access the file (simulated lock)")
 
-    scheduled_calls: list[tuple[Path, Path]] = []
-
-    def fake_schedule(s: Path, q: Path) -> bool:
-        scheduled_calls.append((s, q))
-        return True
-
     monkeypatch.setattr(cli_main, "_hermes_exe_shims", lambda d: [shim])
-    with patch.object(Path, "rename", always_fails), patch.object(
-        cli_main, "_schedule_replace_on_reboot", fake_schedule
-    ), patch("time.sleep", lambda *_a, **_k: None):
+    with patch.object(Path, "rename", always_fails), patch(
+        "time.sleep", lambda *_a, **_k: None
+    ):
         pairs = cli_main._quarantine_running_hermes_exe(tmp_path)
 
     captured = capsys.readouterr().out
 
-    # The reboot-deferred path was used.
-    assert scheduled_calls and scheduled_calls[0][0] == shim
-    # It is NOT added to the returned roll-back list (the issue calls this
-    # out — don't undo a deferred operation).
     assert pairs == []
-    # The user got a clear message, not raw [WinError 32].
-    assert "scheduled" in captured.lower()
-    assert "reboot" in captured.lower()
+    assert "could not quarantine hermes.exe" in captured.lower()
+    assert "scheduled" not in captured.lower()
+
+
+def test_pending_rename_filter_removes_only_hermes_quarantine_pairs(tmp_path):
+    scripts = tmp_path / "Scripts"
+    shim = scripts / "hermes.exe"
+    other = tmp_path / "other.exe"
+    entries = [
+        rf"\??\{shim}",
+        rf"!\??\{shim}.old.123",
+        rf"\??\{other}",
+        rf"\??\{other}.old",
+        rf"\??\{scripts / 'hermes-agent.exe'}",
+        rf"\??\{scripts / 'replacement.exe'}",
+        "odd-trailing-entry",
+    ]
+
+    kept, removed = cli_main._filter_pending_hermes_replacements(
+        entries, [shim, scripts / "hermes-agent.exe"]
+    )
+
+    assert removed == 1
+    assert kept == entries[2:]
 
 
 
@@ -523,6 +535,101 @@ def test_unreadable_argv_falls_back_to_the_captured_prefix(monkeypatch):
 # cmd_update integration — concurrent-instance gate
 # ---------------------------------------------------------------------------
 
+
+@pytest.mark.windows_only
+def test_cmd_update_self_locked_refuses_before_update_mutation(monkeypatch, capsys):
+    from hermes_cli import config as config_mod
+
+    monkeypatch.setattr(config_mod, "is_managed", lambda: False)
+    monkeypatch.setattr(config_mod, "detect_install_method", lambda _root: "git")
+    monkeypatch.setattr(
+        cli_main, "_windows_running_hermes_launcher_locked", lambda: True
+    )
+    cleaned = []
+    monkeypatch.setattr(
+        cli_main, "_cleanup_pending_hermes_replacements", lambda: cleaned.append(True)
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_cmd_update_impl",
+        lambda *_a, **_k: pytest.fail("update mutated state under a self-lock"),
+    )
+    monkeypatch.setattr(sys, "argv", ["hermes", "update", "-y"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli_main.cmd_update(SimpleNamespace(check=False))
+
+    assert exc_info.value.code == 2
+    assert cleaned == [True]
+    output = capsys.readouterr().out
+    assert sys.executable in output
+    assert "-m hermes_cli.main update -y" in output
+
+
+@pytest.mark.windows_only
+def test_cmd_update_replaceable_launcher_reaches_update(monkeypatch):
+    from hermes_cli import config as config_mod
+
+    monkeypatch.setattr(config_mod, "is_managed", lambda: False)
+    monkeypatch.setattr(config_mod, "detect_install_method", lambda _root: "git")
+    monkeypatch.setattr(
+        cli_main, "_windows_running_hermes_launcher_locked", lambda: False
+    )
+    called = []
+    monkeypatch.setattr(
+        cli_main,
+        "_cmd_update_impl",
+        lambda args, *, gateway_mode: called.append((args, gateway_mode)),
+    )
+    monkeypatch.setattr(cli_main, "_install_hangup_protection", lambda **_k: None)
+    monkeypatch.setattr(cli_main, "_finalize_update_output", lambda _state: None)
+    monkeypatch.setattr("hermes_cli.update_lock.UpdateLock.acquire", lambda _self: True)
+    monkeypatch.setattr("hermes_cli.update_lock.UpdateLock.release", lambda _self: None)
+
+    args = SimpleNamespace(check=False, gateway=False)
+    cli_main.cmd_update(args)
+
+    assert called == [(args, False)]
+
+
+@pytest.mark.windows_only
+def test_windows_delete_probe_distinguishes_unshared_handle(tmp_path):
+    import ctypes
+    from ctypes import wintypes
+
+    target = tmp_path / "hermes.exe"
+    target.write_bytes(b"MZ-test")
+    assert cli_main._windows_path_blocks_delete(target) is False
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    handle = create_file(
+        str(target),
+        0x80000000,
+        0x00000001,
+        None,
+        3,
+        0x00000080,
+        None,
+    )
+    assert handle != wintypes.HANDLE(-1).value
+    try:
+        assert cli_main._windows_path_blocks_delete(target) is True
+    finally:
+        close_handle(handle)
 
 
 

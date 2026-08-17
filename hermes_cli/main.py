@@ -70,6 +70,7 @@ from hermes_cli._subprocess_compat import suppress_platform_ver_console
 
 suppress_platform_ver_console()
 
+import ntpath
 import os
 import sys
 
@@ -8711,7 +8712,7 @@ def _recover_core_update_marker_locked() -> None:
 
 
 def _windows_running_hermes_launcher_locked() -> bool:
-    """True when a venv ``hermes*.exe`` shim is this process or an ancestor.
+    """True when an ancestral venv ``hermes*.exe`` blocks delete access.
 
     Best-effort: returns False when psutil is unavailable or inspection fails.
     """
@@ -8735,14 +8736,75 @@ def _windows_running_hermes_launcher_locked() -> bool:
         me = psutil.Process()
         for proc in [me] + list(me.parents()):
             try:
-                exe_norm = str(Path(proc.exe()).resolve()).lower()
+                exe_path = Path(proc.exe())
+                exe_norm = str(exe_path.resolve()).lower()
             except Exception:
                 continue
             if exe_norm in shim_set:
-                return True
+                return _windows_path_blocks_delete(exe_path)
     except Exception:
         return False
     return False
+
+
+def _windows_path_blocks_delete(path: Path) -> bool:
+    """Probe whether another Windows handle prevents replacing ``path``.
+
+    Opening the file with DELETE access is non-mutating, but Windows rejects it
+    with a sharing violation when an existing executable handle omitted
+    ``FILE_SHARE_DELETE``.  Fail open if the Win32 probe itself is unavailable;
+    the quarantine retry remains the downstream safety net.
+    """
+    if not _is_windows() or not path.is_file():
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        DELETE = 0x00010000
+        FILE_SHARE_READ = 0x00000001
+        FILE_SHARE_WRITE = 0x00000002
+        FILE_SHARE_DELETE = 0x00000004
+        OPEN_EXISTING = 3
+        FILE_ATTRIBUTE_NORMAL = 0x00000080
+        ERROR_ACCESS_DENIED = 5
+        ERROR_SHARING_VIOLATION = 32
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+
+        handle = create_file(
+            str(path),
+            DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+        invalid_handle = wintypes.HANDLE(-1).value
+        if handle == invalid_handle:
+            return ctypes.get_last_error() in {
+                ERROR_ACCESS_DENIED,
+                ERROR_SHARING_VIOLATION,
+            }
+        close_handle(handle)
+        return False
+    except Exception:
+        return False
 
 
 def _default_venv_install_target() -> tuple[list[str], dict[str, str] | None]:
@@ -8855,19 +8917,15 @@ def _quarantine_running_hermes_exe(
 
     1. Retry up to ``max_attempts`` times with exponential backoff
        (100/250/500/1000 ms). Handles the AV-scanner case.
-    2. If all retries fail, schedule the .exe for replacement on next
-       reboot via ``MoveFileExW(MOVEFILE_DELAY_UNTIL_REBOOT)``. This still
-       lets uv create a fresh shim at the original path (Windows will keep
-       the old file's content under a new name until the reboot), so the
-       update can complete; the user just needs to reboot to fully unload
-       the stale image.
+    2. If all retries fail, do not schedule a reboot rename. Scheduling does
+       not release the current handle, so the install still fails, and the
+       deferred operation can later move away a freshly installed shim.
     3. Print a clear warning naming the most likely culprit (running
-       Hermes Desktop / gateway / REPL) and pointing to ``--force``.
+       Hermes Desktop / gateway / REPL) and how to release the lock.
 
     Returns the list of (original, quarantined) pairs so the caller can roll
     back if the install itself fails before uv writes a replacement. Pairs
-    where we used ``MOVEFILE_DELAY_UNTIL_REBOOT`` are NOT returned — they
-    are already deferred and roll-back is meaningless.
+    Locked files are not returned because no rename occurred.
     """
     moved: list[tuple[Path, Path]] = []
     if not _is_windows():
@@ -8903,27 +8961,9 @@ def _quarantine_running_hermes_exe(
         if last_exc is None:
             continue
 
-        # All in-process renames failed. Try MoveFileEx with
-        # MOVEFILE_DELAY_UNTIL_REBOOT as a last resort. This succeeds in the
-        # exact case where the inline rename failed (another process holds
-        # the handle without share-delete), at the cost of requiring a
-        # reboot to fully reclaim the old .exe.
-        scheduled = _schedule_replace_on_reboot(shim, target)
-        if scheduled:
-            print(
-                f"  ⚠ {shim.name} is locked by another process; scheduled "
-                f"replacement on next reboot."
-            )
-            print(
-                "    The new shim was written at the same path, but a "
-                "reboot is needed to fully unload the old one."
-            )
-            # Do NOT append to ``moved``: we don't want roll-back to undo a
-            # reboot-deferred operation.
-            continue
-
-        # Truly couldn't budge the .exe. Print an actionable warning and let
-        # uv try its luck — sometimes uv's own retry handling pulls through.
+        # A reboot-deferred rename does not make the path replaceable in this
+        # process. Let uv surface the install failure without adding a stale
+        # PendingFileRenameOperations pair that could clobber a later repair.
         print(
             f"  ⚠ Could not quarantine {shim.name} ({last_exc.__class__.__name__}: "
             f"another process is holding it open)."
@@ -8936,39 +8976,75 @@ def _quarantine_running_hermes_exe(
     return moved
 
 
-def _schedule_replace_on_reboot(shim: Path, quarantine_target: Path) -> bool:
-    """Schedule ``shim`` -> ``quarantine_target`` via PendingFileRenameOperations.
+_PENDING_RENAME_KEY = r"SYSTEM\CurrentControlSet\Control\Session Manager"
+_PENDING_RENAME_VALUE = "PendingFileRenameOperations"
 
-    Uses Win32 ``MoveFileExW`` with ``MOVEFILE_REPLACE_EXISTING |
-    MOVEFILE_DELAY_UNTIL_REBOOT``. The OS persists the rename in
-    ``HKLM\\System\\CurrentControlSet\\Control\\Session Manager\\
-    PendingFileRenameOperations`` and applies it before any user-mode code
-    runs on next boot — at which point no process can hold the .exe.
 
-    Returns ``True`` if the schedule call succeeded, ``False`` otherwise
-    (non-Windows, ctypes failure, lack of privilege, etc.). Never raises.
-    """
-    if not _is_windows():
-        return False
-    try:
-        import ctypes
-        from ctypes import wintypes
+def _normalize_pending_rename_path(value: str) -> str:
+    """Normalize a Session Manager rename operand for path comparison."""
+    path = str(value).lstrip("!")
+    if path.startswith("\\??\\"):
+        path = path[4:]
+    return ntpath.normcase(ntpath.normpath(path))
 
-        MOVEFILE_REPLACE_EXISTING = 0x1
-        MOVEFILE_DELAY_UNTIL_REBOOT = 0x4
 
-        MoveFileExW = ctypes.windll.kernel32.MoveFileExW
-        MoveFileExW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
-        MoveFileExW.restype = wintypes.BOOL
-
-        ok = MoveFileExW(
-            str(shim),
-            str(quarantine_target),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_DELAY_UNTIL_REBOOT,
+def _filter_pending_hermes_replacements(
+    entries: list[str], shims: list[Path]
+) -> tuple[list[str], int]:
+    """Drop only old shim-quarantine pairs, preserving unrelated operations."""
+    shim_paths = {_normalize_pending_rename_path(str(shim)) for shim in shims}
+    kept: list[str] = []
+    removed = 0
+    index = 0
+    while index + 1 < len(entries):
+        source, target = entries[index], entries[index + 1]
+        source_norm = _normalize_pending_rename_path(source)
+        target_norm = _normalize_pending_rename_path(target)
+        stale = source_norm in shim_paths and target_norm.startswith(
+            f"{source_norm}.old."
         )
-        return bool(ok)
-    except Exception:
-        return False
+        if stale:
+            removed += 1
+        else:
+            kept.extend((source, target))
+        index += 2
+    if index < len(entries):
+        kept.append(entries[index])
+    return kept, removed
+
+
+def _cleanup_pending_hermes_replacements(scripts_dir: Path | None = None) -> int:
+    """Best-effort removal of stale reboot renames created by older Hermes."""
+    if not _is_windows():
+        return 0
+    if scripts_dir is None:
+        scripts_dir = _venv_scripts_dir()
+    if scripts_dir is None:
+        return 0
+    try:
+        import winreg
+
+        access = winreg.KEY_QUERY_VALUE | winreg.KEY_SET_VALUE
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, _PENDING_RENAME_KEY, 0, access
+        ) as key:
+            entries, value_type = winreg.QueryValueEx(key, _PENDING_RENAME_VALUE)
+            if value_type != winreg.REG_MULTI_SZ or not isinstance(entries, list):
+                return 0
+            kept, removed = _filter_pending_hermes_replacements(
+                entries, _hermes_exe_shims(scripts_dir)
+            )
+            if not removed:
+                return 0
+            if kept:
+                winreg.SetValueEx(
+                    key, _PENDING_RENAME_VALUE, 0, winreg.REG_MULTI_SZ, kept
+                )
+            else:
+                winreg.DeleteValue(key, _PENDING_RENAME_VALUE)
+            return removed
+    except (FileNotFoundError, OSError, ValueError):
+        return 0
 
 
 def _restore_quarantined_exes(moved: list[tuple[Path, Path]]) -> None:
@@ -9021,11 +9097,13 @@ def _run_quarantined_install(
 
 
 def _cleanup_quarantined_exes(scripts_dir: Path | None = None) -> None:
-    """Sweep ``hermes.exe.old.*`` left by prior updates.
+    """Sweep old shim files and stale deferred renames left by prior updates.
 
     Called early on every hermes invocation. The .old files are unlocked once
-    their owning process exited, so deletion succeeds the next run. Silent
-    no-op when nothing's there or on file-locked / permission errors.
+    their owning process exited, so deletion succeeds the next run. Old Hermes
+    versions may also have queued a reboot rename that would move a later fresh
+    shim away; remove only pairs matching this venv's quarantine naming scheme.
+    Silent no-op when nothing's there or on file-lock / permission errors.
     """
     if not _is_windows():
         return
@@ -9033,6 +9111,7 @@ def _cleanup_quarantined_exes(scripts_dir: Path | None = None) -> None:
         scripts_dir = _venv_scripts_dir()
     if scripts_dir is None:
         return
+    _cleanup_pending_hermes_replacements(scripts_dir)
     try:
         for stale in scripts_dir.glob("*.exe.old.*"):
             try:
@@ -9931,6 +10010,21 @@ def cmd_update(args):
             branch_explicit=bool(getattr(args, "branch", None)),
         )
         return
+
+    # A setuptools/uv Windows launcher stays alive as an ancestor of the
+    # Python process. If that launcher denies FILE_SHARE_DELETE, neither our
+    # rename retry nor uv can replace it while this command is running.
+    # Refuse before backup/git/install mutation; the module entry point runs
+    # under python.exe and therefore leaves the console-script shim unlocked.
+    if _is_windows() and _windows_running_hermes_launcher_locked():
+        _cleanup_pending_hermes_replacements()
+        module_cmd = subprocess.list2cmdline(
+            [sys.executable, "-m", "hermes_cli.main", *sys.argv[1:]]
+        )
+        print("✗ Windows cannot update a hermes.exe launcher that is currently in use.")
+        print("  Re-run the same update through the venv Python interpreter:")
+        print(f"    {module_cmd}")
+        sys.exit(2)
 
     gateway_mode = getattr(args, "gateway", False)
 
