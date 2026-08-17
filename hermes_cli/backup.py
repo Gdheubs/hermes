@@ -82,6 +82,35 @@ _EXCLUDED_DIRS = {
     ".ruff_cache",
 }
 
+# Root-level browser profiles are live, machine-specific runtime state. Their
+# SQLite databases can remain locked indefinitely while Chromium is running,
+# which prevents the ZIP central directory from ever being written. Managed
+# browser and Node runtimes are downloaded again by setup/update, while quick
+# state snapshots duplicate the live state already written to the full backup.
+# Keep these exclusions root-only so identically named directories inside user
+# skills/projects remain portable. ``chrome-debug`` is the canonical Hermes
+# browser-profile name; the cdp variants are retained for older/local
+# LaunchAgent configurations.
+_ROOT_ONLY_EXCLUDED_DIRS = {
+    "browsers",
+    "chrome-debug",
+    "chrome-cdp-profile",
+    "chrome-cdp-visible-profile",
+    "node",
+    "state-snapshots",
+}
+
+
+def _is_runtime_output_path(rel_path: Path) -> bool:
+    """Return True for generated cron output in the default or named profiles."""
+    parts = rel_path.parts
+    return (
+        parts[:2] == ("cron", "output")
+        or len(parts) >= 4
+        and parts[0] == "profiles"
+        and parts[2:4] == ("cron", "output")
+    )
+
 # File-name suffixes to skip
 _EXCLUDED_SUFFIXES = (
     ".pyc",
@@ -310,6 +339,12 @@ def _should_exclude(rel_path: Path) -> bool:
     """Return True if *rel_path* (relative to hermes root) should be skipped."""
     parts = rel_path.parts
 
+    if parts and parts[0] in _ROOT_ONLY_EXCLUDED_DIRS:
+        return True
+
+    if _is_runtime_output_path(rel_path):
+        return True
+
     for part in parts:
         if part not in _EXCLUDED_DIRS:
             continue
@@ -329,6 +364,26 @@ def _should_exclude(rel_path: Path) -> bool:
         return True
 
     return False
+
+
+def _prune_backup_dirnames(dirnames: list[str], rel_dir: Path) -> set[str]:
+    """Prune excluded child directories from one ``os.walk`` iteration."""
+    is_root = rel_dir == Path(".")
+    kept: list[str] = []
+    for dirname in dirnames:
+        if is_root and dirname in _ROOT_ONLY_EXCLUDED_DIRS:
+            continue
+        if _is_runtime_output_path(rel_dir / dirname):
+            continue
+        if dirname in _EXCLUDED_DIRS:
+            if dirname == "hermes-agent" and not is_root:
+                kept.append(dirname)
+            continue
+        kept.append(dirname)
+
+    removed = set(dirnames) - set(kept)
+    dirnames[:] = kept
+    return removed
 
 
 def _should_skip_backup_file(abs_path: Path, rel_path: Path, out_path: Path) -> bool:
@@ -673,16 +728,8 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
         dp = Path(dirpath)
         rel_dir = dp.relative_to(hermes_root)
 
-        # Prune excluded directories in-place so os.walk doesn't descend
-        # ``hermes-agent`` is only pruned at the root level; nested dirs
-        # with the same name (e.g. in skills/) must be preserved.
-        is_root = rel_dir == Path(".")
-        orig_dirnames = dirnames[:]
-        dirnames[:] = [
-            d for d in dirnames
-            if d not in _EXCLUDED_DIRS or (d == "hermes-agent" and not is_root)
-        ]
-        for removed in set(orig_dirnames) - set(dirnames):
+        # Prune excluded directories in-place so os.walk doesn't descend.
+        for removed in _prune_backup_dirnames(dirnames, rel_dir):
             skipped_dirs.add(str(rel_dir / removed))
 
         for fname in filenames:
@@ -1842,8 +1889,9 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
     try:
         for dirpath, dirnames, filenames in os.walk(hermes_root, followlinks=False):
             dp = Path(dirpath)
-            # Prune excluded directories in-place so os.walk doesn't descend
-            dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
+            rel_dir = dp.relative_to(hermes_root)
+            # Keep this path in lockstep with run_backup().
+            _prune_backup_dirnames(dirnames, rel_dir)
 
             for fname in filenames:
                 fpath = dp / fname

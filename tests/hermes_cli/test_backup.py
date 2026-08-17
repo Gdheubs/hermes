@@ -133,6 +133,30 @@ class TestShouldExclude:
         from hermes_cli.backup import _should_exclude
         assert _should_exclude(Path("backups/pre-update-2026-04-27-063400.zip"))
 
+    @pytest.mark.parametrize(
+        "dirname",
+        [
+            "browsers",
+            "chrome-debug",
+            "chrome-cdp-profile",
+            "chrome-cdp-visible-profile",
+            "node",
+            "state-snapshots",
+        ],
+    )
+    def test_excludes_only_root_regeneratable_runtime_dirs(self, dirname):
+        """Machine-local runtimes and duplicate snapshots stay out of backups."""
+        from hermes_cli.backup import _should_exclude
+        assert _should_exclude(Path(dirname) / "nested" / "file")
+        assert not _should_exclude(Path("skills/example") / dirname / "notes.md")
+
+    def test_excludes_generated_cron_output_but_not_job_definitions(self):
+        from hermes_cli.backup import _should_exclude
+        assert _should_exclude(Path("cron/output/job/result.md"))
+        assert _should_exclude(Path("profiles/operator/cron/output/job/result.md"))
+        assert not _should_exclude(Path("cron/jobs.json"))
+        assert not _should_exclude(Path("workspace/example/cron/output/fixture.md"))
+
     def test_excludes_sqlite_sidecars(self):
         """SQLite WAL/SHM/journal sidecars must not ship alongside the
         safe-copied .db — pairing a fresh snapshot with stale sidecar state
@@ -213,10 +237,64 @@ class TestBackup:
         assert staged_dirs, "no SQLite snapshot was staged"
         assert all(d == str(out_zip.parent) for d in staged_dirs), staged_dirs
 
+    @pytest.mark.parametrize(
+        "writer_name",
+        ["run_backup", "_write_full_zip_backup"],
+    )
+    def test_full_backup_walkers_prune_live_root_browser_profiles(
+        self, tmp_path, monkeypatch, writer_name
+    ):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        _make_hermes_tree(hermes_home)
+        runtime_dirs = {
+            "browsers": Path("chrome-for-testing") / "chrome",
+            "chrome-cdp-profile": Path("Default") / "History",
+            "node": Path("bin") / "node",
+            "state-snapshots": Path("snapshot") / "state.db",
+        }
+        for dirname, child in runtime_dirs.items():
+            path = hermes_home / dirname / child
+            path.parent.mkdir(parents=True)
+            path.write_text("runtime")
+        nested = hermes_home / "skills" / "example" / "chrome-cdp-profile"
+        nested.mkdir(parents=True)
+        (nested / "notes.md").write_text("keep")
+        cron_output = hermes_home / "cron" / "output" / "job"
+        cron_output.mkdir(parents=True)
+        (cron_output / "result.md").write_text("generated")
 
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        out_zip = tmp_path / f"{writer_name}.zip"
 
+        import hermes_cli.backup as backup_mod
+        real_walk = backup_mod.os.walk
+        walked = []
 
+        def traced_walk(*args, **kwargs):
+            for item in real_walk(*args, **kwargs):
+                walked.append(Path(item[0]))
+                yield item
 
+        monkeypatch.setattr(backup_mod.os, "walk", traced_walk)
+        if writer_name == "run_backup":
+            backup_mod.run_backup(Namespace(output=str(out_zip)))
+        else:
+            assert backup_mod._write_full_zip_backup(out_zip, hermes_home) == out_zip
+
+        for dirname in runtime_dirs:
+            runtime_dir = hermes_home / dirname
+            assert not any(
+                path == runtime_dir or runtime_dir in path.parents for path in walked
+            )
+        assert not any(path == cron_output or cron_output in path.parents for path in walked)
+        with zipfile.ZipFile(out_zip) as zf:
+            names = zf.namelist()
+        for dirname in runtime_dirs:
+            assert not any(name.startswith(f"{dirname}/") for name in names)
+        assert not any(name.startswith("cron/output/") for name in names)
+        assert "skills/example/chrome-cdp-profile/notes.md" in names
 
     def test_skips_symlinked_files(self, tmp_path, monkeypatch):
         """Backup must not dereference symlinks and leak files outside HERMES_HOME."""
