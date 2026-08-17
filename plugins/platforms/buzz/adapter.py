@@ -84,27 +84,29 @@ from gateway.platforms.base import (
 from gateway.config import Platform
 
 
-# Buzz chat messages are Nostr kind 9 events.  ``buzz messages get`` also
-# returns housekeeping kinds (joins, canvas updates, …) — only kind 9 is
-# dispatched to the agent.
+# Buzz stream messages are Nostr kind 9 events. Forum roots/comments use
+# separate thread semantics and are deliberately outside this adapter.
 _CHAT_KIND = 9
+_FORUM_EVENT_KINDS = frozenset({45001, 45003})
 # How many events to request per poll / seed call.
 _FETCH_LIMIT = 50
 # Bound on the per-channel de-dupe set (events, not bytes).
 _SEEN_CAP = 500
-# Re-run DM discovery (``dms list`` plus the channels-list fallback) every
-# N poll sweeps to pick up conversations opened mid-run.
-_DM_DISCOVERY_EVERY = 5
+# Re-run joined-channel and DM discovery every N poll sweeps so the polling
+# fallback adopts conversations opened mid-run.
+_CHANNEL_DISCOVERY_EVERY = 5
 
 _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
 _CLI_TIMEOUT = 30.0
 
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
-# kind 44100 is Buzz's channel-membership event — used for live DM discovery.
+# Buzz emits relay-signed membership notifications for joins and removals.
 _WS_AUTH_TIMEOUT = 20.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
+_WS_MEMBERSHIP_REMOVED_KIND = 44101
+_WS_MEMBERSHIP_KINDS = frozenset({_WS_MEMBERSHIP_KIND, _WS_MEMBERSHIP_REMOVED_KIND})
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
 
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
@@ -344,6 +346,17 @@ def _parse_json_list(stdout: str) -> List[dict]:
     return [item for item in data if isinstance(item, dict)]
 
 
+def _parse_json_list_strict(stdout: str) -> Optional[List[dict]]:
+    """Parse a JSON object array, preserving malformed-vs-empty distinction."""
+    try:
+        data = json.loads(stdout)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
+        return None
+    return data
+
+
 # ---------------------------------------------------------------------------
 # Buzz Adapter
 # ---------------------------------------------------------------------------
@@ -510,14 +523,25 @@ class BuzzAdapter(BasePlatformAdapter):
         except ImportError:
             self._lock_key = None  # status module not available (e.g. tests)
 
+        # Start the membership cursor before taking the joined-channel
+        # snapshot. A join racing with startup is then present either in the
+        # snapshot or in the membership subscription's inclusive overlap.
+        if self.transport in ("auto", "websocket"):
+            self._membership_since = int(time.time())
+
         # Map channel ids to names and pick the watch set.
-        code, out, err = await self._run_cli(["channels", "list"])
+        code, out, err = await self._run_cli(["channels", "list", "--member"])
         if code != 0:
             message = _cli_error_message(err, code)
             logger.error("Buzz: failed to list channels — %s", message)
             self._set_fatal_error("connect_failed", message, retryable=code == 2)
             return False
-        listed = _parse_json_list(out)
+        listed = _parse_json_list_strict(out)
+        if listed is None:
+            message = "buzz channels list returned malformed JSON"
+            logger.error("Buzz: %s", message)
+            self._set_fatal_error("connect_failed", message, retryable=True)
+            return False
         self._channel_names = {
             str(ch.get("channel_id")): str(ch.get("name") or ch.get("channel_id"))
             for ch in listed
@@ -528,9 +552,9 @@ class BuzzAdapter(BasePlatformAdapter):
                 self._channel_meta[str(ch["channel_id"])] = ch
         watch = self.channels or list(self._channel_names)
         if not watch:
-            logger.error("Buzz: no channels to watch (configure BUZZ_CHANNELS or join a channel)")
-            self._set_fatal_error("config_missing", "no Buzz channels to watch", retryable=False)
-            return False
+            logger.info(
+                "Buzz: no joined channels yet; waiting for dynamic discovery"
+            )
 
         # Seed high-water marks from the newest events so a (re)start never
         # replays channel history into the agent.
@@ -743,7 +767,8 @@ class BuzzAdapter(BasePlatformAdapter):
             logger.info("Buzz: WebSocket transport unavailable (%s); falling back to polling", e)
             return False
         self._ws_ready = asyncio.Event()
-        self._membership_since = int(time.time())
+        if not self._membership_since:
+            self._membership_since = int(time.time())
         self._ws_task = asyncio.create_task(self._websocket_loop())
         try:
             await asyncio.wait_for(self._ws_ready.wait(), timeout=_WS_AUTH_TIMEOUT + 5)
@@ -790,9 +815,21 @@ class BuzzAdapter(BasePlatformAdapter):
                 detail = response[-1] if len(response) > 1 else "authentication failed"
                 raise ConnectionError(f"Buzz WebSocket AUTH failed: {detail}")
 
-    async def _send_channel_subscription(self, websocket, subscription_id: str, channel_id: str) -> None:
+    async def _send_channel_subscription(
+        self,
+        websocket,
+        subscription_id: str,
+        channel_id: str,
+        *,
+        since: Optional[int] = None,
+    ) -> None:
         state = self._channel_state.get(channel_id) or {}
-        since = max(int(state.get("last_ts") or time.time()) - 1, 0)
+        if since is None:
+            last_ts = int(state.get("last_ts") or time.time())
+            subscription_floor = int(state.get("subscription_floor") or 0)
+            since = max(last_ts - 1, subscription_floor, 0)
+        else:
+            since = max(int(since), 0)
         request = [
             "REQ",
             subscription_id,
@@ -800,20 +837,47 @@ class BuzzAdapter(BasePlatformAdapter):
         ]
         await websocket.send(json.dumps(request, separators=(",", ":")))
 
+    async def _subscribe_missing_channels(
+        self,
+        websocket,
+        subscriptions: Dict[str, Optional[str]],
+    ) -> None:
+        """Subscribe every watched channel not represented on this socket."""
+        subscribed_channels = {
+            channel_id for channel_id in subscriptions.values() if channel_id is not None
+        }
+        for channel_id in list(self._channel_state):
+            if channel_id in subscribed_channels:
+                continue
+            subscription_index = len(subscriptions)
+            subscription_id = f"hermes-buzz-dm-{subscription_index}"
+            while subscription_id in subscriptions:
+                subscription_index += 1
+                subscription_id = f"hermes-buzz-dm-{subscription_index}"
+            await self._send_channel_subscription(
+                websocket,
+                subscription_id,
+                channel_id,
+            )
+            # Record socket state only after the REQ frame is sent successfully.
+            subscriptions[subscription_id] = channel_id
+            subscribed_channels.add(channel_id)
+            logger.info("Buzz: subscribed to new conversation %s", channel_id)
+
     async def _subscribe_websocket(self, websocket) -> Dict[str, Optional[str]]:
-        """Subscribe to every watched conversation plus membership events
-        (kind 44100 p-tagged to us) for live DM discovery."""
+        """Subscribe to every watched conversation plus relay-signed
+        membership changes for live regular-channel and DM discovery."""
         subscriptions: Dict[str, Optional[str]] = {}
         for index, channel_id in enumerate(list(self._channel_state)):
             subscription_id = f"hermes-buzz-{index}"
-            subscriptions[subscription_id] = channel_id
             await self._send_channel_subscription(websocket, subscription_id, channel_id)
+            subscriptions[subscription_id] = channel_id
         if self._self_pubkey:
             request = [
                 "REQ",
                 _WS_MEMBERSHIP_SUB_ID,
                 {
-                    "kinds": [_WS_MEMBERSHIP_KIND],
+                    "kinds": sorted(_WS_MEMBERSHIP_KINDS),
                     "#p": [self._self_pubkey],
                     "since": max(self._membership_since - 1, 0),
                 },
@@ -823,18 +887,64 @@ class BuzzAdapter(BasePlatformAdapter):
         return subscriptions
 
     async def _handle_membership_event(self, websocket, subscriptions: Dict[str, Optional[str]], event: dict) -> None:
-        """A membership event p-tagged to us: rediscover conversations and
-        subscribe to any new ones (fresh DMs dispatch from their beginning)."""
-        self._membership_since = max(self._membership_since, int(event.get("created_at") or 0))
-        before = set(self._channel_state)
+        """Reconcile subscriptions after a relay-signed membership change."""
+        event_since = max(int(event.get("created_at") or 0), 0)
+        kind = int(event.get("kind") or 0)
+        # Old adds must not widen state. Removals still need an authoritative
+        # snapshot because different channels' notifications can arrive out of
+        # timestamp order and the snapshot also handles a concurrent rejoin.
+        if event_since < self._membership_since and kind != _WS_MEMBERSHIP_REMOVED_KIND:
+            return
+        tags = event.get("tags")
+        channel_id = ""
+        if isinstance(tags, list):
+            channel_id = next(
+                (
+                    str(tag[1])
+                    for tag in tags
+                    if isinstance(tag, (list, tuple))
+                    and len(tag) > 1
+                    and tag[0] == "h"
+                ),
+                "",
+            )
+
+        if kind == _WS_MEMBERSHIP_REMOVED_KIND:
+            self._membership_since = max(self._membership_since, event_since)
+            # Explicit channels are an operator-owned static watch set.
+            if self.channels:
+                return
+            if await self._discover_joined_channels(seed=True, reconcile=True) is None:
+                raise ConnectionError("Buzz joined-channel reconciliation failed")
+            for subscription_id, subscribed_channel in list(subscriptions.items()):
+                if subscribed_channel is None or subscribed_channel in self._channel_state:
+                    continue
+                await websocket.send(
+                    json.dumps(["CLOSE", subscription_id], separators=(",", ":"))
+                )
+                # Mutate socket state only after CLOSE is sent successfully.
+                subscriptions.pop(subscription_id, None)
+                logger.info(
+                    "Buzz: unsubscribed from removed conversation %s",
+                    subscribed_channel,
+                )
+            # The same authoritative snapshot can reveal a concurrent join.
+            await self._subscribe_missing_channels(websocket, subscriptions)
+            return
+        if kind != _WS_MEMBERSHIP_KIND:
+            return
+
+        if await self._discover_joined_channels(
+            since=event_since, seed=True, target_channel_id=channel_id
+        ) is None:
+            raise ConnectionError("Buzz joined-channel discovery failed")
+        self._membership_since = max(self._membership_since, event_since)
+
+        # The membership-target channel is time-sensitive. Subscribe before
+        # unrelated DM discovery can spend up to two CLI timeouts.
+        await self._subscribe_missing_channels(websocket, subscriptions)
         await self._discover_dms(seed=False)
-        for channel_id in self._channel_state:
-            if channel_id in before:
-                continue
-            subscription_id = f"hermes-buzz-dm-{len(subscriptions)}"
-            subscriptions[subscription_id] = channel_id
-            await self._send_channel_subscription(websocket, subscription_id, channel_id)
-            logger.info("Buzz: subscribed to new conversation %s", channel_id)
+        await self._subscribe_missing_channels(websocket, subscriptions)
 
     async def _websocket_loop(self) -> None:
         """Persistent authenticated subscription with bounded reconnect
@@ -857,6 +967,13 @@ class BuzzAdapter(BasePlatformAdapter):
                         max_size=_WS_MAX_MESSAGE_BYTES,
                     ) as websocket:
                         await self._authenticate_websocket(websocket)
+                        if await self._discover_joined_channels(
+                            seed=True, reconcile=True
+                        ) is None:
+                            raise ConnectionError(
+                                "Buzz joined-channel reconciliation failed"
+                            )
+                        await self._discover_dms(seed=False)
                         subscriptions = await self._subscribe_websocket(websocket)
                         self._ws_active = True
                         if self._ws_ready is not None:
@@ -907,7 +1024,10 @@ class BuzzAdapter(BasePlatformAdapter):
                 await asyncio.sleep(self.poll_interval)
                 self._poll_count += 1
                 try:
-                    if self._poll_count % _DM_DISCOVERY_EVERY == 0:
+                    if self._poll_count % _CHANNEL_DISCOVERY_EVERY == 0:
+                        await self._discover_joined_channels(
+                            seed=True, reconcile=True
+                        )
                         await self._discover_dms(seed=False)
                     for channel_id in list(self._channel_state):
                         await self._poll_channel(channel_id)
@@ -918,20 +1038,36 @@ class BuzzAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             raise
 
-    async def _seed_channel(self, channel_id: str, chat_type: str) -> None:
-        """Initialize a channel's high-water mark from its newest events."""
+    async def _seed_channel(
+        self,
+        channel_id: str,
+        chat_type: str,
+        *,
+        before: int = 0,
+        safe_floor: bool = False,
+    ) -> None:
+        """Initialize a channel's high-water mark from its newest history."""
         state = {"chat_type": chat_type, "last_ts": 0, "seen": OrderedDict()}
         self._channel_state[channel_id] = state
-        code, out, err = await self._run_cli(
-            ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
-        )
+        safe_boundary = int(time.time()) if safe_floor else 0
+        history_before = before or max(safe_boundary - 1, 0)
+        args = [
+            "messages", "get", "--channel", channel_id,
+            "--limit", str(_FETCH_LIMIT),
+        ]
+        if history_before:
+            args.extend(["--before", str(history_before)])
+        code, out, err = await self._run_cli(args)
         if code != 0:
             logger.warning(
                 "Buzz: could not seed channel %s — %s", channel_id, _cli_error_message(err, code)
             )
-            # Fall back to "now" so a transiently unreadable channel does not
-            # replay its whole history once it becomes readable.
-            state["last_ts"] = int(time.time())
+            # Fall back to a safe current boundary so a transiently unreadable
+            # channel does not replay history once it becomes readable.
+            floor = safe_boundary if safe_floor else int(time.time())
+            state["last_ts"] = floor
+            if safe_floor:
+                state["subscription_floor"] = floor
             return
         for event in _parse_json_list(out):
             event_id = event.get("id")
@@ -944,6 +1080,95 @@ class BuzzAdapter(BasePlatformAdapter):
             # so it bypasses the mention gate from the very first poll.
             self._maybe_latch_dm(channel_id, state, event)
         self._trim_seen(state)
+        if safe_floor:
+            floor = max(safe_boundary, int(state["last_ts"]) + 1)
+            state["last_ts"] = floor
+            state["subscription_floor"] = floor
+
+    async def _discover_joined_channels(
+        self,
+        *,
+        since: int = 0,
+        seed: bool = False,
+        target_channel_id: str = "",
+        reconcile: bool = True,
+    ) -> Optional[bool]:
+        """Reconcile joined streams; return changed state or ``None`` on failure."""
+        if self.channels:
+            return False
+        code, out, err = await self._run_cli(["channels", "list", "--member"])
+        if code != 0:
+            logger.warning(
+                "Buzz: failed to rediscover joined channels — %s",
+                _cli_error_message(err, code),
+            )
+            return None
+        channels = _parse_json_list_strict(out)
+        if channels is None:
+            logger.warning("Buzz: joined-channel discovery returned malformed JSON")
+            return None
+        joined_ids = {
+            str(channel.get("channel_id") or "") for channel in channels
+        }
+        if target_channel_id and target_channel_id not in joined_ids:
+            logger.warning(
+                "Buzz: membership channel %s missing from joined-channel snapshot",
+                target_channel_id,
+            )
+            return None
+        changed = False
+        if reconcile:
+            for watched_channel_id, state in list(self._channel_state.items()):
+                if (
+                    state.get("chat_type") == "group"
+                    and watched_channel_id not in joined_ids
+                ):
+                    changed = True
+                    self._channel_state.pop(watched_channel_id, None)
+                    self._channel_names.pop(watched_channel_id, None)
+                    self._channel_meta.pop(watched_channel_id, None)
+                    logger.info(
+                        "Buzz: stopped watching channel no longer joined: %s",
+                        watched_channel_id,
+                    )
+        for channel in channels:
+            channel_id = str(channel.get("channel_id") or "")
+            if not channel_id:
+                continue
+            name = str(channel.get("name") or channel_id)
+            if self._channel_names.get(channel_id) != name:
+                changed = True
+            self._channel_meta[channel_id] = channel
+            self._channel_names[channel_id] = name
+            if channel_id in self._channel_state:
+                continue
+            changed = True
+            channel_since = (
+                int(since)
+                if not target_channel_id or channel_id == target_channel_id
+                else 0
+            )
+            if seed:
+                # Buzz maps --before to Nostr's inclusive `until`; stop at the
+                # prior second so events sharing the join timestamp stay live.
+                history_before = max(channel_since - 1, 0) if channel_since else 0
+                await self._seed_channel(
+                    channel_id,
+                    chat_type="group",
+                    before=history_before,
+                    safe_floor=not bool(channel_since),
+                )
+                state = self._channel_state[channel_id]
+                state["last_ts"] = max(state["last_ts"], channel_since)
+                if channel_since:
+                    state["subscription_floor"] = channel_since
+            else:
+                self._channel_state[channel_id] = {
+                    "chat_type": "group",
+                    "last_ts": max(channel_since, 0),
+                    "seen": OrderedDict(),
+                }
+        return changed
 
     async def _discover_dms(self, *, seed: bool) -> None:
         """Watch DM conversations.  New ones found mid-run dispatch from their
@@ -1014,7 +1239,10 @@ class BuzzAdapter(BasePlatformAdapter):
         state["seen"][event_id] = None
         state["last_ts"] = max(state["last_ts"], created_at)
 
-        if int(event.get("kind") or 0) != _CHAT_KIND:
+        kind = int(event.get("kind") or 0)
+        if kind in _FORUM_EVENT_KINDS:
+            return
+        if kind != _CHAT_KIND:
             return
         pubkey = str(event.get("pubkey") or "").lower()
         content = event.get("content")

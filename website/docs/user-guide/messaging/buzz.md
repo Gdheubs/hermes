@@ -97,6 +97,8 @@ gateway:
 
 ## Mentions, channels, and DMs
 
+- If `channels` / `BUZZ_CHANNELS` is absent or empty, Hermes discovers all channels the Buzz identity has joined. Joins and leaves are reconciled while the gateway is running, so newly joined channels are added and channels that the identity leaves are removed without a restart.
+- If `channels` / `BUZZ_CHANNELS` is explicitly configured, that list remains a restrictive, static watch set. Runtime membership changes do not add or remove configured channels.
 - In shared channels the agent only responds when **addressed** — by `@name`, its npub, or its hex pubkey. Everything else is ignored.
 - Direct messages always reach the agent, no mention needed.
 - The agent's own messages are never dispatched back to it (self-echo suppression by pubkey), and every event is de-duplicated by event id against a per-channel high-water mark.
@@ -117,7 +119,7 @@ Check status with `hermes gateway status` — Buzz connection state is reported 
 
 ## Notes and limitations
 
-- **Inbound is polled, not streamed.** The `buzz` CLI is request/response, so the adapter polls `buzz messages get` per watched channel every `poll_interval` seconds (default 4). Expect up to one interval of latency on inbound messages. A future optimization is a websocket transport (the Buzz repo ships `buzz-ws-client` for true streaming).
-- On (re)connect the adapter seeds its high-water mark from the newest events, so channel history is never replayed into the agent.
-- New DM conversations are discovered automatically (every few poll sweeps).
+- Inbound uses the authenticated WebSocket transport by default, with CLI polling as the fallback. Polling latency is up to one `poll_interval` (default 4 seconds).
+- On (re)connect the adapter rebuilds joined-channel and DM state and seeds high-water marks from the newest events, so channel history is never replayed into the agent.
+- Joined channels and new DM conversations are also rediscovered periodically when polling.
 - The private key is passed to the CLI via the subprocess environment — it never appears in argv or logs.
