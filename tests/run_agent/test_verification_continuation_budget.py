@@ -121,6 +121,12 @@ def test_intermediate_ack_uses_summary_instead_of_premature_text(agent, monkeypa
 
     assert result["final_response"] == "verified summary."
     assert result["turn_exit_reason"] == "max_iterations_reached(1/1)"
+    retry_pair = result["messages"][1:3]
+    assert [message["role"] for message in retry_pair] == ["assistant", "user"]
+    assert all(
+        message.get("_intent_ack_continuation_nudge") is True
+        for message in retry_pair
+    )
     agent._handle_max_iterations.assert_called_once()
 
 
@@ -251,5 +257,4 @@ def test_streamed_interim_then_different_summary_not_marked_previewed(agent, mon
     # CRITICAL: response_previewed must be False — the interim narration was
     # NOT the final response, so the CLI must render the summary.
     assert result["response_previewed"] is False
-
 

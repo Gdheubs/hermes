@@ -251,6 +251,10 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # drive the bounded retry. Persisting them would replay the internal
     # retry instruction as user-authored context on resume.
     "_dropped_toolcall_nudge",
+    # Intent-ack continuation pair: a short assistant progress acknowledgement
+    # plus the synthetic user nudge that asks the model to make the real tool
+    # call. Both exist only to drive the bounded in-turn retry.
+    "_intent_ack_continuation_nudge",
 )
 
 

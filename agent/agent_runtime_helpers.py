@@ -3846,11 +3846,13 @@ def intent_ack_continuation_mode(agent) -> str:
       * ``"codex_only"`` — historical scope: continue only on the
         ``codex_responses`` api_mode, and only for codebase/workspace acks
         (``require_workspace=True``).
-      * ``"all"``        — user opted in for every api_mode; continue on any
-        future-ack + action verb (``require_workspace=False``).
+      * ``"all"``        — user opted in for every api_mode, or the provider
+        is Copilot ACP; continue on any future-ack + action verb
+        (``require_workspace=False``).
 
     Mirrors the four-mode shape of ``agent.tool_use_enforcement``: ``"auto"``
-    (default) → codex_only; ``True``/"true"/"always"/"yes"/"on" → all;
+    (default) → codex_only for Codex Responses, all for Copilot ACP;
+    ``True``/"true"/"always"/"yes"/"on" → all;
     ``False``/"false"/"never"/"no"/"off" → off; ``list`` → all when a substring
     matches the active model name, else off.
     """
@@ -3863,6 +3865,12 @@ def intent_ack_continuation_mode(agent) -> str:
     if isinstance(mode, list):
         model_lower = (agent.model or "").lower()
         return "all" if any(p.lower() in model_lower for p in mode if isinstance(p, str)) else "off"
+    # Copilot ACP translates Hermes tools into prompt instructions rather than
+    # native provider tool definitions. A short intent acknowledgement can
+    # therefore arrive as a clean text stop; reuse the bounded continuation
+    # guard so the model gets a chance to emit the structured tool block.
+    if getattr(agent, "provider", "") == "copilot-acp":
+        return "all"
     # "auto" or any unrecognised value — historical codex-only behavior.
     return "codex_only" if agent.api_mode == "codex_responses" else "off"
 

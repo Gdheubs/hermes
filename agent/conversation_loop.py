@@ -7847,12 +7847,14 @@ def run_conversation(
                 ):
                     codex_ack_continuations += 1
                     interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
+                    interim_msg["_intent_ack_continuation_nudge"] = True
                     append_message(messages, interim_msg)
                     agent._emit_interim_assistant_message(interim_msg)
 
                     continue_msg = {
                         "role": "user",
                         "content": _CODEX_ACK_CONTINUATION_NUDGE,
+                        "_intent_ack_continuation_nudge": True,
                     }
                     append_message(messages, continue_msg)
                     agent._session_messages = messages
