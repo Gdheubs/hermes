@@ -175,6 +175,17 @@ class TestEmptyRetryBudget:
             == guard.REDUCED_EMPTY_RETRY_BUDGET
         )
 
+    def test_reduced_budget_never_raises_configured_zero(self, monkeypatch):
+        """agent.empty_response_retries=0 means never retry, even when the
+        attempt is expensive: the reduction clamps to the configured base
+        instead of silently granting one full-price retry."""
+        monkeypatch.setattr(
+            guard, "_estimate_attempt_cost", lambda a, r: Decimal("0.80")
+        )
+        agent = _agent(_empty_response_retries=0)
+        assert guard.empty_retry_base(agent) == 0
+        assert guard.empty_retry_budget(agent, _response()) == 0
+
     def test_default_budget_below_threshold(self, monkeypatch):
         monkeypatch.setattr(
             guard, "_estimate_attempt_cost", lambda a, r: Decimal("0.01")

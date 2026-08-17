@@ -7589,8 +7589,10 @@ def run_conversation(
                         continue
 
                     # ── Empty response retry ──────────────────────
-                    # Model returned nothing usable.  Retry up to 3
-                    # times before attempting fallback.  This covers
+                    # Model returned nothing usable.  Retry up to
+                    # agent.empty_response_retries times (default 5; short
+                    # jittered backoff between attempts) before attempting
+                    # fallback.  This covers
                     # both truly empty responses (no content, no
                     # reasoning) AND reasoning-only responses after
                     # prefill exhaustion — models like mimo-v2-pro
@@ -7621,10 +7623,14 @@ def run_conversation(
                             finish_reason=finish_reason,
                             response=response,
                         )
+                    # Base ceiling is the operator-configured
+                    # agent.empty_response_retries (see empty_response_guard);
+                    # the guard can reduce it further for high-cost attempts.
+                    _empty_retry_base = _empty_guard.empty_retry_base(agent)
                     _empty_retry_budget = (
                         _empty_guard.empty_retry_budget(agent, response)
                         if _empty_candidate
-                        else _empty_guard.DEFAULT_EMPTY_RETRY_BUDGET
+                        else _empty_retry_base
                     )
                     _deterministic_empty = _empty_candidate and (
                         _empty_guard.deterministic_empty(agent)
@@ -7648,7 +7654,7 @@ def run_conversation(
                         )
                         _budget_note = (
                             " — high-cost request, reduced retry budget"
-                            if _empty_retry_budget < _empty_guard.DEFAULT_EMPTY_RETRY_BUDGET
+                            if _empty_retry_budget < _empty_retry_base
                             else ""
                         )
                         agent._buffer_status(
@@ -7656,12 +7662,14 @@ def run_conversation(
                             f"({agent._empty_content_retries}/{_empty_retry_budget}) "
                             f"in {wait_time:.0f}s{_budget_note}"
                         )
-                        # Sleep in small increments to stay responsive to interrupts
                         sleep_end = time.time() + wait_time
                         _backoff_touch_counter = 0
                         while time.time() < sleep_end:
                             if agent._interrupt_requested:
-                                agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during empty-response retry wait, aborting.", force=True)
+                                agent._vprint(
+                                    f"{agent.log_prefix}⚡ Interrupt during empty-response backoff, aborting.",
+                                    force=True,
+                                )
                                 _interrupt_text = (
                                     f"Operation interrupted: retrying empty response from model "
                                     f"(retry {agent._empty_content_retries}/{_empty_retry_budget})."
