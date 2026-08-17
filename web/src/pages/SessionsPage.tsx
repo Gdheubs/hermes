@@ -867,6 +867,7 @@ export default function SessionsPage() {
   const [stats, setStats] = useState<SessionStoreStats | null>(null);
   const [pruneOpen, setPruneOpen] = useState(false);
   const [pruneDays, setPruneDays] = useState("90");
+  const [pruneIncludeLive, setPruneIncludeLive] = useState(false);
   const [pruning, setPruning] = useState(false);
   const [importingSessions, setImportingSessions] = useState(false);
   const { toast, showToast } = useToast();
@@ -1499,7 +1500,12 @@ export default function SessionsPage() {
     }
     setPruning(true);
     try {
-      const resp = await api.pruneSessions(days);
+      const resp = await api.pruneSessions(
+        days,
+        undefined,
+        undefined,
+        pruneIncludeLive,
+      );
       showToast(formatSessionPruneResult(resp), "success");
       setPruneOpen(false);
       loadSessions(0);
@@ -1510,7 +1516,7 @@ export default function SessionsPage() {
     } finally {
       setPruning(false);
     }
-  }, [pruneDays, showToast, loadSessions, loadStats]);
+  }, [pruneDays, pruneIncludeLive, showToast, loadSessions, loadStats]);
 
   const pendingSession = sessionDelete.pendingId
     ? sessions.find((s) => s.id === sessionDelete.pendingId)
@@ -1633,8 +1639,9 @@ export default function SessionsPage() {
           <DialogHeader>
             <DialogTitle>Prune old sessions</DialogTitle>
             <DialogDescription>
-              Permanently remove archived sessions whose last activity is older
-              than the given number of days. Active sessions are never pruned.
+              Permanently remove ended sessions whose last activity is older than
+              the given number of days. Open sessions are skipped unless you
+              choose the reversible archive option below.
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-1.5">
@@ -1655,6 +1662,22 @@ export default function SessionsPage() {
               }}
               disabled={pruning}
             />
+            <div className="mt-2 flex items-start gap-2">
+              <Checkbox
+                checked={pruneIncludeLive}
+                id="prune-include-live"
+                onCheckedChange={(checked) =>
+                  setPruneIncludeLive(checked === true)
+                }
+                disabled={pruning}
+              />
+              <label
+                htmlFor="prune-include-live"
+                className="cursor-pointer text-xs text-muted-foreground"
+              >
+                Also archive matching open sessions (reversible)
+              </label>
+            </div>
           </div>
           <DialogFooter>
             <Button

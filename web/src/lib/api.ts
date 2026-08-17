@@ -451,8 +451,14 @@ export const api = {
     older_than_days: number,
     source?: string,
     profile = getManagementProfile(),
+    include_live = false,
   ) =>
-    fetchJSON<{ ok: boolean; removed: number; skipped_open: number }>(
+    fetchJSON<{
+      ok: boolean;
+      removed: number;
+      archived?: number;
+      skipped_open: number;
+    }>(
       "/api/sessions/prune",
       {
         method: "POST",
@@ -461,6 +467,7 @@ export const api = {
           older_than_days,
           source,
           profile: profile || undefined,
+          include_live,
         }),
       },
     ),

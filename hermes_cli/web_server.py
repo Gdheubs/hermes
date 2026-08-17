@@ -12096,14 +12096,18 @@ def _prune_sessions(body: SessionPrune):
             max_tool_calls=body.max_tool_calls,
             archived=None if body.include_archived else False,
         )
-        skipped_open = db.count_open_prune_matches(**filters)
+        archive_filters = (
+            {**filters, "archived": False} if body.include_live else filters
+        )
+        open_matches = db.count_open_prune_matches(**archive_filters)
         if body.dry_run:
             rows = db.list_prune_candidates(**filters)
-            return {
+            result = {
                 "ok": True,
                 "removed": 0,
                 "matched": len(rows),
-                "skipped_open": skipped_open,
+                "matched_open": open_matches,
+                "skipped_open": 0 if body.include_live else open_matches,
                 # Rows are ordered by last activity, not creation time.
                 "oldest_last_active": rows[0]["last_active"] if rows else None,
                 "newest_last_active": rows[-1]["last_active"] if rows else None,
@@ -12126,12 +12130,22 @@ def _prune_sessions(body: SessionPrune):
                     for r in rows
                 ],
             }
+            if body.include_live:
+                result["archived"] = 0
+            return result
         sessions_dir = profile_home / "sessions"
         removed = db.prune_sessions(
             sessions_dir=sessions_dir if sessions_dir.exists() else None,
             **filters,
         )
-        return {"ok": True, "removed": removed, "skipped_open": skipped_open}
+        result = {
+            "ok": True,
+            "removed": removed,
+            "skipped_open": 0 if body.include_live else open_matches,
+        }
+        if body.include_live:
+            result["archived"] = db.archive_open_prune_matches(**archive_filters)
+        return result
     finally:
         db.close()
 

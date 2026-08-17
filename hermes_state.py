@@ -11867,17 +11867,93 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         why an otherwise matching session was skipped without making live
         sessions eligible for destructive pruning.
         """
-        self._apply_prune_age_filter(older_than_days, filters)
-        where, params = self._prune_filter_where(source=source, **filters)
-        ended_guard = "s.ended_at IS NOT NULL"
-        if not where.startswith(ended_guard):
-            raise RuntimeError("prune filter lost its ended-session safety guard")
-        open_where = f"s.ended_at IS NULL{where[len(ended_guard):]}"
+        open_where, params = self._open_prune_filter_where(
+            older_than_days, source, filters
+        )
         with self._lock:
             cursor = self._conn.execute(
                 f"SELECT COUNT(*) FROM sessions s WHERE {open_where}", params
             )
             return int(cursor.fetchone()[0])
+
+    def _open_prune_filter_where(
+        self,
+        older_than_days: Optional[float],
+        source: Optional[str],
+        filters: Dict[str, Any],
+    ) -> Tuple[str, List[Any]]:
+        """Build the prune filter with only its ended-session guard inverted."""
+        self._apply_prune_age_filter(older_than_days, filters)
+        where, params = self._prune_filter_where(source=source, **filters)
+        ended_guard = "s.ended_at IS NOT NULL"
+        if not where.startswith(ended_guard):
+            raise RuntimeError("prune filter lost its ended-session safety guard")
+        return f"s.ended_at IS NULL{where[len(ended_guard):]}", params
+
+    def archive_open_prune_matches(
+        self,
+        older_than_days: Optional[float] = None,
+        source: str = None,
+        **filters,
+    ) -> int:
+        """Archive unended sessions matching the otherwise-destructive prune filters.
+
+        This is deliberately separate from :meth:`prune_sessions`: destructive
+        pruning must retain its ended-session guard. Only unarchived rows are
+        selected, and every match's compression lineage is archived atomically
+        so the conversation remains hidden and recoverable as a unit.
+        """
+        filters["archived"] = False
+        open_where, params = self._open_prune_filter_where(
+            older_than_days, source, filters
+        )
+
+        def _do(conn):
+            matched = int(
+                conn.execute(
+                    f"SELECT COUNT(*) FROM sessions s WHERE {open_where}", params
+                ).fetchone()[0]
+            )
+            if not matched:
+                return 0
+            conn.execute(
+                f"""
+                WITH RECURSIVE
+                  matches(id) AS (
+                    SELECT s.id FROM sessions s WHERE {open_where}
+                  ),
+                  ancestors(id) AS (
+                    SELECT id FROM matches
+                    UNION
+                    SELECT parent.id
+                    FROM ancestors a
+                    JOIN sessions child ON child.id = a.id
+                    JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  descendants(id) AS (
+                    SELECT id FROM matches
+                    UNION
+                    SELECT child.id
+                    FROM descendants d
+                    JOIN sessions parent ON parent.id = d.id
+                    JOIN sessions child ON child.parent_session_id = parent.id
+                    WHERE parent.end_reason = 'compression'
+                  ),
+                  lineage(id) AS (
+                    SELECT id FROM ancestors
+                    UNION
+                    SELECT id FROM descendants
+                  )
+                UPDATE sessions
+                SET archived = 1
+                WHERE id IN (SELECT id FROM lineage)
+                """,
+                params,
+            )
+            return matched
+
+        return self._execute_write(_do)
 
     def archive_sessions(
         self,

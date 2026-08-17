@@ -13135,6 +13135,14 @@ def main():
         help="Also delete archived sessions (excluded by default)",
     )
     sessions_prune.add_argument(
+        "--include-live",
+        action="store_true",
+        help=(
+            "Archive matching open sessions instead of skipping them; "
+            "ended sessions are still permanently deleted"
+        ),
+    )
+    sessions_prune.add_argument(
         "--never-active",
         action="store_true",
         help=(

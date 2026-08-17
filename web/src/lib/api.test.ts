@@ -118,6 +118,33 @@ describe("api.getModelOptions", () => {
   });
 });
 
+describe("api.pruneSessions", () => {
+  it("passes the include-live archive option to the session API", async () => {
+    const fetchMock = jsonFetchMock({
+      ok: true,
+      removed: 1,
+      archived: 2,
+      skipped_open: 0,
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.pruneSessions(30, undefined, undefined, true);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/sessions/prune",
+      expect.objectContaining({
+        body: JSON.stringify({
+          older_than_days: 30,
+          source: undefined,
+          profile: undefined,
+          include_live: true,
+        }),
+        method: "POST",
+      }),
+    );
+  });
+});
+
 describe("api OAuth helpers", () => {
   it("starts OAuth login in gated mode without requiring an injected session token", async () => {
     vi.stubGlobal("window", { __HERMES_AUTH_REQUIRED__: true });

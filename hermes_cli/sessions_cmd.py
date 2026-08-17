@@ -878,6 +878,13 @@ def cmd_sessions(args, sessions_parser=None):
         else:
             print(f"Session '{args.session_id}' not found.")
 
+    elif (
+        action == "prune"
+        and getattr(args, "never_active", False)
+        and getattr(args, "include_live", False)
+    ):
+        print("Error: --include-live cannot be combined with --never-active.")
+
     elif action == "prune" and getattr(args, "never_active", False):
         # Separate branch on purpose: the shared prune/archive selector is
         # pinned to `ended_at IS NOT NULL`, so never-closed rows sit outside
@@ -942,13 +949,19 @@ def cmd_sessions(args, sessions_parser=None):
             filters["archived"] = False
 
         candidates = db.list_prune_candidates(**filters)
+        include_live = action == "prune" and getattr(args, "include_live", False)
+        archive_filters = (
+            {**filters, "archived": False} if include_live else filters
+        )
         # Archive expands each selected row to its compression lineage, which
         # can include open continuations; a direct-open count would therefore
         # describe the eventual archive effect inaccurately.
         skipped_open = (
-            db.count_open_prune_matches(**filters) if action == "prune" else 0
+            db.count_open_prune_matches(**archive_filters)
+            if action == "prune"
+            else 0
         )
-        if skipped_open:
+        if skipped_open and not include_live:
             suffix = "" if skipped_open == 1 else "s"
             print(
                 f"Note: {skipped_open} open session{suffix} also match these "
@@ -956,20 +969,29 @@ def cmd_sessions(args, sessions_parser=None):
                 "sessions. Use `hermes sessions delete <id>` "
                 "to remove one explicitly."
             )
+        elif skipped_open:
+            suffix = "" if skipped_open == 1 else "s"
+            print(
+                f"Note: {skipped_open} matching open session{suffix} will be "
+                "archived, not deleted, so the operation remains reversible."
+            )
         verb = "Delete" if action == "prune" else "Archive"
-        if not candidates:
+        if not candidates and not (include_live and skipped_open):
             print(f"No sessions match ({describe_filters(filters)}).")
             return
 
         # Candidates are ordered by activity oldest-first. Surface that
         # span so a long-lived but recently used conversation cannot look
         # old merely because of its creation date.
-        _oldest = candidates[0].get("last_active")
-        _newest = candidates[-1].get("last_active")
-        _span = (
-            f"oldest activity {format_epoch(_oldest)}, "
-            f"newest activity {format_epoch(_newest)}"
-        )
+        if candidates:
+            _oldest = candidates[0].get("last_active")
+            _newest = candidates[-1].get("last_active")
+            _span = (
+                f"oldest activity {format_epoch(_oldest)}, "
+                f"newest activity {format_epoch(_newest)}"
+            )
+        else:
+            _span = "no ended sessions"
 
         if args.dry_run or not args.yes:
             shown = candidates if args.dry_run else candidates[:15]
@@ -988,12 +1010,24 @@ def cmd_sessions(args, sessions_parser=None):
             if len(candidates) > len(shown):
                 print(f"  … and {len(candidates) - len(shown)} more")
             if args.dry_run:
-                print(f"Dry run — nothing {'deleted' if action == 'prune' else 'archived'}.")
+                if include_live:
+                    print(
+                        f"Dry run — would delete {len(candidates)} ended session(s) "
+                        f"and archive {skipped_open} open session(s)."
+                    )
+                else:
+                    print(f"Dry run — nothing {'deleted' if action == 'prune' else 'archived'}.")
                 return
 
         if not args.yes:
+            prompt = f"{verb} these {len(candidates)} session(s) ({_span})? [y/N] "
+            if include_live:
+                prompt = (
+                    f"Delete {len(candidates)} ended session(s) and archive "
+                    f"{skipped_open} open session(s)? [y/N] "
+                )
             if not _confirm_prompt(
-                f"{verb} these {len(candidates)} session(s) ({_span})? [y/N] "
+                prompt
             ):
                 print("Cancelled.")
                 return
@@ -1001,7 +1035,14 @@ def cmd_sessions(args, sessions_parser=None):
         if action == "prune":
             sessions_dir = get_hermes_home() / "sessions"
             count = db.prune_sessions(sessions_dir=sessions_dir, **filters)
-            print(f"Pruned {count} session(s).")
+            if include_live:
+                archived = db.archive_open_prune_matches(**archive_filters)
+                print(
+                    f"Pruned {count} ended session(s); archived {archived} "
+                    "open session(s)."
+                )
+            else:
+                print(f"Pruned {count} session(s).")
         else:
             count = db.archive_sessions(**filters)
             print(

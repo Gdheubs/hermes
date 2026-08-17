@@ -369,6 +369,7 @@ class SessionPrune(BaseModel):
     min_tool_calls: Optional[int] = None
     max_tool_calls: Optional[int] = None
     include_archived: bool = False
+    include_live: bool = False
     dry_run: bool = False
 
 
