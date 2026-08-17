@@ -68,6 +68,43 @@ class TestGatewayLifecyclePattern:
 
 
     @pytest.mark.parametrize("text", [
+        # Regression: `p?kill` had no leading \b, so it matched the "kill"
+        # tail of any word — notably "skill". Combined with the permissive
+        # [^\n]* bridges, ordinary text/commands mentioning a skill plus
+        # "hermes" plus "gateway" were blocked as kill commands. Real report:
+        # an agent running a read-only health check inside the gateway had
+        # this command rejected:
+        #   echo "=== thermal skill intact ==="; ls -la ~/.hermes/skills/...;
+        #   echo "=== gateway still healthy ==="
+        'echo "thermal skill intact"; ls -la /home/u/.hermes/skills/; echo "gateway healthy"',
+        "the skill is fine, hermes gateway is healthy",
+        "reinstall skill for hermes, check gateway",
+        "my skill list for hermes gateway",
+        "load the obsidian skill then report hermes gateway status",
+        # Same class, other words ending in "kill":
+        "roadkill on the hermes gateway dashboard",
+        "overkill: hermes gateway has three health checks",
+    ])
+    def test_words_ending_in_kill_are_not_kill_commands(self, text):
+        assert not _contains_gateway_lifecycle_command(text), f"Should NOT match: {text!r}"
+
+    @pytest.mark.parametrize("text", [
+        # Paired positive case for the anchor change above: the true
+        # positives `kill`/`pkill` (as their own token, both orderings)
+        # must still match after adding the leading \b.
+        "kill hermes gateway",
+        "kill the hermes gateway process",
+        "pkill -f hermes.*gateway",
+        "pkill -f gateway.*hermes",
+        # Case-insensitivity: the whole pattern compiles with `(?i)`, so
+        # this must still match — confirms Branch D isn't accidentally
+        # case-sensitive despite having its own `\b` anchors now.
+        "Kill Hermes Gateway",
+    ])
+    def test_kill_and_pkill_still_match_after_anchor(self, text):
+        assert _contains_gateway_lifecycle_command(text), f"Should match: {text!r}"
+
+    @pytest.mark.parametrize("text", [
         "restart the server application",
         "hermes cron list",
         "hermes update",
