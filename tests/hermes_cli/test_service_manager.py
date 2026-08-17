@@ -7,6 +7,8 @@ implementation in this same file once that phase ships.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from hermes_cli.service_manager import (
@@ -192,7 +194,7 @@ def fake_subprocess_run(monkeypatch: pytest.MonkeyPatch):
 # tests/docker/test_s6_profile_gateway_integration.py.
 
 
-def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
+def test_seed_supervise_skeleton_creates_expected_layout(tmp_path, monkeypatch) -> None:
     """Verifies the dirs + FIFO + modes the helper lays down."""
     import stat
 
@@ -200,6 +202,18 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
 
     svc_dir = tmp_path / "gateway-foo"
     svc_dir.mkdir()
+    # chmod can only set the setgid bit on a dir owned by your group; under
+    # a wheel-owned TMPDIR (e.g. /private/tmp on macOS) that fails. Make the
+    # skeleton root ours so the layout modes are reproducible everywhere.
+    os.chown(svc_dir, os.getuid(), os.getgid())
+
+    # Mock chown: on macOS a real os.chown() clears the setgid bit (Darwin
+    # semantics differ from Linux), making the resulting mode dependent on
+    # whether the caller is in the target group. The skeleton layout test
+    # asserts the modes the helper intends to lay down, so keep chown a
+    # no-op. _seed_supervise_skeleton imports os locally, but patching the
+    # os module itself covers any local `import os` reference.
+    monkeypatch.setattr(os, "chown", lambda *a, **k: None)
 
     _seed_supervise_skeleton(svc_dir)
 

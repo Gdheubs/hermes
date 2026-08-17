@@ -50,6 +50,20 @@ def test_real_binaries_execute_leading_dash_program_payload(
     if shutil.which(tool) is None or (needs_tty and shutil.which("script") is None):
         pytest.skip(f"{tool} or script is not installed")
 
+    # These cases assert GNU-specific behavior (--compress-program / --pager
+    # executing a leading-dash program argument). BSD builds (macOS default
+    # sort/man) parse the same flags differently or hang, so require the GNU
+    # flavor — the payload-execution invariant only holds there.
+    if tool in ("sort", "man"):
+        try:
+            version_out = subprocess.run(
+                [tool, "--version"], capture_output=True, text=True, timeout=5
+            ).stdout
+        except (OSError, subprocess.TimeoutExpired):
+            version_out = ""
+        if "GNU" not in version_out:
+            pytest.skip(f"{tool} is not the GNU build (no --compress-program/--pager payload semantics)")
+
     marker = tmp_path / "executed"
     payload = tmp_path / "-payload-marker"
     payload.write_text("#!/bin/sh\nprintf executed > \"$MARKER\"\ncat\n")
