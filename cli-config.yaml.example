@@ -937,6 +937,15 @@ agent:
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration
   max_turns: 500
 
+  # Session token fuse: hard ceiling on cumulative session tokens (cache
+  # reads included — long tool-heavy sessions re-read a large live context
+  # on every call, so cache reads dominate runaway cost). One warning at
+  # 80%; at the ceiling the turn stops cleanly with a start-a-fresh-session
+  # notice, without the budget-exhausted summary fallback. 0 = disabled.
+  # Set well above legitimate heavy-task usage; this is a runaway fuse,
+  # not a working limit.
+  # session_token_hard_stop: 0
+
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving
   # API responses.  Only fires after the agent has been idle for this duration.

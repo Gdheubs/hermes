@@ -1871,6 +1871,18 @@ def init_agent(
         _agent_section = {}
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
 
+    # Session token fuse: hard ceiling on cumulative session tokens (cache
+    # reads included). 0 disables. Set well above legitimate heavy-task
+    # usage — the fuse stops runaway episodes, not work. Checked at the top
+    # of each conversation-loop iteration.
+    try:
+        agent.session_token_hard_stop = max(
+            0, int(_agent_section.get("session_token_hard_stop", 0) or 0)
+        )
+    except (TypeError, ValueError):
+        agent.session_token_hard_stop = 0
+    agent._session_token_fuse_warned = False
+
     # Empty-response retry guard config (NS-503): additive
     # ``agent.empty_response_guard`` subsection. Resolution is tolerant —
     # a malformed section falls back to the schema defaults (guard on,

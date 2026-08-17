@@ -1927,7 +1927,40 @@ def run_conversation(
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
             break
-        
+
+        # Session token fuse (agent.session_token_hard_stop, 0 = disabled):
+        # hard ceiling on cumulative session tokens, cache reads included —
+        # a runaway episode's cost is context re-read, not fresh output.
+        # Deliberately NOT routed through the budget-exhausted summary
+        # fallback: that would spend one more full-context call on a session
+        # the fuse exists to stop. Warn once at 80%.
+        _token_fuse = getattr(agent, "session_token_hard_stop", 0) or 0
+        if _token_fuse > 0:
+            _fuse_used = getattr(agent, "session_total_tokens", 0) or 0
+            if _fuse_used >= _token_fuse:
+                _turn_exit_reason = f"session_token_fuse({_fuse_used}/{_token_fuse})"
+                agent._emit_status(
+                    f"🛑 Session token fuse: {_fuse_used:,} of {_token_fuse:,} "
+                    "tokens used — stopping this turn. Continue in a fresh "
+                    "session (/new)."
+                )
+                if not agent.quiet_mode:
+                    agent._safe_print(
+                        f"\n🛑 Session token fuse blown "
+                        f"({_fuse_used:,}/{_token_fuse:,} tokens); stopping turn."
+                    )
+                break
+            if (
+                _fuse_used >= 0.8 * _token_fuse
+                and not getattr(agent, "_session_token_fuse_warned", False)
+            ):
+                agent._session_token_fuse_warned = True
+                agent._emit_status(
+                    f"⚠️ Session tokens at {_fuse_used:,} of the "
+                    f"{_token_fuse:,} fuse — wrap up or move to a fresh "
+                    "session soon."
+                )
+
         api_call_count += 1
         agent._api_call_count = api_call_count
         agent._touch_activity(f"starting API call #{api_call_count}")

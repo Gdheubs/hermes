@@ -44,6 +44,14 @@ DEFAULT_CONFIG = {
     },
     "agent": {
         "max_turns": 500,
+        # Session token fuse: hard ceiling on cumulative session tokens
+        # (cache reads included — context re-read is what runaway episodes
+        # actually spend). 0 = disabled. When the ceiling is reached the
+        # conversation loop stops the turn with a clear "/new" notice and
+        # WITHOUT the budget-exhausted summary fallback (which would spend
+        # one more full-context call). Set well above legitimate heavy-task
+        # usage; this is a runaway fuse, not a working limit.
+        "session_token_hard_stop": 0,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
