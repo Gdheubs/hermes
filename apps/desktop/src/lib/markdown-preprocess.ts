@@ -2,6 +2,7 @@ import { normalizeMathDelimiters } from '@assistant-ui/react-streamdown'
 
 import { isLikelyProseFence, sanitizeLanguageTag } from '@/lib/markdown-code'
 import { clampHtmlNestingDepth } from '@/lib/markdown-html-depth'
+import { fenceRawSvgBlocks } from '@/lib/markdown-inline-svg'
 import { stripPreviewTargets } from '@/lib/preview-targets'
 import { linkifySessionRefs } from '@/lib/session-refs'
 
@@ -68,7 +69,9 @@ function hasCloseFenceLine(body: string, marker: string): boolean {
 }
 
 function scrubBacktickNoise(text: string): string {
-  const balancedFenceRe = /(^|\n)([ \t]*)(`{3,}|~{3,})([^\n]*)\n([\s\S]*?)\n[ \t]*\3[ \t]*(?=\n|$)/g
+  const balancedFenceRe =
+    /(^|\n)(?:(?: {0,3}>[ \t]?)+|[ \t]*)(`{3,}|~{3,})[^\n]*\n([\s\S]*?)\n(?:(?: {0,3}>[ \t]?)+|[ \t]*)\2[ \t]*(?=\n|$)/g
+
   const protectedRanges: { end: number; start: number }[] = []
   let match: RegExpExecArray | null
 
@@ -480,7 +483,8 @@ function normalizeFenceBlocks(text: string): string {
 
 export function preprocessMarkdown(text: string): string {
   const cleaned = text.replace(REASONING_BLOCK_RE, '').replace(PREVIEW_MARKER_RE, '')
-  const scrubbed = scrubBacktickNoise(cleaned)
+  const svgFenced = fenceRawSvgBlocks(cleaned)
+  const scrubbed = scrubBacktickNoise(svgFenced)
   const normalizedFences = normalizeFenceBlocks(scrubbed)
   const strippedEmptyFences = stripEmptyFenceBlocks(normalizedFences)
 
