@@ -153,3 +153,86 @@ class TestWebhookEnabledGate:
         import hermes_cli.webhook as wh_mod
         assert wh_mod._is_webhook_enabled() is False
 
+
+class TestManageCommands:
+    """Task 15: show / update / enable / disable / rotate-secret / --replace."""
+
+    def _mk(self, **kw):
+        return _make_args(**kw)
+
+    def test_subscribe_conflict_requires_replace(self, capsys):
+        webhook_command(self._mk(webhook_action="subscribe", name="dup", secret="s1"))
+        capsys.readouterr()
+        webhook_command(self._mk(webhook_action="subscribe", name="dup", secret="s2"))
+        out = capsys.readouterr().out
+        assert "already exists" in out.lower()
+        # Without --replace, the route is untouched.
+        assert _load_subscriptions()["dup"]["secret"] == "s1"
+
+    def test_subscribe_replace_overwrites(self, capsys):
+        webhook_command(self._mk(webhook_action="subscribe", name="dup", secret="s1"))
+        capsys.readouterr()
+        webhook_command(self._mk(
+            webhook_action="subscribe", name="dup", secret="s2", replace=True
+        ))
+        capsys.readouterr()
+        assert _load_subscriptions()["dup"]["secret"] == "s2"
+
+    def test_show_masks_secret(self, capsys):
+        webhook_command(self._mk(
+            webhook_action="subscribe", name="shown",
+            secret="a-very-long-secret-value", description="desc",
+        ))
+        capsys.readouterr()
+        webhook_command(self._mk(webhook_action="show", name="shown"))
+        out = capsys.readouterr().out
+        assert "a-very-long-secret-value" not in out
+        assert "a-ve" in out  # masked head
+
+    def test_show_json(self, capsys):
+        webhook_command(self._mk(webhook_action="subscribe", name="js", secret="xyz123456"))
+        capsys.readouterr()
+        webhook_command(self._mk(webhook_action="show", name="js", json=True))
+        out = capsys.readouterr().out
+        import json as _json
+        data = _json.loads(out)
+        assert data["name"] == "js"
+        assert "xyz123456" not in out
+
+    def test_disable_and_enable(self, capsys):
+        webhook_command(self._mk(webhook_action="subscribe", name="toggle"))
+        capsys.readouterr()
+        webhook_command(self._mk(webhook_action="disable", name="toggle"))
+        capsys.readouterr()
+        assert _load_subscriptions()["toggle"]["enabled"] is False
+        webhook_command(self._mk(webhook_action="enable", name="toggle"))
+        capsys.readouterr()
+        assert _load_subscriptions()["toggle"]["enabled"] is True
+
+    def test_update_patches_fields(self):
+        webhook_command(self._mk(webhook_action="subscribe", name="upd", prompt="old"))
+        webhook_command(self._mk(webhook_action="update", name="upd", prompt="new", events="a,b"))
+        route = _load_subscriptions()["upd"]
+        assert route["prompt"] == "new"
+        assert route["events"] == ["a", "b"]
+
+    def test_rotate_secret_shows_once(self, capsys):
+        webhook_command(self._mk(webhook_action="subscribe", name="rot", secret="oldsecret"))
+        capsys.readouterr()
+        webhook_command(self._mk(webhook_action="rotate-secret", name="rot"))
+        out = capsys.readouterr().out
+        assert "New secret" in out
+        new_secret = _load_subscriptions()["rot"]["secret"]
+        assert new_secret != "oldsecret"
+        assert len(new_secret) > 20
+
+    def test_list_json_is_parseable_and_secret_safe(self, capsys):
+        webhook_command(self._mk(webhook_action="subscribe", name="lj", secret="topsecret123"))
+        capsys.readouterr()
+        webhook_command(self._mk(webhook_action="list", json=True))
+        out = capsys.readouterr().out
+        import json as _json
+        data = _json.loads(out)
+        assert any(r["name"] == "lj" for r in data)
+        assert "topsecret123" not in out
+
