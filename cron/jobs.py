@@ -1919,8 +1919,15 @@ def create_job(
     # (#30719). Enforced here (not only in the CLI layer) so the agent's
     # `cronjob` model tool — which calls create_job directly — is also
     # covered, not just `hermes cron create`.
-    from cron.lifecycle_guard import check_gateway_lifecycle
+    from cron.lifecycle_guard import check_gateway_lifecycle, check_cron_script_content
     check_gateway_lifecycle(prompt_text, normalized_script)
+
+    # F3: no_agent script jobs run their script via subprocess with no
+    # approval gate, so the script BYTES are scanned at create time for
+    # approval-policy tampering / credential exfil / destructive payloads.
+    # Gate at CREATE time with a clear error — existing deliberate
+    # watchdog jobs (memory-watchdog.sh pattern) are unaffected.
+    check_cron_script_content(normalized_script)
 
     label_source = (prompt_text or (normalized_skills[0] if normalized_skills else None) or (normalized_script if normalized_no_agent else None)) or "cron job"
 
@@ -2120,6 +2127,11 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     bool(updated.get("no_agent")),
                     _upd_script or None,
                 )
+                # F3: same create-time script-content gate through the
+                # update door — an update that swaps in a dangerous
+                # no_agent script must not bypass the create-time scan.
+                from cron.lifecycle_guard import check_cron_script_content
+                check_cron_script_content(_upd_script or None)
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
