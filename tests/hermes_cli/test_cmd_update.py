@@ -728,6 +728,68 @@ class TestCmdUpdateCheckBranchFlag:
         assert any("upstream/main" in c for c in rev_list_cmds), rev_list_cmds
 
 
+class TestCmdUpdateMissingGitBinary:
+    """``hermes update`` with no ``git`` on PATH must exit 1 with a friendly
+    message instead of leaking a FileNotFoundError traceback (#86529).
+
+    subprocess.run(["git", ...]) raises FileNotFoundError when the binary is
+    missing — NOT CalledProcessError, which the update paths already catch.
+    """
+
+    def test_check_path_missing_git_exits_cleanly(self, capsys):
+        args = SimpleNamespace(check=True, branch=None)
+
+        def _missing_git(cmd, **kwargs):
+            if cmd and cmd[0] == "git":
+                raise FileNotFoundError(2, "No such file or directory", "git")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with (
+            patch("hermes_cli.config.detect_install_method", return_value="git"),
+            patch("subprocess.run", side_effect=_missing_git),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_update(args)
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "git" in out
+        assert "was not found on PATH" in out
+        assert "Traceback" not in out
+        assert "FileNotFoundError" not in out
+
+    def test_update_path_missing_git_exits_cleanly(self, capsys, _patch_gateway_discovery):
+        args = SimpleNamespace(check=False, branch=None, gateway=False, fast=False)
+        _update_lock = patch("hermes_cli.update_lock.UpdateLock.acquire", return_value=True)
+        _finalize = patch(
+            "hermes_cli.main._finalize_update_output",
+            lambda io_state: None,
+        )
+        _hangup = patch("hermes_cli.main._install_hangup_protection", return_value=None)
+
+        def _missing_git(cmd, **kwargs):
+            if cmd and cmd[0] == "git":
+                raise FileNotFoundError(2, "No such file or directory", "git")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with (
+            patch("hermes_cli.config.detect_install_method", return_value="git"),
+            patch("subprocess.run", side_effect=_missing_git),
+            _update_lock,
+            _finalize,
+            _hangup,
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                cmd_update(args)
+
+        assert exc_info.value.code == 1
+        out = capsys.readouterr().out
+        assert "git" in out
+        assert "was not found on PATH" in out
+        assert "Traceback" not in out
+        assert "FileNotFoundError" not in out
+
+
 class TestCmdUpdateZipBranchRefusal:
     """``hermes update --branch=<non-main>`` must refuse on the ZIP fallback path.
 

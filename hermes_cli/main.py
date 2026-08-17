@@ -9888,6 +9888,22 @@ def _size_delta_label(saved_mb: float) -> str:
     return f"grew by {-saved_mb:.1f} MB"
 
 
+def _friendly_missing_binary_error(exc: OSError) -> None:
+    """Print a friendly message when the update path can't spawn git.
+
+    ``hermes update``/``hermes update --check`` shell out to git. On a POSIX
+    install with a ``.git`` directory but no ``git`` on PATH (slim containers,
+    broken PATH), ``subprocess.run(["git", ...])`` raises ``FileNotFoundError``
+    — which is NOT a ``CalledProcessError`` subclass and used to escape the
+    cmd_update wrapper as a bare traceback. This turns that into a one-line
+    remediation naming the missing binary (#86529).
+    """
+    name = getattr(exc, "filename", None) or (exc.args[0] if exc.args else "git")
+    print(f"✗ `{name}` is required to update Hermes but was not found on PATH.")
+    print("  Install it and try again, or run the update from a different shell.")
+    sys.exit(1)
+
+
 def cmd_update(args):
     """Update Hermes Agent to the latest version.
 
@@ -9926,10 +9942,15 @@ def cmd_update(args):
         # --check honors --branch so the "any new commits?" answer matches
         # what a subsequent `hermes update --branch=<x>` would actually pull.
         branch = _resolve_update_branch(args)
-        _self()._cmd_update_check(
-            branch=branch,
-            branch_explicit=bool(getattr(args, "branch", None)),
-        )
+        try:
+            _self()._cmd_update_check(
+                branch=branch,
+                branch_explicit=bool(getattr(args, "branch", None)),
+            )
+        except FileNotFoundError as exc:
+            # Missing git binary escapes subprocess.run as FileNotFoundError,
+            # not CalledProcessError — surface a friendly message (#86529).
+            _friendly_missing_binary_error(exc)
         return
 
     gateway_mode = getattr(args, "gateway", False)
@@ -9958,6 +9979,11 @@ def cmd_update(args):
 
     try:
         _self()._cmd_update_impl(args, gateway_mode=gateway_mode)
+    except FileNotFoundError as exc:
+        # Missing git binary escapes subprocess.run as FileNotFoundError,
+        # not CalledProcessError — surface a friendly message instead of a
+        # bare traceback (finally still releases the lock + restores stdio).
+        _friendly_missing_binary_error(exc)
     finally:
         _update_lock.release()
         _finalize_update_output(_update_io_state)
