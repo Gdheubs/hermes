@@ -13537,6 +13537,7 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
     {
         "clear",
         "compress",
+        "context",
         "effort",
         "history",
         "models",
@@ -13547,7 +13548,7 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
     }
 )
 
-_ISOLATED_SESSION_READ_COMMANDS = frozenset({"context", "tools", "help"})
+_ISOLATED_SESSION_READ_COMMANDS = frozenset({"tools", "help"})
 
 
 def _format_live_usage_output(session: dict) -> str:
