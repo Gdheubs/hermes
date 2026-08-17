@@ -4413,18 +4413,19 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
     """Detect provider responses that authenticated but cannot serve aux shape.
 
     Some OpenAI-compatible routes return HTTP 200 with an empty/malformed
-    ChatCompletion instead of a normal provider error.  That is still a
-    provider/model capability failure for auxiliary tasks: downstream callers
-    need ``choices[0].message`` and should be able to continue through the
+    ChatCompletion or a router timeout shim instead of a normal provider error.
+    Both are provider/model capability failures for auxiliary tasks: downstream
+    callers need a usable completion and should be able to continue through the
     same fallback path as explicit model-incompatibility errors.
     """
     if not isinstance(exc, RuntimeError):
         return False
     msg = str(exc).lower()
+    if "auxiliary " not in msg:
+        return False
     return (
-        "auxiliary " in msg
-        and "llm returned invalid response" in msg
-        and "choices[0].message" in msg
+        "llm returned router timeout shim" in msg
+        or ("llm returned invalid response" in msg and "choices[0].message" in msg)
     )
 
 
@@ -8614,7 +8615,16 @@ def _validate_llm_response(
             f"Auxiliary {task or 'call'}: LLM returned None response"
         )
     from agent.aux_accounting import record_aux_usage
-    record_aux_usage(response, task, provider=provider, base_url=base_url)
+    from agent.chat_completion_validation import classify_chat_completion_response
+
+    def _reject_router_timeout_shim(candidate: Any) -> None:
+        """Keep HTTP-success router failures eligible for provider fallback."""
+        if classify_chat_completion_response(candidate) == "router_timeout_shim":
+            raise RuntimeError(
+                f"Auxiliary {task or 'call'}: LLM returned router timeout shim"
+            )
+
+    _reject_router_timeout_shim(response)
     # Allow SimpleNamespace responses from adapters (CodexAuxiliaryClient,
     # AnthropicAuxiliaryClient) — they have .choices[0].message.
     try:
@@ -8624,6 +8634,10 @@ def _validate_llm_response(
     except (AttributeError, TypeError, IndexError) as exc:
         recovered = _recover_aux_response_message(response)
         if recovered is not None:
+            _reject_router_timeout_shim(recovered)
+            record_aux_usage(
+                recovered, task, provider=provider, base_url=base_url
+            )
             _record_relay_auxiliary_response_model(response)
             _complete_relay_auxiliary_call()
             return recovered
@@ -8635,6 +8649,7 @@ def _validate_llm_response(
             f"Expected object with .choices[0].message — check provider "
             f"adapter or custom endpoint compatibility."
         ) from exc
+    record_aux_usage(response, task, provider=provider, base_url=base_url)
     _record_relay_auxiliary_response_model(response)
     _complete_relay_auxiliary_call()
     return response
@@ -8693,18 +8708,18 @@ def _recover_aux_response_message(response: Any) -> Optional[Any]:
 
     choice = SimpleNamespace(
         message=SimpleNamespace(content=text),
-        finish_reason=getattr(response, "finish_reason", None) or "stop",
+        finish_reason=_obj_get(response, "finish_reason") or "stop",
     )
     try:
         response.choices = [choice]
         return response
     except Exception:
         return SimpleNamespace(
-            id=getattr(response, "id", ""),
-            model=getattr(response, "model", ""),
-            object=getattr(response, "object", "chat.completion"),
+            id=_obj_get(response, "id", ""),
+            model=_obj_get(response, "model", ""),
+            object=_obj_get(response, "object", "chat.completion"),
             choices=[choice],
-            usage=getattr(response, "usage", None),
+            usage=_obj_get(response, "usage"),
         )
 
 
