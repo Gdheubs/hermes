@@ -6073,6 +6073,7 @@ function installPreviewShortcut(window) {
 import {
   applyZoomLevel,
   DEFAULT_ZOOM_LEVEL,
+  installZoomReassertOnDisplayEvents,
   installZoomReassertOnWindowEvents,
   percentToZoomLevel,
   ZOOM_STEP,
@@ -10517,6 +10518,7 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
     // listener is spent, so zoom was silently lost on renderer crash
     // recovery and any in-place reload/navigation (#46429).
     installZoomReassertOnWindowEvents(win, () => restorePersistedZoomLevel(win))
+    installZoomReassertOnDisplayEvents(screen, win, () => restorePersistedZoomLevel(win))
     win.webContents.on('did-finish-load', () => restorePersistedZoomLevel(win))
   }
 
