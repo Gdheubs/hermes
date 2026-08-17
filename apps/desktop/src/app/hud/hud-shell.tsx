@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Tip } from '@/components/ui/tooltip'
 import { useI18n } from '@/i18n'
 import { chatMessageText } from '@/lib/chat-messages'
-import { closeHud } from '@/store/hud'
+import { closeHud, resetHudLayout } from '@/store/hud'
 import { $activeSessionAwaitingInput } from '@/store/prompts'
 import { $busy, $messages } from '@/store/session'
 
@@ -401,6 +401,20 @@ export function HudShell() {
           variant="ghost"
         >
           <TitlebarIcon name="screen-normal" />
+        </Button>
+      </Tip>
+
+      <Tip label={t.titlebar.resetHudLayout}>
+        <Button
+          aria-label={t.titlebar.resetHudLayout}
+          className={`${titlebarButtonClass} absolute z-20`}
+          data-hud-reset=""
+          onClick={resetHudLayout}
+          size="icon-titlebar"
+          type="button"
+          variant="ghost"
+        >
+          <TitlebarIcon name="discard" />
         </Button>
       </Tip>
 

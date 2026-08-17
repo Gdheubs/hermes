@@ -2930,7 +2930,8 @@ button[data-slot='aui_msg-reactions'] svg {
    Placed from --hud-bar-height rather than CSS anchor(). Lightning CSS drops a
    whole rule containing an `anchor()` on the vertical axis, so the flipped-edge
    override never reached the browser and the chip rendered off screen. */
-[data-hud-shell] [data-hud-exit] {
+[data-hud-shell] [data-hud-exit],
+[data-hud-shell] [data-hud-reset] {
   left: auto;
   top: auto;
   right: 0.375rem;
@@ -2974,9 +2975,14 @@ button[data-slot='aui_msg-reactions'] svg {
   pointer-events: auto;
 }
 
+[data-hud-shell] [data-hud-reset] {
+  right: 2rem;
+}
+
 /* Flipped, "above the composer" is the reserved strip at the top of the
    window rather than a gap the band has to leave. */
-[data-hud-shell][data-hud-edge='top'] [data-hud-exit] {
+[data-hud-shell][data-hud-edge='top'] [data-hud-exit],
+[data-hud-shell][data-hud-edge='top'] [data-hud-reset] {
   bottom: auto;
   top: 0;
 }
@@ -2993,8 +2999,12 @@ button[data-slot='aui_msg-reactions'] svg {
    nothing. */
 [data-hud-shell]:has([data-slot='composer-dock']:hover) [data-hud-exit],
 [data-hud-shell]:has([data-slot='composer-bounds']:hover) [data-hud-exit],
+[data-hud-shell]:has([data-slot='composer-dock']:hover) [data-hud-reset],
+[data-hud-shell]:has([data-slot='composer-bounds']:hover) [data-hud-reset],
 [data-hud-shell] [data-hud-exit]:hover,
-[data-hud-shell] [data-hud-exit]:focus-visible {
+[data-hud-shell] [data-hud-exit]:focus-visible,
+[data-hud-shell] [data-hud-reset]:hover,
+[data-hud-shell] [data-hud-reset]:focus-visible {
   opacity: 1;
   visibility: visible;
   transition-duration: var(--hud-reveal), 0s, var(--hud-reveal);
@@ -3008,7 +3018,9 @@ button[data-slot='aui_msg-reactions'] svg {
    opaque titlebar, and here the button IS the opaque surface, so assigning it
    directly would make the chip see-through on hover. */
 [data-hud-shell] [data-hud-exit]:hover,
-[data-hud-shell] [data-hud-exit]:focus-visible {
+[data-hud-shell] [data-hud-exit]:focus-visible,
+[data-hud-shell] [data-hud-reset]:hover,
+[data-hud-shell] [data-hud-reset]:focus-visible {
   background:
     linear-gradient(var(--ui-control-hover-background), var(--ui-control-hover-background)), var(--dt-card) !important;
 }

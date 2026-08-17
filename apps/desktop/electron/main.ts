@@ -194,6 +194,7 @@ import {
   writeSecretFileAtomic
 } from './hardening'
 import { cursorPointInWindow } from './hud-cursor'
+import { applyHudResetBounds, defaultHudBounds } from './hud-geometry'
 import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
@@ -10940,9 +10941,6 @@ let hudProfile = null
 // of a game chat frame, and where one belongs. Defaults only: once the user
 // moves or resizes the HUD, hud-state.json wins (same pattern as the main
 // window's window-state.json).
-const HUD_WIDTH = 620
-const HUD_HEIGHT = 320
-const HUD_BOTTOM_MARGIN = 72
 const HUD_STATE_PATH = path.join(app.getPath('userData'), 'hud-state.json')
 
 function readHudState() {
@@ -11095,19 +11093,7 @@ function hudBounds() {
   const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
   const area = display?.workArea
 
-  if (!area) {
-    return { width: HUD_WIDTH, height: HUD_HEIGHT, x: undefined, y: undefined }
-  }
-
-  const width = Math.min(HUD_WIDTH, area.width)
-  const height = Math.min(HUD_HEIGHT, area.height)
-
-  return {
-    width,
-    height,
-    x: Math.round(area.x + (area.width - width) / 2),
-    y: Math.round(Math.max(area.y, area.y + area.height - height - HUD_BOTTOM_MARGIN))
-  }
+  return defaultHudBounds(area)
 }
 
 function hudUrl(sessionId, profile) {
@@ -12141,6 +12127,27 @@ ipcMain.on('hermes:hud:set-bounds', (event, bounds) => {
   if (resizing) {
     win.setResizable(false)
   }
+})
+
+ipcMain.handle('hermes:hud:reset-layout', async event => {
+  if (!hudWindow || hudWindow.isDestroyed() || event.sender !== hudWindow.webContents) {
+    return { ok: false }
+  }
+
+  const win = hudWindow
+  const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
+  const bounds = defaultHudBounds(display?.workArea)
+
+  if (!applyHudResetBounds(win, bounds)) {
+    rememberLog('[hud] reset layout failed while applying window bounds')
+    return { ok: false }
+  }
+
+  // Write synchronously so closing immediately after Reset cannot restore the
+  // stale malformed geometry on the next launch.
+  persistHudState()
+
+  return { ok: true }
 })
 
 // The HUD renderer reporting which session it is on, so the close broadcast
