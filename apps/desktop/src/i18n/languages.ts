@@ -34,6 +34,12 @@ export const LOCALE_OPTIONS = [
     name: 'العربية',
     englishName: 'Arabic',
     configValue: 'ar'
+  },
+  {
+    id: 'fa',
+    name: 'فارسی',
+    englishName: 'Persian',
+    configValue: 'fa'
   }
 ] as const satisfies readonly { configValue: string; englishName: string; id: Locale; name: string }[]
 
@@ -79,7 +85,17 @@ const LOCALE_ALIASES: Record<string, Locale> = {
   'ar-eg': 'ar',
   ar_eg: 'ar',
   arabic: 'ar',
-  العربية: 'ar'
+  العربية: 'ar',
+  fa: 'fa',
+  'fa-ir': 'fa',
+  fa_ir: 'fa',
+  // Dari is the Afghan variety of Persian; it shares this catalog rather than
+  // falling back to English.
+  'fa-af': 'fa',
+  fa_af: 'fa',
+  persian: 'fa',
+  farsi: 'fa',
+  فارسی: 'fa'
 }
 
 export function isLocale(value: unknown): value is Locale {
