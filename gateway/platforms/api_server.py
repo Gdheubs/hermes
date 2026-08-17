@@ -11,6 +11,7 @@ Exposes an HTTP server with endpoints:
 - GET  /api/sessions               — list client-visible Hermes sessions
 - POST /api/sessions               — create an empty Hermes session
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
+- POST /api/sessions/{session_id}/archive[/unarchive] — reversible soft-archive
 - GET  /api/sessions/{session_id}/messages — read session message history
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
@@ -2069,6 +2070,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions", self._handle_create_session),
             ("GET", "/api/sessions/{session_id}", self._handle_get_session),
             ("PATCH", "/api/sessions/{session_id}", self._handle_patch_session),
+            ("POST", "/api/sessions/{session_id}/archive", self._handle_archive_session),
+            ("POST", "/api/sessions/{session_id}/unarchive", self._handle_unarchive_session),
             ("DELETE", "/api/sessions/{session_id}", self._handle_delete_session),
             ("GET", "/api/sessions/{session_id}/messages", self._handle_session_messages),
             ("POST", "/api/sessions/{session_id}/fork", self._handle_fork_session),
@@ -3187,6 +3190,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
                 "session_update": {"method": "PATCH", "path": "/api/sessions/{session_id}"},
+                "session_archive": {"method": "POST", "path": "/api/sessions/{session_id}/archive"},
+                "session_unarchive": {"method": "POST", "path": "/api/sessions/{session_id}/unarchive"},
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
@@ -3564,6 +3569,33 @@ class APIServerAdapter(BasePlatformAdapter):
             await asyncio.to_thread(db.end_session, session_id, str(body["end_reason"]))
         session = await asyncio.to_thread(db.get_session, session_id) or session
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+
+    async def _set_session_archived(self, request: "web.Request", archived: bool) -> "web.Response":
+        """Set the reversible archive flag for one API session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        session, err = await self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error("Session database unavailable", code="session_db_unavailable"),
+                status=503,
+            )
+        await asyncio.to_thread(db.set_session_archived, session_id, archived)
+        session = await asyncio.to_thread(db.get_session, session_id) or session
+        return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
+
+    async def _handle_archive_session(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/archive."""
+        return await self._set_session_archived(request, True)
+
+    async def _handle_unarchive_session(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/unarchive."""
+        return await self._set_session_archived(request, False)
 
     async def _handle_delete_session(self, request: "web.Request") -> "web.Response":
         """DELETE /api/sessions/{session_id}."""
