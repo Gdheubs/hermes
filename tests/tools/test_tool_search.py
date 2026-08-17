@@ -85,6 +85,35 @@ class TestClassification:
         for name in BRIDGE_TOOL_NAMES:
             assert not is_deferrable_tool_name(name)
 
+    def test_gui_surface_tools_stay_visible_without_global_core_exposure(self):
+        """A GUI session must not gain the generic bridge only because it has
+        finite first-party renderer capabilities that classic CLI lacks."""
+        from tools.registry import discover_builtin_tools
+        from tools.tool_search import (
+            ToolSearchConfig,
+            assemble_tool_defs,
+            classify_tools,
+        )
+        from toolsets import _HERMES_CORE_TOOLS, resolve_toolset
+
+        discover_builtin_tools()
+        gui_names = set(resolve_toolset("desktop_ui")) | set(resolve_toolset("project"))
+        gui_defs = [_td(name, f"First-party GUI capability {name}") for name in gui_names]
+
+        visible, deferrable = classify_tools(gui_defs)
+
+        assert {td["function"]["name"] for td in visible} == gui_names
+        assert deferrable == []
+        assert gui_names.isdisjoint(_HERMES_CORE_TOOLS)
+
+        assembled = assemble_tool_defs(
+            gui_defs,
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "on"}),
+        )
+        assert not assembled.activated
+        assert {td["function"]["name"] for td in assembled.tool_defs} == gui_names
+
     def test_unknown_tool_not_deferrable(self):
         """Defensive: a tool name we cannot resolve to a registry entry must
         not be claimed as deferrable. This protects against the OpenClaw

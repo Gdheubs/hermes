@@ -188,6 +188,16 @@ def load_config() -> ToolSearchConfig:
 # ---------------------------------------------------------------------------
 
 
+# Finite, first-party tools that only exist on a GUI session.  They stay out of
+# _HERMES_CORE_TOOLS so non-GUI clients never pay for their schemas, but once a
+# GUI session enables them they must remain direct model tools.  Treating them
+# as an unbounded plugin catalog makes Desktop/TUI gain the generic ``tool_call``
+# bridge solely because the renderer is present, and small local models may then
+# select that bridge without its required ``name`` instead of using an ordinary
+# core tool.
+_DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project"})
+
+
 def _core_tool_names() -> frozenset[str]:
     """Return the set of tool names that must NEVER be deferred.
 
@@ -201,13 +211,33 @@ def _core_tool_names() -> frozenset[str]:
         return frozenset()
 
 
+def _direct_surface_tool_names() -> frozenset[str]:
+    """Return the statically declared tools for direct GUI surfaces.
+
+    Read the built-in declarations rather than trusting a registry entry's
+    toolset so a plugin cannot opt an arbitrary schema out of deferral merely
+    by reusing the ``desktop_ui`` or ``project`` toolset name.
+    """
+    try:
+        from toolsets import TOOLSETS
+
+        return frozenset(
+            name
+            for toolset in _DIRECT_SURFACE_TOOLSETS
+            for name in TOOLSETS.get(toolset, {}).get("tools", ())
+        )
+    except Exception:
+        return frozenset()
+
+
 def is_deferrable_tool_name(name: str) -> bool:
     """Return True if a tool with this name is *eligible* for deferral.
 
     A tool is deferrable iff it is registered with an MCP toolset prefix
-    OR it is not in ``_HERMES_CORE_TOOLS``. Core tools are never deferred
-    even when their toolset is technically plugin-provided (this protects
-    against accidental shadowing).
+    OR it is neither in ``_HERMES_CORE_TOOLS`` nor a finite first-party GUI
+    surface toolset. Core and direct surface tools are never deferred even
+    when their toolset is technically plugin-provided (this protects against
+    accidental shadowing).
     """
     if name in BRIDGE_TOOL_NAMES:
         return False
@@ -221,6 +251,8 @@ def is_deferrable_tool_name(name: str) -> bool:
             return False
         if entry.toolset.startswith("mcp-"):
             return True
+        if name in _direct_surface_tool_names():
+            return False
         # Non-MCP, non-core → plugin tool, eligible.
         return True
     except Exception:
