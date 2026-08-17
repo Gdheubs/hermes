@@ -2386,6 +2386,31 @@ class TestAuxiliaryTaskExtraBody:
             "thinking": {"type": "disabled"}, "metadata": {"user_id": "u1"},
         }
 
+    def test_anthropic_aux_drops_openai_only_response_format(self):
+        """response_format must NOT reach a native Anthropic Messages call.
+
+        Anthropic rejects unknown top-level body keys with HTTP 400
+        ``response_format: Extra inputs are not permitted``, which killed
+        session titling outright on an Anthropic aux slot. Callers already
+        fall back to prose parsing, so the key must be dropped, not forwarded.
+        """
+        api_kwargs = self._run_anthropic_adapter(
+            call_extra_body={
+                "response_format": {"type": "json_schema", "json_schema": {}},
+                "metadata": {"user_id": "u1"},
+            },
+        )
+        forwarded = api_kwargs.get("extra_body") or {}
+        assert "response_format" not in forwarded
+        assert forwarded == {"metadata": {"user_id": "u1"}}
+
+    def test_anthropic_aux_drops_only_openai_key_leaves_no_empty_extra_body(self):
+        """When the ONLY extra_body key is OpenAI-shaped, nothing is forwarded."""
+        api_kwargs = self._run_anthropic_adapter(
+            call_extra_body={"response_format": {"type": "json_object"}},
+        )
+        assert not api_kwargs.get("extra_body")
+
 
 
 

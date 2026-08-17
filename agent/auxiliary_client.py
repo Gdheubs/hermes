@@ -1170,6 +1170,24 @@ def _nous_extra_body() -> dict:
 # ``_nous_extra_body()`` or import ``nous_portal_tags`` directly.
 NOUS_EXTRA_BODY = _nous_extra_body()
 
+# extra_body keys that are OpenAI-shaped ONLY and must never be forwarded to a
+# native Anthropic Messages call. Anthropic rejects unknown top-level body keys
+# outright ("Extra inputs are not permitted", HTTP 400), so a caller that asks
+# for OpenAI structured output (``response_format``) would silently break the
+# whole auxiliary task on an Anthropic aux slot rather than degrade gracefully.
+#   - ``reasoning``: translated into the native ``thinking`` field upstream;
+#     forwarding it too would double-specify reasoning.
+#   - ``response_format`` / ``json_schema`` / ``json_mode``: OpenAI structured
+#     output. Callers already have prose/JSON-scan fallbacks (see
+#     agent/title_generator.py::_extract_title_text), so dropping the hint is
+#     strictly better than a 400.
+_OPENAI_ONLY_EXTRA_BODY_KEYS = frozenset({
+    "reasoning",
+    "response_format",
+    "json_schema",
+    "json_mode",
+})
+
 # Set at resolve time — True if the auxiliary client points to Nous Portal
 auxiliary_is_nous: bool = False
 
@@ -2067,7 +2085,8 @@ class _AnthropicCompletionsAdapter:
         if caller_extra_body and isinstance(caller_extra_body, dict):
             passthrough = {
                 k: v for k, v in caller_extra_body.items()
-                if k != "reasoning" and not str(k).startswith("_")
+                if k not in _OPENAI_ONLY_EXTRA_BODY_KEYS
+                and not str(k).startswith("_")
             }
             if passthrough:
                 existing = anthropic_kwargs.get("extra_body") or {}
