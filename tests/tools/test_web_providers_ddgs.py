@@ -3,30 +3,38 @@
 Covers:
 - DDGSWebSearchProvider.is_available() — reflects package importability
 - DDGSWebSearchProvider.search() — happy path, missing package, runtime error
+- DDGSWebSearchProvider.extract() — happy path, per-URL error, missing package
 - Result normalization (title, url, description, position)
 - Process-isolated timeout / interrupt / GIL-hold / reap (#68096)
 - _is_backend_available("ddgs") / _get_backend() integration
-- web_extract returns a search-only error when ddgs is active
+- web_extract with ddgs backend (no longer search-only)
 """
 from __future__ import annotations
 
-import json
 import sys
 import time
 import types
 
 import pytest
 
-from tests.tools.conftest import register_all_web_providers
 
-
-def _install_fake_ddgs(monkeypatch, *, text_results=None, text_raises=None, text_sleep=None):
+def _install_fake_ddgs(
+    monkeypatch,
+    *,
+    text_results=None,
+    text_raises=None,
+    text_sleep=None,
+    extract_results=None,
+    extract_raises=None,
+):
     """Install a stub ``ddgs`` module in sys.modules for the duration of a test.
 
     ``text_results``: iterable of dicts to yield from DDGS().text(...).
     ``text_raises``: if set, DDGS().text raises this exception instead.
     ``text_sleep``: if set, DDGS().text blocks for this many seconds before
         yielding — simulates a hung/slow search for the timeout test.
+    ``extract_results``: dict mapping URL -> dict returned from DDGS().extract().
+    ``extract_raises``: if set, DDGS().extract raises this exception instead.
     """
     import time as _time
 
@@ -48,6 +56,13 @@ def _install_fake_ddgs(monkeypatch, *, text_results=None, text_raises=None, text
                 raise text_raises
             for hit in (text_results or []):
                 yield hit
+        def extract(self, url, fmt=None):
+            if extract_raises is not None:
+                raise extract_raises
+            if extract_results and url in extract_results:
+                return extract_results[url]
+            # Match real ddgs behavior: empty dict on miss
+            return {}
 
     fake.DDGS = _FakeDDGS
     monkeypatch.setitem(sys.modules, "ddgs", fake)
@@ -257,37 +272,72 @@ class TestDDGSBackendWiring:
 
 
 # ---------------------------------------------------------------------------
-# ddgs is search-only: web_extract returns a clear error
+# ddgs extract() — happy path, per-URL error, missing package
 # ---------------------------------------------------------------------------
 
 
-class TestDDGSSearchOnlyErrors:
-    _register_providers = staticmethod(register_all_web_providers)
+class TestDDGSExtract:
+    """DDGS now exposes extract() — verify the plugin wires it correctly."""
 
-    @pytest.fixture(autouse=True)
-    def _populate_web_registry(self):
-        self._register_providers()
-        yield
-        from agent.web_search_registry import _reset_for_tests
-        _reset_for_tests()
+    def test_extract_happy_path_returns_normalized_results(self, monkeypatch):
+        from plugins.web.ddgs import provider as ddgs_provider
 
-    def test_web_extract_returns_search_only_error(self, monkeypatch):
-        import asyncio
-        from tools import web_tools
-
-        monkeypatch.setattr(web_tools, "_load_web_config", lambda: {"backend": "ddgs"})
-        monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: True)
-        monkeypatch.setattr(web_tools, "_is_tool_gateway_ready", lambda: False)
-        async def _allow_ssrf(_url: str) -> bool:
-            return True
-
-        monkeypatch.setattr(web_tools, "async_is_safe_url", _allow_ssrf)
-        monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False, raising=False)
-
-        result_str = asyncio.get_event_loop().run_until_complete(
-            web_tools.web_extract_tool(["https://example.com"])
+        _install_fake_ddgs(
+            monkeypatch,
+            extract_results={
+                "https://example.com/a": {"title": "A", "content": "AAA body"},
+                "https://example.com/b": {"title": "B", "content": "BBB body"},
+            },
         )
-        result = json.loads(result_str)
-        assert result["success"] is False
-        assert "search-only" in result["error"].lower()
-        assert "duckduckgo" in result["error"].lower() or "ddgs" in result["error"].lower()
+        prov = ddgs_provider.DDGSWebSearchProvider()
+        results = prov.extract(["https://example.com/a", "https://example.com/b"])
+
+        assert len(results) == 2
+        assert results[0]["url"] == "https://example.com/a"
+        assert results[0]["title"] == "A"
+        assert results[0]["content"] == "AAA body"
+        assert results[0]["raw_content"] == "AAA body"
+        assert results[0]["metadata"]["source"] == "ddgs"
+        assert results[1]["title"] == "B"
+        assert results[1]["content"] == "BBB body"
+
+    def test_extract_miss_returns_empty_content_not_error(self, monkeypatch):
+        """Real ddgs returns ``{}`` on URL miss; provider should record empty content."""
+        from plugins.web.ddgs import provider as ddgs_provider
+
+        _install_fake_ddgs(monkeypatch, extract_results={})
+        prov = ddgs_provider.DDGSWebSearchProvider()
+        results = prov.extract(["https://example.com/missing"])
+
+        assert len(results) == 1
+        assert results[0]["url"] == "https://example.com/missing"
+        assert results[0]["content"] == ""
+        assert "error" not in results[0]
+
+    def test_extract_per_url_exception_surfaces_as_error_entry(self, monkeypatch):
+        from plugins.web.ddgs import provider as ddgs_provider
+
+        _install_fake_ddgs(
+            monkeypatch,
+            extract_raises=RuntimeError("upstream ddgs error"),
+        )
+        prov = ddgs_provider.DDGSWebSearchProvider()
+        results = prov.extract(["https://example.com/x"])
+
+        assert len(results) == 1
+        assert "error" in results[0]
+        assert "DuckDuckGo extract failed" in results[0]["error"]
+        assert "upstream ddgs error" in results[0]["error"]
+
+    def test_extract_missing_package_returns_error_per_url(self, monkeypatch):
+        """If ``ddgs`` isn't installed, each URL gets an explicit error entry."""
+        from plugins.web.ddgs import provider as ddgs_provider
+
+        # Ensure ddgs isn't importable — fake it as missing by NOT installing it.
+        monkeypatch.setitem(sys.modules, "ddgs", None)
+        prov = ddgs_provider.DDGSWebSearchProvider()
+        results = prov.extract(["https://example.com/a", "https://example.com/b"])
+
+        assert len(results) == 2
+        assert results[0]["error"] == "ddgs package is not installed — run `pip install ddgs`"
+        assert results[1]["error"] == "ddgs package is not installed — run `pip install ddgs`"

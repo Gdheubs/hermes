@@ -25,7 +25,7 @@ import os
 import subprocess
 import sys
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from agent.web_search_provider import WebSearchProvider
 
@@ -298,7 +298,7 @@ class DDGSWebSearchProvider(WebSearchProvider):
         return True
 
     def supports_extract(self) -> bool:
-        return False
+        return True
 
     def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
         """Execute a DuckDuckGo search and return normalized results.
@@ -349,6 +349,62 @@ class DDGSWebSearchProvider(WebSearchProvider):
             "DDGS search '%s': %d results (limit %d)", query, len(web_results), limit
         )
         return {"success": True, "data": {"web": web_results}}
+
+    def extract(self, urls: List[str], **kwargs: Any) -> List[Dict[str, Any]]:
+        """Extract content from one or more URLs via the ``ddgs`` package.
+
+        Returns the hermes web_extract shape: a list of dicts with ``url``,
+        ``title``, ``content``, ``raw_content`` (best-effort duplicates of
+        ``content`` — ddgs doesn't separate the two), and ``metadata``.
+
+        The upstream ``ddgs`` ``DDGS().extract()`` returns ``{url, content}``
+        per URL. We normalize to the registry contract; per-URL failures
+        surface as ``{"error": ...}`` entries so the caller can decide
+        whether to retry or skip.
+        """
+        try:
+            from ddgs import DDGS  # type: ignore
+        except ImportError:
+            return [
+                {
+                    "url": u,
+                    "error": "ddgs package is not installed — run `pip install ddgs`",
+                }
+                for u in urls
+            ]
+
+        results: List[Dict[str, Any]] = []
+        fmt = (kwargs.get("format") or "text_markdown").strip()
+        with DDGS() as client:
+            for url in urls:
+                try:
+                    raw = client.extract(url, fmt=fmt)
+                except Exception as exc:  # noqa: BLE001 — ddgs raises its own exceptions
+                    logger.warning("DDGS extract error for %s: %s", url, exc)
+                    results.append({"url": url, "error": f"DuckDuckGo extract failed: {exc}"})
+                    continue
+                if not isinstance(raw, dict):
+                    results.append(
+                        {"url": url, "error": f"DuckDuckGo extract returned non-dict: {type(raw).__name__}"}
+                    )
+                    continue
+                content = str(raw.get("content", "") or "")
+                title = str(raw.get("title", "") or "")
+                results.append(
+                    {
+                        "url": url,
+                        "title": title,
+                        "content": content,
+                        "raw_content": content,  # ddgs doesn't separate
+                        "metadata": {
+                            "source": "ddgs",
+                            "format": fmt,
+                            "length": len(content),
+                        },
+                    }
+                )
+        logger.info("DDGS extract: %d/%d URLs succeeded", sum(1 for r in results if "error" not in r), len(urls))
+        return results
 
     def get_setup_schema(self) -> Dict[str, Any]:
         return {
