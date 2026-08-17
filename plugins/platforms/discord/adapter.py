@@ -210,6 +210,28 @@ def _truncate_discord_component_text(text: str, limit: int) -> str:
     return _prefix_within_utf16_limit(str(text or ""), max(0, limit))
 
 
+# Discord select menus cap at 25 options (API hard limit). Free models are
+# appended to the END of the curated provider lists (see
+# ``union_with_portal_free_recommendations`` in hermes_cli/models.py), so a
+# naive ``models[:25]`` slice silently drops every ``:free`` model for
+# providers with >25 curated entries (e.g. nous: 36, openrouter: 34). A
+# free-tier user then sees no free options at all. Order free models first
+# within the option budget so they are never hidden behind the cap.
+_DISCORD_SELECT_MAX_OPTIONS = 25
+
+
+def _is_free_model_id(model_id: str) -> bool:
+    """Return True for a model id carrying the conventional ``:free`` marker."""
+    return ":free" in (model_id or "").strip().lower()
+
+
+def _ordered_discord_model_ids(model_ids: list) -> list:
+    """Stable-sort model ids free-first, preserving relative order within each group."""
+    free = [m for m in model_ids if _is_free_model_id(m)]
+    paid = [m for m in model_ids if not _is_free_model_id(m)]
+    return (free + paid)[:_DISCORD_SELECT_MAX_OPTIONS]
+
+
 def _abort_discord_websocket_transport(websocket: Any) -> bool:
     """Abort the active aiohttp transport after a bounded close times out."""
     socket = getattr(websocket, "socket", None)
@@ -9234,7 +9256,7 @@ def _define_discord_view_classes() -> None:
 
             models = provider.get("models", [])
             options = []
-            for model_id in models[:25]:
+            for model_id in _ordered_discord_model_ids(models):
                 short = model_id.split("/")[-1] if "/" in model_id else model_id
                 options.append(
                     discord.SelectOption(
@@ -9323,7 +9345,7 @@ def _define_discord_view_classes() -> None:
             self._build_model_select(provider_slug)
 
             total = provider.get("total_models", 0) if provider else 0
-            shown = min(len(provider.get("models", [])), 25) if provider else 0
+            shown = len(_ordered_discord_model_ids(provider.get("models", []))) if provider else 0
             extra = f"\n*{total - shown} more available — type `/model <name>` directly*" if total > shown else ""
 
             await interaction.response.edit_message(
