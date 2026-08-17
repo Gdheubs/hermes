@@ -3935,6 +3935,7 @@ def select_provider_and_model(args=None):
         "arcee",
         "gmi",
         "nvidia",
+        "sambanova",
         "ollama-cloud",
         "tencent-tokenhub",
         "lmstudio",
