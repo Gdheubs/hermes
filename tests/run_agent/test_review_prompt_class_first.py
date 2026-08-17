@@ -144,6 +144,36 @@ def test_combined_review_prompt_rejects_unresolved_failures():
     _assert_unresolved_failure_guidance(AIAgent._COMBINED_REVIEW_PROMPT, "_COMBINED_REVIEW_PROMPT")
 
 
+# ---------------------------------------------------------------------------
+# Anti-pattern guidance — see issue #82772. The reviewer embedded a rule into
+# a skill instructing future review passes to resist the prompt's own "be
+# ACTIVE" pressure. The content was correct, but persisting a stance on the
+# review mechanism itself is a distinct failure mode from the five existing
+# "Do NOT capture" classes, which all cover incorrect content.
+# ---------------------------------------------------------------------------
+
+
+def _assert_system_stance_guidance(prompt: str, label: str) -> None:
+    lower = prompt.lower()
+    assert "system mechanism" in lower, (
+        f"{label}: must call out stances on system mechanisms as not-skill-worthy"
+    )
+    assert "this very review pass" in lower or "review pass" in lower, (
+        f"{label}: must name the review pass itself as an example mechanism"
+    )
+    assert "say so in your reply" in lower, (
+        f"{label}: must redirect the conflict to the reply, not the skill library"
+    )
+
+
+def test_skill_review_prompt_rejects_system_stance_capture():
+    _assert_system_stance_guidance(AIAgent._SKILL_REVIEW_PROMPT, "_SKILL_REVIEW_PROMPT")
+
+
+def test_combined_review_prompt_rejects_system_stance_capture():
+    _assert_system_stance_guidance(AIAgent._COMBINED_REVIEW_PROMPT, "_COMBINED_REVIEW_PROMPT")
+
+
 
 
 
