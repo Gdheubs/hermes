@@ -489,11 +489,27 @@ def cmd_status(args) -> None:
     mem_mark = "enabled ✓" if memory_enabled else "disabled ✗"
     user_mark = "enabled ✓" if user_profile_enabled else "disabled ✗"
 
-    # Check if the memory tool is enabled for the CLI platform via the
-    # canonical resolver (handles composite toolsets like hermes-cli).
+    # Check if the memory tool is enabled across configured platforms via
+    # the canonical resolver. This previously hardcoded "cli", which
+    # misreported status for gateway platforms: memory enabled under
+    # platform_toolsets.telegram but absent from the cli toolset showed
+    # "disabled" even though the tool worked on the platform in use (#81430).
     from hermes_cli.tools_config import _get_platform_tools
-    cli_tools = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
-    memory_tool_enabled = "memory" in cli_tools
+    platform_toolsets_cfg = config.get("platform_toolsets") or {}
+    # Always include the platform the command runs under (cli), even when the
+    # user only configured gateway platforms. Otherwise a CLI user with
+    # platform_toolsets: {telegram: [...]} gets a false "disabled" — cli falls
+    # back to its default toolset (hermes-cli, which includes memory) via
+    # _get_platform_tools, but was never added to the checked set. dict.fromkeys
+    # dedupes while preserving order.
+    configured_platforms = list(dict.fromkeys([*platform_toolsets_cfg, "cli"]))
+    tool_status_by_platform = {}
+    for plat in configured_platforms:
+        plat_tools = _get_platform_tools(config, plat, include_default_mcp_servers=False)
+        tool_status_by_platform[plat] = "memory" in plat_tools
+    # Summary line reflects whether memory is enabled for at least one
+    # configured platform; the per-platform breakdown below gives the detail.
+    memory_tool_enabled = any(tool_status_by_platform.values())
     tool_mark = "enabled ✓" if memory_tool_enabled else "disabled ✗"
 
     print("\nMemory status\n" + "─" * 40)
@@ -501,6 +517,11 @@ def cmd_status(args) -> None:
     print(f"    Memory injection:   {mem_mark}")
     print(f"    User profile:       {user_mark}")
     print(f"    Memory tool:        {tool_mark}")
+    if len(tool_status_by_platform) > 1:
+        print("    Memory tool by platform:")
+        for plat, en in tool_status_by_platform.items():
+            plat_mark = "enabled ✓" if en else "disabled ✗"
+            print(f"      {plat:<12} {plat_mark}")
     print(f"  Provider:  {provider_name or '(none — built-in only)'}")
 
     providers = _get_available_providers()
