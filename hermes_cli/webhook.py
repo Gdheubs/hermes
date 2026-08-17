@@ -21,7 +21,14 @@ from typing import Dict
 
 from hermes_constants import display_hermes_home
 from utils import atomic_replace
-from hermes_cli.config import cfg_get
+
+
+
+def _effective_webhook_config():
+    """Return the unified runtime webhook configuration."""
+    from gateway.webhook_config import resolve_effective_webhook_config
+
+    return resolve_effective_webhook_config()
 
 
 _SUBSCRIPTIONS_FILENAME = "webhook_subscriptions.json"
@@ -80,18 +87,49 @@ def _save_subscriptions(subs: Dict[str, dict]) -> None:
         raise
 
 
-def _get_webhook_config() -> dict:
-    """Load webhook platform config. Returns {} if not configured."""
+def _store_route_secret(name: str, value: str) -> str:
+    """Store a route secret in the profile resolver and return its reference."""
+    ref = "WEBHOOK_ROUTE_" + re.sub(r"[^A-Za-z0-9_]", "_", name.upper())
+    from hermes_cli.config import save_env_value
+    save_env_value(ref, value)
+    return ref
+
+
+def _resolve_route_secret(route: dict) -> str:
+    ref = route.get("secret_ref")
+    if not ref:
+        return str(route.get("secret", "") or "")
+    from agent.secret_scope import get_secret
+    value = get_secret(str(ref), "")
+    if value:
+        return str(value)
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config()
-        return cfg_get(cfg, "platforms", "webhook", default={})
+        from hermes_cli.config import get_env_value_prefer_dotenv
+        return str(get_env_value_prefer_dotenv(str(ref)) or "")
+    except Exception:
+        return ""
+
+
+def _get_webhook_config() -> dict:
+    """Return the legacy dict shape backed by effective webhook config."""
+    try:
+        effective = _effective_webhook_config()
+        return {
+            "enabled": effective.enabled,
+            "extra": {
+                "host": effective.host,
+                "port": effective.port,
+            },
+        }
     except Exception:
         return {}
 
 
 def _is_webhook_enabled() -> bool:
-    return bool(_get_webhook_config().get("enabled"))
+    try:
+        return _effective_webhook_config().enabled
+    except Exception:
+        return bool(_get_webhook_config().get("enabled"))
 
 
 def _get_webhook_base_url() -> str:
@@ -146,6 +184,10 @@ def webhook_command(args):
         print("Run 'hermes webhook --help' for details.")
         return
 
+    if sub == "migrate-secrets":
+        _cmd_migrate_secrets(args)
+        return
+
     if not _require_webhook_enabled():
         return
 
@@ -168,18 +210,33 @@ def _cmd_subscribe(args):
     subs = _load_subscriptions()
     is_update = name in subs
 
-    secret = args.secret or secrets.token_urlsafe(32)
+    existing_route = subs.get(name) if is_update else None
+    supplied_secret = bool(args.secret)
+    secret = args.secret or ("" if is_update else secrets.token_urlsafe(32))
     events = [e.strip() for e in args.events.split(",")] if args.events else []
 
+    if is_update and not supplied_secret and isinstance(existing_route, dict):
+        secret_ref = existing_route.get("secret_ref")
+        if not secret_ref:
+            secret = str(existing_route.get("secret", "") or "")
+            if secret:
+                # Incrementally migrate a legacy route at the next write while
+                # keeping the old route usable if secure persistence fails.
+                secret_ref = _store_route_secret(name, secret)
+    else:
+        secret_ref = _store_route_secret(name, secret)
     route = {
         "description": args.description or f"Agent-created subscription: {name}",
         "events": events,
-        "secret": secret,
         "prompt": args.prompt or "",
         "skills": [s.strip() for s in args.skills.split(",")] if args.skills else [],
         "deliver": args.deliver or "log",
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if secret_ref:
+        route["secret_ref"] = secret_ref
+    elif secret:
+        route["secret"] = secret
 
     if getattr(args, "deliver_only", False):
         if route["deliver"] == "log":
@@ -205,7 +262,10 @@ def _cmd_subscribe(args):
 
     print(f"\n  {status} webhook subscription: {name}")
     print(f"  URL:    {base_url}/webhooks/{name}")
-    print(f"  Secret: {secret}")
+    if not is_update or supplied_secret:
+        print(f"  Secret: {secret}")
+    else:
+        print("  Secret: (unchanged; not displayed)")
     if events:
         print(f"  Events: {', '.join(events)}")
     else:
@@ -274,7 +334,7 @@ def _cmd_test(args):
         return
 
     route = subs[name]
-    secret = route.get("secret", "")
+    secret = _resolve_route_secret(route)
     base_url = _get_webhook_base_url()
     url = f"{base_url}/webhooks/{name}"
 
@@ -305,3 +365,40 @@ def _cmd_test(args):
     except Exception as e:
         print(f"  Error: {e}")
         print("  Is the gateway running? (hermes gateway run)")
+
+# WEBHOOK_REVOLUTION_TASK8_MIGRATION_COMMAND_V1
+def _cmd_migrate_secrets(args):
+    """Migrate every legacy webhook secret, returning value-free receipts."""
+    from hermes_cli.migrations.webhook_secret_refs import (
+        migrate_webhook_config,
+        migrate_webhook_routes,
+    )
+
+    route_path = _subscriptions_path()
+    route_result = {
+        "migrated_routes": [],
+        "receipts": [],
+        "scrubbed_backups": [],
+    }
+    if route_path.exists():
+        backups = tuple(route_path.parent.glob(route_path.name + ".bak*"))
+        route_result = migrate_webhook_routes(
+            route_path,
+            backup_paths=backups,
+        )
+
+    config_path = _hermes_home() / "config.yaml"
+    config_result = {"migrated": False, "receipts": []}
+    if config_path.exists():
+        config_result = migrate_webhook_config(config_path)
+
+    result = {"routes": route_result, "config": config_result}
+    if getattr(args, "json", False):
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print(
+            "Webhook secret migration complete: "
+            f"{len(route_result.get('migrated_routes', []))} route(s), "
+            f"config={'migrated' if config_result.get('migrated') else 'unchanged'}."
+        )
+    return result
