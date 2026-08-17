@@ -2727,6 +2727,9 @@ async def _execute_tool_batch_async(agent, runnable_calls, timeout_s):
         max_workers=_max_workers_for_tool_batch(runnable_calls)
     )
     worker_tids: list[int] = []
+    # A shared authorization gate for the batch (the sync concurrent path's
+    # contract: the gate coordinates the auth-gated calls across the batch).
+    authorization_gate = _ConcurrentToolAuthorizationGate()
 
     def _run(call):
         tid = threading.current_thread().ident
@@ -2737,7 +2740,12 @@ async def _execute_tool_batch_async(agent, runnable_calls, timeout_s):
             if getattr(agent, "_interrupt_requested", False):
                 return ("interrupted", None)
             try:
-                return ("ok", _run_agent_tool_execution_middleware(agent, **call))
+                return (
+                    "ok",
+                    _run_agent_tool_execution_middleware(
+                        agent, authorization_gate=authorization_gate, **call
+                    ),
+                )
             except Exception as exc:  # per-call error contract (matches the sync path)
                 return ("error", repr(exc))
         finally:
@@ -2750,7 +2758,10 @@ async def _execute_tool_batch_async(agent, runnable_calls, timeout_s):
 
     loop = asyncio.get_running_loop()
     try:
-        futures = [loop.run_in_executor(executor, _run, c) for c in runnable_calls]
+        futures = [
+            loop.run_in_executor(executor, propagate_context_to_thread(_run), c)
+            for c in runnable_calls
+        ]
         done, pending = await _wait_with_interrupt(agent, futures, timeout_s)
         for f in pending:
             f.cancel()
