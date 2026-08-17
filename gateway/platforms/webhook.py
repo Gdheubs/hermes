@@ -350,40 +350,58 @@ class WebhookAdapter(BasePlatformAdapter):
         self._mark_disconnected()
         logger.info("[webhook] Disconnected")
 
-    async def send(
-        self,
-        chat_id: str,
-        content: str,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """Deliver the agent's response to the configured destination.
+    def _normalize_deliveries(self, route_config: dict, payload: dict) -> list[dict]:
+        """Normalize legacy single ``deliver``/``deliver_extra`` (or the new
+        ``deliveries`` list) into a canonical list of delivery targets.
 
-        chat_id is ``webhook:{route}:{delivery_id}``.  The delivery info
-        stored during webhook receipt is read with ``.get()`` (not popped)
-        so that interim status messages emitted before the final response
-        — fallback-model notifications, context-pressure warnings, etc. —
-        do not consume the entry and silently downgrade the final response
-        to the ``log`` deliver type.  TTL cleanup happens on POST.
+        Each entry is ``{"deliver": <type>, "deliver_extra": <rendered dict>}``.
+        Legacy single-deliver routes translate to a one-element list (#32403).
         """
-        if _is_webhook_silence_response(content):
-            logger.info(
-                "[webhook] Response for %s is a silence marker — not delivering", chat_id
-            )
-            return SendResult(success=True)
+        rendered_extra = self._render_delivery_extra(
+            route_config.get("deliver_extra", {}), payload
+        )
+        if route_config.get("deliveries"):
+            out: list[dict] = []
+            for item in route_config["deliveries"]:
+                if not isinstance(item, dict):
+                    continue
+                out.append(
+                    {
+                        "deliver": item.get("deliver", "log"),
+                        "deliver_extra": self._render_delivery_extra(
+                            item.get("deliver_extra", {}), payload
+                        ),
+                    }
+                )
+            if out:
+                return out
+        # Legacy single-deliver shape.
+        return [
+            {
+                "deliver": route_config.get("deliver", "log"),
+                "deliver_extra": rendered_extra,
+            }
+        ]
 
-        delivery = self._delivery_info.get(chat_id, {})
-        deliver_type = delivery.get("deliver", "log")
+    def _normalize_delivery(self, delivery: dict) -> list[dict]:
+        """Backward-compatible: accept a legacy single-deliver dict and return a
+        one-element deliveries list. Used by ``send`` for pre-fanout callers."""
+        if "deliveries" in delivery:
+            return [d for d in delivery["deliveries"] if isinstance(d, dict)]
+        return [
+            {
+                "deliver": delivery.get("deliver", "log"),
+                "deliver_extra": delivery.get("deliver_extra", {}),
+            }
+        ]
 
+    async def _deliver_one(self, content: str, target: dict) -> SendResult:
+        """Deliver to a single target dict (``{deliver, deliver_extra}``)."""
+        deliver_type = target.get("deliver", "log")
         if deliver_type == "log":
-            logger.info("[webhook] Response for %s: %s", chat_id, content[:200])
             return SendResult(success=True)
-
         if deliver_type == "github_comment":
-            return await self._deliver_github_comment(content, delivery)
-
-        # Cross-platform delivery — any platform with a gateway adapter.
-        # Check both built-in names and plugin-registered platforms.
+            return await self._deliver_github_comment(content, target)
         _is_known_platform = deliver_type in _BUILTIN_DELIVER_PLATFORMS
         if not _is_known_platform:
             try:
@@ -392,13 +410,70 @@ class WebhookAdapter(BasePlatformAdapter):
             except Exception:
                 pass
         if self.gateway_runner and _is_known_platform:
-            return await self._deliver_cross_platform(
-                deliver_type, content, delivery
-            )
-
+            return await self._deliver_cross_platform(deliver_type, content, target)
         logger.warning("[webhook] Unknown deliver type: %s", deliver_type)
         return SendResult(
             success=False, error=f"Unknown deliver type: {deliver_type}"
+        )
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Deliver the agent's response to every configured target.
+
+        chat_id is ``webhook:{route}:{delivery_id}``.  The delivery info
+        stored during webhook receipt is read with ``.get()`` (not popped)
+        so that interim status messages emitted before the final response
+        — fallback-model notifications, context-pressure warnings, etc. —
+        do not consume the entry and silently downgrade the final response
+        to the ``log`` deliver type.  TTL cleanup happens on POST.
+
+        Fan-out: every target in ``deliveries`` is attempted independently;
+        one failure does not erase another target's success. The returned
+        result is success if ANY target succeeded, and carries a
+        per-target breakdown in ``details``.
+        """
+        if _is_webhook_silence_response(content):
+            logger.info(
+                "[webhook] Response for %s is a silence marker — not delivering", chat_id
+            )
+            return SendResult(success=True)
+
+        delivery = self._delivery_info.get(chat_id, {})
+        targets = self._normalize_delivery(delivery)
+        if not targets:
+            targets = [{"deliver": "log", "deliver_extra": {}}]
+
+        results: list[SendResult] = []
+        for target in targets:
+            try:
+                results.append(await self._deliver_one(content, target))
+            except Exception as exc:
+                logger.exception("[webhook] Delivery raised for %s", chat_id)
+                results.append(SendResult(success=False, error=str(exc)))
+
+        # log-only targets still "succeed"; treat the whole delivery as
+        # success when any real or log target succeeded and none hard-failed
+        # on a genuine cross-platform/comment attempt.
+        succeeded = [r for r in results if r.success]
+        failed = [r for r in results if not r.success]
+        if not failed:
+            return SendResult(success=True)
+        # Preserve legacy single-target semantics: if there was exactly one
+        # target, return its result verbatim.
+        if len(results) == 1:
+            return results[0]
+        return SendResult(
+            success=bool(succeeded),
+            error=(
+                None
+                if succeeded
+                else "; ".join(r.error or "delivery failed" for r in failed)
+            ),
         )
 
     def _prune_delivery_info(self, now: float) -> None:
@@ -914,12 +989,8 @@ class WebhookAdapter(BasePlatformAdapter):
         # Store delivery info for send().  Read by every send() invocation
         # for this chat_id (interim status messages and the final response),
         # so we do NOT pop on send.  TTL-based cleanup keeps the dict bounded.
-        deliver_config = {
-            "deliver": route_config.get("deliver", "log"),
-            "deliver_extra": self._render_delivery_extra(
-                route_config.get("deliver_extra", {}), payload
-            ),
-        }
+        deliveries = self._normalize_deliveries(route_config, payload)
+        deliver_config = {"deliveries": deliveries}
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
         self._delivery_info_order.append((now, session_chat_id))

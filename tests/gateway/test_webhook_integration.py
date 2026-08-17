@@ -303,10 +303,13 @@ class TestGitHubCommentDelivery:
         chat_id = "webhook:pr-bot:gh-comment-001"
         assert chat_id in adapter._delivery_info
 
-        # Verify deliver_extra was rendered with payload data
+        # Verify deliver_extra was rendered with payload data. The legacy
+        # single ``deliver`` is normalized into a one-element ``deliveries``
+        # list (#32403); the rendered extra lives on that target.
         delivery = adapter._delivery_info[chat_id]
-        assert delivery["deliver_extra"]["repo"] == "org/repo"
-        assert delivery["deliver_extra"]["pr_number"] == "42"
+        target = delivery["deliveries"][0]
+        assert target["deliver_extra"]["repo"] == "org/repo"
+        assert target["deliver_extra"]["pr_number"] == "42"
 
         # Mock subprocess.run and call send()
         mock_result = MagicMock()
