@@ -608,6 +608,10 @@ class TestPreflightCompression:
                 "agent.conversation_loop.estimate_messages_tokens_rough",
                 return_value=144_669,
             ),
+            patch(
+                "agent.deepseek_replay.estimate_messages_tokens_rough",
+                return_value=144_669,
+            ),
             patch.object(
                 agent,
                 "_compress_context",
@@ -696,14 +700,22 @@ class TestPreflightCompression:
         agent.status_callback = lambda ev, msg: status_messages.append((ev, msg))
 
         _rough_calls = {"n": 0}
+        _rough_calls2 = {"n": 0}
 
         def _rough_estimate(*_args, **_kwargs):
             _rough_calls["n"] += 1
             return 114_000 if _rough_calls["n"] == 1 else 40_000
 
+        def _rough_estimate2(*_args, **_kwargs):
+            # Independent counter for the estimator's internal raw reading:
+            # both sites are called once per preflight, so lockstep is kept.
+            _rough_calls2["n"] += 1
+            return 114_000 if _rough_calls2["n"] == 1 else 40_000
+
         with (
             patch("agent.turn_context.estimate_request_tokens_rough", side_effect=_rough_estimate),
             patch("agent.conversation_loop.estimate_request_tokens_rough", side_effect=_rough_estimate),
+            patch("agent.deepseek_replay.estimate_messages_tokens_rough", side_effect=_rough_estimate2),
             patch.object(agent, "_compress_context") as mock_compress,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
@@ -1095,13 +1107,21 @@ class TestToolResultPreflightCompression:
         # which previously made the no-op pass look successful and allowed two
         # more immediate summaries.
         assembled_estimates = iter(
-            [1_000, 150_000, 148_000, 148_000, 148_000]
+            [1_000, 156_000, 154_000, 154_000, 154_000]
         )
+        # The estimator subtracts tool-result compaction savings (~24K on the
+        # 100K-char result), so the assembled values are rebased to still
+        # cross the 130K threshold post-compaction.
+        assembled_estimates2 = iter([1_000, 156_000, 154_000, 154_000, 154_000])
 
         with (
             patch(
                 "agent.conversation_loop.estimate_messages_tokens_rough",
                 side_effect=lambda *_a, **_k: next(assembled_estimates),
+            ),
+            patch(
+                "agent.deepseek_replay.estimate_messages_tokens_rough",
+                side_effect=lambda *_a, **_k: next(assembled_estimates2),
             ),
             patch("run_agent.handle_function_call", return_value="x" * 100_000),
             patch.object(

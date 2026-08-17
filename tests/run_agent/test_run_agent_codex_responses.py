@@ -1449,7 +1449,10 @@ def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(mo
     """
     agent = _build_agent(monkeypatch)
     agent.context_compressor.context_length = 20_000
-    agent.context_compressor.threshold_tokens = 20_000
+    # Wire-based preflight: the 80K-char result compacts to ~835, so the
+    # assembled request is ~891 tokens and the initial is ~9 — 500 sits
+    # between them, keeping "fires mid-turn, not initially".
+    agent.context_compressor.threshold_tokens = 500
 
     responses = [
         _codex_tool_call_response(),
@@ -1488,7 +1491,9 @@ def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(mo
     assert result["completed"] is True
     assert result["final_response"] == "Summary after compaction."
     assert len(compress_calls) == 1
-    assert compress_calls[0] >= 15_000
+    # Wire-based pressure (~2,900: compacted assembled request + tools)
+    # crosses the rebased threshold; far below the raw ~20K overstatement.
+    assert compress_calls[0] >= 500
     assert len(requests) == 2
 
 
@@ -1515,7 +1520,8 @@ def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, 
     agent._cleanup_task_resources = lambda task_id: None
 
     agent.context_compressor.context_length = 20_000
-    agent.context_compressor.threshold_tokens = 20_000
+    # Wire-based preflight: the assembled 80K-char result compacts to ~835.
+    agent.context_compressor.threshold_tokens = 500
 
     agent._session_db = SessionDB()
     agent._ensure_db_session()

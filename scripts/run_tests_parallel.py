@@ -378,7 +378,7 @@ def _run_one_file_once(
     file_timeout: float,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    cmd = [sys.executable, "-m", "pytest", "-p", "no:cacheprovider", str(file), *pytest_args]
     
     subproc_start = time.monotonic()
     # launch the pytest process
@@ -754,8 +754,8 @@ def main() -> int:
         "-j",
         "--jobs",
         type=int,
-        default=int(os.environ.get("HERMES_TEST_WORKERS") or (os.cpu_count() or 4) * 2),
-        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count*2)",
+        default=int(os.environ.get("HERMES_TEST_WORKERS") or max(2, (os.cpu_count() or 4) - 1)),
+        help="Parallel worker count (default: $HERMES_TEST_WORKERS or cpu_count-1, the Maven-style)",
     )
     parser.add_argument(
         "--paths",
@@ -1097,7 +1097,16 @@ def main() -> int:
 
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures: List[Future] = []
-        for file in files:
+        # LPT submission order: the slow files claim the workers first, so the
+        # suite's tail is minimized (longest-processing-time-first, using the
+        # cached durations; unknown files get the default).
+        _dur = _load_durations(repo_root)
+        files_submit = sorted(
+            files,
+            key=lambda f: _dur.get(_format_file(f, repo_root), 2.0),
+            reverse=True,
+        )
+        for file in files_submit:
             t0 = time.monotonic()
             fut = pool.submit(
                 _run_one_file, file, pytest_passthrough, repo_root,

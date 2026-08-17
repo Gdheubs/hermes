@@ -56,13 +56,13 @@ def _expand_tilde(path: str) -> str:
 # ---------------------------------------------------------------------------
 # Read-size guard: cap the character count returned to the model.
 # We're model-agnostic so we can't count tokens; characters are a safe proxy.
-# 100K chars ≈ 25–35K tokens across typical tokenisers.  Files larger than
+# 50K chars ≈ 12-15K tokens across typical tokenisers.  Files larger than
 # this in a single read are a context-window hazard — the model should use
 # offset+limit to read the relevant section.
 #
 # Configurable via config.yaml:  file_read_max_chars: 200000
 # ---------------------------------------------------------------------------
-_DEFAULT_MAX_READ_CHARS = 100_000
+_DEFAULT_MAX_READ_CHARS = 50_000
 _max_read_chars_cached: int | None = None
 
 

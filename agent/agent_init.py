@@ -2078,12 +2078,16 @@ def init_agent(
         except (TypeError, ValueError):
             return default
 
-    # Opt-in proactive tool-result prune trigger (0 = disabled — the
-    # default, so an unset key is behavior-neutral).  Negative values are
-    # treated as disabled rather than erroring.
-    compression_proactive_prune_tokens = max(
-        0, _parse_prune_int(_compression_cfg.get("proactive_prune_tokens", 0), 0)
-    )
+    # Prune trigger: sentinel -1 = auto (compressor derives window // 8);
+    # explicit value (incl. 0 = off) is authoritative. NB: quoted "-1" in
+    # YAML is a string, so it disables instead of auto (accepted corner).
+    _raw_prune_tokens = _compression_cfg.get("proactive_prune_tokens", -1)
+    if _raw_prune_tokens == -1:
+        compression_proactive_prune_tokens = -1
+    else:
+        compression_proactive_prune_tokens = max(
+            0, _parse_prune_int(_raw_prune_tokens, 0)
+        )
     compression_proactive_prune_min_chars = _parse_prune_int(
         _compression_cfg.get("proactive_prune_min_result_chars", 8000), 8000
     )
@@ -2102,6 +2106,8 @@ def init_agent(
     compression_protect_first = max(
         0, int(_compression_cfg.get("protect_first_n", 3))
     )
+    compression_checkpoint_mode = bool(_compression_cfg.get("checkpoint_mode", False))
+    compression_checkpoint_tool_ratio = float(_compression_cfg.get("checkpoint_tool_ratio", 0.7))
     compression_abort_on_summary_failure = str(
         _compression_cfg.get("abort_on_summary_failure", False)
     ).lower() in {"true", "1", "yes"}
@@ -2633,6 +2639,8 @@ def init_agent(
             provider=agent.provider,
             api_mode=agent.api_mode,
             abort_on_summary_failure=compression_abort_on_summary_failure,
+            checkpoint_mode=compression_checkpoint_mode,
+            checkpoint_tool_ratio=compression_checkpoint_tool_ratio,
             max_tokens=agent.max_tokens,
             model_thresholds=compression_model_thresholds,
             threshold_tokens_cap=compression_threshold_tokens,

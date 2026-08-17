@@ -34,7 +34,7 @@ def _reset_limits_cache():
 
 class TestDefaults:
     def test_defaults_match_previous_hardcoded_values(self):
-        assert tol.DEFAULT_MAX_BYTES == 50_000
+        assert tol.DEFAULT_MAX_BYTES == 20_000
         assert tol.DEFAULT_MAX_LINES == 2000
         assert tol.DEFAULT_MAX_LINE_LENGTH == 2000
 

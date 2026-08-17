@@ -36,6 +36,12 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
+from agent.deepseek_replay import (
+    apply_deepseek_replay_compaction,
+    estimate_request_tokens_after_deepseek_replay,
+    merge_replay_usage,
+    replay_compaction_limits,
+)
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
@@ -2434,10 +2440,23 @@ def run_conversation(
         # messages walk inside estimate_request_tokens_rough. Tools added
         # separately (compression needs them: 50+ tools = 20-30K tokens).
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
-        approx_tokens = estimate_messages_tokens_rough(api_messages)
-        request_pressure_tokens = approx_tokens + (
-            _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
+        # Per-provider tunable replay-compaction thresholds (config
+        # ``replay_compaction``), resolved once per turn and shared by the
+        # preflight estimate and the wire-time compaction below.
+        _replay_limits = replay_compaction_limits(agent.provider)
+        _raw_approx = estimate_messages_tokens_rough(api_messages)
+        # Measure request pressure against the post-compaction wire size so
+        # the raw estimate can't fire compression early (estimate-only).
+        # Preflight estimate: post-replay wire size for every provider.
+        approx_tokens = estimate_request_tokens_after_deepseek_replay(
+            api_messages,
+            provider=agent.provider,
+            model=agent.model,
+            base_url=agent.base_url,
+            limits=_replay_limits,
         )
+        _preflight_tools = _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
+        request_pressure_tokens = approx_tokens + _preflight_tools
         total_chars = approx_tokens * 4
         # Stash this request's rough estimate so update_from_response() can
         # pair it with the provider's real prompt count — the (rough, real)
@@ -2518,18 +2537,36 @@ def run_conversation(
         _defer_preflight = getattr(
             _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
         )
+        _preflight_defer = (
+            _defer_preflight(request_pressure_tokens)
+            if callable(_defer_preflight)
+            else False
+        )
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
-        if (
+        _preflight_fire = bool(
             agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
-            and not _defer_preflight(request_pressure_tokens)
+            and not _preflight_defer
             and not _compression_cooldown
             and _compressor.should_compress(request_pressure_tokens)
-        ):
+        )
+        # One structured line per preflight (debug level: diagnostics for
+        # integration runs, not prod noise): every compression/compaction
+        # boundary value, so a debug run pins where reality diverges.
+        logger.debug(
+            "economy preflight: raw=%d replay=%d tools=%d pressure=%d "
+            "threshold=%d defer=%s cooldown=%s blocked=%s enabled=%s "
+            "attempts=%d/%d fire=%s",
+            _raw_approx, approx_tokens, _preflight_tools, request_pressure_tokens,
+            _preflight_threshold, _preflight_defer, _compression_cooldown,
+            _preflight_compression_blocked, agent.compression_enabled,
+            compression_attempts, max_compression_attempts, _preflight_fire,
+        )
+        if _preflight_fire:
             if _moa_prepared_request is not None:
                 pending_moa_prepared_request = _moa_prepared_request
             compression_attempts += 1
@@ -2767,6 +2804,16 @@ def run_conversation(
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
+                # Wire-time replay economy (send copy; idempotent).
+                api_messages, _replay_diag = apply_deepseek_replay_compaction(
+                    api_messages,
+                    provider=agent.provider,
+                    model=agent.model,
+                    base_url=agent.base_url,
+                    limits=replay_compaction_limits(agent.provider),
+                )
+                if _replay_diag.tokens_saved > 0 or _replay_diag.stripped_reasoning > 0:
+                    logger.info("%s", _replay_diag.summary())
                 # Same story for prompt-cache decoration (#72626): try_activate_
                 # fallback refreshes the policy flags, but the decorated list
                 # still carries the primary's breakpoints (or none). Strip and
@@ -3981,6 +4028,8 @@ def run_conversation(
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
+                    # Replay savings on the canonical usage dict.
+                    merge_replay_usage(usage_dict, _replay_diag)
                     # Capture the boundary latch before update_from_response()
                     # consumes it. Only a real provider prompt count for the
                     # request immediately following a completed compaction can
@@ -5683,6 +5732,16 @@ def run_conversation(
 
                     if new_ctx is not None:
                         agent._buffer_vprint(f"Context limit detected from API: {new_ctx:,} tokens (was {old_ctx:,})")
+                        # Confirmation: a re-learn of a previously-expired value
+                        # proves the provider really rejects there -> sticky.
+                        if getattr(compressor, "_learned_context_limit_confirmed_value", None) == new_ctx:
+                            compressor._learned_context_limit_sticky = True
+                        # Otherwise arm the same-session expiry FIRST: the learned
+                        # limit restores the catalog window after a bounded turn
+                        # count (a wrong-low learn must not pin a days-long session).
+                        _mark_learned = getattr(compressor, "mark_learned_context_limit", None)
+                        if callable(_mark_learned):
+                            _mark_learned()
                         compressor.update_model(
                             model=agent.model,
                             context_length=new_ctx,
@@ -7291,11 +7350,17 @@ def run_conversation(
                         messages, tools=agent.tools or None
                     )
 
-                if (
+                _post_fire = (
                     agent.compression_enabled
                     and compression_attempts < max_compression_attempts
                     and _compressor.should_compress(_real_tokens)
-                ):
+                )
+                logger.debug(
+                    "economy post-response: real=%d threshold=%d fire=%s attempts=%d/%d",
+                    _real_tokens, getattr(_compressor, "threshold_tokens", 0),
+                    _post_fire, compression_attempts, max_compression_attempts,
+                )
+                if _post_fire:
                     compression_attempts += 1
                     # Compression is actually running (block cleared / was
                     # never blocked) — reset the blocked-overflow warning

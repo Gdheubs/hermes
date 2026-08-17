@@ -953,6 +953,12 @@ def _apply_macos_checkpoint_barrier(conn: sqlite3.Connection) -> None:
 
     Best-effort: never raises.
     """
+    if os.environ.get("HERMES_TEST_ISOLATION"):
+        try:
+            conn.execute("PRAGMA synchronous=OFF")
+        except Exception:
+            pass
+        return
     if sys.platform != "darwin":
         return
     try:
@@ -963,6 +969,10 @@ def _apply_macos_checkpoint_barrier(conn: sqlite3.Connection) -> None:
 
 def _enforce_macos_synchronous_full(conn: sqlite3.Connection) -> None:
     """Enforce ``PRAGMA synchronous=FULL`` on macOS to prevent btree corruption.
+
+    Test isolation (``HERMES_TEST_ISOLATION``): the throwaway test DBs skip
+    the FULL-fsync durability barrier and run ``synchronous=OFF`` — no fsync
+    per transaction. The corruption protection targets real sessions.
 
     On Darwin, the default ``synchronous=NORMAL`` only calls ``fsync()``,
     which Apple's fsync(2) man page explicitly states does *not* guarantee

@@ -40,6 +40,9 @@ def _compressor(summary="ROLLING SUMMARY") -> ContextCompressor:
         provider="test",
     )
     cc._micro_compact_enabled = True
+    # The fixture's exchanges are small (<= ~500 tok); the reclaim gate would
+    # skip them. The gate's own test exercises the default floor separately.
+    cc._micro_compact_min_exchange_tokens = 0
     # Stand in for the auxiliary summarizer LLM.
     cc._micro_summarize_one = lambda _text: summary
     return cc
@@ -821,3 +824,42 @@ class TestDefragFlushCursorInvalidation:
             "finalize_turn must invalidate the bounded flush-scan cursor "
             "when the defrag pop stripped a live marker's stamp"
         )
+
+
+class TestMicroCompactionGateAndPruneFirst:
+    def test_tiny_exchange_skipped_by_default_floor(self):
+        """The reclaim gate skips a pass whose oldest exchange is tiny (a
+        cache break + aux LLM call is not worth it (default floor 1024)."""
+        cc = _compressor("S")
+        cc._micro_compact_min_exchange_tokens = 1024  # default
+        messages = _conversation(exchanges=4)
+        # shrink every exchange below the floor
+        for m in messages:
+            if isinstance(m.get("content"), str) and m["content"].startswith("answer"):
+                m["content"] = "answer"  # ~2 tokens
+        result = cc._micro_compact(list(messages))
+        assert result == messages  # unchanged — no absorb, no summary marker
+
+    def test_prune_first_compacts_summary_input_not_stored(self):
+        """A tool-heavy exchange: the summary input carries the compacted
+        head+tail, while the stored messages keep the raw result."""
+        seen = {}
+
+        def spy(text):
+            seen["text"] = text
+            return "S"
+
+        cc = _compressor("S")
+        cc._micro_compact_min_exchange_tokens = 0
+        cc._micro_summarize_one = spy
+        messages = [
+            {"role": "user", "content": "do it"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "f", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "L" * 30_000},
+            {"role": "user", "content": "go on"},
+        ]
+        before = messages[2]["content"]
+        cc._micro_compact(list(messages))
+        assert "--- head ---" in seen["text"]  # summary input was compacted
+        assert messages[2]["content"] == before  # stored messages untouched

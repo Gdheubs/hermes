@@ -518,10 +518,25 @@ tool_loop_guardrails:
 #   200K context, threshold 0.50, ratio 0.20 → 20K tokens of recent tail preserved
 #   1M   context, threshold 0.50, ratio 0.20 → 100K tokens of recent tail preserved
 #
+# Wire-time replay economy (agent/deepseek_replay.py): oversized tool results
+# are head+tail compacted on the provider copy every turn. Per-provider
+# tunable; 0/invalid values fall back to these defaults.
+replay_compaction:
+  max_tokens: 2000     # compact tool results estimated above this many tokens
+  max_chars: 12288     # ...or above this many characters
+  keep_runes: 3000     # retained head+tail runes per compacted result
+  provider_overrides: {}  # e.g. {anthropic: {max_tokens: 4000}}
+
 compression:
   # Enable automatic context compression (default: true)
   # Set to false if you prefer to manage context manually or want errors on overflow
   enabled: true
+  # Deterministic no-LLM checkpoint for tool-heavy middles (default: false):
+  # a tool-heavy compressible span gets a goal/tool-evidence/next-action
+  # checkpoint instead of the summarizer call. checkpoint_tool_ratio = the
+  # tool-token share (0-1) above which the checkpoint applies (default 0.7).
+  checkpoint_mode: false
+  checkpoint_tool_ratio: 0.7
 
   # Opt-in compression progress notices on chat platforms (default: false).
   # By design, routine automatic compression is SILENT on human-facing chat
@@ -646,7 +661,7 @@ compression:
   # the provider's prompt-cache prefix — the min_reclaim gate below keeps
   # those cache breaks episodic (like a compression boundary) instead of
   # per-turn.
-  proactive_prune_tokens: 0
+  proactive_prune_tokens: -1  # auto: window/8 for windows >= 512K; 0 = off
 
   # The prune's summarize pass only touches tool results larger than this many
   # characters (clamped to >= 200 so a generated summary can't be

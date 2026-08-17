@@ -1581,6 +1581,7 @@ def parse_context_limit_from_error(error_msg: str) -> Optional[int]:
         r'(?:max(?:imum)?|limit)\s*(?:context\s*)?(?:length|size|window)?\s*(?:is|of|:)?\s*(\d{4,})',
         r'context\s*(?:length|size|window)\s*(?:is|of|:)?\s*(\d{4,})',
         r'(\d{4,})\s*(?:token)?\s*(?:context|limit)',
+        r'max(?:imum)?\s*(?:number of\s*)?input tokens?\s*(?:of|:)?\s*(\d{4,})',  # Bedrock: "exceeds the maximum input tokens of N", "Max input tokens: N", "maximum number of input tokens: N"
         r'>\s*(\d{4,})\s*(?:max|limit|token)',  # "250000 tokens > 200000 maximum"
         r'(\d{4,})\s*(?:max(?:imum)?)\b',  # "200000 maximum"
     ]

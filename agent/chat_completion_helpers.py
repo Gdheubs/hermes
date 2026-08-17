@@ -1822,6 +1822,52 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
+
+def resolve_qwen_preserve_thinking(agent) -> bool:
+    """Send parameters.preserve_thinking=true on Qwen wires so the historical
+    reasoning is always consumed. Default true; false makes it strippable
+    (the strip gate must align first). Non-Qwen models return False."""
+    try:
+        from agent.prompt_caching import is_qwen_model
+        from hermes_cli.config import load_config_readonly
+
+        if not is_qwen_model((agent.model or "").lower()):
+            return False
+        return bool(load_config_readonly().get("HERMES_QWEN_PRESERVE_THINKING", True))
+    except Exception:
+        return True
+
+
+def resolve_qwen_context_overflow_policy(agent) -> str | None:
+    """Qwen overflow policy injected per request (qwen-family models).
+
+    Defaults to ``stopAtLimit`` so the provider rejects at its context limit
+    and the agent self-compresses, instead of silently truncating the
+    compacted wire (``rollingWindow`` / ``truncateMiddle``). The field is a
+    Qwen-platform request field, so the default applies only on Qwen-platform
+    endpoints (portal.qwen.ai / dashscope); an explicit config value wins on
+    any endpoint (it is the user's escape hatch), and empty disables.
+    Non-Qwen models always return None.
+    """
+    try:
+        from agent.prompt_caching import is_qwen_model
+        from hermes_cli.config import load_config_readonly
+
+        if not is_qwen_model((agent.model or "").lower()):
+            return None
+        policy = load_config_readonly().get("HERMES_QWEN_CONTEXT_OVERFLOW_POLICY")
+        if policy is not None:
+            return policy or None  # explicit wins; empty disables
+        host = (getattr(agent, "_base_url_lower", "") or "").lower()
+        if (
+            base_url_host_matches(host, "portal.qwen.ai")
+            or base_url_host_matches(host, "dashscope.aliyuncs.com")
+        ):
+            return "stopAtLimit"
+        return None
+    except Exception:
+        return None
+
 def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
@@ -2019,6 +2065,11 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             "sessionId": agent.session_id or "hermes",
             "promptId": str(uuid.uuid4()),
         }
+    # Qwen context-overflow policy (stopAtLimit default): the provider
+    # rejects at the limit so the agent self-compresses; rollingWindow /
+    # truncateMiddle would silently truncate the compacted wire.
+    _qwen_overflow_policy = resolve_qwen_context_overflow_policy(agent)
+    _qwen_preserve_thinking = resolve_qwen_preserve_thinking(agent)
 
     # ── Provider profile path (registered providers) ───────────────────
     # Profiles handle per-provider quirks via hooks. When a profile is
@@ -2060,6 +2111,8 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             anthropic_max_output=_ant_max,
             supports_reasoning=agent._supports_reasoning_extra_body(),
             qwen_session_metadata=_qwen_meta,
+            qwen_context_overflow_policy=_qwen_overflow_policy,
+            qwen_preserve_thinking=_qwen_preserve_thinking,
         )
 
     # ── Legacy flag path ────────────────────────────────────────────
@@ -2101,6 +2154,8 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         qwen_prepare_fn=agent._qwen_prepare_chat_messages if _is_qwen else None,
         qwen_prepare_inplace_fn=agent._qwen_prepare_chat_messages_inplace if _is_qwen else None,
         qwen_session_metadata=_qwen_meta,
+        qwen_context_overflow_policy=_qwen_overflow_policy,
+        qwen_preserve_thinking=_qwen_preserve_thinking,
         fixed_temperature=_fixed_temp,
         omit_temperature=_omit_temp,
         supports_reasoning=agent._supports_reasoning_extra_body(),

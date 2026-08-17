@@ -143,7 +143,18 @@ def test_pre_api_compression_budget_rearms_only_after_pressure_clears(
     agent.context_compressor = compressor
 
     estimate_values = iter([200, 190, 200, 10])
+    estimate_values2 = iter([200, 190, 200, 10])
     _last_estimate = [10]
+    _last_estimate2 = [10]
+
+    def _next_estimate2(*_args, **_kwargs):
+        # Independent replay for the estimator's internal raw reading; both
+        # sites advance once per preflight, so the pressure trajectory holds.
+        try:
+            _last_estimate2[0] = next(estimate_values2)
+        except StopIteration:
+            pass
+        return _last_estimate2[0]
 
     def _next_estimate(*_args, **_kwargs):
         # The provider-recovery variant re-runs the pre-API preflight after
@@ -190,6 +201,10 @@ def test_pre_api_compression_budget_rearms_only_after_pressure_clears(
         patch(
             "agent.conversation_loop.estimate_messages_tokens_rough",
             side_effect=_next_estimate,
+        ),
+        patch(
+            "agent.deepseek_replay.estimate_messages_tokens_rough",
+            side_effect=_next_estimate2,
         ),
         patch(
             "agent.conversation_loop._estimate_tools_tokens_rough",

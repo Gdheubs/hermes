@@ -512,6 +512,13 @@ _SUMMARY_TOKENS_CEILING = 10_000
 # same cursor position, skip the stuck exchange and advance the cursor so the
 # system doesn't busy-loop on an unsummarizable exchange every turn.
 _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES = 3
+# A micro pass costs a prompt-cache break + one aux LLM call; skip the pass
+# when the oldest exchange has too little mass to justify it.
+_MICRO_COMPACT_MIN_EXCHANGE_TOKENS = 1024
+# A provider-learned context limit expires after this many successful turns,
+# restoring the catalog window (sessions can run for days, so a wrong-low
+# learn must not pin premature compression for the whole session.
+_LEARNED_CONTEXT_LIMIT_TURNS = 200
 
 # Aggregate cap on the serialized turn block fed to the summarizer prompt
 # (chars). Per-message truncation (_CONTENT_MAX / _TOOL_ARGS_MAX) alone is
@@ -534,6 +541,9 @@ _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 # constructor clamp on ``proactive_prune_min_result_chars``, and the clarify
 # summary cap (which must stay strictly BELOW this so a preserved user answer
 # is never re-summarized away on a later prune pass).
+# Auto-prune floor (sentinel -1): only >= this window, at window // 8.
+LARGE_WINDOW_PRUNE_FLOOR = 512_000
+
 _PRUNE_MIN_CHARS = 200
 
 # Non-response sentinels the clarify callbacks embed as ``user_response`` when
@@ -1057,6 +1067,24 @@ _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 # only meant to preserve continuity anchors from the dropped window, not to
 # become another unbounded transcript copy after the LLM summarizer failed.
 _FALLBACK_SUMMARY_MAX_CHARS = 8_000
+
+# Coding/tool-heavy signal set (the checkpoint + the strip share it).
+# ── Coding / tool-heavy signal set (the checkpoint + the preserve-thinking
+#    strip share it). Deterministic, no ML.
+_CODING_TOOL_NAMES = frozenset({
+    "read_file", "write_file", "edit_file", "apply_patch", "replace_in_file",
+    "grep", "rg", "glob", "search_files", "read_special_file", "run_tests",
+    "bash", "shell", "python", "execute", "compile", "build", "git",
+    "cargo", "go", "gcc", "g++", "clang", "rustc", "npm", "bun", "yarn",
+    "make", "cmake", "pip", "mvn", "gradle", "dotnet", "csharp", "java",
+    "node", "deno", "tsc", "eslint", "pytest", "go test",
+})
+import re as _re
+_CODING_PROMPT_PATTERNS = (
+    _re.compile(r"```|\bdef \b|\bclass \b|\bimport \b|\bfrom \b"),
+    _re.compile(r"(?:src|test|tests|lib|app|agent)/[\w./-]+\.[\w]+"),
+    _re.compile(r"\b(?:refactor|bug|fix|test|compile|build|deploy|commit|optimize|query|schema|endpoint|performance|regression)\b"),
+)
 _FALLBACK_PREVIOUS_SUMMARY_MAX_CHARS = 3_000
 _FALLBACK_TURN_MAX_CHARS = 700
 _AUTO_FOCUS_MAX_TURNS = 3
@@ -2608,6 +2636,11 @@ class ContextCompressor(ContextEngine):
         self.provider = provider
         self.api_mode = api_mode
         self.context_length = context_length
+        # Auto prune default follows the new window (1M <-> small switches).
+        if getattr(self, "_auto_proactive_prune", False):
+            self.proactive_prune_tokens = (
+                context_length // 8 if context_length >= LARGE_WINDOW_PRUNE_FLOOR else 0
+            )
         # Re-resolve per-model threshold for the NEW model, then re-apply the
         # small-context threshold floor. Starting from _config_threshold_percent
         # (the raw config value) so a switch from a model with an override to
@@ -2820,6 +2853,8 @@ class ContextCompressor(ContextEngine):
         provider: str = "",
         api_mode: str = "",
         abort_on_summary_failure: bool = False,
+        checkpoint_mode: bool = False,
+        checkpoint_tool_ratio: float = 0.7,
         max_tokens: int | None = None,
         model_thresholds: dict[str, float] | None = None,
         threshold_tokens_cap: Any = None,
@@ -2863,6 +2898,8 @@ class ContextCompressor(ContextEngine):
         self.protect_last_n = protect_last_n
         # Proactive tool-result pruning (cost-oriented; runs INDEPENDENTLY of the
         # full-compression trigger, via prune_tool_results_only()). 0 = disabled.
+        # Sentinel -1 (auto) is resolved later, once the context length is
+        # initialized (see below).
         self.proactive_prune_tokens = int(proactive_prune_tokens or 0)
         # Floor the summarize threshold at 200 chars (matching
         # _prune_old_tool_results' dedup floor). Below ~200 a generated summary
@@ -2904,6 +2941,9 @@ class ContextCompressor(ContextEngine):
         # When False (default = historical behavior), insert a
         # deterministic "summary unavailable" handoff and drop the middle window.
         self.abort_on_summary_failure = abort_on_summary_failure
+        # Deterministic no-LLM checkpoint for tool-heavy middles (off by default).
+        self.checkpoint_mode = bool(checkpoint_mode)
+        self.checkpoint_tool_ratio = min(1.0, max(0.0, float(checkpoint_tool_ratio or 0.7)))
 
         # ── Micro-compaction (per-turn rolling compaction) ─────────
         # Default: OFF. Each pass rewrites already-sent history, so it breaks
@@ -2926,7 +2966,17 @@ class ContextCompressor(ContextEngine):
         # makes this the dial that sets how often that break is paid. 1 =
         # every turn (most aggressive reclaim, one break per turn).
         self._micro_compact_every_n_turns: int = 1
+        self._micro_compact_min_exchange_tokens: int = _MICRO_COMPACT_MIN_EXCHANGE_TOKENS
         self._micro_compact_turns_since_pass: int = 0
+        # Learned provider context limit: adopted from a 413 (lower-only), it
+        # expires after a bounded turn count and the catalog window is
+        # restored; a wrong-low learn must not stick for a days-long session.
+        self._learned_context_limit_turns_left: int = 0
+        self._pre_learn_context_length: int | None = None
+        # Confirmation: a re-learn of a previously-expired value proves the
+        # limit is real (the provider consistently rejects there) -> sticky.
+        self._learned_context_limit_confirmed_value: int | None = None
+        self._learned_context_limit_sticky: bool = False
 
         # Defer context-length resolution to first access (#32221):
         # get_model_context_length() can issue a synchronous /models HTTP
@@ -2941,6 +2991,13 @@ class ContextCompressor(ContextEngine):
         self._config_context_length = config_context_length
         self._configured_threshold_percent = self.threshold_percent
         self._resolved_context_length: int | None = None
+        self._auto_proactive_prune = self.proactive_prune_tokens == -1
+        # Sentinel -1: derive window // 8 from the resolved context length.
+        if self.proactive_prune_tokens == -1:
+            window = self._resolve_context_length()
+            self.proactive_prune_tokens = (
+                window // 8 if window >= LARGE_WINDOW_PRUNE_FLOOR else 0
+            )
         self._threshold_tokens: int | None = None
         self._tail_token_budget: int | None = None
         self._max_summary_tokens: int | None = None
@@ -3038,8 +3095,35 @@ class ContextCompressor(ContextEngine):
         self._active_compression_telemetry: Optional[Dict[str, Any]] = None
         self._compression_telemetry_seed: Optional[Dict[str, Any]] = None
 
+    def mark_learned_context_limit(self) -> None:
+        """Capture the pre-learn window + arm the expiry (call BEFORE the
+        learned update_model). A wrong-low learn heals within the session."""
+        self._pre_learn_context_length = getattr(self, "context_length", None)
+        self._learned_context_limit_turns_left = _LEARNED_CONTEXT_LIMIT_TURNS
+
+    def _expire_learned_context_limit(self) -> None:
+        pre = self._pre_learn_context_length
+        # Remember the value that just expired: a re-learn of the same value
+        # proves the provider really rejects there -> sticky (no re-expiry).
+        self._learned_context_limit_confirmed_value = getattr(self, "context_length", None)
+        self._pre_learn_context_length = None
+        self._learned_context_limit_turns_left = 0
+        if pre and pre > getattr(self, "context_length", 0):
+            self.context_length = pre
+            try:
+                self.threshold_tokens = self._compute_threshold_tokens(
+                    pre, getattr(self, "threshold_percent", 0.5),
+                    getattr(self, "_max_output_tokens", None),
+                )
+            except Exception:
+                pass
+
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
+        if not self._learned_context_limit_sticky and self._learned_context_limit_turns_left > 0:
+            self._learned_context_limit_turns_left -= 1
+            if self._learned_context_limit_turns_left == 0:
+                self._expire_learned_context_limit()
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
         self.last_completion_tokens = usage.get("completion_tokens", 0)
         self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
@@ -6523,8 +6607,39 @@ This compaction should PRIORITISE preserving all information related to the focu
         # subsumes any earlier marker. Captured before summarizing.
         _cumulative = bool(self._micro_compact_rolling_summary.strip())
 
-        # Micro-summarize one exchange
-        exchange_text = self._serialize_one_exchange(messages, exchange_start, exchange_end)
+        # Reclaim gate on the RAW exchange mass: a pass costs a cache break
+        # + an aux LLM call, so skip it when the exchange itself is tiny (the
+        # cadence still advanced, so this cannot wedge the cursor). The gate
+        # must NOT see the compacted size (a tool-heavy exchange would
+        # otherwise compact below the floor and never absorb.
+        # estimate_messages_tokens_rough on the raw span: a cheap gate that
+        # does not pay a full serialize (the compacted serialize below is the
+        # only one the summary needs).
+        _raw_exchange_tokens = estimate_messages_tokens_rough(
+            messages[exchange_start:exchange_end]
+        )
+        if _raw_exchange_tokens < self._micro_compact_min_exchange_tokens:
+            return messages
+
+        # Prune-first: deterministically compact the exchange's oversized
+        # tool results (head+tail, no LLM) before serializing, so the summary
+        # call reads a smaller input; same Phase-1 tradeoff as full
+        # compression. Operates on a COPY: the stored messages are never
+        # mutated, so a failed summary cannot leak compacted bodies into the
+        # persisted history (the raw stays until the splice replaces it).
+        _serialize_span = [dict(m) for m in messages[exchange_start:exchange_end]]  # per-dict copy: never mutate the stored messages
+        try:
+            from agent.deepseek_replay import tool_result_replay_content
+            for _m in _serialize_span:
+                if _m.get("role") == "tool" and isinstance(_m.get("content"), str):
+                    _replayed = tool_result_replay_content(_m["content"], limits=None)
+                    if _replayed != _m["content"]:
+                        _m["content"] = _replayed
+        except Exception:
+            pass
+        exchange_text = self._serialize_one_exchange(
+            _serialize_span, 0, len(_serialize_span)
+        )
         _exchange_tokens = estimate_tokens_rough(exchange_text)
         updated_summary = self._micro_summarize_one(exchange_text)
         if updated_summary is None:
@@ -6873,6 +6988,141 @@ This compaction should PRIORITISE preserving all information related to the focu
                 continue
             merged.append(msg)
         return merged
+
+    @staticmethod
+    def _span_tool_ratio(turns_to_summarize: List[Dict[str, Any]]) -> float:
+        """Share of the compressible span's TOKENS that are tool messages.
+
+        Token share, not message count: a few giant tool results dominate a
+        conversational middle and still signal a tool-heavy session.
+        """
+        if not turns_to_summarize:
+            return 0.0
+        total = estimate_messages_tokens_rough(turns_to_summarize)
+        if total <= 0:
+            return 0.0
+        tool_tokens = sum(
+            estimate_messages_tokens_rough([m])
+            for m in turns_to_summarize
+            if m.get("role") == "tool" or m.get("tool_call_id") or m.get("tool_calls")
+        )
+        return tool_tokens / total
+
+    @staticmethod
+    def _coding_tool_name_share(turns_to_summarize: List[Dict[str, Any]]) -> float:
+        """Share of the tool CALLS whose name is a known coding tool.
+
+        Catches a middle dominated by coding-tool activity even when the
+        result payloads are small (the token ratio would miss it).
+        """
+        calls = []
+        for m in turns_to_summarize:
+            for tc in m.get("tool_calls") or []:
+                name = ((tc.get("function") or {}).get("name") or "").lower()
+                if name:
+                    calls.append(name)
+            if m.get("name") and (m.get("role") == "tool" or m.get("tool_call_id")):
+                calls.append(str(m["name"]).lower())
+        if not calls:
+            return 0.0
+        return sum(1 for n in calls if n in _CODING_TOOL_NAMES) / len(calls)
+
+    @staticmethod
+    def _coding_prompt_hint(messages: List[Dict[str, Any]]) -> bool:
+        """True when a user or assistant message carries a coding hint
+        (code fences, file paths, coding verbs) — catches code-bearing turns
+        with no tool calls at all."""
+        for m in messages:
+            content = str(m.get("content") or "")
+            if not content:
+                continue
+            for pat in _CODING_PROMPT_PATTERNS:
+                if pat.search(content):
+                    return True
+        return False
+
+    @classmethod
+    def _tool_heavy_score(cls, turns_to_summarize) -> float:
+        """Tool-heavy score in [0,1]: the max of the tool-token ratio and the
+        coding-tool-name share. THE checkpoint signal — a conversational middle
+        quoting code (a coding hint) is NOT tool-heavy and must keep the LLM
+        summary."""
+        return max(
+            cls._span_tool_ratio(turns_to_summarize),
+            cls._coding_tool_name_share(turns_to_summarize),
+        )
+
+    @classmethod
+    def _coding_score(cls, turns_to_summarize, all_messages) -> float:
+        """Coding-heavy score in [0,1]: the tool signals plus the prompt-hint
+        indicator. The preserve-thinking strip's signal (a code-bearing turn
+        with no tools still counts as coding). The max keeps ANY strong signal
+        decisive."""
+        return max(
+            cls._tool_heavy_score(turns_to_summarize),
+            1.0 if cls._coding_prompt_hint(all_messages) else 0.0,
+        )
+
+    def _build_compaction_checkpoint(
+        self,
+        turns_to_summarize: List[Dict[str, Any]],
+        messages: List[Dict[str, Any]],
+        compress_start: int,
+        memory_context: str = "",
+    ) -> str:
+        """Deterministic compaction checkpoint (no LLM summary).
+
+        The middle was tool-heavy: the disk state + the preserved recent tail
+        suffice for continuity. The checkpoint records the goal, the recent
+        tool evidence (head+tail), and the pending next action; the raw middle
+        is dropped (re-runnable from the workspace snapshot in the system
+        prompt). Same summary-message plumbing downstream.
+        """
+        goal = ""
+        for m in reversed(messages[:compress_start]):
+            if m.get("role") == "user" and m.get("content"):
+                goal = str(m["content"])[-400:]
+                break
+        evidence_lines = []
+        for m in reversed(turns_to_summarize):
+            if (m.get("role") == "tool" or m.get("tool_call_id") or m.get("tool_calls")) and len(evidence_lines) < 3:
+                name = m.get("name") or "tool"
+                if not m.get("role") == "tool":
+                    calls = m.get("tool_calls") or []
+                    name = ", ".join(tc.get("function", {}).get("name", "?") for tc in calls) or name
+                content = str(m.get("content") or "")
+                head = content[:200]
+                tail = content[-80:] if len(content) > 280 else ""
+                evidence_lines.append(f"- {name}: {head}" + (f"...{tail}" if tail else ""))
+        next_action = ""
+        for m in reversed(messages[:compress_start] + turns_to_summarize):
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                calls = [tc.get("function", {}).get("name", "?") for tc in m["tool_calls"]]
+                next_action = ", ".join(calls)
+                break
+        NL = "\n"
+        _recovery_sid = getattr(self, "_session_id", "") or ""
+        _recovery_hint = (
+            f"session_search(query=..., session_id='{_recovery_sid}')"
+            if _recovery_sid else "session search"
+        )
+        body = (
+            "Deterministic compaction checkpoint (tool-heavy session, no LLM "
+            f"summary): {len(turns_to_summarize)} middle message(s) dropped; the "
+            f"raw middle stays in the session store (recoverable via {_recovery_hint}) "
+            "and the current workspace state is in the system prompt." + NL +
+            f"GOAL: {goal}" + NL +
+            "RECENT TOOL EVIDENCE:" + NL + NL.join(evidence_lines) + NL +
+            f"NEXT ACTION (pending): {next_action}"
+        )
+        if memory_context and memory_context.strip():
+            body += NL + "MEMORY CONTEXT: " + memory_context.strip()[:400]
+        summary = self._with_summary_prefix(_redact_compaction_text(body.strip()))
+        summary = _reinject_pruned_skill_markers(
+            summary, _collect_ghosted_skill_names(turns_to_summarize)
+        )
+        _augment = getattr(self, "_augment_summary_lean", None)
+        return _augment(summary, turns_to_summarize) if _augment else summary
 
     def compress(
         self,
@@ -7274,6 +7524,21 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         if feasibility_skip:
             summary = None  # No LLM call; Phase 4 inserts the deterministic fallback
+        elif (
+            getattr(self, "checkpoint_mode", False)
+            and self._tool_heavy_score(turns_to_summarize)
+            >= getattr(self, "checkpoint_tool_ratio", 0.7)
+        ):
+            # Tool-heavy middle: the deterministic checkpoint (no LLM call).
+            summary = self._build_compaction_checkpoint(
+                turns_to_summarize, messages, compress_start, memory_context
+            )
+            # Mirror the LLM path's success bookkeeping.
+            self._previous_summary = summary
+            self._clear_compression_failure_cooldown()
+            self._summary_model_fallen_back = False
+            self._last_summary_error = None
+            self._last_summary_auth_failure = False
         else:
             # Deriving the auto focus topic scans recent user turns — only pay
             # for it when a summary will actually be generated.

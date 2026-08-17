@@ -1734,3 +1734,91 @@ class TestFallbackWarning:
             if r.levelno == logging.WARNING and "falling back" in r.getMessage()
         ]
         assert len(fallback_warnings) == 0
+
+
+def test_context_limit_from_error_decision_paths():
+    """Pin the provider-reported context-limit learning's decision paths:
+    too-large -> keep the current window; too-small (below the parser's
+    4-digit floor) -> never adopted; input-overflow shape accepted; the
+    output-cap shape excluded."""
+    from agent.model_metadata import (
+        get_context_length_from_provider_error,
+        parse_context_limit_from_error,
+    )
+
+    # Input-overflow shape: the "N > M maximum" 413 message.
+    assert parse_context_limit_from_error(
+        "prompt is too long: 233153 tokens > 200000 maximum"
+    ) == 200000
+    # Output-cap shape (Anthropic "max_tokens too large") is NOT a window.
+    assert parse_context_limit_from_error(
+        "max_tokens: 32768 > context_window: 200000 - input_tokens: 190000 = available_tokens: 10000"
+    ) is None
+    # Too-large reported limit: lower-only; keep the current window.
+    assert get_context_length_from_provider_error("max_model_len 500000", 131072) is None
+    # Too-small: the parser's 4-digit floor rejects sub-1000; a 4-digit small
+    # window is adopted (a real small model) but never persisted (sub-64K).
+    assert get_context_length_from_provider_error("max_model_len 100", 131072) is None
+    assert get_context_length_from_provider_error("max_model_len 8000", 131072) == 8000
+
+
+def test_learned_context_limit_expires_and_restores_catalog_window():
+    """A provider-learned limit heals within the session: after a bounded
+    turn count the catalog window is restored (wrong-low must not pin a
+    days-long session)."""
+    from agent.context_compressor import ContextCompressor, _LEARNED_CONTEXT_LIMIT_TURNS
+
+    cc = ContextCompressor(
+        model="deepseek-v4-pro", config_context_length=1_000_000,
+        quiet_mode=True, provider="deepseek",
+    )
+    cc.update_model(model="deepseek-v4-pro", context_length=1_000_000)
+    pre = cc.context_length
+    # Learn a wrong-low limit (as the 413 handler does: mark first, then update).
+    cc.mark_learned_context_limit()
+    cc.update_model(model="deepseek-v4-pro", context_length=8_000)
+    assert cc.context_length == 8_000 and pre == 1_000_000
+    # N successful turns: the expiry restores the catalog window.
+    for _ in range(_LEARNED_CONTEXT_LIMIT_TURNS + 1):
+        cc.update_from_response({"prompt_tokens": 100, "completion_tokens": 10})
+    assert cc.context_length == pre, "catalog window must be restored within the session"
+
+
+def test_confirmed_learned_limit_is_sticky():
+    """A re-learn of a previously-expired value proves the provider really
+    rejects there -> sticky (no re-expiry / no recurring-413 oscillation)."""
+    from agent.context_compressor import ContextCompressor, _LEARNED_CONTEXT_LIMIT_TURNS
+
+    cc = ContextCompressor(
+        model="deepseek-v4-pro", config_context_length=1_000_000,
+        quiet_mode=True, provider="deepseek",
+    )
+    cc.update_model(model="deepseek-v4-pro", context_length=1_000_000)
+    # Learn a low limit, let it expire.
+    cc.mark_learned_context_limit()
+    cc.update_model(model="deepseek-v4-pro", context_length=8_000)
+    for _ in range(_LEARNED_CONTEXT_LIMIT_TURNS + 1):
+        cc.update_from_response({"prompt_tokens": 100, "completion_tokens": 10})
+    assert cc.context_length == 1_000_000  # expired -> catalog restored
+    # The provider 413s at the same 8000 again -> confirm -> sticky.
+    assert cc._learned_context_limit_confirmed_value == 8_000
+    cc._learned_context_limit_sticky = True
+    cc.mark_learned_context_limit()
+    cc.update_model(model="deepseek-v4-pro", context_length=8_000)
+    for _ in range(_LEARNED_CONTEXT_LIMIT_TURNS * 2 + 1):
+        cc.update_from_response({"prompt_tokens": 100, "completion_tokens": 10})
+    assert cc.context_length == 8_000, "confirmed limit must stick (no re-expiry)"
+
+
+def test_context_limit_parser_bedrock_shapes():
+    """The Bedrock overflow shapes report the real limit; the learned-limit
+    path must adopt them (a wrong Bedrock static window would otherwise
+    persist — the drift check does not cover bedrock)."""
+    from agent.model_metadata import parse_context_limit_from_error
+
+    for msg in (
+        "ValidationException: input exceeds the maximum input tokens of 200000",
+        "ValidationException: prompt exceeds the maximum number of input tokens: 200000",
+        "ModelStreamErrorException: Input is too long for this model. Max input tokens: 200000",
+    ):
+        assert parse_context_limit_from_error(msg) == 200000, msg

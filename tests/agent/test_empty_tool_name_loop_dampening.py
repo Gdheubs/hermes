@@ -134,11 +134,11 @@ def agent_env():
     prev_home = os.environ.get("HERMES_HOME")
     os.environ["HERMES_HOME"] = os.path.join(test_home, ".hermes")
 
-    # Import fresh so the patched conversation_loop is exercised even when the
-    # module was imported earlier in the same worker.
-    for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
-            del sys.modules[mod]
+    # NOTE: no sys.modules nuke here. This test builds a real AIAgent and
+    # exercises the real conversation loop against the mock provider; nothing
+    # is patched, so re-importing agent.*/tools.*/hermes_* was vestigial and
+    # toxic: it re-ran plugin discovery, polluting caplog/module identity for
+    # every other test file sharing the process.
     from run_agent import AIAgent
 
     agent = AIAgent(
@@ -154,6 +154,16 @@ def agent_env():
         yield agent, _MockHandler
     finally:
         srv.shutdown()
+        # AIAgent init routes file logging through hermes_logging's process-global
+        # queue listener; rmtree deletes the temp HERMES_HOME dirs underneath it,
+        # so any later log write in the same process hits the deleted path and
+        # raises FileNotFoundError (the cross-file flake that bites whenever this
+        # file shares a pytest process with others (the per-file runner hides it,
+        # but combined/IDE runs don't). hermes_logging ships a test-isolation
+        # helper for exactly this: stop the listener and close its handlers
+        # before removing the temp home.
+        from hermes_logging import _reset_queued_handlers
+        _reset_queued_handlers()
         shutil.rmtree(test_home, ignore_errors=True)
         if prev_home is None:
             os.environ.pop("HERMES_HOME", None)

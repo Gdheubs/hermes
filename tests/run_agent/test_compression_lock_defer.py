@@ -293,6 +293,10 @@ class TestPreApiLockDeferDoesNotBurnBudget:
                 "agent.conversation_loop.estimate_messages_tokens_rough",
                 return_value=500_000,
             ),
+            patch(
+                "agent.deepseek_replay.estimate_messages_tokens_rough",
+                return_value=500_000,
+            ),
             patch.object(agent, "_compress_context", side_effect=_lock_then_success),
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),

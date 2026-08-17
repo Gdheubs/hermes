@@ -1,0 +1,28 @@
+name: context-window-drift
+on:
+  schedule:
+    - cron: '0 3 * * 1'   # weekly Monday 03:00 UTC
+  pull_request:
+    paths:
+      - 'agent/model_metadata.py'
+permissions:
+  contents: read
+concurrency:
+  group: context-window-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+      - run: uv sync --locked --python 3.11 --extra dev
+      - name: Compare static context windows vs OpenRouter
+        run: .venv/bin/python scripts/check_context_windows.py

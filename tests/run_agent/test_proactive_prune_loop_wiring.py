@@ -231,3 +231,12 @@ class TestProactivePruneLoopWiring:
         # tool output may be wrapped in an untrusted_tool_result envelope —
         # assert the original payload survived un-pruned.
         assert all('"ok": true' in m["content"] for m in tool_rows)
+
+    def test_prune_not_consulted_when_compression_disabled(self, agent):
+        # Safety: the auto prune sentinel must never rewrite history when the
+        # user disabled compression; the loop gates the prune call on
+        # agent.compression_enabled (verified safe by code audit).
+        agent.compression_enabled = False
+        result = _run_tool_loop(agent, n_tool_iterations=2)
+        assert result["completed"] is True
+        agent.context_compressor.prune_tool_results_only.assert_not_called()
