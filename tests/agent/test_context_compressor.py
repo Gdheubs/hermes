@@ -2106,8 +2106,26 @@ class TestTruncateToolCallArgsJson:
         shrunk = shrink(original)
         parsed = _json.loads(shrunk)  # must not raise
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
-        assert parsed["content"].endswith("...[truncated]")
+        assert "context-pruned" in parsed["content"]
+        assert parsed["content"].endswith("abc ")
         assert len(shrunk) < len(original)
+
+    def test_shrunken_durable_body_preserves_terminal_requirements(self):
+        import json as _json
+
+        shrink = self._helper()
+        terminal_requirement = "\nAcceptance: Closes #83435"
+        original = _json.dumps({
+            "title": "fix context pruning",
+            "body": ("Evidence and implementation detail. " * 40)
+            + terminal_requirement,
+        })
+
+        parsed = _json.loads(shrink(original))
+
+        assert parsed["body"].endswith(terminal_requirement)
+        assert not parsed["body"].endswith("...[truncated]")
+        assert "context-pruned" in parsed["body"]
 
 
 
@@ -2127,7 +2145,20 @@ class TestTruncateToolCallArgsJson:
         assert parsed["enabled"] is True
         assert parsed["timeout"] is None
         assert parsed["items"] == [1, 2, 3]
-        assert parsed["note"].endswith("...[truncated]")
+        assert "context-pruned" in parsed["note"]
+        assert parsed["note"].endswith("z" * 100)
+
+    def test_medium_string_leaves_do_not_expand_compact_json(self):
+        import json as _json
+
+        shrink = self._helper()
+        original = _json.dumps(
+            {"first": "x" * 300, "second": "y" * 300},
+            separators=(",", ":"),
+        )
+
+        assert len(original) > 500
+        assert shrink(original) == original
 
 
 
@@ -2165,7 +2196,8 @@ class TestTruncateToolCallArgsJson:
         # Must parse — otherwise downstream provider returns 400
         parsed = _json.loads(shrunk)
         assert parsed["path"] == "~/.hermes/skills/shopping/browser-setup-notes.md"
-        assert parsed["content"].endswith("...[truncated]")
+        assert "context-pruned" in parsed["content"]
+        assert parsed["content"].endswith("x " * 50)
 
 
 class TestLazyContextResolution:

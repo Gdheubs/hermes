@@ -1419,7 +1419,16 @@ def _strip_image_parts_from_parts(parts: Any) -> Any:
     return out if had_image else None
 
 
-def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
+_PRUNED_TOOL_ARG_GAP = (
+    "\n...[context-pruned middle; reread the durable source before reuse]...\n"
+)
+
+
+def _truncate_tool_call_args_json(
+    args: str,
+    head_chars: int = 200,
+    tail_chars: int = 200,
+) -> str:
     """Shrink long string values inside a tool-call arguments JSON blob while
     preserving JSON validity.
 
@@ -1437,9 +1446,12 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     and the session gets stuck re-sending the same broken history on every
     turn. See issue #11762 for the observed loop.
 
-    This helper parses the arguments, shrinks long string leaves inside the
-    parsed structure, and re-serialises. Non-string values (paths, ints,
-    booleans) are preserved intact. If the arguments are not valid JSON
+    This helper parses the arguments, shrinks the middle of long string leaves
+    inside the parsed structure, and re-serialises. Retaining the suffix keeps
+    terminal requirements and closing structure visible, and prevents the
+    compressor's own marker from becoming a copy-forwardable tail in a later
+    durable tool call. Non-string values (paths, ints, booleans) are preserved
+    intact. If the arguments are not valid JSON
     to begin with — some model backends use non-JSON tool arguments — the
     original string is returned unchanged rather than replaced with
     something neither we nor the backend can parse.
@@ -1451,8 +1463,9 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
 
     def _shrink(obj: Any) -> Any:
         if isinstance(obj, str):
-            if len(obj) > head_chars:
-                return obj[:head_chars] + "...[truncated]"
+            shortened = obj[:head_chars] + _PRUNED_TOOL_ARG_GAP + obj[-tail_chars:]
+            if len(shortened) < len(obj):
+                return shortened
             return obj
         if isinstance(obj, dict):
             return {k: _shrink(v) for k, v in obj.items()}
@@ -1462,7 +1475,8 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
 
     shrunken = _shrink(parsed)
     # ensure_ascii=False preserves CJK/emoji instead of bloating with \uXXXX
-    return json.dumps(shrunken, ensure_ascii=False)
+    serialized = json.dumps(shrunken, ensure_ascii=False)
+    return serialized if len(serialized) < len(args) else args
 
 
 _IMAGE_PART_TYPES = frozenset({"image_url", "input_image", "image"})
