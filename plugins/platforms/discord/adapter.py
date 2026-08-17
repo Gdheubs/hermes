@@ -1633,6 +1633,14 @@ class DiscordAdapter(BasePlatformAdapter):
         )
         if not admitted:
             return False
+        if await self._discord_bot_reply_cap_reached(message):
+            logger.warning(
+                "[%s] Dropping Discord bot message %s: bot reply chain reached cap %s",
+                getattr(self, "name", "discord"),
+                getattr(message, "id", "unknown"),
+                self._discord_bot_reply_cap(),
+            )
+            return False
         return await self._handle_message(
             message, role_authorized=role_authorized,
         )
@@ -2697,6 +2705,14 @@ class DiscordAdapter(BasePlatformAdapter):
             message, claim=False,
         )
         if not admitted:
+            return False
+        if await self._discord_bot_reply_cap_reached(message):
+            logger.warning(
+                "[%s] Dropping recovered Discord bot message %s: bot reply chain reached cap %s",
+                getattr(self, "name", "discord"),
+                getattr(message, "id", "unknown"),
+                self._discord_bot_reply_cap(),
+            )
             return False
         return await self._handle_message(
             message,
@@ -6695,6 +6711,58 @@ class DiscordAdapter(BasePlatformAdapter):
         """Per-profile DISCORD_ALLOW_BOTS mode (none|mentions|all)."""
         return self._gate_env("DISCORD_ALLOW_BOTS", "none").lower().strip() or "none"
 
+    def _discord_bot_reply_cap(self) -> int:
+        """Maximum bot-authored replies after the message that starts a chain.
+
+        A value of zero disables the cap. This is behavioral configuration, so
+        it intentionally lives in config.yaml rather than the secret env file.
+        """
+        configured = self.config.extra.get("bot_reply_cap", 4)
+        if isinstance(configured, bool):
+            return 4
+        try:
+            cap = int(configured)
+        except (TypeError, ValueError):
+            return 4
+        return cap if cap >= 0 else 4
+
+    async def _discord_bot_reply_cap_reached(self, message: Any) -> bool:
+        """Return whether dispatching this message would exceed its bot chain budget."""
+        cap = self._discord_bot_reply_cap()
+        if cap == 0 or not getattr(getattr(message, "author", None), "bot", False):
+            return False
+
+        replies = 0
+        current = message
+        while replies < cap:
+            reference = getattr(current, "reference", None)
+            if reference is None:
+                return False
+
+            parent = getattr(reference, "resolved", None)
+            if not getattr(parent, "author", None):
+                fetch_message = getattr(getattr(current, "channel", None), "fetch_message", None)
+                if not callable(fetch_message):
+                    return True
+                try:
+                    fetched = fetch_message(reference.message_id)
+                    parent = await fetched if inspect.isawaitable(fetched) else fetched
+                except Exception:
+                    logger.debug(
+                        "[%s] Could not resolve Discord reply ancestor %s for bot reply cap",
+                        self.name,
+                        getattr(reference, "message_id", "unknown"),
+                        exc_info=True,
+                    )
+                    return True
+
+            if not getattr(getattr(parent, "author", None), "bot", False):
+                return False
+            replies += 1
+            current = parent
+
+        return True
+
     def _discord_free_response_channels(self) -> set:
         """Return Discord channel IDs/names where no bot mention is required.
 
@@ -10352,6 +10420,13 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             if isinstance(candidate_extra, dict):
                 platform_extra_cfg = candidate_extra
     seeded_extra = {}
+    bot_reply_cap = (
+        discord_cfg["bot_reply_cap"]
+        if "bot_reply_cap" in discord_cfg
+        else platform_extra_cfg.get("bot_reply_cap")
+    )
+    if bot_reply_cap is not None:
+        seeded_extra["bot_reply_cap"] = bot_reply_cap
     # Authorization gate keys are ALWAYS seeded into PlatformConfig.extra so
     # every adapter carries its own profile's allow/deny lists (issue #72348).
     # The os.environ writes below remain first-writer-wins for legacy env-only
