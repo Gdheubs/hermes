@@ -81,7 +81,9 @@ function renderLiveClarify({ multiSelect = false }: { multiSelect?: boolean } = 
     multiSelect,
     question: 'Which deployment target?',
     requestId: 'request-1',
-    sessionId: 'session-1'
+    sessionId: 'session-1',
+    receivedAt: 0,
+    timeoutSeconds: null
   })
   renderClarify(<ClarifyTool {...liveClarifyProps()} />)
 
@@ -380,7 +382,9 @@ describe('ClarifyTool recommended option', () => {
       multiSelect: false,
       question: 'Which deployment target?',
       requestId: 'request-1',
-      sessionId: 'session-1'
+      sessionId: 'session-1',
+      receivedAt: 0,
+      timeoutSeconds: null
     })
     renderClarify(<ClarifyTool {...liveClarifyProps(['staging (Recommended)', 'production'])} />)
 
@@ -424,7 +428,9 @@ describe('ClarifyTool pending marker', () => {
       multiSelect: false,
       question: 'Anything else?',
       requestId: 'request-1',
-      sessionId: 'session-1'
+      sessionId: 'session-1',
+      receivedAt: 0,
+      timeoutSeconds: null
     })
 
     const args = { question: 'Anything else?' }
