@@ -134,7 +134,7 @@ class TestTrustGateAtCallTime:
     def test_trusted_server_skips_approval_for_write_tools(
         self, fake_session
     ):
-        """trust: full (and the default) never consults approval."""
+        """trust: full never consults approval."""
         _set_trust("srv", "full")
         handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
         with patch(
@@ -144,15 +144,22 @@ class TestTrustGateAtCallTime:
         consent.assert_not_called()
         assert json.loads(raw) == {"result": "ok"}
 
-    def test_unconfigured_server_defaults_to_full_trust(self, fake_session):
-        """Backward compat: servers with no trust key behave as before."""
+    def test_unconfigured_server_defaults_to_untrusted(self, fake_session):
+        """F5: servers with no trust key default to UNTRUSTED (fail closed).
+
+        A server added without an explicit trust decision must not
+        silently get write-capable tools past approval. Operators opt into
+        ungated access with ``trust: full``.
+        """
         handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
         with patch(
-            "tools.approval.request_elicitation_consent"
+            "tools.approval.request_elicitation_consent",
+            return_value="decline",
         ) as consent:
             raw = handler({"repo": "x"})
-        consent.assert_not_called()
-        assert json.loads(raw) == {"result": "ok"}
+        consent.assert_called_once()
+        fake_session.call_tool.assert_not_awaited()
+        assert "did not approve" in json.loads(raw)["error"]
 
     def test_read_only_false_hint_is_gated(self, fake_session):
         """An explicit readOnlyHint=False is write-capable."""
@@ -189,8 +196,8 @@ class TestTrustNormalization:
         assert mcp_tool._normalize_server_trust("full") == "full"
         assert mcp_tool._normalize_server_trust("UNTRUSTED") == "untrusted"
         assert mcp_tool._normalize_server_trust("  Full ") == "full"
-        # Missing key → default full (backward compatible; documented).
-        assert mcp_tool._normalize_server_trust(None) == "full"
+        # Missing key → default untrusted (fail closed, F5).
+        assert mcp_tool._normalize_server_trust(None) == "untrusted"
 
 
 class TestAnnotationCaptureAtDiscovery:

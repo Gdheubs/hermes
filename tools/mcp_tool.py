@@ -4288,9 +4288,14 @@ _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 #   skipping approval for calls the operator was already warned about when
 #   they marked the server untrusted. It can never widen access on top of
 #   the approval a write-capable tool would otherwise need.
-# - Default trust for servers with NO ``trust`` key is ``full`` (gate off)
-#   for backward compatibility — existing configs keep working unchanged.
-#   Operators opt servers into gating explicitly with ``trust: untrusted``.
+# - Default trust for servers with NO ``trust`` key is ``untrusted``
+#   (gate on, fail closed): a server added without an explicit trust
+#   decision must not silently get write-capable tools past approval
+#   (F5). Operators opt servers into ungated access explicitly with
+#   ``trust: full``. This changed from the historical ``full`` default —
+#   existing configs that relied on the implicit default (e.g.
+#   cua-driver, penpot) must add ``trust: full`` to keep their previous
+#   behavior.
 # - Any unrecognized ``trust`` value normalizes to ``untrusted``
 #   (fail closed): a typo must never silently disable the gate.
 #
@@ -4307,12 +4312,12 @@ _TRUST_UNTRUSTED = "untrusted"
 def _normalize_server_trust(value: Any) -> str:
     """Normalize a config ``trust`` value to ``full`` or ``untrusted``.
 
-    Missing (None) → ``full`` (backward-compatible default, documented
-    above). Any string other than the two known tiers → ``untrusted``:
-    a misspelled tier must fail closed, never silently disable gating.
+    Missing (None) → ``untrusted`` (fail-closed default, F5). Any string
+    other than the two known tiers → ``untrusted``: a misspelled tier must
+    fail closed, never silently disable gating.
     """
     if value is None:
-        return _TRUST_FULL
+        return _TRUST_UNTRUSTED
     text = str(value).strip().lower()
     if text == _TRUST_FULL:
         return _TRUST_FULL
@@ -4365,7 +4370,7 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
     formatted via ``tool_error``) when the call is blocked. Fail-closed:
     approval-system errors block the call.
     """
-    trust = _server_trust_levels.get(server_name, _TRUST_FULL)
+    trust = _server_trust_levels.get(server_name, _TRUST_UNTRUSTED)
     if trust != _TRUST_UNTRUSTED:
         return None
     if _tool_read_only_hints.get(server_name, {}).get(tool_name) is True:
