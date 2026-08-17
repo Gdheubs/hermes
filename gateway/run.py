@@ -17260,10 +17260,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # dispatch sink unchecked. Apply the same admin/user policy to
                 # the raw typed name here so non-admins can't invoke admin-only
                 # quick commands. (#44727)
-                _denied = self._check_slash_access(source, command)
+                # F8: additionally, exec-type quick commands must REQUIRE an
+                # admin policy — when allow_admin_from is unset the policy is
+                # disabled (backward-compat: everyone unrestricted), which
+                # would let ANY chat user run a shell command in the gateway
+                # process. Fail closed: exec quick commands default to
+                # disabled unless an admin list is configured.
+                qcmd = quick_commands[command]
+                if not isinstance(qcmd, dict):
+                    qcmd = {}
+                _denied = self._check_slash_access(
+                    source, command, require_policy=(qcmd.get("type") == "exec")
+                )
                 if _denied is not None:
                     return _denied
-                qcmd = quick_commands[command]
                 if qcmd.get("type") == "exec":
                     exec_cmd = qcmd.get("command", "")
                     if exec_cmd:
@@ -20599,7 +20609,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
     def _check_slash_access(
-        self, source: SessionSource, canonical_cmd: str
+        self, source: SessionSource, canonical_cmd: str, *, require_policy: bool = False
     ) -> Optional[str]:
         """Return a denial message if ``source`` cannot run ``canonical_cmd``,
         else None. Used by both the cold and running-agent dispatch paths
@@ -20610,12 +20620,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         :func:`gateway.slash_access.policy_for_source` — when the operator
         hasn't set ``allow_admin_from`` for the scope, the policy returns
         ``enabled=False`` and this method always returns None.
+
+        ``require_policy`` (F8): when True, a source whose scope has NO
+        admin policy configured (``allow_admin_from`` unset → gating
+        disabled) is DENIED rather than allowed. Used for ``type:exec``
+        quick commands, which run a shell command in the gateway process:
+        with gating disabled they would be reachable by ANY chat user
+        (fail open). Exec quick commands require an explicit admin policy.
         """
         from gateway.slash_access import policy_for_source as _policy_for_source
 
         if not canonical_cmd:
             return None
         policy = _policy_for_source(self.config, source)
+        if require_policy and not policy.enabled:
+            logger.info(
+                "Slash command /%s denied for %s:%s (exec quick command, no admin policy configured)",
+                canonical_cmd,
+                source.platform.value if source.platform else "?",
+                source.user_id,
+            )
+            return (
+                f"⛔ /{canonical_cmd} is disabled: exec quick commands require "
+                f"allow_admin_from to be configured for this platform."
+            )
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
         logger.info(
