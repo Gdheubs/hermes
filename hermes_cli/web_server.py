@@ -11699,6 +11699,14 @@ def _session_latest_descendant(session_id: str, db):
 
     /model may create child sessions. Dashboard refresh should continue the
     newest child instead of reopening the old parent.
+
+    Delegate subagent sessions (created via the delegate_task tool, tagged in
+    ``model_config._delegate_from``) are NOT continuation targets: they are
+    short-lived parallel workers spawned *by* the parent, not forks the user
+    chose to continue. Including them hijacks the resume — clicking the parent
+    session in the dashboard silently opens the newest subagent session
+    instead. The recursion skips them, so a parent with only delegate children
+    resolves back to itself.
     """
     def row_get(row, key, index):
         if isinstance(row, dict):
@@ -11710,6 +11718,13 @@ def _session_latest_descendant(session_id: str, db):
                 return row[index]
             except Exception:
                 return None
+
+    def is_delegate_model_config(model_config):
+        try:
+            parsed = json.loads(model_config or "{}")
+        except (json.JSONDecodeError, TypeError):
+            return False
+        return isinstance(parsed, dict) and parsed.get("_delegate_from") is not None
 
     sid = db.resolve_session_id(session_id)
     if not sid or not db.get_session(sid):
@@ -11726,14 +11741,19 @@ def _session_latest_descendant(session_id: str, db):
     if conn is not None:
         raw_rows = conn.execute(
             """
-            WITH RECURSIVE descendants(id, parent_session_id, started_at) AS (
-                SELECT id, parent_session_id, started_at FROM sessions WHERE id = ?
+            WITH RECURSIVE descendants(id, parent_session_id, started_at, model_config) AS (
+                SELECT id, parent_session_id, started_at, model_config FROM sessions WHERE id = ?
                 UNION
-                SELECT s.id, s.parent_session_id, s.started_at
+                SELECT s.id, s.parent_session_id, s.started_at, s.model_config
                 FROM sessions s
                 JOIN descendants d ON s.parent_session_id = d.id
+                WHERE CASE
+                    WHEN json_valid(s.model_config)
+                    THEN json_extract(s.model_config, '$._delegate_from') IS NULL
+                    ELSE 1
+                END
             )
-            SELECT id, parent_session_id, started_at FROM descendants
+            SELECT id, parent_session_id, started_at, model_config FROM descendants
             """,
             (sid,),
         ).fetchall()
@@ -11745,6 +11765,10 @@ def _session_latest_descendant(session_id: str, db):
             })
     else:
         rows = db.list_sessions_rich(limit=10000, offset=0, compact_rows=True)
+        rows = [
+            r for r in rows
+            if not is_delegate_model_config(r.get("model_config"))
+        ]
 
     children = {}
     for row in rows:
