@@ -151,20 +151,63 @@ def _capture_mode() -> str:
     return _DEFAULT_CAPTURE_MODE
 
 
-# Secret redaction in ``sanitized`` mode reuses the project-wide
+# Secret redaction in ``sanitized`` mode first reuses the project-wide
 # ``agent.redact.redact_sensitive_text(force=True)`` — which covers 50+ credential
 # patterns, private keys, JWTs, auth headers, DB connection strings, and env
 # assignments with pre-check-gated regex. The ``force=True`` flag ensures
 # redaction runs even if the user has ``security.redact_secrets: false`` set —
 # appropriate for an observability plugin exporting to an external service.
+#
+# That shared redactor is scoped to *local* logs/tool output (its own
+# docstring: "Longer tokens preserve the first 6 and last 4 characters for
+# debuggability") — a reasonable tradeoff when only the operator ever reads
+# the log, but not once the text is about to leave the machine for a
+# third-party cloud service. This plugin is the one call site where that
+# distinction matters, so a second, stricter pass runs on top: full
+# redaction (no partial reveal) of the same credential shapes, plus email
+# addresses, which the shared redactor doesn't attempt at all (it targets
+# credentials, not general PII). Upstreamed as a PR to
+# NousResearch/hermes-agent rather than kept as a silent local patch —
+# delete this second pass once that lands.
+_REDACTED = "[REDACTED]"
+_UPLOAD_MASK_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), _REDACTED),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"), _REDACTED),
+    (re.compile(r"\bghp_[A-Za-z0-9]{20,}\b"), _REDACTED),
+    (re.compile(r"\bsk-or-v1-[A-Za-z0-9]{16,}\b"), _REDACTED),
+    (re.compile(r"\b[sp]k-lf-[A-Za-z0-9\-]{8,}\b"), _REDACTED),
+    (re.compile(r"\b[sp]k-[A-Za-z0-9_\-]{16,}\b"), _REDACTED),
+    (re.compile(r"\bBearer\s+[A-Za-z0-9._\-~+/=]{8,}"), f"Bearer {_REDACTED}"),
+    (re.compile(r"\bAuthorization\s*[:=]\s*\S+", re.IGNORECASE), f"Authorization: {_REDACTED}"),
+    (
+        re.compile(
+            r"\b([A-Za-z0-9_.\-]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD))"
+            r"(\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|\S+)",
+            re.IGNORECASE,
+        ),
+        rf"\1\2{_REDACTED}",
+    ),
+    (re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"), _REDACTED),
+]
 
 
 def _redact_secrets(value: str) -> str:
+    # Order matters: the stricter, fully-redacting patterns must run BEFORE
+    # the shared redactor, which partially reveals long tokens
+    # ("sk-abc...2345") for local-log debuggability. Once that partial
+    # reveal has happened, the full-secret shape no longer matches these
+    # patterns and can't be tightened further.
+    try:
+        for pattern, replacement in _UPLOAD_MASK_PATTERNS:
+            value = pattern.sub(replacement, value)
+    except Exception:
+        pass
     try:
         from agent.redact import redact_sensitive_text
-        return redact_sensitive_text(value, force=True)
+        value = redact_sensitive_text(value, force=True)
     except Exception:
-        return value
+        pass
+    return value
 
 
 def _describe_content(value: Any, *, depth: int = 0) -> Any:

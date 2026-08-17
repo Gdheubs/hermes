@@ -937,6 +937,53 @@ class TestUsageFromSanitizedResponse:
 
 
 # ---------------------------------------------------------------------------
+# Redaction before cloud upload.
+# ---------------------------------------------------------------------------
+
+class TestUploadRedaction:
+    """_redact_secrets must fully redact (not partially reveal) before
+
+    anything reaches the Langfuse cloud. The shared agent.redact utility
+    deliberately keeps a 6/4-char preview for local-log debuggability
+    (see its docstring) -- correct there, wrong once data is about to
+    leave the machine. This plugin layers a stricter pass on top; these
+    tests cover that pass specifically.
+    """
+
+    def _fresh_plugin(self):
+        mod_name = "plugins.observability.langfuse"
+        sys.modules.pop(mod_name, None)
+        return importlib.import_module(mod_name)
+
+    @pytest.mark.parametrize("secret", [
+        "sk-abcdefghijklmnopqrstuvwxyz012345",
+        "sk-or-v1-0123456789abcdef0123456789abcdef",
+        "AKIAIOSFODNN7EXAMPLE",
+        "ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+    ])
+    def test_secret_shapes_fully_redacted_not_partially_revealed(self, secret):
+        mod = self._fresh_plugin()
+        redacted = mod._redact_secrets(f"here is the key {secret} use it")
+        assert secret not in redacted
+        # No partial reveal (prefix/suffix) of the original secret either.
+        assert secret[:8] not in redacted
+        assert secret[-4:] not in redacted
+
+    def test_email_is_redacted(self):
+        mod = self._fresh_plugin()
+        redacted = mod._redact_secrets("contact person@example.com for access")
+        assert "person@example.com" not in redacted
+
+    def test_ordinary_prose_passes_through_unchanged(self):
+        mod = self._fresh_plugin()
+        for prose in (
+            "Refactor the trace helper so it stops leaking state between turns.",
+            "def add(a, b):\n    return a + b",
+        ):
+            assert mod._redact_secrets(prose) == prose, f"false positive on: {prose!r}"
+
+
+# ---------------------------------------------------------------------------
 # Model attribution: wire truth over stale agent attribute
 # ---------------------------------------------------------------------------
 
