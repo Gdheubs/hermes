@@ -6,6 +6,7 @@ export type PtyKeyboardShortcut =
   | "copy"
   | "delete-word-backward"
   | "delete-word-forward"
+  | "insert-newline"
   | "pass";
 
 export function resolvePtyKeyboardShortcut(
@@ -40,6 +41,15 @@ export function resolvePtyKeyboardShortcut(
     ev.key === "Delete"
   ) {
     return "delete-word-forward";
+  }
+
+  if (
+    ((ev.shiftKey && !ev.altKey) || (ev.altKey && !ev.shiftKey)) &&
+    !ev.ctrlKey &&
+    !ev.metaKey &&
+    ev.key === "Enter"
+  ) {
+    return "insert-newline";
   }
 
   return "pass";

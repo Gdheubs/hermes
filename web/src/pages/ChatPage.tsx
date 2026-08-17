@@ -723,6 +723,27 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         return false;
       }
 
+      // Shift+Enter / Alt+Enter → insert newline in the composer. xterm.js
+      // sends a bare \r for Enter regardless of held modifiers, so the TUI
+      // can never tell Shift/Alt+Enter apart from plain Enter (which submits
+      // the draft). Send the kitty-protocol CSI-u encoding the TUI's parser
+      // already decodes: ESC[13;2u = Shift+Enter, ESC[13;3u = Alt+Enter.
+      if (shortcut === "insert-newline") {
+        // During IME composition, Enter confirms the composed text; let it
+        // through so CJK input keeps working.
+        if (ev.isComposing) {
+          return true;
+        }
+
+        ev.preventDefault();
+        sendPtyShortcutSequence(
+          wsRef.current,
+          ptyStateRef.current,
+          ev.shiftKey ? "\x1b[13;2u" : "\x1b[13;3u",
+        );
+        return false;
+      }
+
       if (pasteModifier && ev.key.toLowerCase() === "v") {
         // preventDefault suppresses the DOM paste event, so image paste must
         // be handled here via clipboard.read() — readText() alone misses

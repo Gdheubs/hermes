@@ -44,6 +44,32 @@ describe('resolvePtyKeyboardShortcut', () => {
       resolvePtyKeyboardShortcut(key({ ctrlKey: true, key: 'Delete' }), false, false),
     ).toBe('delete-word-forward')
   })
+
+  it('maps Shift+Enter to newline insertion', () => {
+    expect(
+      resolvePtyKeyboardShortcut(key({ shiftKey: true, key: 'Enter' }), false, false),
+    ).toBe('insert-newline')
+  })
+
+  it('maps Alt+Enter to newline insertion', () => {
+    expect(
+      resolvePtyKeyboardShortcut(key({ altKey: true, key: 'Enter' }), false, false),
+    ).toBe('insert-newline')
+  })
+
+  it('leaves plain Enter to xterm (submit)', () => {
+    expect(resolvePtyKeyboardShortcut(key({ key: 'Enter' }), false, false)).toBe('pass')
+  })
+
+  it('does not hijack Ctrl+Shift+Enter', () => {
+    expect(
+      resolvePtyKeyboardShortcut(
+        key({ ctrlKey: true, shiftKey: true, key: 'Enter' }),
+        false,
+        false,
+      ),
+    ).toBe('pass')
+  })
 })
 
 describe('sendPtyShortcutSequence', () => {
