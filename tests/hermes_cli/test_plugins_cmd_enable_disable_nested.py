@@ -77,6 +77,37 @@ class TestResolvePluginKey:
         assert _resolve_plugin_key("openai") is None
         assert _resolve_plugin_key("image_gen/openai") == "image_gen/openai"
 
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    def test_ambiguous_manifest_name_returns_none(self, mock_user, mock_bundled, tmp_path):
+        """Same *manifest name* under two categories must NOT silently pick one.
+
+        The bundled tree really does this: ``image_gen/deepinfra`` and
+        ``video_gen/deepinfra`` both declare ``name: deepinfra``. Resolving
+        that to whichever was scanned first makes the other unreachable
+        through the identifier the CLI prints.
+        """
+        from hermes_cli.plugins_cmd import _resolve_plugin_key
+        _make_category_plugin(tmp_path, "image_gen", "deepinfra", {"name": "deepinfra"})
+        _make_category_plugin(tmp_path, "video_gen", "deepinfra", {"name": "deepinfra"})
+        mock_user.return_value = tmp_path
+        mock_bundled.return_value = tmp_path / "nonexistent"
+        assert _resolve_plugin_key("deepinfra") is None
+        assert _resolve_plugin_key("video_gen/deepinfra") == "video_gen/deepinfra"
+        assert _resolve_plugin_key("image_gen/deepinfra") == "image_gen/deepinfra"
+
+    @patch("hermes_cli.plugins.get_bundled_plugins_dir")
+    @patch("hermes_cli.plugins_cmd._plugins_dir")
+    def test_manifest_name_still_beats_a_sibling_leaf(self, mock_user, mock_bundled, tmp_path):
+        """An exact manifest-name hit stays unambiguous even when another
+        plugin's directory leaf happens to match the same string."""
+        from hermes_cli.plugins_cmd import _resolve_plugin_key
+        _make_plugin_dir(tmp_path, "openai", {"name": "openai"})
+        _make_category_plugin(tmp_path, "image_gen", "openai", {"name": "image-gen-openai"})
+        mock_user.return_value = tmp_path
+        mock_bundled.return_value = tmp_path / "nonexistent"
+        assert _resolve_plugin_key("openai") == "openai"
+
 
 # ---------------------------------------------------------------------------
 # cmd_enable / cmd_disable — write the canonical key

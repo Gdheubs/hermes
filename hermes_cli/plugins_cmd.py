@@ -1333,52 +1333,77 @@ def _save_enabled_set(enabled: set) -> None:
     save_config(config)
 
 
+def _candidate_plugin_entries(name: str) -> list:
+    """Return every discovered entry *name* could refer to, best tier first.
+
+    Matching runs in three tiers, and a tier stops the search as soon as it
+    matches anything:
+
+    1. the canonical key (``observability/nemo_relay``) — unique by
+       construction, so it always resolves outright;
+    2. the manifest name (``nemo_relay``);
+    3. the bare directory leaf of the key.
+
+    Tiers 2 and 3 can legitimately match more than one plugin: the bundled
+    tree ships ``image_gen/deepinfra`` and ``video_gen/deepinfra``, and both
+    manifests say ``name: deepinfra``. Returning every candidate lets callers
+    refuse rather than silently pick whichever happens to be scanned first.
+    """
+    entries = _discover_all_plugins()
+    # entry = (name, version, description, source, dir_path, key)
+    for entry in entries:
+        if name == entry[5]:
+            return [entry]
+    by_manifest_name = [entry for entry in entries if name == entry[0]]
+    if by_manifest_name:
+        return by_manifest_name
+    return [entry for entry in entries if name == entry[5].split("/")[-1]]
+
+
 def _resolve_plugin_key(name: str) -> Optional[str]:
     """Resolve a user-supplied plugin identifier to its canonical registry key.
 
     Accepts either the bare manifest name (``nemo_relay``), the directory
     name, or the full path-derived key (``observability/nemo_relay``) and
     returns the canonical key the loader gates on (``manifest.key`` or, for a
-    flat plugin, the bare name). Returns ``None`` when no plugin matches.
+    flat plugin, the bare name). Returns ``None`` when no plugin matches, or
+    when the identifier is ambiguous — see :func:`_candidate_plugin_entries`.
 
     This is the single normalization point so ``hermes plugins enable`` /
     ``disable`` write the same key that ``PluginManager`` matches against —
     nested category plugins (e.g. ``observability/nemo_relay``) included.
     """
-    entries = _discover_all_plugins()
-    # 1. Exact match on canonical key or manifest name — always unambiguous.
-    for entry in entries:
-        # entry = (name, version, description, source, dir_path, key)
-        if name == entry[5] or name == entry[0]:
-            return entry[5]
-    # 2. Fall back to a bare leaf-name match (e.g. "nemo_relay" ->
-    #    "observability/nemo_relay"), but only when it resolves to exactly one
-    #    plugin so we never silently pick the wrong same-named nested plugin.
-    leaf_matches = [entry[5] for entry in entries if name == entry[5].split("/")[-1]]
-    if len(leaf_matches) == 1:
-        return leaf_matches[0]
-    return None
+    candidates = _candidate_plugin_entries(name)
+    return candidates[0][5] if len(candidates) == 1 else None
 
 
 def _resolve_plugin_key_and_source(name: str) -> Optional[tuple]:
     """Resolve *name* to ``(canonical_key, source)`` or ``None`` if no match.
 
-    Mirrors :func:`_resolve_plugin_key`'s normalization but also returns the
-    plugin's source (``"bundled"``, ``"user"``, ``"project"``, ...) so the
-    enable path can tell whether a built-in-override consent prompt is needed.
+    Mirrors :func:`_resolve_plugin_key`'s normalization — ambiguous
+    identifiers included — but also returns the plugin's source
+    (``"bundled"``, ``"user"``, ``"project"``, ...) so the enable path can
+    tell whether a built-in-override consent prompt is needed.
     """
-    entries = _discover_all_plugins()
-    for entry in entries:
-        # entry = (name, version, description, source, dir_path, key)
-        if name == entry[5] or name == entry[0]:
-            return (entry[5], entry[3])
-    leaf_matches = [
-        (entry[5], entry[3]) for entry in entries
-        if name == entry[5].split("/")[-1]
-    ]
-    if len(leaf_matches) == 1:
-        return leaf_matches[0]
-    return None
+    candidates = _candidate_plugin_entries(name)
+    if len(candidates) != 1:
+        return None
+    return (candidates[0][5], candidates[0][3])
+
+
+def _print_unresolved_plugin(console, name: str) -> None:
+    """Report why *name* did not resolve: unknown, or matching several plugins."""
+    candidates = _candidate_plugin_entries(name)
+    if len(candidates) <= 1:
+        console.print(f"[red]Plugin '{name}' is not installed or bundled.[/red]")
+        return
+    console.print(
+        f"[red]Plugin '{name}' is ambiguous — it matches "
+        f"{len(candidates)} plugins:[/red]"
+    )
+    for entry in candidates:
+        console.print(f"  [bold]{entry[5]}[/bold]")
+    console.print("[dim]Re-run with one of the full keys above.[/dim]")
 
 
 def _set_plugin_entry_flag(plugin_id: str, key: str, value: bool) -> None:
@@ -1418,7 +1443,7 @@ def cmd_enable(name: str, allow_tool_override: Optional[bool] = None) -> None:
     # nested category plugins — and normalize to its canonical registry key.
     resolved = _resolve_plugin_key_and_source(name)
     if resolved is None:
-        console.print(f"[red]Plugin '{name}' is not installed or bundled.[/red]")
+        _print_unresolved_plugin(console, name)
         sys.exit(1)
     key, source = resolved
 
@@ -1695,7 +1720,7 @@ def cmd_disable(name: str) -> None:
     console = Console()
     key = _resolve_plugin_key(name)
     if key is None:
-        console.print(f"[red]Plugin '{name}' is not installed or bundled.[/red]")
+        _print_unresolved_plugin(console, name)
         sys.exit(1)
 
     enabled = _get_enabled_set()
@@ -1928,6 +1953,30 @@ def _filter_plugin_entries(entries: list, args: Any, enabled: set, disabled: set
     return filtered
 
 
+def _display_identifiers(entries: list) -> dict:
+    """Map canonical key -> the identifier to print for each entry.
+
+    The Name column doubles as the argument for ``hermes plugins
+    enable``/``disable``, so it has to name exactly one plugin. A manifest
+    name shared by two categories does not: bundled ``image_gen/deepinfra``
+    and ``video_gen/deepinfra`` both declare ``name: deepinfra``, which the
+    loader keeps apart by path-derived key but which prints as two identical
+    rows. Show the canonical key for those, and leave every unambiguous row
+    on its manifest name.
+
+    Callers must pass the *unfiltered* entry list — a collision hidden by a
+    ``--enabled``/``--no-bundled`` filter is still a collision for anyone
+    typing the name back into a command.
+    """
+    name_counts: dict = {}
+    for entry in entries:
+        name_counts[entry[0]] = name_counts.get(entry[0], 0) + 1
+    return {
+        entry[5]: (entry[5] if name_counts[entry[0]] > 1 else entry[0])
+        for entry in entries
+    }
+
+
 def cmd_list(args: Any | None = None) -> None:
     """List all plugins (bundled + user) with enabled/disabled state."""
     from rich.console import Console
@@ -1942,12 +1991,13 @@ def cmd_list(args: Any | None = None) -> None:
 
     enabled = _get_enabled_set()
     disabled = _get_disabled_set()
+    display = _display_identifiers(entries)
     entries = _filter_plugin_entries(entries, args, enabled, disabled)
 
     if getattr(args, "json", False):
         payload = [
             {
-                "name": name,
+                "name": display[key],
                 "status": _plugin_status(name, enabled, disabled, key=key),
                 "version": str(version),
                 "description": description,
@@ -1961,7 +2011,7 @@ def cmd_list(args: Any | None = None) -> None:
     if getattr(args, "plain", False):
         for name, version, _description, source, _dir, key in entries:
             status = _plugin_status(name, enabled, disabled, key=key)
-            print(f"{status:12} {source:8} {str(version):8} {name}")
+            print(f"{status:12} {source:8} {str(version):8} {display[key]}")
         return
 
     if not entries:
@@ -1983,7 +2033,7 @@ def cmd_list(args: Any | None = None) -> None:
             status = "[green]enabled[/green]"
         else:
             status = "[yellow]not enabled[/yellow]"
-        table.add_row(name, status, str(version), description, source)
+        table.add_row(display[key], status, str(version), description, source)
 
     console.print()
     console.print(table)
@@ -2232,9 +2282,13 @@ def cmd_toggle() -> None:
     plugin_keys = []
     plugin_labels = []
     plugin_selected = set()
+    # Same collision rule as ``hermes plugins list``: a manifest name shared
+    # by two categories can't identify a row on its own.
+    display = _display_identifiers(entries)
 
     for i, (name, _version, description, source, _d, key) in enumerate(entries):
-        label = f"{name} \u2014 {description}" if description else name
+        label = display[key]
+        label = f"{label} \u2014 {description}" if description else label
         if source == "bundled":
             label = f"{label} [bundled]"
         plugin_keys.append(key)
