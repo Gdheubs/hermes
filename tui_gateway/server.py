@@ -270,6 +270,7 @@ _LONG_HANDLERS = frozenset(
         "image.generate",
         "projects.discover_repos",
         "projects.record_repos",
+        "projects.scan_repos",
         "projects.for_cwd",
         "projects.tree",
         "projects.project_sessions",

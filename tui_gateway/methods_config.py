@@ -105,6 +105,62 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5061, str(e))
 
 
+@method("projects.scan_repos")
+def _(rid, params: dict) -> dict:
+    """Server-side git repo discovery for remote-connected desktops.
+
+    The desktop's native crawl only sees the host that runs the Electron app.
+    When the desktop is remote (app host != backend files), that crawl never
+    reaches the repos the backend is co-located with. This method walks the
+    policy roots on the BACKEND instead, records the result into the same
+    ``discovered_repos`` cache, and returns the merged repo list — so remote
+    desktops get disk-scanned repos exactly like local ones.
+    """
+    try:
+        from hermes_cli import projects_db as pdb
+        from tui_gateway import repo_scan
+
+        policy = _repo_discovery_policy()
+        policy_key = _repo_discovery_policy_key(policy)
+
+        repos = repo_scan.scan_repos(
+            policy["roots"],
+            enabled=policy["enabled"],
+            exclude_paths=policy["exclude_paths"],
+        )
+
+        with pdb.connect_closing() as conn:
+            pdb.reconcile_discovered_repos_policy(
+                conn,
+                policy_key,
+                preserve_unversioned=_repo_discovery_policy_is_default(policy),
+            )
+            if policy["enabled"]:
+                pdb.record_discovered_repos(
+                    conn,
+                    [(r["root"], r["label"]) for r in repos],
+                    replace=True,
+                    policy_key=policy_key,
+                )
+            else:
+                pdb.clear_discovered_repos(conn, policy_key=policy_key)
+
+        db = _get_db()
+        return _ok(
+            rid,
+            {
+                "repos": _discover_repos_payload(
+                    db, include_cached=policy["enabled"]
+                )
+                if db is not None
+                else [],
+                "discovery_policy": policy,
+            },
+        )
+    except Exception as e:
+        return _err(rid, 5061, str(e))
+
+
 @method("projects.tree")
 def _(rid, params: dict) -> dict:
     """Authoritative project overview: project -> repo -> lane structure with

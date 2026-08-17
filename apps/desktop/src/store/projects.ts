@@ -601,9 +601,7 @@ function syncReposScanning(): void {
 $gateway.subscribe(syncReposScanning)
 
 export async function scanAndRecordRepos(force = false): Promise<void> {
-  if (isDesktopFsRemoteMode()) {
-    return
-  }
+  const remoteFs = isDesktopFsRemoteMode()
 
   let context: ActiveProjectsContext
 
@@ -613,9 +611,13 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
     return
   }
 
-  const scan = desktopGit()?.scanRepos
+  // The native crawl lives in the Electron host, so it can only see the
+  // filesystem of the machine running the desktop app. In remote mode that
+  // host is NOT the backend that holds the repos, so the scan must run
+  // server-side instead — the backend is co-located with the files.
+  const scan = remoteFs ? undefined : desktopGit()?.scanRepos
 
-  if (!scan) {
+  if (!remoteFs && !scan) {
     return
   }
 
@@ -639,11 +641,24 @@ export async function scanAndRecordRepos(force = false): Promise<void> {
         discovery_policy: policy,
         repos: []
       })
+    } else if (remoteFs) {
+      scanningGatewayGenerations.set(context.gateway, generation)
+      syncReposScanning()
+
+      // Server-side discovery: the backend walks the policy roots on ITS host
+      // (where the repos live), records them, and returns the merged list.
+      await gatewayRequestOn(context.gateway, 'projects.scan_repos', {
+        discovery_policy: policy
+      })
+
+      if (state.generation !== generation) {
+        return
+      }
     } else {
       scanningGatewayGenerations.set(context.gateway, generation)
       syncReposScanning()
 
-      const repos = await scan(policy.roots, {
+      const repos = await scan!(policy.roots, {
         enabled: true,
         excludePaths: policy.exclude_paths
       })

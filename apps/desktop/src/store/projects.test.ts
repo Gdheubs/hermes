@@ -488,15 +488,35 @@ describe('repository discovery policy', () => {
     })
   })
 
-  it('does not scan the local filesystem for remote connections', async () => {
+  it('scans server-side for remote connections instead of the local filesystem', async () => {
+    const request = vi.fn(async (method: string) =>
+      method === 'projects.tree'
+        ? { active_id: null, projects: [], scoped_session_ids: [] }
+        : method === 'projects.scan_repos'
+          ? { accepted: true, repos: [{ label: 'repo', root: '/backend/repo' }] }
+          : { accepted: false, repos: [] }
+    )
+    gatewayWith(request)
+
     isDesktopFsRemoteMode.mockReturnValue(true)
     const scanRepos = vi.fn()
     desktopGit.mockReturnValue({ scanRepos } as never)
+    getHermesConfig.mockResolvedValue({
+      desktop: {
+        repo_scan_enabled: true,
+        repo_scan_exclude_paths: [],
+        repo_scan_roots: []
+      }
+    })
 
     await scanAndRecordRepos(true)
 
+    // The local Electron crawl must never run against the desktop host's fs.
     expect(scanRepos).not.toHaveBeenCalled()
-    expect(getHermesConfig).not.toHaveBeenCalled()
+    // Discovery is delegated to the backend, which walks ITS host's files.
+    expect(request).toHaveBeenCalledWith('projects.scan_repos', {
+      discovery_policy: { enabled: true, exclude_paths: [], roots: [] }
+    })
   })
 })
 
