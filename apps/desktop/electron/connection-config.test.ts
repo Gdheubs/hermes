@@ -25,9 +25,11 @@ import {
   cookiesHavePrivyAccessToken,
   cookiesHavePrivySession,
   cookiesHaveSession,
+  gatewayErrorDetail,
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   isGatewayAuthRejection,
+  isGatewayTerminalRejection,
   localProfileEntry,
   modeIsRemoteLike,
   normalizeRemoteBaseUrl,
@@ -871,6 +873,97 @@ test('gateway ticket failures classify only explicit auth rejection statuses as 
   const serverFailure = gatewayTicketFailure(new Error('network timeout'), 'sign in', 'retry connection') as any
   assert.equal(serverFailure.message, 'retry connection')
   assert.equal(serverFailure.needsOauthLogin, undefined)
+})
+
+test('non-auth 4xx is a terminal rejection, not a transport blip', () => {
+  // 400/404/422 are deterministic: the same request fails the same way every
+  // retry, so they must not be lumped in with 5xx/network errors.
+  assert.equal(isGatewayTerminalRejection({ statusCode: 400 }), true)
+  assert.equal(isGatewayTerminalRejection({ statusCode: 404 }), true)
+  assert.equal(isGatewayTerminalRejection({ statusCode: 422 }), true)
+
+  // 401/403 stay on the existing "sign in again" path.
+  assert.equal(isGatewayTerminalRejection({ statusCode: 401 }), false)
+  assert.equal(isGatewayTerminalRejection({ statusCode: 403 }), false)
+  assert.equal(isGatewayTerminalRejection({ needsOauthLogin: true }), false)
+
+  // Genuinely retryable failures are untouched.
+  assert.equal(isGatewayTerminalRejection({ statusCode: 500 }), false)
+  assert.equal(isGatewayTerminalRejection({ statusCode: 503 }), false)
+  assert.equal(isGatewayTerminalRejection(new Error('network timeout')), false)
+})
+
+test('gatewayErrorDetail unwraps the gateway explanation from a fetch error', () => {
+  // The shape fetchJson rejects with: `${statusCode}: ${body}`.
+  assert.equal(
+    gatewayErrorDetail(new Error('404: {"detail":"Unknown provider: \'\'"}')),
+    "Unknown provider: ''"
+  )
+  assert.equal(gatewayErrorDetail(new Error('400: {"error":"bad request"}')), 'bad request')
+
+  // Non-JSON bodies fall back to the raw text.
+  assert.equal(gatewayErrorDetail(new Error('404: Not Found')), 'Not Found')
+
+  // Nothing useful to show.
+  assert.equal(gatewayErrorDetail(new Error('404: ')), '')
+  assert.equal(gatewayErrorDetail(undefined), '')
+
+  // Runaway HTML error pages get truncated rather than dumped into a toast.
+  const long = gatewayErrorDetail(new Error(`500: ${'x'.repeat(400)}`))
+  assert.equal(long.length, 201)
+  assert.ok(long.endsWith('…'))
+})
+
+test('a terminal gateway rejection surfaces the real reason instead of "could not reach"', () => {
+  // Regression for #87232: a 404 from /auth/native/authorize was reported to
+  // the user as a reachability failure ("Try reconnecting") and retried
+  // forever, hiding the actual cause.
+  const rejection = Object.assign(new Error('404: {"detail":"Unknown provider: \'\'"}'), {
+    statusCode: 404
+  })
+
+  const failure = gatewayTicketFailure(
+    rejection,
+    'Your remote gateway session has expired. Sign in again.',
+    'Could not reach the remote Hermes gateway. Try reconnecting.'
+  ) as any
+
+  assert.ok(
+    failure.message.includes("Unknown provider: ''"),
+    `expected the gateway's own detail in the message, got: ${failure.message}`
+  )
+  assert.ok(failure.message.includes('404'), 'expected the status code in the message')
+  assert.ok(
+    !failure.message.includes('Could not reach'),
+    'a 404 is not a reachability failure and must not be reported as one'
+  )
+  assert.equal(failure.terminal, true)
+  assert.equal(failure.statusCode, 404)
+  assert.equal(failure.needsOauthLogin, undefined)
+  assert.equal(failure.cause, rejection)
+
+  // The wrap has to stay classifiable — gatewayWsUrlIpcResult re-inspects it.
+  assert.equal(isGatewayTerminalRejection(failure), true)
+})
+
+test('gateway WS URL IPC result flags terminal rejections separately from reauth', async () => {
+  const terminal = Object.assign(new Error('400: {"detail":"code_challenge required"}'), {
+    statusCode: 400
+  })
+
+  assert.deepEqual(await gatewayWsUrlIpcResult(async () => Promise.reject(terminal)), {
+    error: '400: {"detail":"code_challenge required"}',
+    ok: false,
+    terminal: true
+  })
+
+  // 5xx keeps the plain retryable shape — no terminal flag.
+  const transient = Object.assign(new Error('503: upstream unavailable'), { statusCode: 503 })
+
+  assert.deepEqual(await gatewayWsUrlIpcResult(async () => Promise.reject(transient)), {
+    error: '503: upstream unavailable',
+    ok: false
+  })
 })
 
 test('gateway WS URL IPC result serializes success and the auth-vs-transport matrix', async () => {

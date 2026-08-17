@@ -126,13 +126,83 @@ function isGatewayAuthRejection(error) {
   return statusCode === 401 || statusCode === 403
 }
 
-function gatewayTicketFailure(error, authMessage, transportMessage) {
-  const needsOauthLogin = isGatewayAuthRejection(error)
-  const err = new Error(needsOauthLogin ? authMessage : transportMessage)
-
-  if (needsOauthLogin) {
-    ;(err as any).needsOauthLogin = true
+/**
+ * True when the gateway answered with a 4xx that retrying cannot fix — 400,
+ * 404, 422 and friends, but NOT the 401/403 "sign in again" pair.
+ *
+ * These are configuration faults (unknown provider, bad request shape): the
+ * identical request fails identically on every retry. Treating them as
+ * transport errors is what turns a one-line server-side misconfiguration into
+ * an unattributable "could not reach the gateway" reconnect loop.
+ */
+function isGatewayTerminalRejection(error) {
+  if (isGatewayAuthRejection(error)) {
+    return false
   }
+
+  const statusCode = Number(error && typeof error === 'object' ? (error as any).statusCode : NaN)
+
+  return Number.isFinite(statusCode) && statusCode >= 400 && statusCode < 500
+}
+
+/**
+ * Pull the gateway's own explanation out of a `"<status>: <body>"` fetch error.
+ *
+ * `fetchJson` rejects with that shape (main.ts), and the body is usually
+ * FastAPI's `{"detail": "..."}`. Surfacing the detail is the whole point: the
+ * user needs to see "Unknown provider: ''", not a generic failure.
+ */
+function gatewayErrorDetail(error) {
+  const raw = error instanceof Error ? error.message : String(error ?? '')
+  const body = raw.replace(/^\s*\d{3}\s*:\s*/, '').trim()
+
+  if (!body) {
+    return ''
+  }
+
+  try {
+    const parsed = JSON.parse(body)
+    const detail = parsed?.detail ?? parsed?.error ?? parsed?.message
+
+    if (typeof detail === 'string' && detail.trim()) {
+      return detail.trim()
+    }
+  } catch {
+    // Not JSON — the raw body is the best explanation we have.
+  }
+
+  return body.length > 200 ? `${body.slice(0, 200)}…` : body
+}
+
+function gatewayTicketFailure(error, authMessage, transportMessage) {
+  if (isGatewayAuthRejection(error)) {
+    const err = new Error(authMessage) as any
+
+    err.needsOauthLogin = true
+    err.cause = error
+
+    return err
+  }
+
+  if (isGatewayTerminalRejection(error)) {
+    const statusCode = Number((error as any).statusCode)
+    const detail = gatewayErrorDetail(error)
+    const err = new Error(
+      detail
+        ? `The remote Hermes gateway rejected the request (HTTP ${statusCode}): ${detail}`
+        : `The remote Hermes gateway rejected the request (HTTP ${statusCode}).`
+    ) as any
+
+    // Carried so the caller can stop retrying and so this stays classifiable
+    // after the wrap (gatewayWsUrlIpcResult re-inspects the thrown error).
+    err.terminal = true
+    err.statusCode = statusCode
+    err.cause = error
+
+    return err
+  }
+
+  const err = new Error(transportMessage)
 
   err.cause = error
 
@@ -147,6 +217,7 @@ async function gatewayWsUrlIpcResult(resolveWsUrl: () => Promise<string>) {
     return {
       error: error instanceof Error ? error.message : String(error),
       ...(isGatewayAuthRejection(error) ? { needsOauthLogin: true as const } : {}),
+      ...(isGatewayTerminalRejection(error) ? { terminal: true as const } : {}),
       ok: false as const
     }
   }
@@ -770,10 +841,12 @@ export {
   cookiesHavePrivyAccessToken,
   cookiesHavePrivySession,
   cookiesHaveSession,
+  gatewayErrorDetail,
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,
   isGatewayAuthRejection,
+  isGatewayTerminalRejection,
   localProfileEntry,
   modeIsRemoteLike,
   normalizeRemoteBaseUrl,
