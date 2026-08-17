@@ -68,6 +68,42 @@ class TestParseDashScopeOutputCap:
         assert parse_available_output_tokens_from_error(msg) == 32768
 
 
+class TestParseSglangOutputCap:
+    """SGLang reports the input and completion token counts explicitly,
+    separate from the context window (#83521)."""
+
+    _SGLANG_MSG = (
+        "Requested token count exceeds the model's maximum context length of "
+        "131072 tokens. You requested a total of 132528 tokens: 66992 tokens "
+        "from the input messages and 65536 tokens for the completion. Please "
+        "reduce the number of tokens in the input messages or the completion "
+        "to fit within the limit."
+    )
+
+    def test_sglang_format(self):
+        # available output = 131072 - 66992 = 64080
+        assert parse_available_output_tokens_from_error(self._SGLANG_MSG) == 64080
+
+    def test_sglang_is_output_cap(self):
+        assert is_output_cap_error(self._SGLANG_MSG) is True
+
+    def test_sglang_case_insensitive_and_whitespace(self):
+        msg = self._SGLANG_MSG.upper().replace(":", " : ")
+        assert parse_available_output_tokens_from_error(msg) == 64080
+        assert is_output_cap_error(msg) is True
+
+    def test_sglang_genuine_input_overflow_routes_to_compression(self):
+        # Input tokens alone already meet/exceed the context window -> a
+        # real overflow, not an output-cap error, even with the same wording.
+        msg = (
+            "Requested token count exceeds the model's maximum context length "
+            "of 100000 tokens. You requested a total of 150000 tokens: 120000 "
+            "tokens from the input messages and 30000 tokens for the completion."
+        )
+        assert parse_available_output_tokens_from_error(msg) is None
+        assert is_output_cap_error(msg) is False
+
+
 class TestIsOutputCapError:
     """`is_output_cap_error` is the broader yes/no gate that keeps an
     output-cap 400 out of the compression death-loop even when we can't parse
