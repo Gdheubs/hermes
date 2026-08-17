@@ -97,6 +97,68 @@ class TestReconnectAfterNotADb:
             db.close()
 
 
+class TestReadPoolEvictsPoisonedConnection:
+    """_read_ctx()'s pooled-read side of the same runtime-corruption class:
+    a pooled read connection that starts raising 'file is not a database'
+    must be evicted, not requeued — requeuing hands the same broken
+    connection to every subsequent reader forever, since (unlike the single
+    writer connection) nothing ever reopens a pooled connection once it
+    starts failing."""
+
+    def test_poisoned_connection_is_evicted_not_requeued(self, tmp_path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session(session_id="s1", source="cli", model="test")
+            assert db._wal_active is True, "test requires the read pool to be in play"
+
+            # Baseline: a healthy read checks a connection out and returns it.
+            with db._read_ctx() as conn1:
+                conn1.execute("SELECT 1")
+            assert db._read_pool.qsize() == 1
+
+            # Borrow it back from the pool and simulate the runtime
+            # corruption class raising mid-read.
+            with pytest.raises(sqlite3.DatabaseError, match="not a database"):
+                with db._read_ctx() as conn2:
+                    assert conn2 is conn1, "must be the same pooled connection"
+                    raise sqlite3.DatabaseError("file is not a database")
+
+            assert db._read_pool.qsize() == 0, (
+                "the poisoned connection must not be requeued"
+            )
+
+            # A subsequent read must open a genuinely fresh connection rather
+            # than being handed the poisoned one again.
+            with db._read_ctx() as conn3:
+                assert conn3 is not conn1
+        finally:
+            db.close()
+
+    def test_other_database_errors_still_requeue_normally(self, tmp_path):
+        """Eviction is scoped to the specific 'not a database' signature —
+        an unrelated DatabaseError (e.g. a caller's bad query) must not
+        needlessly discard a perfectly healthy pooled connection."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session(session_id="s1", source="cli", model="test")
+            assert db._wal_active is True
+
+            with db._read_ctx() as conn1:
+                conn1.execute("SELECT 1")
+            assert db._read_pool.qsize() == 1
+
+            with pytest.raises(sqlite3.DatabaseError, match="malformed"):
+                with db._read_ctx() as conn2:
+                    assert conn2 is conn1
+                    raise sqlite3.DatabaseError("database disk image is malformed")
+
+            assert db._read_pool.qsize() == 1, (
+                "a non-'not a database' error must still requeue the connection"
+            )
+        finally:
+            db.close()
+
+
 class TestOnDiskJournalModeEioRetry:
     def _conn_raising_then(self, failures, result_rows):
         conn = MagicMock()
