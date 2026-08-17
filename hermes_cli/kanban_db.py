@@ -3488,6 +3488,11 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                if workspace_kind == "worktree" and workspace_path and branch_name:
+                    _validate_worktree_branch_available(
+                        Path(workspace_path), branch_name,
+                    )
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -7592,6 +7597,88 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
 # Workspace resolution
 # ---------------------------------------------------------------------------
 
+class WorktreeBranchConflictError(ValueError):
+    """A requested branch is already checked out by another worktree."""
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    """Compare paths after resolving links and normalizing Windows case."""
+    return os.path.normcase(str(left.resolve(strict=False))) == os.path.normcase(
+        str(right.resolve(strict=False))
+    )
+
+
+def _git_worktrees_for_branch(repo_root: Path, branch_name: str) -> list[Path]:
+    """Return every registered checkout for ``branch_name``.
+
+    Git normally prevents duplicate branch checkouts, but ``git worktree add
+    --force`` can create them. Callers must therefore inspect every matching
+    porcelain record instead of trusting the first one.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+
+    checkouts: list[Path] = []
+    checkout: Optional[Path] = None
+    wanted_ref = f"refs/heads/{branch_name}"
+    for line in (result.stdout or "").splitlines():
+        if line.startswith("worktree "):
+            checkout = Path(line[len("worktree "):]).expanduser()
+        elif line == f"branch {wanted_ref}" and checkout is not None:
+            checkouts.append(checkout.resolve(strict=False))
+    return checkouts
+
+
+def _worktree_branch_conflict(
+    repo_root: Path, target: Path, branch_name: str,
+) -> Optional[Path]:
+    """Return any branch checkout other than ``target`` itself."""
+    return next(
+        (
+            checkout
+            for checkout in _git_worktrees_for_branch(repo_root, branch_name)
+            if not _same_path(checkout, target)
+        ),
+        None,
+    )
+
+
+def _validate_worktree_branch_available(target: Path, branch_name: str) -> None:
+    """Reject implicit reuse of a branch checked out by another worktree."""
+    target = target.expanduser()
+    requested = target.resolve(strict=False)
+    repo_root = _git_toplevel(target) or _repo_root_for_worktree_target(target.parent)
+    if repo_root is None:
+        return
+    checkouts = _git_worktrees_for_branch(repo_root, branch_name)
+    if not checkouts:
+        return
+    if (
+        target.exists()
+        and _is_linked_worktree_checkout(target)
+        and all(_same_path(checkout, requested) for checkout in checkouts)
+    ):
+        return
+    conflict = next(
+        (checkout for checkout in checkouts if not _same_path(checkout, requested)),
+        checkouts[0],
+    )
+    raise WorktreeBranchConflictError(
+        f"branch {branch_name!r} is already checked out at {conflict}; "
+        "use that exact linked worktree path to reuse it, or choose another branch"
+    )
+
+
 def _git_toplevel(path: Path) -> Optional[Path]:
     """Return the git toplevel containing ``path``, or ``None`` if not in a repo."""
     try:
@@ -7719,6 +7806,12 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         if target_common == repo_common:
             return
     target.parent.mkdir(parents=True, exist_ok=True)
+    conflict = _worktree_branch_conflict(repo_root, target, branch_name)
+    if conflict is not None:
+        raise WorktreeBranchConflictError(
+            f"branch {branch_name!r} is already checked out at {conflict}; "
+            "use that exact linked worktree path to reuse it, or choose another branch"
+        )
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
@@ -7734,6 +7827,14 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         check=False,
     )
     if result.returncode != 0:
+        # The preflight above and `git worktree add` are separate processes.
+        # Re-check after a failed add so a concurrent checkout is terminal.
+        conflict = _worktree_branch_conflict(repo_root, target, branch_name)
+        if conflict is not None:
+            raise WorktreeBranchConflictError(
+                f"branch {branch_name!r} is already checked out at {conflict}; "
+                "use that exact linked worktree path to reuse it, or choose another branch"
+            )
         stderr = (result.stderr or result.stdout or "").strip()
         raise RuntimeError(
             f"git worktree add failed for {target} on branch {branch_name}: {stderr}"
@@ -9333,11 +9434,13 @@ def _record_spawn_failure(
     error: str,
     *,
     failure_limit: int = None,
+    force_trip: bool = False,
 ) -> bool:
     return _record_task_failure(
         conn, task_id, error,
         outcome="spawn_failed",
         failure_limit=failure_limit,
+        force_trip=force_trip,
         release_claim=True,
         end_run=True,
     )
@@ -10237,9 +10340,11 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
+            is_branch_conflict = isinstance(exc, WorktreeBranchConflictError)
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
+                force_trip=is_branch_conflict,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)
@@ -10364,9 +10469,11 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
+            is_branch_conflict = isinstance(exc, WorktreeBranchConflictError)
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
+                force_trip=is_branch_conflict,
             )
             if auto:
                 result.auto_blocked.append(claimed.id)

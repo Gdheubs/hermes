@@ -336,8 +336,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--workspace", default="scratch",
                           help="scratch | worktree | worktree:<path> | dir:<path> "
                                "(default: scratch)")
-    p_create.add_argument("--branch", default=None,
-                          help="Branch name for worktree tasks, e.g. wt/t6-wire")
+    p_create.add_argument(
+        "--branch",
+        default=None,
+        help=(
+            "Branch name for worktree tasks, e.g. wt/t6-wire. Branches must "
+            "not already be checked out elsewhere unless --workspace names "
+            "that exact linked worktree."
+        ),
+    )
     p_create.add_argument("--project", default=None,
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
