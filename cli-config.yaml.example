@@ -1177,6 +1177,7 @@ platform_toolsets:
 #
 # discord:
 #   require_mention: true            # Require @mention in server channels (default: true)
+#   bot_reply_cap: 4                 # Stop bot-authored reply chains after this many replies (0 disables)
 #   auto_thread: true                # Auto-create thread on @mention (default: true)
 #   free_response_channels: ""       # Channel IDs where no mention is needed
 #   reactions: true                  # Show processing reactions (default: true)

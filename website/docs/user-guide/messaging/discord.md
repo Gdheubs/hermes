@@ -319,10 +319,10 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `HERMES_DISCORD_TEXT_BATCH_DELAY_SECONDS` | No | `0.6` | Grace window the adapter waits before flushing a queued text chunk. Useful for smoothing streamed output. |
 | `HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS` | No | `2.0` | Delay between split chunks when a single message exceeds Discord's length limit. |
 
-:::warning Bot-to-bot conversation is not supported
-`DISCORD_ALLOW_BOTS` exists to accept input from a specific trusted bot (e.g. a relay or webhook bot), not to let two Hermes profiles talk to each other. The default, `"none"`, ignores all other bots and is the safe setting.
+:::tip Bot-to-bot conversations are bounded
+When `DISCORD_ALLOW_BOTS` admits another bot, Hermes follows Discord reply references and stops a bot-authored chain after four replies by default. This prevents Discord's automatic replied-user ping from turning a single cross-bot tag into an infinite acknowledgement loop.
 
-Wiring multiple Hermes profiles to reply to one another in a shared channel — by setting `"mentions"` or `"all"` across several profiles — is an unsupported topology. Discord auto-`@mentions` the replied-to author on every reply, so under `"mentions"` two bots will satisfy each other's mention gate indefinitely and ack-loop. There is no circuit breaker for this because the supported configuration is simply to leave `DISCORD_ALLOW_BOTS` at `"none"`. If you must accept a particular bot, scope the acceptance narrowly and never to another auto-replying agent.
+Configure the budget with `discord.bot_reply_cap`. A new human-authored message starts a fresh chain. Set the cap to `0` only when an external circuit breaker already exists; that restores unlimited bot reply chains.
 :::
 
 ### Config File (`config.yaml`)
@@ -334,6 +334,7 @@ The `discord` section in `~/.hermes/config.yaml` mirrors the env vars above. Con
 discord:
   require_mention: true           # Require @mention in server channels
   thread_require_mention: false   # If true, require @mention in threads too (multi-bot threads)
+  bot_reply_cap: 4                # Stop bot-authored reply chains after this many replies (0 disables)
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
   auto_thread: true               # Auto-create threads on @mention
   reactions: true                 # Add emoji reactions during processing
