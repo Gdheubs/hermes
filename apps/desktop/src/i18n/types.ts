@@ -142,6 +142,9 @@ export interface Translations {
       remoteSignInHint: (signInLabel: string) => string
       signOutAndSignIn: string
       remoteFailureHint: string
+      cloudDownTitle: string
+      cloudDownDescription: string
+      cloudDownHint: string
       hideRecentLogs: string
       showRecentLogs: string
       signedInTitle: string
