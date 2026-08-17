@@ -861,6 +861,7 @@ async def web_extract_tool(
         if not safe_urls:
             results = []
         else:
+            _ensure_web_plugins_loaded()
             backend = _get_extract_backend()
 
             # All seven providers (brave-free, ddgs, searxng, exa, parallel,
