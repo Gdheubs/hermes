@@ -2647,7 +2647,13 @@ def _get_platform_tools(
     # A plugin toolset is "known" for a platform once `hermes tools`
     # has been saved for that platform (tracked via known_plugin_toolsets).
     # Unknown plugins default to enabled; known-but-absent = disabled.
-    if plugin_ts_keys:
+    #
+    # F7 (explicit empty): an explicitly saved EMPTY toolset list is the
+    # operator saying "no toolsets for this platform" — a newly discovered
+    # plugin toolset must NOT auto-enable and resurrect tools the operator
+    # explicitly removed. With `[]`, plugin toolsets only appear once the
+    # operator opts in via `hermes tools` (which writes the list).
+    if plugin_ts_keys and not explicit_empty:
         known_map = config.get("known_plugin_toolsets", {}) or {}
         known_for_platform = set(known_map.get(platform, []) or [])
         for pts in plugin_ts_keys:

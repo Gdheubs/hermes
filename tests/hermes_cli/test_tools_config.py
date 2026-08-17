@@ -105,6 +105,42 @@ def test_empty_platform_toolsets_list_means_disable_all():
     assert enabled == set()
 
 
+def test_empty_platform_toolsets_with_unseen_plugin_stays_empty():
+    """F7 (plugin auto-enable door): an explicitly saved EMPTY toolset list
+    must not be reopened by a newly discovered plugin toolset. Previously
+    the plugin block auto-enabled unknown plugins unconditionally, so
+    ``platform_toolsets: {cli: []}`` could still resolve to a nonempty tool
+    surface (the operator explicitly removed them). With [], plugin
+    toolsets only appear once the operator opts in via `hermes tools`."""
+    import hermes_cli.tools_config as _tc
+
+    with patch.object(
+        _tc, "_get_plugin_toolset_keys", return_value={"brand-new-plugin-ts"}
+    ):
+        config = {"platform_toolsets": {"cli": []}}
+        enabled = _get_platform_tools(
+            config, "cli", include_default_mcp_servers=False
+        )
+    assert enabled == set()
+
+
+def test_unseen_plugin_still_autoenables_for_nonempty_explicit_list():
+    """F7 control: the explicit-empty guard must NOT change the documented
+    behavior for non-empty explicit configs — a newly discovered plugin
+    toolset still auto-enables there (opt-out remains `hermes tools`)."""
+    import hermes_cli.tools_config as _tc
+
+    with patch.object(
+        _tc, "_get_plugin_toolset_keys", return_value={"brand-new-plugin-ts"}
+    ):
+        config = {"platform_toolsets": {"cli": ["web"]}}
+        enabled = _get_platform_tools(
+            config, "cli", include_default_mcp_servers=False
+        )
+    assert "web" in enabled
+    assert "brand-new-plugin-ts" in enabled
+
+
 def test_unset_platform_toolsets_still_applies_defaults():
     """F7 control: a genuinely UNSET restriction value keeps the historical
     default resolution — only explicit values are fail-closed."""
