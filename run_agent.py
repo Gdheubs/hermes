@@ -510,6 +510,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        session_write_policy=None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -597,6 +598,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            session_write_policy=session_write_policy,
         )
 
     def _get_session_db_for_recall(self):
@@ -1819,6 +1821,11 @@ class AIAgent:
         appended to the review prompt — e.g. "save the deploy workflow as a
         skill". The automatic post-turn triggers never set it.
         """
+        from agent.background_review import (
+            SKIP_BACKGROUND_REVIEW_THREAD,
+            spawn_background_review_thread,
+        )
+
         # A delegation subagent (``_delegate_depth > 0``) must not run the
         # automatic post-turn review. Subagents are ephemeral workers already
         # barred from writing shared MEMORY.md (``DELEGATE_BLOCKED_TOOLS``) and
@@ -1840,7 +1847,6 @@ class AIAgent:
             enabled, task_cfg = load_background_review_settings()
             if not enabled:
                 return
-        from agent.background_review import spawn_background_review_thread
         from tools.thread_context import propagate_context_to_thread
         target, _prompt = spawn_background_review_thread(
             self,
@@ -1850,6 +1856,8 @@ class AIAgent:
             focus=focus,
             task_cfg=task_cfg,
         )
+        if target is SKIP_BACKGROUND_REVIEW_THREAD:
+            return
         # Carry the active profile into the review thread so MEMORY.md / skill
         # review writes land in the right profile (#54937).
         t = threading.Thread(
@@ -8689,11 +8697,8 @@ class AIAgent:
             )
             from agent.auxiliary_client import scoped_runtime_main
 
-            # The outer token restores the caller's Context even though turn setup
-            # replaces the value with the live runtime after fallback restoration.
-            # Keep the scope local instead of storing ContextVar tokens on the agent,
-            # which may be observed from another thread.
-            with bind_subagent_parent(self), scoped_runtime_main({}):
+            def _run_scoped_turn_body():
+                nonlocal durable_turn_lease_turn_active
                 try:
                     if durable_turn_lease_thread is not None:
                         with durable_turn_lease_activity_lock:
@@ -8712,6 +8717,7 @@ class AIAgent:
                         persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=moa_config,
                     )
+                    return result
                 finally:
                     # The lease remains held through relay/task finalization, but
                     # those post-loop steps must not receive a late refresh
@@ -8720,6 +8726,61 @@ class AIAgent:
                     # Interrupt clear is deferred to after thread join in the
                     # outer finally: a refresher firing between stop and join
                     # would otherwise set an interrupt that survives the clear.
+
+            # Session-write-policy scope: bind the policy bound at
+            # AIAgent.__init__ for the duration of the turn so every
+            # tool dispatch (file_tools, file_operations, memory_tool,
+            # skill_manager_tool, terminal_tool, etc.) consults the
+            # canonical policy from the ContextVar — fail closed on
+            # HERMES_READ_ONLY_SESSION / protected sessions before any
+            # side effect. The outer token restores the caller's Context
+            # even though turn setup replaces the value with the live
+            # runtime after fallback restoration.
+            #
+            # PHASE 2: also bind the typed SelfImprovementDecision
+            # captured at session start. The contextmanager uses
+            # try/finally/reset_self_improvement_decision so a raise
+            # inside the turn body cannot leak a stale ALLOW into
+            # subsequent operations. The decision is read by the L1
+            # background-review check, the L2 self-improvement tool
+            # guards, and the cron/suggestions guard. Default-OFF
+            # invariant: missing decision -> DENY_FALLBACK_DECISION.
+            try:
+                from agent.session_write_policy import (
+                    SessionWritePolicy,
+                    session_write_policy_scope,
+                )
+                from agent.self_improvement_decision_context import (
+                    DENY_FALLBACK_DECISION,
+                    self_improvement_decision_scope,
+                )
+
+                _swp_policy = getattr(self, "session_write_policy", None)
+                _si_decision = getattr(self, "_self_improvement_decision", None)
+                if _si_decision is None or not hasattr(_si_decision, "allow"):
+                    _si_decision = DENY_FALLBACK_DECISION
+                if isinstance(_swp_policy, SessionWritePolicy):
+                    with (
+                        session_write_policy_scope(_swp_policy),
+                        self_improvement_decision_scope(_si_decision),
+                        bind_subagent_parent(self),
+                        scoped_runtime_main({}),
+                    ):
+                        result = _run_scoped_turn_body()
+                else:
+                    with (
+                        self_improvement_decision_scope(_si_decision),
+                        bind_subagent_parent(self),
+                        scoped_runtime_main({}),
+                    ):
+                        result = _run_scoped_turn_body()
+            except ImportError:
+                # Fallback: session_write_policy helpers unavailable
+                # (should not happen — agent/session_write_policy.py is
+                # part of Phase 2A core) but keep the main runtime/lease
+                # scopes active rather than failing the whole conversation.
+                with bind_subagent_parent(self), scoped_runtime_main({}):
+                    result = _run_scoped_turn_body()
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:
                 relay_outcome = "cancelled"
