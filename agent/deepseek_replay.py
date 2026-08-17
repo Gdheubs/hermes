@@ -231,7 +231,7 @@ def estimate_request_tokens_after_deepseek_replay(
                     saved += estimate_tokens_rough(content) - estimate_tokens_rough(replay)
         elif role == "assistant" and not _has_tool_calls(msg):
             # The strip deletes the key too, which costs tokens even when the
-            # value is empty — the estimate used to miss those ~6 tok/turn
+            # value is empty; the estimate used to miss those ~6 tok/turn
             # (found by fuzzing).
             if _plain_turn_strip_allowed(provider, model, base_url) and "reasoning_content" in msg:
                 saved += estimate_tokens_rough(str({"reasoning_content": msg["reasoning_content"]}))

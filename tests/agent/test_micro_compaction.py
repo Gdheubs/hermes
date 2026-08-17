@@ -828,7 +828,7 @@ class TestDefragFlushCursorInvalidation:
 
 class TestMicroCompactionGateAndPruneFirst:
     def test_tiny_exchange_skipped_by_default_floor(self):
-        """The reclaim gate skips a pass whose oldest exchange is tiny — a
+        """The reclaim gate skips a pass whose oldest exchange is tiny (a
         cache break + aux LLM call is not worth it (default floor 1024)."""
         cc = _compressor("S")
         cc._micro_compact_min_exchange_tokens = 1024  # default

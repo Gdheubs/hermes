@@ -1864,7 +1864,7 @@ def _resolve_continue_arg(args, *, use_tui: bool) -> None:
                 )
                 sys.exit(1)
         else:
-            # -c with no argument — prefer this terminal's own breadcrumb
+            # -c with no argument; prefer this terminal's own breadcrumb
             # (written at session start / rotation) so side-by-side terminals
             # each continue their own conversation. Falls back to the
             # most-recent session when there is no valid breadcrumb, or when

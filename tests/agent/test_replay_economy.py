@@ -308,7 +308,7 @@ def test_unicode_compaction_survives_anthropic_conversion():
 def test_strip_never_removes_thinking_content_blocks():
     # DeepSeek-via-Anthropic thinking round-trips as content blocks, not the
     # reasoning_content field; the strip must only remove the field, never a
-    # thinking block (conservative direction — the endpoint accepts extras).
+    # thinking block (conservative direction (the endpoint accepts extras).
     msgs = [{"role": "assistant", "content": "preview", "reasoning_content": "R" * 100},
             {"role": "assistant", "content": [{"type": "thinking", "thinking": "T" * 100}],
              "reasoning_content": "R" * 100},

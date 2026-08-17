@@ -170,7 +170,7 @@ def test_deepseek_wire_compacts_tool_result_and_strips_plain_reasoning():
         srv.shutdown()
         # Same teardown hygiene as test_empty_tool_name_loop_dampening: the
         # AIAgent init routes file logging through hermes_logging's process-global
-        # queue listener under the temp HERMES_HOME — stop the listener + close
+        # queue listener under the temp HERMES_HOME; stop the listener + close
         # its handlers before rmtree so a later log write in the same process
         # can't hit the deleted path (cross-file flake).
         from hermes_logging import _reset_queued_handlers

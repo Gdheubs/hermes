@@ -2080,7 +2080,7 @@ def init_agent(
 
     # Prune trigger: sentinel -1 = auto (compressor derives window // 8);
     # explicit value (incl. 0 = off) is authoritative. NB: quoted "-1" in
-    # YAML is a string, so it disables instead of auto — accepted corner.
+    # YAML is a string, so it disables instead of auto (accepted corner).
     _raw_prune_tokens = _compression_cfg.get("proactive_prune_tokens", -1)
     if _raw_prune_tokens == -1:
         compression_proactive_prune_tokens = -1

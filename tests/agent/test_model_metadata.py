@@ -1754,7 +1754,7 @@ def test_context_limit_from_error_decision_paths():
     assert parse_context_limit_from_error(
         "max_tokens: 32768 > context_window: 200000 - input_tokens: 190000 = available_tokens: 10000"
     ) is None
-    # Too-large reported limit: lower-only — keep the current window.
+    # Too-large reported limit: lower-only; keep the current window.
     assert get_context_length_from_provider_error("max_model_len 500000", 131072) is None
     # Too-small: the parser's 4-digit floor rejects sub-1000; a 4-digit small
     # window is adopted (a real small model) but never persisted (sub-64K).

@@ -711,7 +711,7 @@ DEFAULT_CONFIG = {
         "proactive_prune_tokens": -1,  # auto: window-gated (compressor derives
                                       # window // 8); 0 = off, positive = override.
                                       # Each committed prune rewrites history,
-                                      # breaking the prompt-cache prefix — the
+                                      # breaking the prompt-cache prefix; the
                                       # min_reclaim gate keeps breaks episodic.
         "proactive_prune_min_result_chars": 8000,  # the prune's summarize pass only
                                       # touches tool results larger than this (chars);

@@ -234,7 +234,7 @@ class TestProactivePruneLoopWiring:
 
     def test_prune_not_consulted_when_compression_disabled(self, agent):
         # Safety: the auto prune sentinel must never rewrite history when the
-        # user disabled compression — the loop gates the prune call on
+        # user disabled compression; the loop gates the prune call on
         # agent.compression_enabled (verified safe by code audit).
         agent.compression_enabled = False
         result = _run_tool_loop(agent, n_tool_iterations=2)

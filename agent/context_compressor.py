@@ -516,7 +516,7 @@ _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES = 3
 # when the oldest exchange has too little mass to justify it.
 _MICRO_COMPACT_MIN_EXCHANGE_TOKENS = 1024
 # A provider-learned context limit expires after this many successful turns,
-# restoring the catalog window — sessions can run for days, so a wrong-low
+# restoring the catalog window (sessions can run for days, so a wrong-low
 # learn must not pin premature compression for the whole session.
 _LEARNED_CONTEXT_LIMIT_TURNS = 200
 
@@ -2947,7 +2947,7 @@ class ContextCompressor(ContextEngine):
         self._micro_compact_turns_since_pass: int = 0
         # Learned provider context limit: adopted from a 413 (lower-only), it
         # expires after a bounded turn count and the catalog window is
-        # restored — a wrong-low learn must not stick for a days-long session.
+        # restored; a wrong-low learn must not stick for a days-long session.
         self._learned_context_limit_turns_left: int = 0
         self._pre_learn_context_length: int | None = None
         # Confirmation: a re-learn of a previously-expired value proves the
@@ -6587,7 +6587,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # Reclaim gate on the RAW exchange mass: a pass costs a cache break
         # + an aux LLM call, so skip it when the exchange itself is tiny (the
         # cadence still advanced, so this cannot wedge the cursor). The gate
-        # must NOT see the compacted size — a tool-heavy exchange would
+        # must NOT see the compacted size (a tool-heavy exchange would
         # otherwise compact below the floor and never absorb.
         # estimate_messages_tokens_rough on the raw span: a cheap gate that
         # does not pay a full serialize (the compacted serialize below is the
@@ -6600,7 +6600,7 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Prune-first: deterministically compact the exchange's oversized
         # tool results (head+tail, no LLM) before serializing, so the summary
-        # call reads a smaller input — same Phase-1 tradeoff as full
+        # call reads a smaller input; same Phase-1 tradeoff as full
         # compression. Operates on a COPY: the stored messages are never
         # mutated, so a failed summary cannot leak compacted bodies into the
         # persisted history (the raw stays until the splice replaces it).

@@ -157,7 +157,7 @@ def agent_env():
         # AIAgent init routes file logging through hermes_logging's process-global
         # queue listener; rmtree deletes the temp HERMES_HOME dirs underneath it,
         # so any later log write in the same process hits the deleted path and
-        # raises FileNotFoundError — the cross-file flake that bites whenever this
+        # raises FileNotFoundError (the cross-file flake that bites whenever this
         # file shares a pytest process with others (the per-file runner hides it,
         # but combined/IDE runs don't). hermes_logging ships a test-isolation
         # helper for exactly this: stop the listener and close its handlers
