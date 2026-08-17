@@ -2205,7 +2205,17 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
             f"  \033[33m⚠\033[0m MESSAGING_CWD={messaging_cwd} found in .env — "
             f"this is deprecated."
         )
-    if terminal_cwd_env and not config_has_explicit_cwd:
+    # Suppress the false positive: when TERMINAL_CWD equals the launch cwd that cli.py's
+    # bridge just wrote — recorded at set-time in the internal, non-user-facing
+    # _HERMES_TERMINAL_CWD_LAUNCHED sentinel (realpath-normalized) — it is a fresh
+    # bridge-written value, not a stale .env export. Missing sentinel or mismatch keeps it.
+    launched = os.environ.get("_HERMES_TERMINAL_CWD_LAUNCHED")
+    _is_fresh_bridge_cwd = (
+        terminal_cwd_env is not None
+        and bool(launched)
+        and os.path.realpath(terminal_cwd_env) == os.path.realpath(launched)
+    )
+    if terminal_cwd_env and not config_has_explicit_cwd and not _is_fresh_bridge_cwd:
         # TERMINAL_CWD in env but not from config bridge — likely from .env
         lines.append(
             f"  \033[33m⚠\033[0m TERMINAL_CWD={terminal_cwd_env} found in .env — "

@@ -702,6 +702,8 @@ def load_cli_config() -> Dict[str, Any]:
                     continue
                 # CLI: always export (overrides stale .env or inherited values)
                 os.environ[env_var] = str(terminal_config[config_key])
+                # Internal, not user-facing: set-time record of the launch cwd we just wrote to TERMINAL_CWD (mirrors the _HERMES_GATEWAY idiom) so warn_deprecated_cwd_env_vars() can distinguish a fresh bridge-written value from a stale .env one.
+                os.environ["_HERMES_TERMINAL_CWD_LAUNCHED"] = str(terminal_config[config_key])
                 continue
             if _file_has_terminal_config or env_var not in os.environ:
                 val = terminal_config[config_key]
