@@ -261,6 +261,70 @@ def test_real_task_wins_over_trailing_max_iterations_nudge(compressor):
             },
             id="watch_match",
         ),
+        pytest.param(
+            {
+                "type": "watch_disabled",
+                "session_id": "proc_server",
+                "message": (
+                    "Watch patterns disabled for process proc_server — 5 "
+                    "consecutive rate-limit windows triggered (min spacing "
+                    "30s). Falling back to notify_on_complete semantics; "
+                    "you'll get exactly one notification when the process "
+                    "exits."
+                ),
+            },
+            id="watch_disabled",
+        ),
+        pytest.param(
+            {
+                "type": "watch_overflow_tripped",
+                "message": (
+                    "Watch-pattern overflow: >40 notifications in 60s "
+                    "across all processes. Suppressing further watch_match "
+                    "events for 120s."
+                ),
+            },
+            id="watch_overflow_tripped",
+        ),
+        pytest.param(
+            {
+                "type": "watch_overflow_released",
+                "message": (
+                    "Watch-pattern notifications resumed. 12 match "
+                    "event(s) were suppressed during the flood."
+                ),
+            },
+            id="watch_overflow_released",
+        ),
+        pytest.param(
+            {
+                "type": "async_delegation",
+                "delegation_id": "deleg-1",
+                "goal": "Investigate the flaky auth test",
+                "status": "completed",
+                "summary": "Found the race condition in the session setup.",
+                "role": "leaf",
+                "model": "gpt-5",
+                "api_calls": 4,
+                "duration_seconds": 12,
+            },
+            id="async_delegation",
+        ),
+        pytest.param(
+            {
+                "type": "async_delegation",
+                "is_batch": True,
+                "delegation_id": "deleg-2",
+                "results": [
+                    {"task_index": 0, "status": "completed", "summary": "done"},
+                ],
+                "goals": ["Investigate the flaky auth test"],
+                "role": "leaf",
+                "model": "gpt-5",
+                "total_duration_seconds": 12,
+            },
+            id="async_delegation_batch",
+        ),
     ],
 )
 def test_background_process_notifications_do_not_become_compaction_anchors(
@@ -282,6 +346,25 @@ def test_background_process_notifications_do_not_become_compaction_anchors(
         "Recent user focus:\n- Refactor the auth module and add tests."
     )
     assert compressor._find_last_user_message_idx(messages, head_end=0) == 0
+
+
+def test_internal_notification_display_kind_is_synthetic_regardless_of_text():
+    """gateway/run.py stamps display_kind='internal_notification' on these
+    rows at persist time (#82888). That structural marker must be recognized
+    on its own, independent of the text-prefix matching above — proven with
+    unrelated-looking content."""
+    tagged = {
+        "role": "user",
+        "content": "some future notification wording we haven't seen yet",
+        "display_kind": "internal_notification",
+    }
+    assert ContextCompressor._is_synthetic_compression_user_turn(tagged) is True
+
+    untagged = {
+        "role": "user",
+        "content": "some future notification wording we haven't seen yet",
+    }
+    assert ContextCompressor._is_synthetic_compression_user_turn(untagged) is False
 
 
 @pytest.mark.parametrize(
