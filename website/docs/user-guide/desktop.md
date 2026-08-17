@@ -123,6 +123,12 @@ The **Memory Graph** (command palette → *Memory Graph*, or the status-bar item
 
 Quick Entry is a small always-available composer summoned by a **global hotkey from anywhere on your system** — fire off a prompt without switching to (or even opening) the main window. Enable it in **Settings → Advanced → Quick Entry**; the default shortcut is **Ctrl/Cmd+Shift+Space** and you can set your own (it needs at least one modifier). If another app already owns the chord, the settings row tells you so you can pick a different one.
 
+### HUD mode
+
+HUD mode turns the current chat into a transparent, frameless, always-on-top floating window so you can keep using Hermes while working in another app. Open or close it with the HUD button in the Desktop title bar or **Cmd/Ctrl+Shift+H**.
+
+The HUD uses the real Hermes composer rather than a separate quick-entry client. Attachments, slash commands, the prompt queue, voice controls, and the model picker stay available, while the transcript appears as a compact floating reply band around the composer.
+
 ### Voice
 
 Talk to Hermes and hear it back, the same [voice mode](./features/voice-mode.md) available elsewhere. On macOS the OS will prompt once for microphone access.
