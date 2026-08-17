@@ -29,6 +29,9 @@ class TeamsMeetingPermissionError(TeamsMeetingError):
 
 def _meeting_path(meeting_ref: TeamsMeetingRef | str) -> str:
     meeting_id = meeting_ref.meeting_id if isinstance(meeting_ref, TeamsMeetingRef) else str(meeting_ref)
+    if isinstance(meeting_ref, TeamsMeetingRef) and meeting_ref.organizer_user_id:
+        organizer = quote(meeting_ref.organizer_user_id, safe="")
+        return f"/users/{organizer}/onlineMeetings/{quote(meeting_id, safe='')}"
     return f"/communications/onlineMeetings/{quote(meeting_id, safe='')}"
 
 
@@ -62,7 +65,12 @@ def _parse_thread_id(payload: dict[str, Any]) -> str | None:
     return payload.get("threadId")
 
 
-def _normalize_meeting_ref(payload: dict[str, Any], *, tenant_id: str | None = None) -> TeamsMeetingRef:
+def _normalize_meeting_ref(
+    payload: dict[str, Any],
+    *,
+    tenant_id: str | None = None,
+    organizer_user_id: str | None = None,
+) -> TeamsMeetingRef:
     metadata = {
         key: payload.get(key)
         for key in ("subject", "startDateTime", "endDateTime", "createdDateTime")
@@ -73,7 +81,7 @@ def _normalize_meeting_ref(payload: dict[str, Any], *, tenant_id: str | None = N
         metadata["participants"] = participants
     return TeamsMeetingRef(
         meeting_id=str(payload.get("id") or "").strip(),
-        organizer_user_id=_parse_organizer_user_id(payload),
+        organizer_user_id=organizer_user_id or _parse_organizer_user_id(payload),
         join_web_url=payload.get("joinWebUrl"),
         calendar_event_id=payload.get("calendarEventId"),
         thread_id=_parse_thread_id(payload),
@@ -140,21 +148,30 @@ async def resolve_meeting_reference(
     meeting_id: str | None = None,
     join_web_url: str | None = None,
     tenant_id: str | None = None,
+    organizer_user_id: str | None = None,
 ) -> TeamsMeetingRef:
     if meeting_id:
         try:
-            payload = await client.get_json(_meeting_path(meeting_id))
+            meeting_ref = TeamsMeetingRef(meeting_id=meeting_id, organizer_user_id=organizer_user_id)
+            payload = await client.get_json(_meeting_path(meeting_ref))
         except MicrosoftGraphAPIError as exc:
             raise _wrap_graph_error(exc, missing_message=f"Teams meeting not found: {meeting_id}") from exc
         if not isinstance(payload, dict) or not payload.get("id"):
             raise TeamsMeetingNotFoundError(f"Teams meeting not found: {meeting_id}")
-        return _normalize_meeting_ref(payload, tenant_id=tenant_id)
+        return _normalize_meeting_ref(
+            payload,
+            tenant_id=tenant_id,
+            organizer_user_id=organizer_user_id,
+        )
 
     if join_web_url:
         escaped_join_url = join_web_url.replace("'", "''")
         try:
+            lookup_path = "/communications/onlineMeetings"
+            if organizer_user_id:
+                lookup_path = f"/users/{quote(organizer_user_id, safe='')}/onlineMeetings"
             payload = await client.get_json(
-                "/communications/onlineMeetings",
+                lookup_path,
                 params={"$filter": f"JoinWebUrl eq '{escaped_join_url}'"},
             )
         except MicrosoftGraphAPIError as exc:
@@ -165,7 +182,11 @@ async def resolve_meeting_reference(
         candidates = payload.get("value") if isinstance(payload, dict) else None
         if not isinstance(candidates, list) or not candidates:
             raise TeamsMeetingNotFoundError(f"Teams meeting not found for join URL: {join_web_url}")
-        return _normalize_meeting_ref(candidates[0], tenant_id=tenant_id)
+        return _normalize_meeting_ref(
+            candidates[0],
+            tenant_id=tenant_id,
+            organizer_user_id=organizer_user_id,
+        )
 
     raise ValueError("Either meeting_id or join_web_url is required.")
 

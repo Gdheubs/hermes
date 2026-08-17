@@ -342,12 +342,14 @@ class TeamsMeetingPipeline:
         try:
             job = self._persist_job(job, status="resolving_meeting")
             notification = meeting_ref.metadata.get("notification") if isinstance(meeting_ref.metadata, dict) else {}
-            resolved_meeting = await resolve_meeting_reference(
-                self.graph_client,
-                meeting_id=meeting_ref.meeting_id,
-                join_web_url=meeting_ref.join_web_url or meeting_ref.metadata.get("join_web_url"),
-                tenant_id=meeting_ref.tenant_id,
-            )
+            resolve_kwargs = {
+                "meeting_id": meeting_ref.meeting_id,
+                "join_web_url": meeting_ref.join_web_url or meeting_ref.metadata.get("join_web_url"),
+                "tenant_id": meeting_ref.tenant_id,
+            }
+            if meeting_ref.organizer_user_id:
+                resolve_kwargs["organizer_user_id"] = meeting_ref.organizer_user_id
+            resolved_meeting = await resolve_meeting_reference(self.graph_client, **resolve_kwargs)
             job.meeting_ref = resolved_meeting
             job = self._persist_job(job, meeting_ref=resolved_meeting.to_dict())
 
