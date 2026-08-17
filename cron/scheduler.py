@@ -3357,6 +3357,73 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
+def _snapshot_config_yaml() -> Optional[tuple]:
+    """Snapshot the Hermes config.yaml bytes + mtime for tamper detection.
+
+    Returns ``(path, bytes, mtime_ns)`` or None when the config cannot be
+    read (no config yet, unreadable). Used by the F4 script-lane guard to
+    revert config.yaml modifications made by a no_agent script subprocess.
+    """
+    try:
+        from hermes_cli.config import get_config_path
+        path = get_config_path()
+        st = path.stat()
+        return (path, path.read_bytes(), st.st_mtime_ns)
+    except Exception:
+        return None
+
+
+def _restore_config_yaml_if_tampered(snapshot: Optional[tuple]) -> Optional[str]:
+    """Restore config.yaml if a script subprocess modified it (F4).
+
+    Returns an error message when tampering was detected AND reverted,
+    None when the config is untouched (or the snapshot is unavailable).
+
+    config.yaml is the security policy (approvals.cron_mode / mode / yolo)
+    and approval-policy reads are mtime-keyed — a no_agent script that
+    rewrites it would silently flip the approval gate for the next tick.
+    Scripts run outside the file_tools/terminal hard-blocks that protect
+    config.yaml, so the restore here is the script lane's equivalent of
+    the file_tools deny.
+    """
+    if snapshot is None:
+        return None
+    path, original_bytes, original_mtime = snapshot
+    try:
+        current = path.read_bytes()
+    except OSError:
+        # Config disappeared mid-run (deleted by the script). Restore it.
+        current = None
+    if current == original_bytes:
+        return None
+    logger.warning(
+        "Security: cron script modified %s during its run — reverting the "
+        "change (approval-policy tampering guard F4).",
+        path,
+    )
+    try:
+        tmp = path.with_name(f"{path.name}.hermes-restore-{os.getpid()}.tmp")
+        tmp.write_bytes(original_bytes)
+        os.replace(tmp, path)
+        try:
+            os.utime(path, ns=(original_mtime, original_mtime))
+        except OSError:
+            pass
+    except OSError as exc:
+        logger.error(
+            "Security: could not revert %s after script tampering: %s",
+            path, exc,
+        )
+        return (
+            f"Security: script modified {path}; attempted revert FAILED ({exc}). "
+            "Check the file's approval settings immediately."
+        )
+    return (
+        f"Security: script modified {path} during its run; the change was "
+        "reverted (approval-policy tampering guard). Review the script."
+    )
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -3496,6 +3563,16 @@ def _run_job_script(
         # NEVER mutate the Python process cwd — that would leak into
         # concurrent gateway sessions (#69396).
         _script_cwd = workdir or str(path.parent)
+
+        # F4: config.yaml is the security policy (approvals.cron_mode,
+        # approvals.mode, yolo) and the approval-policy reads are
+        # mtime-keyed — a no_agent script that rewrites it would flip the
+        # policy and the next tick would pick the flip up. Scripts run as
+        # subprocesses OUTSIDE the file_tools/terminal hard-blocks that
+        # protect config.yaml, so we snapshot it before the run and
+        # restore it if the script modified it.
+        config_snapshot = _snapshot_config_yaml()
+
         proc = subprocess.Popen(
             argv,
             stdout=subprocess.PIPE,
@@ -3506,21 +3583,35 @@ def _run_job_script(
             **popen_kwargs,
         )
         deadline = time.monotonic() + script_timeout
+        early_error = None
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 _terminate_cron_script_process(proc)
                 _drain_script_pipes(proc)
-                return False, "Script cancelled because cron fire ownership was lost"
+                early_error = "Script cancelled because cron fire ownership was lost"
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 _terminate_cron_script_process(proc)
                 _drain_script_pipes(proc)
-                return False, f"Script timed out after {script_timeout}s: {path}"
+                early_error = f"Script timed out after {script_timeout}s: {path}"
+                break
             try:
                 stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
                 break
             except subprocess.TimeoutExpired:
                 continue
+
+        # Detect and revert any config.yaml modification the script made.
+        # Runs on EVERY completion path (success, cancel, timeout) so the
+        # mtime-keyed approval-policy cache can never observe a flipped
+        # config from the script lane.
+        tamper_message = _restore_config_yaml_if_tampered(config_snapshot)
+
+        if early_error:
+            return False, early_error
+        if tamper_message:
+            return False, tamper_message
 
         stdout = (stdout_raw or "").strip()
         stderr = (stderr_raw or "").strip()
