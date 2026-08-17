@@ -2013,6 +2013,12 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+class InvalidScheduleUpdate(ValueError):
+    """Raised when an update would leave a job's repeat counter in an
+    impossible state (completed > times) or would reschedule an exhausted
+    job without an explicit fresh-lifecycle reset (reset_completed=true)."""
+
+
 class AmbiguousJobReference(LookupError):
     """Raised when a job name matches more than one job."""
 
@@ -2069,6 +2075,9 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
 
 def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Update a job by ID, refreshing derived schedule fields when needed."""
+    # Defensive copy: the control flag below is popped, and callers (tool,
+    # CLI, REST) may reuse their dict; never mutate the caller's object.
+    updates = dict(updates or {})
     # Block mutation of immutable fields. ``id`` in particular is a filesystem
     # path component under OUTPUT_DIR — letting an update change it leaks
     # path-escape values into output writes/deletes.
@@ -2076,6 +2085,20 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     if bad_fields:
         raise ValueError(
             f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}"
+        )
+
+    # Control flag for the repeat lifecycle, not a stored job field. Popped
+    # before the merge so it can never leak into the saved record. STRICT bool
+    # coercion: only literal True triggers a reset — `bool("false")` is True,
+    # and a string-boolean REST client must never silently re-arm a job.
+    reset_completed = updates.pop("reset_completed", False) is True
+
+    # repeat must be a dict like {"times": N} (or null = infinite). Reject
+    # scalars loudly instead of AttributeError-ing later (R9).
+    if "repeat" in updates and updates["repeat"] is not None and not isinstance(updates["repeat"], dict):
+        raise InvalidScheduleUpdate(
+            "repeat must be a dict like {\"times\": N} (or null for infinite), "
+            f"got {type(updates['repeat']).__name__}"
         )
 
     with _jobs_lock():
@@ -2101,6 +2124,22 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     _mv = str(_mv).strip() if isinstance(_mv, str) else None
                     updates[_mon_field] = _mv or None
 
+            if isinstance(updates.get("repeat"), dict):
+                # The flag is the ONLY sanctioned way to touch `completed`
+                # (R4): an incoming dict that carries it without the flag
+                # bypasses the "fresh lifecycle" contract and can silently
+                # re-execute an already-executed job.
+                if "completed" in updates["repeat"] and not reset_completed:
+                    raise InvalidScheduleUpdate(
+                        "repeat.completed cannot be set directly; use "
+                        "reset_completed=true to start a fresh repetition "
+                        "lifecycle"
+                    )
+                # Merge partial repeat dicts (e.g. {"times": 1}) over the
+                # stored state so a caller that only changes the limit can
+                # never silently drop `completed` (the born-exhausted bug).
+                updates["repeat"] = {**(job.get("repeat") or {}), **updates["repeat"]}
+
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
 
@@ -2121,6 +2160,45 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     _upd_script or None,
                 )
             schedule_changed = "schedule" in updates
+            # Re-arm intent: enabling, triggering, or resuming a job. These
+            # transitions must not silently revive an exhausted finite job.
+            # Truthiness, not `is True`: sloppy clients send enabled=1 / "true".
+            rearming = (
+                bool(updates.get("enabled"))
+                or "next_run_at" in updates
+                or updates.get("state") == "scheduled"
+            )
+
+            # Repeat lifecycle guard: never silently preserve an impossible
+            # counter state. Lowering times below completed, rescheduling an
+            # exhausted job, or re-arming one is rejected unless the caller
+            # explicitly starts a fresh lifecycle.
+            repeat_state = updated.get("repeat") or {}
+            new_times = repeat_state.get("times")
+            if new_times is not None and new_times <= 0:
+                new_times = None  # 0/negative means infinite, as at create time
+            if reset_completed and isinstance(updated.get("repeat"), dict):
+                updated["repeat"]["completed"] = 0
+            elif new_times is not None:
+                completed = repeat_state.get("completed") or 0
+                if isinstance(updates.get("repeat"), dict) and completed >= new_times:
+                    raise InvalidScheduleUpdate(
+                        "repeat.times cannot be lowered to or below "
+                        f"repeat.completed ({completed}/{new_times}) "
+                        "without reset_completed=true"
+                    )
+                if schedule_changed and completed >= new_times:
+                    raise InvalidScheduleUpdate(
+                        "cannot reschedule an exhausted job "
+                        f"(repeat.completed {completed} >= repeat.times {new_times}) "
+                        "without reset_completed=true"
+                    )
+                if rearming and completed >= new_times:
+                    raise InvalidScheduleUpdate(
+                        "cannot re-arm an exhausted job "
+                        f"(repeat.completed {completed} >= repeat.times {new_times}) "
+                        "without reset_completed=true"
+                    )
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
             ) and _normalized_inference_axes(updated) != previous_inference_axes

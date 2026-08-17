@@ -1601,11 +1601,15 @@ def _cron_pause(_engine: HermesConsoleEngine, args: list[str]) -> str:
 def _cron_resume(_engine: HermesConsoleEngine, args: list[str]) -> str:
     if len(args) != 1:
         raise ConsoleCommandError("Usage: cron resume <job>")
-    from cron.jobs import AmbiguousJobReference, resume_job
+    from cron.jobs import AmbiguousJobReference, InvalidScheduleUpdate, resume_job
 
     try:
         job = resume_job(args[0])
     except AmbiguousJobReference as exc:
+        raise ConsoleCommandError(str(exc)) from exc
+    except InvalidScheduleUpdate as exc:
+        # Exhausted finite job: re-arm is a client error with an actionable
+        # remedy (use `hermes cron edit --reset-completed`), not a REPL crash.
         raise ConsoleCommandError(str(exc)) from exc
     if not job:
         raise ConsoleCommandError(f"Job not found: {args[0]}")
@@ -1615,11 +1619,15 @@ def _cron_resume(_engine: HermesConsoleEngine, args: list[str]) -> str:
 def _cron_run(_engine: HermesConsoleEngine, args: list[str]) -> str:
     if len(args) != 1:
         raise ConsoleCommandError("Usage: cron run <job>")
-    from cron.jobs import AmbiguousJobReference, trigger_job
+    from cron.jobs import AmbiguousJobReference, InvalidScheduleUpdate, trigger_job
 
     try:
         job = trigger_job(args[0])
     except AmbiguousJobReference as exc:
+        raise ConsoleCommandError(str(exc)) from exc
+    except InvalidScheduleUpdate as exc:
+        # Exhausted finite job: re-arm is a client error with an actionable
+        # remedy (use `hermes cron edit --reset-completed`), not a REPL crash.
         raise ConsoleCommandError(str(exc)) from exc
     if not job:
         raise ConsoleCommandError(f"Job not found: {args[0]}")

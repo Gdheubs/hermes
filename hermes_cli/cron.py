@@ -461,6 +461,7 @@ def cron_edit(args):
         name=getattr(args, "name", None),
         deliver=getattr(args, "deliver", None),
         repeat=getattr(args, "repeat", None),
+        reset_completed=bool(getattr(args, "reset_completed", False)),
         skills=final_skills,
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),

@@ -130,6 +130,17 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_edit.add_argument("--deliver", help="New delivery target")
     cron_edit.add_argument("--repeat", type=int, help="New repeat count")
     cron_edit.add_argument(
+        "--reset-completed",
+        action="store_true",
+        help=(
+            "Start a FRESH repetition lifecycle: repeat.completed resets to 0, "
+            "so lowering --repeat below the job's completed count (or "
+            "rescheduling an exhausted one-shot) is allowed. Without it, such "
+            "updates are rejected instead of silently creating a job that can "
+            "never fire again."
+        ),
+    )
+    cron_edit.add_argument(
         "--skill",
         dest="skills",
         action="append",

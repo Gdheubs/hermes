@@ -1290,6 +1290,7 @@ try:
         pause_job as _cron_pause,
         resume_job as _cron_resume,
         trigger_job as _cron_trigger,
+        InvalidScheduleUpdate as _CronInvalidScheduleUpdate,
     )
     from cron.scheduler import (
         CronSchedulerRegistrationError as _CronSchedulerRegistrationError,
@@ -1305,6 +1306,7 @@ except ImportError:
     _cron_pause = None
     _cron_resume = None
     _cron_trigger = None
+    _CronInvalidScheduleUpdate = ValueError
 
     class _CronSchedulerRegistrationError(RuntimeError):
         pass
@@ -5647,7 +5649,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled", "reset_completed"}
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
 
@@ -5799,6 +5801,11 @@ class APIServerAdapter(BasePlatformAdapter):
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
         except Exception as e:
+            # A repeat-lifecycle guard rejection is a CLIENT error (the update
+            # would leave the job unable to fire), not a server fault — 400,
+            # not 500 (R2/FM2).
+            if isinstance(e, _CronInvalidScheduleUpdate):
+                return web.json_response({"error": _redact_api_error_text(e)}, status=400)
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
     async def _handle_delete_job(self, request: "web.Request") -> "web.Response":
@@ -5859,6 +5866,10 @@ class APIServerAdapter(BasePlatformAdapter):
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
         except Exception as e:
+            # Repeat-lifecycle guard rejection (exhausted job re-arm) is a
+            # CLIENT error — 400, not 500 (FM-v2-1).
+            if isinstance(e, _CronInvalidScheduleUpdate):
+                return web.json_response({"error": _redact_api_error_text(e)}, status=400)
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
     async def _handle_run_job(self, request: "web.Request") -> "web.Response":
@@ -5881,6 +5892,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response({"error": "Job not found"}, status=404)
             return web.json_response({"job": job})
         except Exception as e:
+            # Repeat-lifecycle guard rejection (exhausted job re-arm) is a
+            # CLIENT error — 400, not 500 (FM-v2-1).
+            if isinstance(e, _CronInvalidScheduleUpdate):
+                return web.json_response({"error": _redact_api_error_text(e)}, status=400)
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
     async def _handle_cron_fire(self, request: "web.Request") -> "web.Response":

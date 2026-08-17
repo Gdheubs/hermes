@@ -1184,6 +1184,7 @@ def cronjob(
     schedule: Optional[str] = None,
     name: Optional[str] = None,
     repeat: Optional[int] = None,
+    reset_completed: Optional[bool] = None,
     deliver: Optional[str] = None,
     include_disabled: bool = False,
     skill: Optional[str] = None,
@@ -1585,12 +1586,18 @@ def cronjob(
                             success=False,
                         )
                 updates["no_agent"] = target_no_agent
+            if reset_completed:
+                # Control flag forwarded OUTSIDE the `if repeat is not None:`
+                # block: a schedule-only reset (the documented use case) must
+                # not silently drop the flag (R2/FM2).
+                updates["reset_completed"] = True
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
-                repeat_state = dict(job.get("repeat") or {})
-                repeat_state["times"] = normalized_repeat
-                updates["repeat"] = repeat_state
+                # Partial dict: the store merges over stored state, so passing
+                # only {"times": N} preserves `completed` without the tool
+                # re-copying it (and never trips the R4 direct-completed guard).
+                updates["repeat"] = {"times": normalized_repeat}
             if schedule is not None:
                 parsed_schedule = parse_schedule(schedule)
                 updates["schedule"] = parsed_schedule
@@ -1657,7 +1664,12 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
             },
             "repeat": {
                 "type": "integer",
-                "description": "Optional repeat count. Omit for defaults (once for one-shot, forever for recurring)."
+                "description": "Optional repeat count. Omit for defaults (once for one-shot, forever for recurring). Lowering repeat below a job's completed count is rejected unless reset_completed=true."
+            },
+            "reset_completed": {
+                "type": "boolean",
+                "default": False,
+                "description": "Optional, update only. True starts a FRESH repetition lifecycle: repeat.completed is reset to 0, so lowering repeat.times (or rescheduling an already-exhausted one-shot) is allowed. Without it, such updates are rejected instead of silently producing a job that can never fire again."
             },
             "deliver": {
                 "type": "string",
