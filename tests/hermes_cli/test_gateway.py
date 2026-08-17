@@ -561,6 +561,131 @@ class TestStopProfileGateway:
         assert killed_pid in reap_extra_excludes[0]
 
 
+class TestStopProfileGatewayWindowsDrain:
+    """``hermes gateway stop`` must let a Windows gateway drain, not kill it.
+
+    ``os.kill(pid, signal.SIGTERM)`` is not a signal on Windows: only
+    ``CTRL_C_EVENT``/``CTRL_BREAK_EVENT`` map to a deliverable console event
+    and everything else goes straight to OpenProcess + TerminateProcess. So
+    writing the planned-stop marker and killing on the next statement
+    destroys the gateway microseconds later — before the planned-stop
+    watcher in ``gateway/run.py`` (0.5s poll) can consume the marker. The
+    drain is skipped: the in-flight turn dies mid-generation, the transcript
+    tail is never flushed and ``resume_pending`` is never set, so the next
+    start does not auto-resume.
+
+    This is reachable at the default install state. The stop dispatcher only
+    routes to ``gateway_windows.stop()`` behind ``is_installed()``
+    (``is_task_registered() or is_startup_entry_installed()``), both of which
+    require an explicit ``hermes gateway install`` — so a Windows user who
+    started with ``hermes gateway`` or the Desktop app lands here instead.
+
+    Host-agnostic: ``is_windows()`` is monkeypatched, so these run on POSIX CI.
+    """
+
+    @staticmethod
+    def _arrange_stop(monkeypatch, pid, *, windows, drained):
+        """Wire stop_profile_gateway's seams; returns the ordered event log."""
+        events = []
+
+        monkeypatch.setattr(gateway, "is_windows", lambda: windows)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: pid)
+        monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
+        monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+        monkeypatch.setattr("time.sleep", lambda _s: None)
+        monkeypatch.setattr(
+            gateway,
+            "_reap_unsupervised_gateway_orphans",
+            lambda extra_exclude=None: False,
+        )
+
+        def _fake_drain(drain_pid):
+            events.append(("drain", drain_pid))
+            return drained
+
+        # raising=False keeps the arrangement itself neutral: the assertions
+        # below are about the ORDER of the recorded events, so a build that
+        # never consults the drain seam must fail on "marker then os.kill",
+        # not on the stub failing to install.
+        monkeypatch.setattr(
+            gateway, "_drain_windows_gateway_pid", _fake_drain, raising=False
+        )
+        monkeypatch.setattr(
+            "gateway.status.write_planned_stop_marker",
+            lambda marker_pid: events.append(("marker", marker_pid)),
+        )
+        monkeypatch.setattr(
+            "gateway.status.terminate_pid",
+            lambda term_pid, force=False: events.append(("terminate", term_pid, force)),
+        )
+        monkeypatch.setattr(
+            gateway.os,
+            "kill",
+            lambda kill_pid, sig: events.append(("os.kill", kill_pid, sig)),
+        )
+        return events
+
+    def test_windows_stop_drains_and_never_terminates(self, monkeypatch):
+        """A gateway that exits inside the drain window is never killed at all."""
+        events = self._arrange_stop(monkeypatch, 4242, windows=True, drained=True)
+
+        assert gateway.stop_profile_gateway() is True
+        # Nothing but the drain: no marker rewrite, no TerminateProcess, no
+        # taskkill. This is the assertion that fails on the pre-fix code path,
+        # where os.kill lands microseconds after the marker.
+        assert events == [("drain", 4242)]
+
+    def test_windows_stop_drains_before_escalating(self, monkeypatch):
+        """Only once the bounded window is spent may the stop escalate."""
+        events = self._arrange_stop(monkeypatch, 4242, windows=True, drained=False)
+
+        assert gateway.stop_profile_gateway() is True
+        kinds = [event[0] for event in events]
+        assert "drain" in kinds and "terminate" in kinds
+        assert kinds.index("drain") < kinds.index("terminate")
+        # Escalation is the backend's bounded tree-kill, not a bare
+        # TerminateProcess that strands the detached gateway's children.
+        assert ("terminate", 4242, True) in events
+        assert not any(event[0] == "os.kill" for event in events)
+
+    def test_posix_stop_path_is_unchanged(self, monkeypatch):
+        """POSIX still signals directly — the drain helper is Windows-only."""
+        events = self._arrange_stop(monkeypatch, 4242, windows=False, drained=True)
+
+        assert gateway.stop_profile_gateway() is True
+        assert not any(event[0] == "drain" for event in events)
+        assert ("marker", 4242) in events
+        assert ("os.kill", 4242, signal.SIGTERM) in events
+        kinds = [event[0] for event in events]
+        assert kinds.index("marker") < kinds.index("os.kill")
+
+    def test_drain_helper_delegates_to_the_windows_backend(self, monkeypatch):
+        """Reuse gateway_windows' drain and its configured stop budget.
+
+        ``_drain_gateway_pid`` is the reference implementation of the correct
+        sequence (write the marker, then WAIT); re-implementing the wait here
+        would be a second mechanism to keep in step.
+        """
+        import hermes_cli.gateway_windows as gateway_windows
+
+        seen = {}
+        monkeypatch.setattr(gateway_windows, "_windows_stop_drain_timeout", lambda: 7.5)
+
+        def _fake_drain(pid, drain_timeout):
+            seen["args"] = (pid, drain_timeout)
+            return True
+
+        monkeypatch.setattr(gateway_windows, "_drain_gateway_pid", _fake_drain)
+
+        assert gateway._drain_windows_gateway_pid(4242) is True
+        assert seen["args"] == (4242, 7.5)
+
+    def test_drain_helper_reports_failure_for_an_unusable_pid(self):
+        """A non-PID must report "not drained" so the caller still escalates."""
+        assert gateway._drain_windows_gateway_pid(0) is False
+        assert gateway._drain_windows_gateway_pid(-1) is False
+
+
 class TestReapUnsupervisedGatewayOrphansMacOS:
     """Tests that the orphan reaper excludes launchd-managed PIDs on macOS.
 
@@ -687,19 +812,27 @@ class TestReapUnsupervisedGatewayOrphansWindows:
         )
 
         killed_pids = []
+        marked_pids = []
         monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
-        monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: None)
+        monkeypatch.setattr(
+            "gateway.status.write_planned_stop_marker", lambda pid: marked_pids.append(pid)
+        )
         monkeypatch.setattr("time.sleep", lambda _: None)
         monkeypatch.setattr("time.monotonic", lambda: 1.0)
 
         result = gateway._reap_unsupervised_gateway_orphans()
 
         assert result is True  # at least one orphan was reaped
+        # On Windows the planned-stop marker IS the stop request — os.kill
+        # there is TerminateProcess, so observing the marker (not the kill)
+        # is what tells us the orphan was acted on.
         killed = [pid for pid, _ in killed_pids]
-        assert orphan_pid in killed       # the real orphan was killed
-        assert recorded_pid not in killed  # the recorded gateway was NOT killed
-        assert bootstrap_pid not in killed  # its supervision chain was NOT killed
+        assert orphan_pid in marked_pids      # the real orphan was asked to drain
+        assert recorded_pid not in marked_pids   # the recorded gateway was NOT touched
+        assert recorded_pid not in killed        # ... by either route
+        assert bootstrap_pid not in marked_pids  # its supervision chain was NOT touched
+        assert bootstrap_pid not in killed
 
     def test_windows_no_orphans_when_only_recorded_gateway_running(self, monkeypatch):
         """If the only gateway processes are the recorded one and its
@@ -736,6 +869,108 @@ class TestReapUnsupervisedGatewayOrphansWindows:
 
         assert result is False  # no orphans reaped
         assert killed_pids == []  # nothing was killed
+
+
+class TestReapUnsupervisedGatewayOrphansWindowsDrain:
+    """The orphan reaper must let a Windows orphan consume its marker.
+
+    ``_reap_unsupervised_gateway_orphans()`` writes the planned-stop marker
+    for every orphan and then signals it — and it is not POSIX-only, so on
+    Windows that signal is TerminateProcess and the marker it just wrote is
+    destroyed before the gateway's planned-stop watcher can poll for it.
+
+    The corrected sequence spends no new time budget. POSIX is SIGTERM (the
+    handler drains) -> 5s survivor wait -> SIGKILL; Windows now writes the
+    marker, skips the immediate kill, and reuses that same 5s survivor
+    window as the drain before escalating.
+
+    Host-agnostic: ``is_windows()`` is monkeypatched, so these run on POSIX CI.
+    """
+
+    @staticmethod
+    def _arrange_reap(monkeypatch, orphan_pid, *, windows, alive):
+        """Reduce the reaper to a single orphan; returns the ordered event log."""
+        events = []
+
+        monkeypatch.setattr(gateway, "is_windows", lambda: windows)
+        monkeypatch.setattr(gateway, "is_macos", lambda: False)
+        monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(
+            gateway, "_windows_scheduled_task_running", lambda _name: False
+        )
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+        monkeypatch.setattr(gateway, "_get_service_pids", lambda: set())
+        monkeypatch.setattr(
+            gateway, "_reaper_candidate_is_supervisor_owned", lambda _pid: False
+        )
+        monkeypatch.setattr(
+            gateway,
+            "find_gateway_pids",
+            lambda exclude_pids=None: [
+                p for p in [orphan_pid] if p not in (exclude_pids or set())
+            ],
+        )
+        monkeypatch.setattr(
+            "gateway.status.write_planned_stop_marker",
+            lambda marker_pid: events.append(("marker", marker_pid)),
+        )
+        monkeypatch.setattr(
+            gateway.os,
+            "kill",
+            lambda kill_pid, sig: events.append(("os.kill", kill_pid, sig)),
+        )
+        monkeypatch.setattr(
+            "gateway.status.terminate_pid",
+            lambda term_pid, force=False: events.append(("terminate", term_pid, force)),
+        )
+        monkeypatch.setattr("time.sleep", lambda _s: None)
+        monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: alive)
+        if alive:
+            # Advance the clock on every read so the survivor window closes.
+            clock = {"now": 0.0}
+
+            def _monotonic():
+                clock["now"] += 1.0
+                return clock["now"]
+
+            monkeypatch.setattr("time.monotonic", _monotonic)
+        else:
+            monkeypatch.setattr("time.monotonic", lambda: 1.0)
+        return events
+
+    def test_windows_orphan_is_asked_to_drain_not_terminated(self, monkeypatch):
+        """An orphan that honours the marker exits without ever being killed."""
+        events = self._arrange_reap(monkeypatch, 99998, windows=True, alive=False)
+
+        assert gateway._reap_unsupervised_gateway_orphans() is True
+        # Pre-fix this reads [("marker", ...), ("os.kill", ..., SIGTERM)] —
+        # the marker and the TerminateProcess that makes it unreadable.
+        assert events == [("marker", 99998)]
+
+    def test_windows_orphan_outliving_the_window_is_force_killed(self, monkeypatch):
+        """The survivor window is the escalation, not a reason to skip it."""
+        events = self._arrange_reap(monkeypatch, 99998, windows=True, alive=True)
+
+        assert gateway._reap_unsupervised_gateway_orphans() is True
+        kinds = [event[0] for event in events]
+        assert "marker" in kinds and "terminate" in kinds
+        assert kinds.index("marker") < kinds.index("terminate")
+        # SIGKILL does not exist on Windows and the SIGTERM fallback is
+        # another bare TerminateProcess; escalate with the backend's
+        # bounded tree-kill instead.
+        assert ("terminate", 99998, True) in events
+        assert not any(event[0] == "os.kill" for event in events)
+
+    def test_posix_orphan_reap_is_unchanged(self, monkeypatch):
+        """POSIX still signals immediately — a guard on the untouched path."""
+        events = self._arrange_reap(monkeypatch, 99998, windows=False, alive=False)
+
+        assert gateway._reap_unsupervised_gateway_orphans() is True
+        assert ("marker", 99998) in events
+        assert ("os.kill", 99998, signal.SIGTERM) in events
+        kinds = [event[0] for event in events]
+        assert kinds.index("marker") < kinds.index("os.kill")
+        assert not any(event[0] == "terminate" for event in events)
 
 
 class TestReaperCandidateIsSupervisorOwned:
@@ -795,19 +1030,26 @@ class TestReaperCandidateIsSupervisorOwned:
         )
 
         killed_pids = []
+        marked_pids = []
         monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
-        monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: None)
+        monkeypatch.setattr(
+            "gateway.status.write_planned_stop_marker", lambda pid: marked_pids.append(pid)
+        )
         monkeypatch.setattr("time.sleep", lambda _: None)
         monkeypatch.setattr("time.monotonic", lambda: 1.0)
 
         result = gateway._reap_unsupervised_gateway_orphans()
 
         assert result is True              # the genuine orphan was reaped
+        # Windows acts on an orphan by writing the planned-stop marker; the
+        # hard kill is the escalation for whatever outlives the drain window.
         killed = [pid for pid, _ in killed_pids]
-        assert orphan_pid in killed          # orphan killed
-        assert gateway_pid not in killed     # supervisor-owned gateway spared (no pidfile!)
-        assert bootstrap_pid not in killed   # its bootstrap spared too
+        assert orphan_pid in marked_pids       # orphan asked to drain
+        assert gateway_pid not in marked_pids  # supervisor-owned gateway spared (no pidfile!)
+        assert gateway_pid not in killed
+        assert bootstrap_pid not in marked_pids  # its bootstrap spared too
+        assert bootstrap_pid not in killed
 
     def test_macos_orphan_reparented_to_launchd_is_still_reaped(self, monkeypatch):
         """POSIX inertness guard: a genuine macOS orphan is reparented directly
@@ -971,16 +1213,21 @@ class TestWindowsScheduledTaskSupervisorGuard:
             ],
         )
         killed_pids = []
+        marked_pids = []
         monkeypatch.setattr(gateway.os, "kill", lambda pid, sig: killed_pids.append((pid, sig)))
         monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
-        monkeypatch.setattr("gateway.status.write_planned_stop_marker", lambda pid: None)
+        monkeypatch.setattr(
+            "gateway.status.write_planned_stop_marker", lambda pid: marked_pids.append(pid)
+        )
         monkeypatch.setattr("time.sleep", lambda _: None)
         monkeypatch.setattr("time.monotonic", lambda: 1.0)
 
         result = gateway._reap_unsupervised_gateway_orphans()
 
         assert result is True
-        assert orphan_pid in [pid for pid, _ in killed_pids]
+        # The reaper's Windows stop request is the planned-stop marker — which
+        # is exactly what this class's own docstring already describes it doing.
+        assert orphan_pid in marked_pids
 
     def test_windows_scheduled_task_running_returns_false_off_windows(self, monkeypatch):
         """The state helper is inert on POSIX (no subprocess spawned)."""

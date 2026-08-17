@@ -1675,6 +1675,45 @@ def _reaper_candidate_is_supervisor_owned(pid: int) -> bool:
     return False
 
 
+def _drain_windows_gateway_pid(pid: int) -> bool:
+    """Ask a running Windows gateway to drain, and WAIT for it to exit.
+
+    ``os.kill(pid, signal.SIGTERM)`` is not a signal on Windows: only
+    ``CTRL_C_EVENT``/``CTRL_BREAK_EVENT`` map to a deliverable console
+    event, and every other value goes straight to OpenProcess +
+    TerminateProcess.  So a call site that writes the planned-stop marker
+    and then calls ``os.kill`` on the next statement destroys the gateway
+    microseconds after the marker lands — before the gateway's
+    planned-stop watcher (``gateway/run.py``, 0.5s poll) can consume it.
+    The drain never runs, the in-flight turn dies mid-generation, the
+    transcript tail is never flushed and ``resume_pending`` is never set,
+    so the next start does not auto-resume.
+
+    ``hermes_cli.gateway_windows._drain_gateway_pid()`` is the reference
+    implementation of the correct sequence — it writes the same marker and
+    then waits — so reuse it here instead of racing it.  The window is the
+    Windows backend's own configured stop budget, the same one
+    ``gateway_windows.stop()`` already spends on this exact operation.
+
+    Returns True only when the PID actually exited inside the window.
+    False — including on any import or backend error — means the caller
+    must escalate to a force-kill.
+    """
+    if not pid or pid <= 0:
+        return False
+    try:
+        from hermes_cli.gateway_windows import (
+            _drain_gateway_pid,
+            _windows_stop_drain_timeout,
+        )
+    except Exception:
+        return False
+    try:
+        return bool(_drain_gateway_pid(pid, _windows_stop_drain_timeout()))
+    except Exception:
+        return False
+
+
 def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool:
     """Kill no-supervisor gateway orphans the pidfile/runtime record can't see.
 
@@ -1687,6 +1726,12 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
     where a ``gateway restart`` argv is a transient management command, not the
     running gateway — gating on ``supports_systemd_services()`` keeps the
     orphan-aware scan from killing live management processes there.
+
+    On Windows ``os.kill(pid, SIGTERM)`` is TerminateProcess, so the
+    planned-stop marker written for each orphan is the only graceful stop
+    request that exists there. The marker is written and the immediate kill
+    is skipped; the survivor window below is the escalation, which makes
+    Windows match POSIX exactly — graceful request, 5 seconds, force-kill.
 
     Args:
         extra_exclude: Additional PIDs to skip (e.g. a PID already killed by
@@ -1780,11 +1825,25 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
         return False
 
     reaped = False
+    windows = is_windows()
     for pid in orphans:
         try:
             write_planned_stop_marker(pid)
         except Exception:
             pass
+        if windows:
+            # On Windows the marker IS the stop request, and it is the only
+            # one there is: os.kill(pid, SIGTERM) below is TerminateProcess,
+            # which would destroy the orphan microseconds after the marker
+            # lands — before the planned-stop watcher's 0.5s poll can
+            # consume it — so the drain never runs and ``resume_pending`` is
+            # never set. Let the survivor window below supply the wait that
+            # the POSIX SIGTERM handler gets for free, then escalate. This
+            # spends the function's own existing 5s budget rather than
+            # adding one, so Windows now matches POSIX exactly: graceful
+            # request, 5 seconds, force-kill.
+            reaped = True
+            continue
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
@@ -1805,7 +1864,16 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
             time.sleep(0.2)
     for pid in survivors:
         try:
-            os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+            if windows:
+                # SIGKILL does not exist on Windows and the getattr fallback
+                # to SIGTERM is another bare TerminateProcess that strands
+                # the detached gateway's children. Use the same bounded
+                # tree-kill the Windows backend escalates with.
+                from gateway.status import terminate_pid
+
+                terminate_pid(pid, force=True)
+            else:
+                os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
         except (ProcessLookupError, PermissionError, OSError):
             pass
 
@@ -1831,6 +1899,11 @@ def stop_profile_gateway() -> bool:
     the old process exited. After killing the recorded PID, also sweep for
     any remaining orphans so each restart produces at most one live gateway
     (#75936).
+
+    On Windows the planned-stop marker is the ONLY way to ask a running
+    gateway to drain, and ``os.kill(pid, SIGTERM)`` there is
+    TerminateProcess — so the marker is drained-for via
+    ``_drain_windows_gateway_pid()`` before any termination is attempted.
     """
     try:
         from gateway.status import get_running_pid, remove_pid_file
@@ -1841,20 +1914,41 @@ def stop_profile_gateway() -> bool:
     if pid is None:
         return _reap_unsupervised_gateway_orphans()
 
-    try:
-        from gateway.status import write_planned_stop_marker
+    # On Windows the marker written below is inert: os.kill(pid, SIGTERM)
+    # is TerminateProcess, so the gateway dies before its planned-stop
+    # watcher can poll for the marker and the drain is skipped entirely.
+    # Route through the Windows backend's drain helper, which writes the
+    # same marker and then waits, and escalate only once that bounded
+    # window is spent.
+    drained = _drain_windows_gateway_pid(pid) if is_windows() else False
 
-        write_planned_stop_marker(pid)
-    except Exception:
-        pass
+    if not drained:
+        try:
+            from gateway.status import write_planned_stop_marker
 
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass  # Already gone
-    except PermissionError:
-        print(f"⚠ Permission denied to kill PID {pid}")
-        return False
+            write_planned_stop_marker(pid)
+        except Exception:
+            pass
+
+        try:
+            if is_windows():
+                from gateway.status import terminate_pid
+
+                # The drain window is spent — escalate with the same
+                # bounded tree-kill the Windows backend uses
+                # (``taskkill /T /F``), not a bare TerminateProcess that
+                # would strand the detached gateway's children.
+                terminate_pid(pid, force=True)
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # Already gone
+        except PermissionError:
+            print(f"⚠ Permission denied to kill PID {pid}")
+            return False
+        except OSError as exc:
+            print(f"⚠ Failed to stop gateway PID {pid}: {exc}")
+            return False
 
     # Wait briefly for it to exit. On Windows, os.kill(pid, 0) is NOT
     # a no-op — route through the cross-platform existence check.
@@ -4962,11 +5056,65 @@ def launchd_install(force: bool = False):
 def launchd_uninstall():
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
-    subprocess.run(
-        ["launchctl", "bootout", f"{_launchd_domain()}/{label}"],
-        check=False,
-        timeout=90,
-    )
+    target = f"{_launchd_domain()}/{label}"
+
+    pid = None
+    try:
+        from gateway.status import get_running_pid, write_planned_stop_marker
+
+        pid = get_running_pid(cleanup_stale=False)
+        if pid is not None:
+            write_planned_stop_marker(pid)
+    except Exception:
+        pid = None
+
+    # Same bootout fall-through launchd_stop() handles: "job already unloaded"
+    # (3/113/125) and "domain unmanageable" (5/125 — the macOS 26+ detached
+    # fallback process, #23387) both mean launchd never took the job, so it
+    # will not send SIGTERM and will not escalate. Uninstall previously sent
+    # nothing at all on that path, leaving the gateway running.
+    #
+    # Any other launchctl failure is left to launchd: uninstall has always
+    # tolerated a failing bootout (it ran with check=False), and pre-empting
+    # a job launchd may still be supervising would just get the process
+    # respawned by KeepAlive.
+    launchd_owns_exit = True
+    try:
+        subprocess.run(["launchctl", "bootout", target], check=True, timeout=90)
+    except subprocess.CalledProcessError as e:
+        if _launchd_error_indicates_unloaded(e) or _launchctl_domain_unsupported(
+            e.returncode
+        ):
+            launchd_owns_exit = False
+
+    if launchd_owns_exit:
+        exited = _wait_for_gateway_exit(
+            timeout=_GATEWAY_STOP_WAIT_SECONDS, force_after=None
+        )
+    else:
+        if pid is not None:
+            try:
+                terminate_pid(pid, force=False)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        exited = _wait_for_gateway_exit(
+            timeout=_GATEWAY_STOP_WAIT_SECONDS,
+            force_after=_GATEWAY_STOP_GRACE_SECONDS,
+        )
+
+    if not exited:
+        # Keep the plist. Removing the service definition out from under a
+        # live gateway strands the operator: `hermes gateway stop` then takes
+        # this same unsupervised fall-through, and `hermes gateway start`
+        # bootstraps a SECOND instance against the same bot token and port.
+        # systemd_uninstall() does not have this problem because `systemctl
+        # stop` is synchronous — it does not return until the unit is down.
+        print(
+            f"⚠ Gateway is still running after {_GATEWAY_STOP_WAIT_SECONDS:.0f}s; "
+            f"keeping {plist_path} so the service can still be stopped."
+        )
+        print("  Stop it, then re-run: hermes gateway stop && hermes gateway uninstall")
+        return
 
     if plist_path.exists():
         plist_path.unlink()
@@ -5036,6 +5184,7 @@ def launchd_start():
 def launchd_stop():
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
+    pid = None
     try:
         from gateway.status import get_running_pid, write_planned_stop_marker
 
@@ -5043,25 +5192,91 @@ def launchd_stop():
         if pid is not None:
             write_planned_stop_marker(pid)
     except Exception:
-        pass
+        pid = None
     # bootout unloads the service definition so KeepAlive doesn't respawn
     # the process.  A plain `kill SIGTERM` only signals the process — launchd
     # immediately restarts it because KeepAlive is unconditionally true.
     # `hermes gateway start` re-bootstraps when it detects the job is unloaded.
+    launchd_owns_exit = True
     try:
         subprocess.run(["launchctl", "bootout", target], check=True, timeout=90)
     except subprocess.CalledProcessError as e:
         # Job already unloaded (3/113/125), or the domain can't be managed at
         # all (5/125, macOS 26+ detached-fallback process, issue #23387) — in
-        # both cases just fall through to the PID-based kill below.
+        # both cases launchd is not supervising this exit, so the CLI owns the
+        # stop and falls through to the PID-based path below.
         if _launchd_error_indicates_unloaded(e) or _launchctl_domain_unsupported(
             e.returncode
         ):
-            pass
+            launchd_owns_exit = False
         else:
             raise
-    _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+    if launchd_owns_exit:
+        # bootout succeeded, so launchd sent SIGTERM and will escalate to
+        # SIGKILL on its own once the plist's ExitTimeOut expires. Forcing from
+        # here would pre-empt that budget and amputate the post-drain teardown,
+        # so only wait — long enough to actually observe launchd's escalation
+        # rather than returning early and reporting a stop that has not
+        # happened. Mirrors launchd_restart(), which likewise passes
+        # force_after=None.
+        exited = _wait_for_gateway_exit(
+            timeout=_GATEWAY_STOP_WAIT_SECONDS, force_after=None
+        )
+    else:
+        # Nothing is supervising this process — launchd never took the job, or
+        # the domain is unmanageable and the gateway is a detached fallback
+        # process (#23387). The CLI is the only thing that will ever signal it,
+        # and previously the only signal it sent was a SIGKILL 5s in, so the
+        # gateway never got a graceful stop at all on this path. Terminate
+        # gracefully first, then escalate no sooner than the budget launchd
+        # itself would have granted.
+        if pid is not None:
+            try:
+                terminate_pid(pid, force=False)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        exited = _wait_for_gateway_exit(
+            timeout=_GATEWAY_STOP_WAIT_SECONDS,
+            force_after=_GATEWAY_STOP_GRACE_SECONDS,
+        )
+    if not exited:
+        # The wait has already named the surviving PID ("still running after
+        # Ns — restart may fail"); following that with "✓ Service stopped"
+        # tells the operator the opposite of what just happened. Report the
+        # stop we actually observed instead. Mirrors systemd_stop(), which
+        # returns with "still stopping after 90s" rather than its ✓ line, and
+        # launchd_restart(), which already branches on this same result.
+        print(
+            f"⚠ Gateway is still running after {_GATEWAY_STOP_WAIT_SECONDS:.0f}s; "
+            "check `hermes gateway status` or logs for final shutdown state."
+        )
+        return
     print("✓ Service stopped")
+
+
+# Graceful-stop budget the CLI must not pre-empt.
+#
+# Every service manager we install already grants the gateway a drain window
+# before escalating SIGTERM -> SIGKILL itself: the launchd plist sets
+# ``ExitTimeOut`` to 25s (see the template in ``generate_launchd_plist``) and
+# the systemd unit sets ``TimeoutStopSec`` to ``max(60, drain + 30)``. 25s is
+# therefore the smallest budget any installed manager honours, and the CLI
+# must not force-kill inside it.
+#
+# The budget is not cosmetic. ``gateway/run.py`` runs its post-drain teardown
+# after the drain completes -- closing the SQLite session databases (releasing
+# the WAL write lock), removing the PID file, releasing the runtime lock, and
+# finally touching the ``.clean_shutdown`` marker. A SIGKILL sent inside the
+# budget skips all of it, so the next start finds a held WAL lock
+# ("database is locked"), a stale PID ("bot token already in use (PID ...)"),
+# and a missing ``.clean_shutdown`` marker, which suspends recently-active
+# sessions.
+_GATEWAY_STOP_GRACE_SECONDS = 25.0
+
+# Total time to wait for exit: the grace budget plus headroom to observe the
+# escalation actually land. The wait returns as soon as the PID is gone, so
+# this is a ceiling on a wedged stop, not an added delay on a healthy one.
+_GATEWAY_STOP_WAIT_SECONDS = _GATEWAY_STOP_GRACE_SECONDS + 5.0
 
 
 def _wait_for_gateway_exit(
@@ -5114,6 +5329,33 @@ def _wait_for_gateway_exit(
         )
         return False
     return True
+
+
+def _abort_on_surviving_gateway(action: str) -> None:
+    """Stop a start/restart that the preceding stop did not actually clear.
+
+    ``_wait_for_gateway_exit`` returns False only once its own force-kill
+    deadline has passed and the PID is *still* alive — it has already sent
+    SIGKILL and printed "still running after Ns — restart may fail". Naming
+    the restart in that warning is the whole point: the caller is about to
+    start a replacement, and doing so is worse than failing here.
+    gateway/run.py writes gateway.pid at startup, so the new process takes
+    over the survivor's record and the survivor becomes precisely the orphan
+    stop_profile_gateway() has to sweep for afterwards (#75936) — no longer
+    reachable through `hermes gateway stop`, still holding the webhook port
+    and the same bot token.
+
+    Never returns; exits non-zero the same way the service-restart failure
+    below it does.
+    """
+    print()
+    print(f"✗ Gateway {action} aborted — the previous gateway is still running.")
+    print(
+        "  Starting a second instance would take over the PID file and leave the"
+    )
+    print("  survivor unreachable from the CLI, holding the same port.")
+    print("  Check `hermes gateway status`, then retry once it is down.")
+    sys.exit(1)
 
 
 def launchd_restart():
@@ -7677,7 +7919,17 @@ def _gateway_command_inner(args):
                 print(
                     f"✓ Killed {killed} stale gateway process(es) across all profiles"
                 )
-                _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+                # kill_gateway_processes() sends SIGTERM; give those drains the
+                # service manager's own budget before escalating to SIGKILL.
+                # If one outlives that too, do not go on to bootstrap a second
+                # instance against the same bot token and port — the outcome
+                # launchd_uninstall() keeps its plist to avoid.
+                exited = _wait_for_gateway_exit(
+                    timeout=_GATEWAY_STOP_WAIT_SECONDS,
+                    force_after=_GATEWAY_STOP_GRACE_SECONDS,
+                )
+                if not exited:
+                    _abort_on_surviving_gateway("start")
 
         if is_termux():
             print(
@@ -7880,7 +8132,16 @@ def _gateway_command_inner(args):
             total = killed + (1 if service_stopped else 0)
             if total:
                 print(f"✓ Stopped {total} gateway process(es) across all profiles")
-            _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+            # The service stop above and kill_gateway_processes() both signal
+            # gracefully; escalate only once the manager's own budget is spent.
+            # A False here means the PID outlived even that SIGKILL, so the
+            # fresh start below would stack a second gateway on the first.
+            exited = _wait_for_gateway_exit(
+                timeout=_GATEWAY_STOP_WAIT_SECONDS,
+                force_after=_GATEWAY_STOP_GRACE_SECONDS,
+            )
+            if not exited:
+                _abort_on_surviving_gateway("restart")
 
             # Start the current profile's service fresh
             print("Starting gateway...")
@@ -7974,7 +8235,18 @@ def _gateway_command_inner(args):
             if stop_profile_gateway():
                 print("✓ Stopped gateway for this profile")
 
-            _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+            # stop_profile_gateway() sends SIGTERM and polls for ~10s; keep
+            # escalating no earlier than the service manager's own budget so a
+            # slow drain finishes its teardown instead of being SIGKILLed.
+            # Nothing supervises this path, so an unheeded False here is worse
+            # than on the service branches: run_gateway() below runs the
+            # replacement in the foreground of this very shell.
+            exited = _wait_for_gateway_exit(
+                timeout=_GATEWAY_STOP_WAIT_SECONDS,
+                force_after=_GATEWAY_STOP_GRACE_SECONDS,
+            )
+            if not exited:
+                _abort_on_surviving_gateway("restart")
 
             # Start fresh
             print("Starting gateway...")
