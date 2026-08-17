@@ -31,15 +31,23 @@ _GOOD_SUMMARY = {
     "source_sessions": 3,
     "source_messages": 12,
     "imported_sessions": 3,
+    # Counts scoped to THIS migration. These are what success is judged on;
+    # target_* are whole-table totals that also include pre-existing rows.
+    "migrated_sessions": 3,
+    "migrated_messages": 12,
     "target_sessions": 3,
     "target_messages": 12,
     "nul_rows": 0,
+    "complete": True,
 }
 
 _MISMATCH_SUMMARY = {
     **_GOOD_SUMMARY,
-    "target_sessions": 2,  # one short
+    "migrated_sessions": 2,  # one short
+    "migrated_messages": 9,
+    "target_sessions": 2,
     "target_messages": 9,
+    "complete": False,
 }
 
 
@@ -435,3 +443,91 @@ class TestArgumentParsing:
         assert "--dsn" in help_text
         assert "--sqlite-path" in help_text
         assert "--yes" in help_text or "-y" in help_text
+
+
+# ---------------------------------------------------------------------------
+# Incomplete-migration detection
+#
+# Rows keep their original SQLite ids and are inserted with ON CONFLICT DO
+# NOTHING, so a target whose id space overlaps the source's silently discards
+# the colliding rows. The target's whole-table totals cannot detect that: a
+# target that already holds rows satisfies any ">= source" comparison no matter
+# how much was dropped. Success must be judged on counts scoped to the sessions
+# this run actually migrated.
+#
+# Concretely: migrating a 3-session / 6-message database into a target that
+# already held 12 messages imported all 3 sessions and 0 messages, and the
+# command reported success with exit 0.
+# ---------------------------------------------------------------------------
+
+
+def test_dropped_messages_fail_the_command():
+    """Every session arrives, every message is dropped -> must not report OK."""
+    summary = {
+        **_GOOD_SUMMARY,
+        "source_sessions": 3,
+        "source_messages": 6,
+        "migrated_sessions": 3,
+        "migrated_messages": 0,
+        # Healthy-looking totals from rows that were already present.
+        "target_sessions": 7,
+        "target_messages": 12,
+        "complete": False,
+    }
+    args = _make_args(dsn="postgresql://u:p@h:5432/d", yes=True)
+    with patch("migrate_state_to_postgres.migrate", return_value=summary), patch(
+        "migrate_state_to_postgres._resolve_sqlite_path",
+        return_value=Path("/tmp/state.db"),
+    ):
+        rc, out, _err = _run(args, tty=False)
+
+    assert rc != 0, f"incomplete migration reported success:\n{out}"
+    assert "0/6" in out, f"missing-message count not surfaced:\n{out}"
+
+
+def test_healthy_target_totals_do_not_mask_missing_rows():
+    """Regression: totals far exceeding the source used to read as success."""
+    summary = {
+        **_GOOD_SUMMARY,
+        "source_sessions": 2,
+        "source_messages": 4,
+        "migrated_sessions": 2,
+        "migrated_messages": 1,
+        "target_sessions": 99,
+        "target_messages": 99,
+        "complete": False,
+    }
+    args = _make_args(dsn="postgresql://u:p@h:5432/d", yes=True)
+    with patch("migrate_state_to_postgres.migrate", return_value=summary), patch(
+        "migrate_state_to_postgres._resolve_sqlite_path",
+        return_value=Path("/tmp/state.db"),
+    ):
+        rc, out, _err = _run(args, tty=False)
+
+    assert rc != 0, (
+        "target totals exceeding the source must not be read as success when "
+        f"the migrated counts fall short:\n{out}"
+    )
+
+
+def test_complete_migration_reports_scoped_counts():
+    """The happy path reports migrated/source, not whole-table totals."""
+    summary = {
+        **_GOOD_SUMMARY,
+        "source_sessions": 3,
+        "source_messages": 6,
+        "migrated_sessions": 3,
+        "migrated_messages": 6,
+        "target_sessions": 3,
+        "target_messages": 6,
+        "complete": True,
+    }
+    args = _make_args(dsn="postgresql://u:p@h:5432/d", yes=True)
+    with patch("migrate_state_to_postgres.migrate", return_value=summary), patch(
+        "migrate_state_to_postgres._resolve_sqlite_path",
+        return_value=Path("/tmp/state.db"),
+    ):
+        rc, out, _err = _run(args, tty=False)
+
+    assert rc == 0, out
+    assert "3/3" in out and "6/6" in out, out

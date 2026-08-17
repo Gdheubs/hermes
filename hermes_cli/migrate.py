@@ -254,32 +254,41 @@ def cmd_migrate_state_to_postgres(args: Any) -> int:
         return 1
 
     # --- Report results ---
+    # Compare against the counts scoped to THIS migration, not the target's
+    # whole-table totals: a target that already holds rows would otherwise
+    # satisfy any >= check no matter how much of the source was dropped.
     src_s = summary["source_sessions"]
     src_m = summary["source_messages"]
+    got_s = summary["migrated_sessions"]
+    got_m = summary["migrated_messages"]
     dst_s = summary["target_sessions"]
     dst_m = summary["target_messages"]
 
-    sessions_ok = dst_s >= src_s
-    messages_ok = dst_m >= src_m
+    sessions_ok = got_s == src_s
+    messages_ok = got_m == src_m
     ok = sessions_ok and messages_ok and summary.get("nul_rows", 0) == 0
 
     if ok:
         print(
             f"  {color('✓', Colors.GREEN)} Migration complete.\n"
-            f"    Sessions : {src_s} source → {dst_s} in target\n"
-            f"    Messages : {src_m} source → {dst_m} in target\n"
+            f"    Sessions : {got_s}/{src_s} migrated\n"
+            f"    Messages : {got_m}/{src_m} migrated\n"
+            f"    Target now holds {dst_s} sessions / {dst_m} messages in total\n"
             f"    SQLite source left untouched: {summary['sqlite_path']}"
         )
     else:
         print(
-            f"  {color('⚠', Colors.YELLOW)} Migration finished with a COUNT MISMATCH — "
-            "verify before switching backends.\n"
-            f"    Sessions : {src_s} source → {dst_s} in target"
-            + (f"  {color('← MISMATCH', Colors.YELLOW)}" if not sessions_ok else "")
-            + f"\n    Messages : {src_m} source → {dst_m} in target"
-            + (f"  {color('← MISMATCH', Colors.YELLOW)}" if not messages_ok else "")
+            f"  {color('⚠', Colors.YELLOW)} Migration INCOMPLETE — rows are missing "
+            "from the target. Do not switch backends yet.\n"
+            f"    Sessions : {got_s}/{src_s} migrated"
+            + (f"  {color('← MISSING', Colors.YELLOW)}" if not sessions_ok else "")
+            + f"\n    Messages : {got_m}/{src_m} migrated"
+            + (f"  {color('← MISSING', Colors.YELLOW)}" if not messages_ok else "")
             + f"\n    nul_rows : {summary.get('nul_rows', 0)}"
-            + f"\n    SQLite source left untouched: {summary['sqlite_path']}"
+            + f"\n    SQLite source left untouched: {summary['sqlite_path']}\n"
+            + "\n  Rows keep their original SQLite ids and are inserted with "
+            "ON CONFLICT DO NOTHING,\n  so this usually means the target already "
+            "contains rows with the same ids.\n  Migrate into an empty database."
         )
         return 1
 

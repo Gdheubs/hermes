@@ -122,6 +122,7 @@ def migrate(sqlite_path: Path, dsn: str) -> dict:
 
     src_sessions = len(exported)
     src_messages = sum(len(s.get("messages") or []) for s in exported)
+    src_session_ids = [s["id"] for s in exported if s.get("id")]
 
     target = hsp.connect_postgres(dsn)
     try:
@@ -136,6 +137,28 @@ def migrate(sqlite_path: Path, dsn: str) -> dict:
         dst_messages = target.execute(
             "SELECT COUNT(*) AS n FROM messages"
         ).fetchone()["n"]
+
+        # Whole-table totals cannot verify THIS migration: a target that already
+        # holds rows looks plausible no matter how much of the source was
+        # dropped. Rows are inserted with ON CONFLICT DO NOTHING and carry their
+        # original SQLite ids, so a target whose id space overlaps the source's
+        # silently discards every colliding message. Count only the sessions we
+        # just migrated, so the check measures the thing it claims to.
+        if src_session_ids:
+            placeholders = ", ".join("?" for _ in src_session_ids)
+            migrated_sessions = target.execute(
+                f"SELECT COUNT(*) AS n FROM sessions WHERE id IN ({placeholders})",
+                tuple(src_session_ids),
+            ).fetchone()["n"]
+            migrated_messages = target.execute(
+                f"SELECT COUNT(*) AS n FROM messages"
+                f" WHERE session_id IN ({placeholders})",
+                tuple(src_session_ids),
+            ).fetchone()["n"]
+        else:
+            migrated_sessions = 0
+            migrated_messages = 0
+
         # PostgreSQL's text type structurally cannot store a NUL byte — a row
         # carrying one is rejected at INSERT time. So a successful import is
         # itself the proof that no NUL survived; there is nothing left to count.
@@ -148,9 +171,22 @@ def migrate(sqlite_path: Path, dsn: str) -> dict:
         "source_sessions": src_sessions,
         "source_messages": src_messages,
         "imported_sessions": imported,
+        # Counts restricted to the sessions this run migrated. These are the
+        # numbers to compare against source_*; the target_* totals below are
+        # whole-table and include anything that was already there.
+        "migrated_sessions": migrated_sessions,
+        "migrated_messages": migrated_messages,
         "target_sessions": dst_sessions,
         "target_messages": dst_messages,
         "nul_rows": nul_rows,
+        # True when every source row is accounted for in the target. False
+        # means rows were dropped -- most likely an id collision, since rows
+        # keep their original SQLite ids and are inserted with
+        # ON CONFLICT DO NOTHING.
+        "complete": (
+            migrated_sessions == src_sessions
+            and migrated_messages == src_messages
+        ),
     }
 
 
@@ -176,19 +212,24 @@ def main(argv: list[str] | None = None) -> int:
 
     summary = migrate(sqlite_path, dsn)
 
-    ok = (
-        summary["target_sessions"] == summary["source_sessions"]
-        and summary["target_messages"] == summary["source_messages"]
-        and summary["nul_rows"] == 0
-    )
+    ok = summary["complete"] and summary["nul_rows"] == 0
     status = "OK" if ok else "MISMATCH"
     print(
-        f"{status} migrated {summary['source_sessions']} sessions / "
-        f"{summary['source_messages']} messages -> PostgreSQL "
-        f"(target: {summary['target_sessions']} sessions / "
-        f"{summary['target_messages']} messages, nul_rows={summary['nul_rows']}). "
+        f"{status} migrated {summary['migrated_sessions']}/"
+        f"{summary['source_sessions']} sessions and "
+        f"{summary['migrated_messages']}/{summary['source_messages']} messages "
+        f"-> PostgreSQL (target now holds {summary['target_sessions']} sessions "
+        f"/ {summary['target_messages']} messages in total). "
         f"SQLite source left untouched: {summary['sqlite_path']}"
     )
+    if not ok:
+        print(
+            "Some source rows are not present in the target. Rows keep their "
+            "original SQLite ids and are inserted with ON CONFLICT DO NOTHING, "
+            "so this usually means the target already contains rows with the "
+            "same ids. Migrate into an empty database.",
+            file=sys.stderr,
+        )
     return 0 if ok else 1
 
 
