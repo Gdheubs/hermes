@@ -433,6 +433,106 @@ class TestTurnTraceIsolation:
         assert len(exited) == 1
         assert exited[0] == (None, None, None)
 
+    def test_finish_trace_bounds_hanging_flush(self, monkeypatch):
+        """#87468: client.flush() blocks until the batch exporter drains —
+        unbounded against an unresponsive backend. _finish_trace's finally
+        used to call it inline, so a hang stalled turn finalization past the
+        cron inactivity watchdog and discarded the turn's real output. The
+        bounded flush must let finalization proceed within the deadline."""
+        import threading
+        import time
+
+        mod = self._fresh_plugin()
+        monkeypatch.setattr(mod, "_end_observation", lambda *a, **k: None)
+        monkeypatch.setattr(mod, "_FLUSH_TIMEOUT_SECONDS", 0.05)
+        mod._TRACE_STATE.clear()
+
+        never = threading.Event()
+
+        class _HangingClient:
+            def create_trace_id(self, seed=None):
+                return f"trace::{seed}"
+
+            def start_as_current_observation(self, **kw):
+                client = self
+
+                class _CM:
+                    def __enter__(self):
+                        return client
+
+                    def __exit__(self, *exc):
+                        return False
+
+                return _CM()
+
+            def update(self, **kw):
+                pass
+
+            def end(self, **kw):
+                pass
+
+            def set_trace_io(self, **kw):
+                pass
+
+            def start_observation(self, **kw):
+                return self
+
+            def flush(self):
+                never.wait(30)  # simulate an unresponsive backend
+
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: _HangingClient())
+
+        start = time.monotonic()
+        self._run_turn(mod, session="sess-hang", turn_n=1, finalize=True)
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 5.0, (
+            f"_finish_trace blocked {elapsed:.1f}s on a hanging flush — "
+            "turn finalization must proceed within the flush deadline"
+        )
+
+    def test_finish_trace_swallows_flush_exception(self, monkeypatch):
+        """A flushing *error* (as opposed to a hang) stays fail-open."""
+        mod = self._fresh_plugin()
+        monkeypatch.setattr(mod, "_end_observation", lambda *a, **k: None)
+        mod._TRACE_STATE.clear()
+
+        class _ExplodingClient:
+            def create_trace_id(self, seed=None):
+                return f"trace::{seed}"
+
+            def start_as_current_observation(self, **kw):
+                client = self
+
+                class _CM:
+                    def __enter__(self):
+                        return client
+
+                    def __exit__(self, *exc):
+                        return False
+
+                return _CM()
+
+            def update(self, **kw):
+                pass
+
+            def end(self, **kw):
+                pass
+
+            def set_trace_io(self, **kw):
+                pass
+
+            def start_observation(self, **kw):
+                return self
+
+            def flush(self):
+                raise RuntimeError("exporter exploded")
+
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: _ExplodingClient())
+
+        # Must not raise.
+        self._run_turn(mod, session="sess-explode", turn_n=1, finalize=True)
+
 
 # ---------------------------------------------------------------------------
 # Placeholder-credential guard (#23823).
