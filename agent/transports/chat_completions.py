@@ -12,6 +12,7 @@ reasoning configuration, temperature handling, and extra_body assembly.
 import json
 from typing import Any, Dict
 
+from agent.atem_dialect import extract_atem_tool_calls, is_muse_glimmer_model
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
 from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
@@ -933,6 +934,23 @@ class ChatCompletionsTransport(ProviderTransport):
         # loop's refusal handler surfaces it clearly and stops. ``refusal`` is
         # ``None`` for normal responses, so this is a no-op in the common case.
         content = msg.content
+
+        # Muse-Glimmer (and any future ATEM-speaking model) never populates
+        # ``msg.tool_calls`` — its chat template writes calls as inline
+        # ``<atem:function_calls>`` markup in ``content`` instead (see
+        # ``agent/atem_dialect.py``). Recover them here, before the refusal
+        # check below, so a real ATEM call isn't mistaken for an empty response.
+        if not tool_calls and is_muse_glimmer_model(getattr(response, "model", None)):
+            atem_calls, atem_content, atem_malformed = extract_atem_tool_calls(content or "")
+            if atem_calls:
+                tool_calls = [
+                    ToolCall(id=call_id, name=name, arguments=arguments)
+                    for call_id, name, arguments in atem_calls
+                ]
+                content = atem_content
+            if atem_malformed:
+                provider_data["atem_malformed"] = atem_malformed
+
         refusal = getattr(msg, "refusal", None)
         if refusal is None and hasattr(msg, "model_extra"):
             _msg_extra = getattr(msg, "model_extra", None) or {}

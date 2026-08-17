@@ -810,3 +810,82 @@ class TestPromptCacheKeyCapability:
             provider_profile=profile,
         )
         assert "prompt_cache_key" not in kwargs
+
+
+class TestChatCompletionsNormalizeAtem:
+    """Muse-Glimmer never populates ``message.tool_calls`` — its chat template
+    writes calls as inline ``<atem:function_calls>`` markup in ``content``
+    instead (see ``agent/atem_dialect.py``). ``normalize_response`` must
+    recover them from a model whose ``response.model`` identifies it as
+    Muse-Glimmer, and must leave every other model untouched.
+    """
+
+    def _atem_response(self, content, *, model="meta-models/Muse-Glimmer-30B", tool_calls=None):
+        return SimpleNamespace(
+            model=model,
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(content=content, tool_calls=tool_calls, reasoning_content=None),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+
+    def test_atem_call_recovered_from_content(self, transport):
+        content = (
+            "<atem:function_calls>\n"
+            '<atem:invoke name="terminal">\n'
+            '<atem:parameter name="command">ls logs/</atem:parameter>\n'
+            "</atem:invoke>\n"
+            "</atem:function_calls>"
+        )
+        nr = transport.normalize_response(self._atem_response(content))
+        assert len(nr.tool_calls) == 1
+        assert nr.tool_calls[0].name == "terminal"
+        assert json.loads(nr.tool_calls[0].arguments) == {"command": "ls logs/"}
+        assert nr.content == ""
+
+    def test_atem_call_with_surrounding_prose_keeps_visible_text(self, transport):
+        content = (
+            "One moment.\n"
+            "<atem:function_calls>\n"
+            '<atem:invoke name="terminal">\n'
+            '<atem:parameter name="command">pwd</atem:parameter>\n'
+            "</atem:invoke>\n"
+            "</atem:function_calls>"
+        )
+        nr = transport.normalize_response(self._atem_response(content))
+        assert len(nr.tool_calls) == 1
+        assert nr.content == "One moment."
+
+    def test_non_atem_model_content_is_left_alone(self, transport):
+        """A model whose slug doesn't match Muse-Glimmer must never have its
+        content parsed for ATEM markup, even if it happens to contain similar
+        text (e.g. discussing the format, or quoting it)."""
+        content = "<atem:function_calls>not really a call</atem:function_calls>"
+        nr = transport.normalize_response(self._atem_response(content, model="gpt-5.4"))
+        assert nr.tool_calls is None
+        assert nr.content == content
+
+    def test_atem_model_with_no_call_markup_is_plain_text(self, transport):
+        nr = transport.normalize_response(self._atem_response("Just an answer, no tool needed."))
+        assert nr.tool_calls is None
+        assert nr.content == "Just an answer, no tool needed."
+
+    def test_structured_tool_calls_take_precedence_over_atem_parsing(self, transport):
+        """If a Muse-Glimmer-labeled response somehow already carries real
+        OpenAI-shaped tool_calls, they must win — ATEM parsing only runs when
+        ``msg.tool_calls`` is empty."""
+        tc = SimpleNamespace(id="call_1", function=SimpleNamespace(name="real", arguments="{}"))
+        nr = transport.normalize_response(self._atem_response("ignored", tool_calls=[tc]))
+        assert len(nr.tool_calls) == 1
+        assert nr.tool_calls[0].name == "real"
+        assert nr.content == "ignored"
+
+    def test_malformed_atem_call_surfaces_in_provider_data(self, transport):
+        """An unclosed call block (the likeliest truncation failure) must be
+        reported rather than silently read as an empty response."""
+        content = 'I\'ll check.\n<atem:function_calls>\n<atem:invoke name="terminal">'
+        nr = transport.normalize_response(self._atem_response(content))
+        assert nr.tool_calls is None
+        assert nr.provider_data is not None
+        assert any("never closed" in m for m in nr.provider_data["atem_malformed"])
