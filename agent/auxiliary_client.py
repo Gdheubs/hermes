@@ -2800,7 +2800,13 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
             "auxiliary.free_only.",
             or_model,
         )
-        _mark_provider_unhealthy("openrouter", ttl=60)
+        # A config-gate skip is a local policy decision, not a provider
+        # failure: do NOT mark OpenRouter unhealthy here. The unhealthy cache
+        # hides the provider from fallback-chain iteration for its TTL, which
+        # would suppress a subsequent *legitimate* explicitly-requested :free
+        # model from another caller within the window (the second half of
+        # #85315). The gate never touched the provider, so there is nothing
+        # to cool down.
         return None, None
     if not _is_free_model(or_model):
         _warn_paid_lane_once(or_model)
@@ -2819,15 +2825,33 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
 
     or_key = explicit_api_key or _scoped_key_env("OPENROUTER_API_KEY")
     if not or_key:
-        _mark_provider_unhealthy("openrouter", ttl=60)
+        _mark_provider_unhealthy(
+            "openrouter", ttl=60, reason="no OpenRouter credentials"
+        )
         return None, None
     logger.debug("Auxiliary client: OpenRouter")
     return _create_openai_client(api_key=or_key, base_url=OPENROUTER_BASE_URL,
                    default_headers=build_or_headers()), or_model
 
 
-def _describe_openrouter_unavailable() -> str:
-    """Return a more precise OpenRouter auth failure reason for logs."""
+def _describe_openrouter_unavailable(model: Optional[str] = None) -> str:
+    """Return the policy or credential reason OpenRouter was unavailable.
+
+    ``model`` is the slug the caller actually requested (``None`` when the
+    caller let config/default decide). The ``auxiliary.free_only`` gate is
+    checked first: it rejects OpenRouter before any credential is read, so
+    reporting a credential problem there would send the user hunting for a
+    key that is present and funded (#85315).
+    """
+    free_only, cfg_model = _aux_openrouter_settings()
+    or_model = model or cfg_model
+    if free_only and not _is_free_model(or_model):
+        return (
+            f"auxiliary.free_only rejected non-free model {or_model!r}; "
+            "the request was skipped before provider availability checks. "
+            "Set auxiliary.openrouter_model to a :free model or disable "
+            "auxiliary.free_only"
+        )
     pool_present, entry = _select_pool_entry("openrouter")
     if pool_present:
         if entry is None:
@@ -3999,10 +4023,19 @@ def _normalize_chain_label(provider: str) -> str:
     return _AUX_UNHEALTHY_LABEL_ALIASES.get(p, p)
 
 
-def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None:
-    """Mark ``provider`` as recently-402'd, hidden from chain iteration
+def _mark_provider_unhealthy(
+    provider: str,
+    ttl: Optional[float] = None,
+    reason: str = "payment / credit error",
+) -> None:
+    """Mark ``provider`` as recently-failed, hidden from chain iteration
     until the TTL expires. Called from the payment-fallback branches in
     ``call_llm`` and ``acall_llm`` after a confirmed payment error.
+
+    ``reason`` is surfaced verbatim in the WARNING. It defaults to the
+    historical payment wording for the payment-fallback callers; other
+    callers (config gates, missing credentials) pass their own so a skip
+    is not misreported as a payment error (#85315).
     """
     label = _normalize_chain_label(provider)
     if not label:
@@ -4010,10 +4043,11 @@ def _mark_provider_unhealthy(provider: str, ttl: Optional[float] = None) -> None
     expires_at = time.time() + (ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS)
     _aux_unhealthy_until[label] = expires_at
     logger.warning(
-        "Auxiliary: marking %s unhealthy for %ds (payment / credit error). "
+        "Auxiliary: marking %s unhealthy for %ds (%s). "
         "Subsequent auxiliary calls will skip it until %s.",
         label,
         int(ttl if ttl is not None else _AUX_UNHEALTHY_TTL_SECONDS),
+        reason,
         time.strftime("%H:%M:%S", time.localtime(expires_at)),
     )
 
@@ -6274,11 +6308,17 @@ def resolve_provider_client(
 
     # ── OpenRouter ───────────────────────────────────────────
     if provider == "openrouter":
-        client, default = _try_openrouter(explicit_api_key=explicit_api_key)
+        # Forward the caller's model so the ``auxiliary.free_only`` gate judges
+        # the slug that will actually be sent, not the config default ─ a caller
+        # explicitly requesting a :free model was otherwise rejected on the
+        # unrelated paid default from auxiliary.openrouter_model (#85315).
+        client, default = _try_openrouter(
+            explicit_api_key=explicit_api_key, model=model
+        )
         if client is None:
             logger.warning(
                 "resolve_provider_client: openrouter requested but %s",
-                _describe_openrouter_unavailable(),
+                _describe_openrouter_unavailable(model),
             )
             return None, None
         final_model = _normalize_resolved_model(model or default, provider)

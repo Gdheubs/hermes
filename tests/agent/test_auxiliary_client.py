@@ -1042,6 +1042,51 @@ class TestOpenRouterPaidLaneGuard:
         assert model is None
         mock_openai.assert_not_called()
 
+    def test_resolver_forwards_explicit_free_model_to_gate(self, monkeypatch):
+        """The concrete OpenRouter route gates the caller's model, not its default."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"free_only": True}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_client = MagicMock(name="openrouter_client")
+            mock_openai.return_value = mock_client
+            client, model = resolve_provider_client(
+                "openrouter", model="nvidia/nemotron-3-ultra-550b-a55b:free"
+            )
+
+        assert client is mock_client
+        assert model == "nvidia/nemotron-3-ultra-550b-a55b:free"
+
+    def test_free_only_gate_does_not_mark_openrouter_unhealthy(self, monkeypatch):
+        """A config-gate skip is not a provider failure: health cache untouched."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"free_only": True}}), \
+             patch("agent.auxiliary_client._mark_provider_unhealthy") as mark_unhealthy:
+            client, model = resolve_provider_client(
+                "openrouter", model="google/gemini-3.6-flash"
+            )
+
+        assert client is None
+        assert model is None
+        mark_unhealthy.assert_not_called()
+
+    def test_free_only_gate_reports_policy_not_credentials(self, monkeypatch, caplog):
+        """A policy skip must not claim a payment/credential failure."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"free_only": True}}), \
+             caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            resolve_provider_client("openrouter", model="google/gemini-3.6-flash")
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any("free_only" in message and "google/gemini-3.6-flash" in message
+                   for message in messages)
+        assert not any("credentials" in message for message in messages)
+
     def test_paid_lane_warns_once(self, monkeypatch, caplog):
         """Engaging the default paid model logs a WARNING (once per model)."""
         import logging
@@ -1074,6 +1119,242 @@ class TestOpenRouterPaidLaneGuard:
         assert not _is_free_model("google/gemini-3.6-flash")
         assert not _is_free_model("")
         assert not _is_free_model(None)
+
+
+class TestFreeOnlyGateHonoursCallerModel:
+    """Regression: the free_only gate must judge the model actually requested.
+
+    ``resolve_provider_client()`` used to drop its ``model`` argument on the
+    floor, so the gate evaluated ``auxiliary.openrouter_model`` (whose default
+    is the PAID ``google/gemini-3.6-flash``) even when the caller explicitly
+    asked for a ``:free`` SKU. Every such call was rejected, OpenRouter was
+    marked unhealthy as a bogus "payment / credit error", and the log blamed
+    missing credentials on a key that is present and funded.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_unhealthy(self):
+        from agent.auxiliary_client import _aux_unhealthy_until
+        _aux_unhealthy_until.clear()
+        yield
+        _aux_unhealthy_until.clear()
+
+    def test_explicit_free_model_passes_gate_despite_paid_config_default(
+        self, monkeypatch
+    ):
+        """Caller asks for a :free model → resolved, not skipped."""
+        from agent.auxiliary_client import resolve_provider_client
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        free_sku = "nvidia/nemotron-3-ultra-550b-a55b:free"
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"free_only": True}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock(name="openrouter_client")
+            client, model = resolve_provider_client("openrouter", free_sku)
+
+        assert client is not None
+        assert model == free_sku
+
+    def test_paid_caller_model_still_blocked_by_gate(self, monkeypatch):
+        """The cost guard itself is intact: a PAID caller model is skipped."""
+        from agent.auxiliary_client import resolve_provider_client
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"free_only": True}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            client, model = resolve_provider_client(
+                "openrouter", "google/gemini-3.6-flash"
+            )
+
+        assert client is None
+        assert model is None
+        mock_openai.assert_not_called()
+
+    def test_gate_rejection_is_not_reported_as_payment_error(
+        self, monkeypatch, caplog
+    ):
+        """A config-gate skip must not claim a payment/credit failure."""
+        import logging
+        from agent.auxiliary_client import _try_openrouter
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"free_only": True}}), \
+             patch("agent.auxiliary_client.OpenAI"):
+            with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+                _try_openrouter(model="google/gemini-3.6-flash")
+
+        messages = " ".join(r.getMessage() for r in caplog.records)
+        assert "payment / credit error" not in messages
+        assert "free_only" in messages
+
+    def test_unavailable_description_blames_the_gate_not_credentials(
+        self, monkeypatch
+    ):
+        """Diagnostic names the free_only gate while the key is present."""
+        from agent.auxiliary_client import _describe_openrouter_unavailable
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"free_only": True}}):
+            reason = _describe_openrouter_unavailable("google/gemini-3.6-flash")
+
+        assert "free_only" in reason
+        assert "credentials" not in reason
+
+
+class TestFreeOnlyGateE2EConfig:
+    """End-to-end: a real config.yaml on disk drives the free_only gate.
+
+    No config mocks here. We point HERMES_HOME at a temp dir with a real
+    ``config.yaml`` and let ``_aux_openrouter_settings()`` read it through
+    ``load_config_readonly()``, then resolve an OpenRouter client through
+    ``resolve_provider_client()``. Verifies the caller's ``:free`` model
+    actually reaches the gate (the regression) and that the gate is genuinely
+    armed from the file (a paid model is still rejected).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_home(self, tmp_path, monkeypatch):
+        from agent.auxiliary_client import _aux_unhealthy_until
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        monkeypatch.setattr(
+            "hermes_cli.config.get_hermes_home", lambda: tmp_path
+        )
+        _aux_unhealthy_until.clear()
+        yield
+        _aux_unhealthy_until.clear()
+
+    @staticmethod
+    def _write_config(hermes_home, **auxiliary):
+        body = "auxiliary:\n" + "".join(
+            f"  {key}: {str(value).lower()}\n"
+            for key, value in auxiliary.items()
+        )
+        (hermes_home / "config.yaml").write_text(body)
+
+    def test_explicit_free_model_resolves_through_real_config(self, tmp_path):
+        """Caller-set :free model is honored when free_only is really loaded."""
+        from agent.auxiliary_client import resolve_provider_client
+
+        self._write_config(tmp_path, free_only=True)
+        free_sku = "nvidia/nemotron-3-ultra-550b-a55b:free"
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock(name="openrouter_client")
+            client, model = resolve_provider_client("openrouter", free_sku)
+
+        assert client is not None
+        assert model == free_sku
+
+    def test_real_config_free_only_still_blocks_paid_caller_model(self, tmp_path):
+        """free_only loaded from disk genuinely rejects a paid caller model."""
+        from agent.auxiliary_client import resolve_provider_client
+
+        self._write_config(tmp_path, free_only=True)
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            client, model = resolve_provider_client(
+                "openrouter", "google/gemini-3.6-flash"
+            )
+
+        assert client is None
+        assert model is None
+        mock_openai.assert_not_called()
+
+
+class TestFreeOnlyGateCombinedBoundaries:
+    """Boundaries across the combined fix (#85315): gate-off behavior, unhealthy
+    cache hygiene (the second-order suppression), reason surfacing, and
+    preserved credential diagnostics."""
+
+    def test_explicit_free_model_passes_when_gate_disabled(self, monkeypatch):
+        """free_only=false: the explicit :free slug is used, gate never blocks."""
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"free_only": False}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_client = MagicMock(name="openrouter_client")
+            mock_openai.return_value = mock_client
+            client, model = resolve_provider_client(
+                "openrouter", model="nvidia/nemotron-3-ultra-550b-a55b:free"
+            )
+
+        assert client is mock_client
+        assert model == "nvidia/nemotron-3-ultra-550b-a55b:free"
+
+    def test_gate_rejection_leaves_openrouter_healthy_for_later_free_requests(
+        self, monkeypatch
+    ):
+        """After a paid-model gate skip, OpenRouter must not be suppressed from
+        the fallback chain: a later explicit :free request resolves within the
+        same window (the second-order half of #85315)."""
+        from agent.auxiliary_client import _is_provider_unhealthy, _aux_unhealthy_until
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"free_only": True}}), \
+             patch("agent.auxiliary_client.OpenAI"):
+            client, model = resolve_provider_client(
+                "openrouter", model="google/gemini-3.6-flash"
+            )
+
+        assert client is None
+        assert model is None
+        # The gate skip must not have poisoned the unhealthy cache.
+        assert _is_provider_unhealthy("openrouter") is False
+        assert "openrouter" not in _aux_unhealthy_until
+
+        # Same window: the explicit :free request still resolves.
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"free_only": True}}), \
+             patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_client = MagicMock(name="openrouter_client")
+            mock_openai.return_value = mock_client
+            client, model = resolve_provider_client(
+                "openrouter", model="nvidia/nemotron-3-ultra-550b-a55b:free"
+            )
+
+        assert client is mock_client
+        assert model == "nvidia/nemotron-3-ultra-550b-a55b:free"
+
+    def test_mark_provider_unhealthy_surfaces_reason_verbatim(self, caplog):
+        """The unhealthy warning names the actual reason, not always a payment
+        error; the payment default is preserved for payment-fallback callers."""
+        import logging
+        from agent.auxiliary_client import _mark_provider_unhealthy, _aux_unhealthy_until
+
+        _aux_unhealthy_until.clear()
+        with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
+            _mark_provider_unhealthy("openrouter", ttl=60, reason="no OpenRouter credentials")
+            _mark_provider_unhealthy("nous")
+
+        messages = " ".join(r.getMessage() for r in caplog.records)
+        assert "no OpenRouter credentials" in messages
+        assert "payment / credit error" in messages
+        _aux_unhealthy_until.clear()
+
+    def test_unavailable_still_reports_credentials_when_gate_off(self, monkeypatch):
+        """Gate off + no key: the credential diagnostics are preserved."""
+        from agent.auxiliary_client import _describe_openrouter_unavailable
+
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
+             patch("hermes_cli.config.load_config_readonly", return_value={"auxiliary": {}}):
+            reason = _describe_openrouter_unavailable("google/gemini-3.6-flash")
+
+        assert "OPENROUTER_API_KEY" in reason or "credentials" in reason
+        assert "free_only" not in reason
 
 
 class TestGetTextAuxiliaryClient:
