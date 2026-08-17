@@ -1204,6 +1204,64 @@ def _report_gateway_start(via: str) -> None:
         print(f"    type {Path(get_hermes_home())}\\logs\\gateway-stdio.log")
 
 
+def _spawn_via_scheduled_task(timeout_s: float = 6.0) -> bool:
+    """Trigger the gateway's own Scheduled Task and confirm a process comes up.
+
+    ``subprocess.Popen`` with ``CREATE_BREAKAWAY_FROM_JOB`` cannot reliably
+    escape a restrictive parent job object: ``CreateProcess`` accepts the flag
+    silently even when the job denies breakaway, so the child lands inside the
+    job and is hard-killed when the updater exits (issue #84185). The Task
+    Scheduler runs the task outside any job holding the calling updater, so
+    ``schtasks /Run`` is the only spawn path guaranteed to survive the
+    parent-job teardown.
+
+    Before triggering, the Scheduled Task is re-registered with the CURRENT
+    ``gateway.cmd``/``gateway.vbs`` scripts so the spawn never replays a stale
+    Python path from task-creation time (issue #84185 follow-up).  The check
+    afterwards confirms that a *new* gateway process appeared that was not
+    already running before the trigger — a pre-update gateway that is still
+    draining connections does not satisfy the check on its own.
+
+    Returns ``True`` when a *new* gateway PID appeared within ``timeout_s`` of
+    the trigger, ``False`` when the task cannot be refreshed/registered, the
+    trigger failed, or no new process appeared in time. Best-effort and
+    Windows-only; safe to call from any post-update spawn point.
+    """
+    _assert_windows()
+    if not is_task_registered():
+        return False
+
+    # Refresh the task scripts so the spawn never replays a stale Python
+    # path from task-creation time (e.g. after an update moved the venv).
+    # This regenerates gateway.cmd + gateway.vbs with the CURRENT state
+    # (get_python_path(), HERMES_HOME, profile arg) and re-registers the
+    # task atomically via delete+create, identical to a fresh install.
+    try:
+        script_path = _write_task_script()
+    except Exception:
+        # If we can't even write the scripts, the task is hopeless.
+        return False
+    ok, _detail = _install_scheduled_task(get_task_name(), script_path)
+    if not ok:
+        return False
+
+    code, _, _ = _exec_schtasks(["/Run", "/TN", get_task_name()])
+    if code != 0:
+        return False
+
+    # Snapshot existing gateways so the post-trigger poll only counts
+    # processes that appeared AFTER the scheduled task fired.  A pre-update
+    # gateway that is still draining must not satisfy the check on its own.
+    from hermes_cli.gateway import find_gateway_pids
+    pre_pids = set(find_gateway_pids())
+
+    ready = _wait_for_gateway_ready(timeout_s=timeout_s)
+    if not ready:
+        return False
+    return bool(set(ready) - pre_pids)
+
+
+
 def _print_next_steps() -> None:
     from hermes_cli.config import get_hermes_home
 

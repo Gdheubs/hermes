@@ -964,17 +964,68 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str]) -> bool:
         if _respawn_env_overlay:
             _popen_kwargs["env"] = {{**os.environ, **_respawn_env_overlay}}
         if sys.platform == "win32":
+            # First choice: trigger the gateway's Scheduled Task via the Task
+            # Scheduler service, which runs the gateway OUTSIDE any job that
+            # contains this watcher.  subprocess.Popen + CREATE_BREAKAWAY_FROM_JOB
+            # is silently accepted by CreateProcess even when the job denies
+            # breakaway (#84185) — the spawned gateway then dies with the job.
+            # The Scheduled-Task route has no such failure mode.
+            #
+            # The task scripts are refreshed before triggering so the spawn
+            # never replays a stale Python path from task-creation time, and
+            # the poll checks for a NEW gateway pid (not one that was already
+            # running) so a pre-update gateway draining in the background
+            # does not satisfy the check on its own.
+            _started_via_task = False
             try:
-                _popen_kwargs["creationflags"] = windows_detach_flags()
-                subprocess.Popen(cmd, **_popen_kwargs)
-            except OSError:
-                # CREATE_BREAKAWAY_FROM_JOB can be rejected with
-                # ERROR_ACCESS_DENIED when the parent's job object refuses
-                # breakaway. Retry without it — DETACHED_PROCESS et al.
-                # alone are enough in most setups. Mirrors the canonical
-                # fallback in gateway_windows._spawn_detached.
-                _popen_kwargs["creationflags"] = windows_detach_flags_without_breakaway()
-                subprocess.Popen(cmd, **_popen_kwargs)
+                from hermes_cli import gateway_windows as _gw
+                if _gw.is_task_registered():
+                    # Refresh task scripts with the CURRENT Python path so the
+                    # Scheduled Task never replays a stale command from
+                    # task-creation time (e.g. after an update moved the venv).
+                    # Falls back to direct spawn if _write_task_script fails.
+                    _script = _gw._write_task_script()
+                    _gw._install_scheduled_task(_gw.get_task_name(), _script)
+
+                    _task = _gw.get_task_name()
+                    _r = subprocess.run(
+                        ["schtasks", "/Run", "/TN", _task],
+                        capture_output=True, timeout=10,
+                    )
+                    if _r.returncode == 0:
+                        _started_via_task = True
+                        # Wait (up to 6s) for a NEW gateway process to appear
+                        # (one that did not exist before the task fired).  A
+                        # pre-update gateway still draining must not satisfy
+                        # the check on its own.  Delayed import to keep the
+                        # top of this watcher minimal.
+                        import time as _t
+                        from hermes_cli.gateway import find_gateway_pids as _fgp
+                        _pre_pids = set(_fgp())
+                        _deadline = _t.monotonic() + 6
+                        _ok = False
+                        while _t.monotonic() < _deadline:
+                            _new = set(_fgp()) - _pre_pids
+                            if _new:
+                                _ok = True
+                                break
+                            _t.sleep(0.4)
+                        _started_via_task = _ok
+            except Exception:
+                _started_via_task = False
+
+            if not _started_via_task:
+                try:
+                    _popen_kwargs["creationflags"] = windows_detach_flags()
+                    subprocess.Popen(cmd, **_popen_kwargs)
+                except OSError:
+                    # CREATE_BREAKAWAY_FROM_JOB can be rejected with
+                    # ERROR_ACCESS_DENIED when the parent's job object refuses
+                    # breakaway. Retry without it — DETACHED_PROCESS et al.
+                    # alone are enough in most setups. Mirrors the canonical
+                    # fallback in gateway_windows._spawn_detached.
+                    _popen_kwargs["creationflags"] = windows_detach_flags_without_breakaway()
+                    subprocess.Popen(cmd, **_popen_kwargs)
         else:
             _popen_kwargs["start_new_session"] = True
             subprocess.Popen(cmd, **_popen_kwargs)
