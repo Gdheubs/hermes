@@ -65,6 +65,70 @@ _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
+# ── Provider error envelope detection (issue #82662) ──────────────────────
+# Some providers report failures as ordinary assistant text instead of a
+# structured error / SSE frame — e.g. "[Error] Our servers are currently
+# overloaded. Please try again later." arrives as the message content of a
+# chat completion with finish_reason="stop".  Detection is deliberately
+# CONSERVATIVE: the text must be SHORT, must OPEN with an "[Error]" tag
+# (optionally behind a symbol prefix), and must contain a clear
+# service-failure marker.  Assistant prose that merely mentions an error word
+# ("[Error] The file does not exist. Please try again.") or a long answer
+# that happens to include "overloaded" must NOT match.
+
+# Matches the "[Error]" opening tag (with an optional leading symbol prefix
+# like "*", ">" or "—") at the start of the text.
+_PROVIDER_ERROR_ENVELOPE_OPEN_RE = re.compile(
+    r"^\s*(?:[*>#\-–—~•·]+\s*)?\[error\]",
+    re.IGNORECASE,
+)
+
+# Service-failure markers that distinguish a provider overload / outage
+# envelope from ordinary assistant content.  Deliberately excludes generic
+# "please try again" / "could not find" phrasing so content-style errors
+# like "[Error] The file does not exist. Please try again." stay False.
+_PROVIDER_ERROR_ENVELOPE_MARKERS = (
+    "overload",
+    "try again later",
+    "currently unavailable",
+    "temporarily unavailable",
+    "at capacity",
+    "too many requests",
+    "server error",
+    "service unavailable",
+)
+
+
+def looks_like_provider_error_envelope(text) -> bool:
+    """True when ``text`` is a short provider error envelope, not real content.
+
+    Conservative detector for the bug class where a provider returns its
+    failure as inline assistant text ("[Error] Our servers are currently
+    overloaded. Please try again later.") instead of a structured error —
+    see issue #82662.  Requires ALL of:
+
+    1. Short text (<= 400 chars, <= 4 lines) — real envelopes are 1-3 lines;
+       assistant answers are longer.
+    2. An "[Error]" opening tag at the start (optional symbol prefix).
+    3. A clear service-failure marker inside (overload / unavailable /
+       at capacity / too many requests / server error / ...).
+
+    Anything failing any condition returns False: "[Error] The file does not
+    exist. Please try again." (no marker), "[Error] I could not find the
+    file...", or a long answer that merely mentions "overloaded".
+    """
+    if not text:
+        return False
+    body = str(text).strip()
+    # Provider failure envelopes are short. Assistant answers that happen
+    # to mention "overloaded" tend to be much longer.
+    if len(body) > 400 or body.count("\n") > 4:
+        return False
+    if not _PROVIDER_ERROR_ENVELOPE_OPEN_RE.match(body):
+        return False
+    lowered = body.lower()
+    return any(marker in lowered for marker in _PROVIDER_ERROR_ENVELOPE_MARKERS)
+
 
 def _context_thread_target(callback):
     """Bind a no-argument thread target to the caller's ContextVars."""

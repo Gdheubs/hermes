@@ -26,6 +26,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.chat_completion_helpers import looks_like_provider_error_envelope
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
@@ -3171,6 +3172,29 @@ def run_conversation(
                             error_details.append("response.choices is None")
                         else:
                             error_details.append("response.choices is empty")
+
+                    # Provider error envelope returned as content (issue
+                    # #82662): some providers return "[Error] Our servers are
+                    # currently overloaded. Please try again later." as
+                    # ordinary completion text (finish_reason="stop") instead
+                    # of a structured error.  Detect by TEXT here, BEFORE the
+                    # finish-reason normalization below, so the invalid-
+                    # response path (retry/fallback) is taken and the envelope
+                    # is never persisted as a successful answer.
+                    if not response_invalid:
+                        try:
+                            _first_choice_content = response.choices[0].message.content
+                        except (AttributeError, IndexError, TypeError):
+                            _first_choice_content = None
+                        if (
+                            isinstance(_first_choice_content, str)
+                            and looks_like_provider_error_envelope(_first_choice_content)
+                        ):
+                            response_invalid = True
+                            error_details.append(
+                                "response content is a provider error envelope: "
+                                + repr(_first_choice_content[:80])
+                            )
 
                 if response_invalid:
                     agent._invoke_api_request_error_hook(

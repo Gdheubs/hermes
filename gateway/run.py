@@ -59,6 +59,7 @@ from agent.conversation_compression import (
     PREFLIGHT_COMPRESSION_STATUS_TEMPLATE,
 )
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
+from agent.chat_completion_helpers import looks_like_provider_error_envelope
 from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
@@ -766,6 +767,11 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     2. AND the error marker appears at the start of the message (optionally
        behind a punctuation/symbol prefix), not buried mid-paragraph in an
        explanation like "HTTP 404 means 'not found' — ...".
+
+    Defense in depth (issue #82662): providers that report their failure as
+    ordinary content ("[Error] Our servers are currently overloaded. Please
+    try again later.") never match the shape regex, so the shared envelope
+    detector used by the conversation loop is also consulted.
     """
     if not text:
         return False
@@ -774,6 +780,8 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     # to mention HTTP status codes ("HTTP 404 means...") tend to be longer.
     if len(body) > 400 or body.count("\n") > 4:
         return False
+    if looks_like_provider_error_envelope(body):
+        return True
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
