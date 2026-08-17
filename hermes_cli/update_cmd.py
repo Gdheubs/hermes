@@ -5247,6 +5247,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
         print()
         print("✓ Code updated!")
 
+        # ── macOS TCC stale-grant notice (#86385) ──────────────────────
+        # Locally-built desktop bundles are re-signed on every update. With the
+        # post-#73681 identifier-pinned DR, new grants survive rebuilds — but a
+        # grant made to a pre-fix binary stays stale: the System Settings toggle
+        # shows ON while macOS re-prompts on every capture, and the modern prompt
+        # has no Allow button, so users loop. One line of guidance after update
+        # tells affected users how to complete the one-time re-grant.
+        if sys.platform == "darwin" and has_desktop_app:
+            print()
+            print(
+                "  ℹ macOS: if Hermes re-prompts for permissions you already "
+                "granted (toggle shows ON), the stored grant is stale — run "
+                "`tccutil reset ScreenCapture com.nousresearch.hermes` (repeat "
+                "per affected service), toggle it ON in System Settings, then "
+                "fully quit & relaunch once."
+            )
+
         # ── Post-update state.db integrity guard (#68474) ─────────────────
         # Verify that state.db survived the update intact.  If the live file
         # is now corrupted (zeroed, missing header, integrity failure),
