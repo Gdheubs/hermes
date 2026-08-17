@@ -112,6 +112,12 @@ def inject_memory_provider_tools(agent: Any) -> int:
     memory_manager = getattr(agent, "_memory_manager", None)
     tools = getattr(agent, "tools", None)
     if not memory_manager or tools is None:
+        logger.debug(
+            "Memory provider tools not injected: prerequisites unavailable "
+            "(memory_manager_present=%s, tools_present=%s)",
+            bool(memory_manager),
+            tools is not None,
+        )
         return 0
 
     existing_tool_names = {
@@ -119,15 +125,30 @@ def inject_memory_provider_tools(agent: Any) -> int:
         for tool in tools
         if isinstance(tool, dict)
     }
+    enabled_toolsets = getattr(agent, "enabled_toolsets", None)
+    disabled_toolsets = getattr(agent, "disabled_toolsets", None)
+    memory_tool_present = "memory" in existing_tool_names
     if not memory_provider_tools_enabled(
-        getattr(agent, "enabled_toolsets", None),
-        getattr(agent, "disabled_toolsets", None),
-        memory_tool_present="memory" in existing_tool_names,
+        enabled_toolsets,
+        disabled_toolsets,
+        memory_tool_present=memory_tool_present,
     ):
+        logger.debug(
+            "Memory provider tools not injected: toolset gate disabled "
+            "(enabled_toolsets=%r, disabled_toolsets=%r, memory_tool_present=%s)",
+            enabled_toolsets,
+            disabled_toolsets,
+            memory_tool_present,
+        )
         return 0
 
     get_schemas = getattr(memory_manager, "get_all_tool_schemas", None)
     if not callable(get_schemas):
+        logger.debug(
+            "Memory provider tools not injected: schema API unavailable "
+            "(memory_manager_type=%s)",
+            type(memory_manager).__name__,
+        )
         return 0
 
     valid_tool_names = getattr(agent, "valid_tool_names", None)
