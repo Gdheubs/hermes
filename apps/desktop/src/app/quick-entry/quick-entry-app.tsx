@@ -1,7 +1,9 @@
 import { useEffect, useReducer, useRef } from 'react'
 
 import {
-  initialQuickComposerState,
+  createInitialQuickComposerState,
+  loadPersistedQuickEntryTarget,
+  persistQuickEntryTarget,
   QUICK_TARGET_CURRENT,
   QUICK_TARGET_NEW,
   type QuickComposerEvent,
@@ -32,6 +34,11 @@ export function QuickEntryApp() {
   // (hand the payload to the shell, ask to hide) and stores the next state, so
   // the decision stays pure and testable while the effects stay in one place.
   const [state, dispatch] = useReducer((current: QuickComposerState, event: QuickComposerEvent) => {
+    if (event.type === 'target') {
+      // Remember the picker choice so the next summon opens on the same target.
+      persistQuickEntryTarget(event.target)
+    }
+
     const { send, state: next } = quickComposerReducer(current, event)
     const api = window.hermesDesktop?.quickEntry
 
@@ -42,7 +49,7 @@ export function QuickEntryApp() {
     }
 
     return next
-  }, initialQuickComposerState)
+  }, undefined, createInitialQuickComposerState)
 
   // Re-summoned by the chord: the shell reuses the window, so reset the draft
   // and take the keyboard back for a fresh capture. Also adopt gateway-state
@@ -51,7 +58,8 @@ export function QuickEntryApp() {
     const api = window.hermesDesktop?.quickEntry
 
     const offShown = api?.onShown(() => {
-      dispatch({ type: 'shown' })
+      // Reset to the persisted picker choice, not always the current chat.
+      dispatch({ resetTarget: loadPersistedQuickEntryTarget(), type: 'shown' })
       requestAnimationFrame(() => inputRef.current?.focus())
     })
 
