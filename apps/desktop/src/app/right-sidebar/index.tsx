@@ -13,7 +13,7 @@ import { cn } from '@/lib/utils'
 import { $panesFlipped } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
 import { openPreview } from '@/store/preview'
-import { $currentCwd } from '@/store/session'
+import { $currentCwd, $selectedStoredSessionId, $workspaceCwdOwner } from '@/store/session'
 
 import { SidebarPanelLabel } from '../shell/sidebar-label'
 
@@ -30,12 +30,16 @@ export function RightSidebarPane({ onActivateFile, onActivateFolder }: RightSide
   const r = t.rightSidebar
   const panesFlipped = useStore($panesFlipped)
   const currentCwd = useStore($currentCwd).trim()
+  const selectedStoredSessionId = useStore($selectedStoredSessionId)
+  const workspaceCwdOwner = useStore($workspaceCwdOwner)
 
-  // The file tree is simply "browse the session's working directory". If the
-  // session has a cwd — a repo, a sibling worktree, or any folder — show it. A
-  // bare/detached chat (resolveNewSessionCwd → '') has none, so it shows the
-  // empty hint instead of whatever dir Hermes happens to run from.
-  const hasWorkspace = Boolean(currentCwd)
+  // `$currentCwd` deliberately retains the previous session's path while a
+  // switch settles so keep-alive workspace panes do not lose their cached
+  // state. Only expose it once ownership says it belongs to the visible
+  // session; hidden/background sessions may keep updating their own state but
+  // must never publish a repository into this shared pane.
+  const hasWorkspace =
+    Boolean(currentCwd) && (workspaceCwdOwner ?? null) === (selectedStoredSessionId ?? null)
 
   const {
     collapseAll,

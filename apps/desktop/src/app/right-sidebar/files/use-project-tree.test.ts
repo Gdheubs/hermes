@@ -225,6 +225,33 @@ describe('useProjectTree', () => {
     expect(readDir).toHaveBeenLastCalledWith('/b')
   })
 
+  it('keeps a new profile tree when an old same-path request settles last', async () => {
+    let resolveOldProfile: ((value: HermesReadDirResult) => void) | undefined
+    readDir.mockImplementationOnce(
+      () =>
+        new Promise(resolve => {
+          resolveOldProfile = resolve
+        })
+    )
+    readDir.mockResolvedValueOnce(ok([{ name: 'new-profile', path: '/workspace/new-profile', isDirectory: false }]))
+
+    $connection.set({ baseUrl: 'gateway-a', mode: 'local', profile: 'a' } as never)
+    const { result } = renderHook(() => useProjectTree('/workspace'))
+    await waitFor(() => expect(readDir).toHaveBeenCalledTimes(1))
+
+    act(() => {
+      $connection.set({ baseUrl: 'gateway-b', mode: 'local', profile: 'b' } as never)
+    })
+    await waitFor(() => expect(result.current.data[0]?.name).toBe('new-profile'))
+
+    await act(async () => {
+      resolveOldProfile?.(ok([{ name: 'old-profile', path: '/workspace/old-profile', isDirectory: false }]))
+      await Promise.resolve()
+    })
+
+    expect(result.current.data.map(node => node.name)).toEqual(['new-profile'])
+  })
+
   it('falls back to the sanitized workspace dir when the session cwd is gone', async () => {
     const sanitizeWorkspaceCwd = vi.fn(async () => ({ cwd: '/home/me/projects', sanitized: true }))
     readDir.mockImplementation(async path => {
