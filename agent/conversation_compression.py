@@ -2915,7 +2915,20 @@ def compress_context(
                         if callable(_session_getter)
                         else None
                     )
-                    if (
+                    if _parent_row is None:
+                        # CHANGE 7 — fail closed on an unreadable session row.
+                        # If the getter is unavailable or returns no row, we
+                        # cannot prove the session is live; adopting rows whose
+                        # liveness is unknown risks feeding an ended session's
+                        # frozen/orphaned rows to the summarizer. Skip adoption.
+                        logger.warning(
+                            "compression: session=%s liveness unverifiable "
+                            "(get_session returned no row); skipping "
+                            "durable-snapshot adoption",
+                            _lock_sid,
+                        )
+                        _preflush_ok = False
+                    elif (
                         _parent_row is not None
                         and _parent_row.get("ended_at") is not None
                     ):
@@ -2985,6 +2998,42 @@ def compress_context(
                         durable_parent = durable_loader(
                             _lock_db, _lock_sid, include_row_ids=True  # CHANGE 2
                         )
+                    if (
+                        _preflush_ok
+                        and isinstance(durable_parent, list)
+                        and _is_pure_append(durable_parent)  # CHANGE 5
+                    ):
+                        # CHANGE 6 — re-verify liveness at the adopt decision.
+                        # The pre-flush ended_at check above ran before the
+                        # flush + re-read; end_session()/append_message() do
+                        # not take the compression lock, so a concurrent
+                        # gateway timeout/hygiene end can land between the
+                        # pre-flush check and here. Re-read the parent row in
+                        # this window and skip adoption if it ended — else an
+                        # ended session's rows (incl. the just-flushed tail)
+                        # would be fed to the summarizer.
+                        if callable(_session_getter):
+                            _parent_row_after = _session_getter(
+                                _lock_db, _lock_sid
+                            )
+                        else:
+                            _parent_row_after = None
+                        if (
+                            _parent_row_after is None
+                            or _parent_row_after.get("ended_at") is not None
+                        ):
+                            logger.info(
+                                "compression: session=%s ended or unreadable "
+                                "(end_reason=%s) after pre-adoption flush; "
+                                "skipping durable-snapshot adoption so "
+                                "ended-session rows are never fed to the "
+                                "summarizer",
+                                _lock_sid,
+                                _parent_row_after.get("end_reason")
+                                if _parent_row_after is not None
+                                else None,
+                            )
+                            _preflush_ok = False
                     if (
                         _preflush_ok
                         and isinstance(durable_parent, list)
