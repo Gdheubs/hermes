@@ -247,6 +247,33 @@ hermes profile import coder.tar.gz   # install an archive as a new profile
 
 In chat, the same two live as `/export` and `/import` — and in the desktop app as **⌘K → Export/Import profile…**. See [Sharing a profile](#sharing-a-profile).
 
+### Naming the default profile
+
+The default profile's internal ID is always `default` — it can't be renamed
+because `~/.hermes` is the installation root. But you can give it a
+**display name**, which every UI surface shows in place of the bare ID:
+
+```bash
+hermes profile rename default Harumesu
+```
+
+```
+ Profile           Model              Gateway   ...
+ ─────────────     ──────────────     ───────
+◆Harumesu (default)  claude-...       running
+```
+
+The display name appears in `hermes profile list`, `hermes profile show`,
+the `/profile` chat command, and the dashboard. It is presentation-only:
+`-p default`, service names, cron jobs, and every other reference keep
+using the canonical `default` ID. Unicode names are fine (e.g.
+`hermes profile rename default 小助手`).
+
+The name is stored as `display_name` in `~/.hermes/profile.yaml`. Remove
+that line (or set an empty value) to revert to the plain `default` label.
+Named profiles can also carry a `display_name` in their `profile.yaml`;
+`rename` for them still performs a real rename.
+
 ## Deleting a profile
 
 ```bash

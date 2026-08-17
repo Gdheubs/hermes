@@ -100,9 +100,26 @@ def _exec_profile(ctx: CommandContext) -> CommandReply:
 
         home_display = display_hermes_home()
 
+    # Presentation-only display name (profile.yaml). Failures never break
+    # /profile — fall back to the bare canonical id.
+    profile_label = profile_name
+    try:
+        from hermes_cli.profiles import (
+            format_profile_label,
+            get_profile_dir,
+            read_profile_meta,
+        )
+
+        display = read_profile_meta(get_profile_dir(profile_name)).get(
+            "display_name", ""
+        )
+        profile_label = format_profile_label(profile_name, display)
+    except Exception:
+        pass
+
     return CommandReply(
-        f"Profile: {profile_name}\nHome: {home_display}",
-        data={"profile": profile_name, "home": home_display},
+        f"Profile: {profile_label}\nHome: {home_display}",
+        data={"profile": profile_label, "home": home_display},
     )
 
 

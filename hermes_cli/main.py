@@ -10063,9 +10063,21 @@ def cmd_profile(args):
 
     if action is None:
         # Bare `hermes profile` — show current profile status
+        from hermes_cli.profiles import (
+            format_profile_label,
+            get_profile_dir,
+            read_profile_meta,
+        )
+
         profile_name = get_active_profile_name()
         dhh = display_hermes_home()
-        print(f"\nActive profile: {profile_name}")
+        try:
+            _display = read_profile_meta(get_profile_dir(profile_name)).get(
+                "display_name", ""
+            )
+        except Exception:
+            _display = ""
+        print(f"\nActive profile: {format_profile_label(profile_name, _display)}")
         print(f"Path:           {dhh}")
 
         profiles = list_profiles()
@@ -10088,6 +10100,8 @@ def cmd_profile(args):
         return
 
     if action == "list":
+        from hermes_cli.profiles import format_profile_label
+
         profiles = list_profiles()
         active = get_active_profile_name()
 
@@ -10111,7 +10125,7 @@ def cmd_profile(args):
                 if (p.name == active or (active == "default" and p.is_default))
                 else "  "
             )
-            name = p.name
+            name = format_profile_label(p.name, getattr(p, "display_name", ""))
             model = (p.model or "—")[:26]
             gw = "running" if p.gateway_running else "stopped"
             alias = (p.alias_name or p.name) if p.alias_path else "—"
@@ -10370,6 +10384,9 @@ def cmd_profile(args):
             _read_distribution_meta,
             _get_wrapper_dir,
             find_alias_for_profile,
+            format_profile_label,
+            normalize_profile_name,
+            read_profile_meta,
         )
 
         if not profile_exists(name):
@@ -10381,8 +10398,9 @@ def cmd_profile(args):
         skills = _count_skills(profile_dir)
         dist_name, dist_version, dist_source = _read_distribution_meta(profile_dir)
         alias_name = find_alias_for_profile(name)
+        display_name = read_profile_meta(profile_dir).get("display_name", "")
 
-        print(f"\nProfile: {name}")
+        print(f"\nProfile: {format_profile_label(normalize_profile_name(name), display_name)}")
         print(f"Path:    {profile_dir}")
         if model:
             print(f"Model:   {model}" + (f" ({provider})" if provider else ""))
@@ -10443,12 +10461,17 @@ def cmd_profile(args):
                     print(f"⚠ {_get_wrapper_dir()} is not in your PATH.")
 
     elif action == "rename":
-        from hermes_cli.profiles import rename_profile
+        from hermes_cli.profiles import normalize_profile_name, rename_profile
 
         try:
             new_dir = rename_profile(args.old_name, args.new_name)
-            print(f"\nProfile renamed: {args.old_name} → {args.new_name}")
-            print(f"Path: {new_dir}\n")
+            if normalize_profile_name(args.old_name) == "default":
+                # Display name set; canonical id untouched (printed by
+                # rename_profile). Nothing else to report.
+                print()
+            else:
+                print(f"\nProfile renamed: {args.old_name} → {args.new_name}")
+                print(f"Path: {new_dir}\n")
         except (ValueError, FileExistsError, FileNotFoundError) as e:
             print(f"Error: {e}")
             sys.exit(1)

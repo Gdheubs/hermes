@@ -657,6 +657,12 @@ class ProfileInfo:
     # surfaces a "review" badge in this case so the user can edit or
     # accept.
     description_auto: bool = False
+    # Optional user-facing display name, persisted in
+    # ``<profile_dir>/profile.yaml``. Presentation-only: every code path
+    # that resolves, compares, or spawns profiles keeps using the
+    # canonical ``name``. Empty when unset — surfaces fall back to
+    # ``name`` exactly as before (see format_profile_label).
+    display_name: str = ""
 
 
 def _read_distribution_meta(profile_dir: Path) -> tuple:
@@ -823,25 +829,27 @@ def _profile_yaml_path(profile_dir: Path) -> Path:
 def read_profile_meta(profile_dir: Path) -> dict:
     """Read ``<profile_dir>/profile.yaml`` and return a dict.
 
-    Returns ``{"description": "", "description_auto": False}`` when the
-    file is missing or unreadable. Never raises — a corrupt
-    profile.yaml on an unrelated profile must not break
-    ``hermes profile list``.
+    Returns ``{"description": "", "description_auto": False,
+    "display_name": ""}`` when the file is missing or unreadable.
+    Never raises — a corrupt profile.yaml on an unrelated profile
+    must not break ``hermes profile list``.
     """
+    _empty = {"description": "", "description_auto": False, "display_name": ""}
     path = _profile_yaml_path(profile_dir)
     if not path.is_file():
-        return {"description": "", "description_auto": False}
+        return dict(_empty)
     try:
         import yaml
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
     except Exception:
-        return {"description": "", "description_auto": False}
+        return dict(_empty)
     if not isinstance(data, dict):
-        return {"description": "", "description_auto": False}
+        return dict(_empty)
     return {
         "description": str(data.get("description") or "").strip(),
         "description_auto": bool(data.get("description_auto", False)),
+        "display_name": str(data.get("display_name") or "").strip(),
     }
 
 
@@ -850,6 +858,7 @@ def write_profile_meta(
     *,
     description: Optional[str] = None,
     description_auto: Optional[bool] = None,
+    display_name: Optional[str] = None,
 ) -> None:
     """Update ``<profile_dir>/profile.yaml`` in place.
 
@@ -874,12 +883,76 @@ def write_profile_meta(
         existing["description"] = description.strip()
     if description_auto is not None:
         existing["description_auto"] = bool(description_auto)
+    if display_name is not None:
+        # Empty string clears the display name (falls back to canonical id).
+        cleaned = display_name.strip()
+        if cleaned:
+            existing["display_name"] = cleaned
+        else:
+            existing.pop("display_name", None)
     # Atomic write: bare open("w") truncates before the dump, and the read
     # path above swallows parse errors as {}, so a crashed write would
     # silently drop unspecified fields on the next call (#51356, #16743).
     from utils import atomic_yaml_write
 
     atomic_yaml_write(path, existing, sort_keys=False)
+
+
+# Display names share the profile-id length cap but none of its charset
+# restrictions: they are presentation-only (never a directory name, wrapper
+# filename, or argv token), so Unicode is fine (#45624 requests a Chinese
+# display name).
+_DISPLAY_NAME_MAX_LEN = 64
+
+
+def validate_display_name(name: str) -> str:
+    """Validate and return a cleaned profile display name.
+
+    Raises ``ValueError`` for empty/whitespace-only input or over-length
+    names. Display names are presentation-only, so any printable Unicode
+    is accepted; only the length is capped (matches the profile-id cap).
+    """
+    cleaned = (name or "").strip()
+    if not cleaned:
+        raise ValueError("Display name cannot be empty.")
+    if len(cleaned) > _DISPLAY_NAME_MAX_LEN:
+        raise ValueError(
+            f"Display name too long ({len(cleaned)} chars). "
+            f"Maximum is {_DISPLAY_NAME_MAX_LEN}."
+        )
+    return cleaned
+
+
+def set_profile_display_name(profile_name: str, display_name: str) -> str:
+    """Set (or clear) a profile's user-facing display name.
+
+    ``display_name`` of ``""`` clears it. Returns the cleaned value that
+    was stored (``""`` when cleared). Presentation-only: the canonical
+    profile id is untouched.
+    """
+    canon = normalize_profile_name(profile_name)
+    validate_profile_name(canon)
+    profile_dir = get_profile_dir(canon)
+    if not profile_dir.is_dir():
+        raise FileNotFoundError(f"Profile '{canon}' does not exist.")
+    cleaned = (display_name or "").strip()
+    if cleaned:
+        cleaned = validate_display_name(cleaned)
+    write_profile_meta(profile_dir, display_name=cleaned)
+    return cleaned
+
+
+def format_profile_label(name: str, display_name: Optional[str]) -> str:
+    """Render a profile for display: ``display_name (canonical_id)``.
+
+    Falls back to the bare canonical id when no display name is set or
+    when it equals the id — byte-for-byte what surfaces printed before
+    display names existed.
+    """
+    dn = (display_name or "").strip()
+    if dn and dn != name:
+        return f"{dn} ({name})"
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -911,6 +984,7 @@ def list_profiles() -> List[ProfileInfo]:
             distribution_source=dist_source,
             description=meta.get("description", ""),
             description_auto=meta.get("description_auto", False),
+            display_name=meta.get("display_name", ""),
         ))
 
     # Named profiles
@@ -953,6 +1027,7 @@ def list_profiles() -> List[ProfileInfo]:
                 distribution_source=dist_source,
                 description=meta.get("description", ""),
                 description_auto=meta.get("description_auto", False),
+                display_name=meta.get("display_name", ""),
             ))
 
     return profiles
@@ -2328,15 +2403,30 @@ def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) ->
 def rename_profile(old_name: str, new_name: str) -> Path:
     """Rename a profile: directory, wrapper script, service, active_profile.
 
-    Returns the new profile directory.
+    The default profile cannot be renamed (its home IS the installation
+    root), so renaming it sets a presentation-only ``display_name`` in
+    ``~/.hermes/profile.yaml`` instead — the canonical id stays
+    ``"default"`` and every resolution path is untouched.
+
+    Returns the (new) profile directory.
     """
     old_canon = normalize_profile_name(old_name)
-    new_canon = normalize_profile_name(new_name)
     validate_profile_name(old_canon)
-    validate_profile_name(new_canon)
 
     if old_canon == "default":
-        raise ValueError("Cannot rename the default profile.")
+        # Presentation-only: the default profile keeps its canonical id.
+        cleaned = validate_display_name(new_name)
+        default_home = _get_default_hermes_home()
+        if not default_home.is_dir():
+            raise FileNotFoundError("Default profile directory does not exist.")
+        write_profile_meta(default_home, display_name=cleaned)
+        print(f"✓ Display name set: {cleaned} (default)")
+        print("  Display name set; canonical id remains 'default'.")
+        return default_home
+
+    new_canon = normalize_profile_name(new_name)
+    validate_profile_name(new_canon)
+
     if new_canon == "default":
         raise ValueError("Cannot rename to 'default' — it is reserved.")
 

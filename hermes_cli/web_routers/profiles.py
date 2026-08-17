@@ -1010,6 +1010,19 @@ async def rename_profile_endpoint(name: str, body: ProfileRename):
     except Exception as e:
         _log.exception("PATCH /api/profiles/%s failed", name)
         raise HTTPException(status_code=500, detail=str(e))
+    try:
+        is_default = profiles_mod.normalize_profile_name(name) == "default"
+    except ValueError:
+        is_default = False
+    if is_default:
+        # Presentation-only: the canonical id stays "default"; the new
+        # name landed as display_name in profile.yaml.
+        return {
+            "ok": True,
+            "name": "default",
+            "display_name": body.new_name.strip(),
+            "path": str(path),
+        }
     return {"ok": True, "name": body.new_name, "path": str(path)}
 
 

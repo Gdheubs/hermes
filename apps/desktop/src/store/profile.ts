@@ -25,6 +25,16 @@ export function normalizeProfileKey(name: string | null | undefined): string {
   return value || 'default'
 }
 
+// Presentation-only label for a profile: "display_name (name)" when a
+// display_name is set (e.g. the renamed default profile), else the bare
+// canonical name. Never used for comparison or routing — canonical `name`
+// remains the identity everywhere.
+export function profileLabel(profile: Pick<ProfileInfo, 'display_name' | 'name'>): string {
+  const display = (profile.display_name ?? '').trim()
+
+  return display && display !== profile.name ? `${display} (${profile.name})` : profile.name
+}
+
 // The profile the running local backend is actually scoped to (mirrors
 // /api/profiles/active `current`). "default" is the root ~/.hermes. This is the
 // display source of truth for the statusbar pill; the desktop's *stored*
