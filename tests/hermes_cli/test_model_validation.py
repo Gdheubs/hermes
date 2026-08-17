@@ -244,9 +244,35 @@ class TestCopilotNormalization:
         assert copilot_model_api_mode("gpt-5.2-codex") == "codex_responses"
         assert copilot_model_api_mode("gpt-5.2") == "codex_responses"
 
+    def test_copilot_api_mode_with_catalog_only_responses(self):
+        catalog = [{
+            "id": "gpt-5.4",
+            "supported_endpoints": ["/responses"],
+            "capabilities": {"type": "chat"},
+        }]
+        assert copilot_model_api_mode("gpt-5.4", catalog=catalog) == "codex_responses"
 
+    def test_copilot_api_mode_non_gpt_responses_only_uses_responses(self):
+        """A non-GPT Responses-only model must use codex_responses."""
+        catalog = [{
+            "id": "mai-code-1-flash-picker",
+            "supported_endpoints": ["/responses"],
+        }]
+        assert (
+            copilot_model_api_mode("mai-code-1-flash-picker", catalog=catalog)
+            == "codex_responses"
+        )
 
-
+    def test_copilot_api_mode_non_gpt_chat_capable_stays_chat(self):
+        """Non-GPT models advertising /chat/completions keep using it."""
+        catalog = [{
+            "id": "claude-opus-4.6",
+            "supported_endpoints": ["/chat/completions", "/v1/messages"],
+        }]
+        assert (
+            copilot_model_api_mode("claude-opus-4.6", catalog=catalog)
+            == "chat_completions"
+        )
 
     def test_opencode_go_api_modes_match_docs(self):
         assert opencode_model_api_mode("opencode-go", "glm-5.1") == "chat_completions"
