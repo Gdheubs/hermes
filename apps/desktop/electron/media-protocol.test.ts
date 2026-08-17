@@ -151,6 +151,45 @@ describe('createMediaProtocolHandler', () => {
     expect(deps.fetchRemote).not.toHaveBeenCalled()
   })
 
+  it('refuses to follow a redirect from the token-auth gateway instead of proxying it', async () => {
+    // The fetch wrappers are wired with redirect: 'error'; a 3xx that still
+    // reaches the handler must surface as unavailable — never as bytes the
+    // renderer trusts under the hermes-media: scheme.
+    const deps = dependencies({
+      fetchRemote: vi.fn(async () =>
+        new Response('<html>login</html>', {
+          headers: { location: 'https://attacker.test/interstitial' },
+          status: 302
+        })
+      )
+    })
+
+    const response = await createMediaProtocolHandler(deps)(request('hermes-media://remote/%2Ftmp%2Fclip.mp4'))
+
+    expect(response.status).toBe(502)
+    expect(await response.text()).not.toContain('login')
+  })
+
+  it('refuses to follow a redirect from the OAuth native-bearer gateway', async () => {
+    const deps = dependencies({
+      ensureRemoteBearer: vi.fn(async () => 'native-access-token'),
+      fetchRemote: vi.fn(async () =>
+        new Response(null, { headers: { location: 'https://attacker.test/clip.mp4' }, status: 307 })
+      ),
+      resolveRemoteConnection: vi.fn(async () => ({
+        authMode: 'oauth' as const,
+        baseUrl: 'https://gateway.test',
+        mode: 'remote' as const,
+        token: null
+      }))
+    })
+
+    const response = await createMediaProtocolHandler(deps)(request('hermes-media://remote/%2Ftmp%2Fclip.mp4'))
+
+    expect(response.status).toBe(502)
+    expect(deps.fetchRemoteWithCookies).not.toHaveBeenCalled()
+  })
+
   it('uses a refreshed native bearer for OAuth remote media when available', async () => {
     const deps = dependencies({
       ensureRemoteBearer: vi.fn(async () => 'native-access-token'),

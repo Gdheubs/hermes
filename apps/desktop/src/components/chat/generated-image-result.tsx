@@ -59,6 +59,7 @@ export const GeneratedImage: FC<{ aspectRatio?: string; result?: unknown }> = ({
   const [loaded, setLoaded] = useState(false)
   const [canvasGone, setCanvasGone] = useState(false)
   const [failed, setFailed] = useState(false)
+  const [openFailed, setOpenFailed] = useState(false)
   const [lightboxOpen, setLightboxOpen] = useState(false)
   const { download, saving } = useImageDownload(src)
 
@@ -70,6 +71,7 @@ export const GeneratedImage: FC<{ aspectRatio?: string; result?: unknown }> = ({
   useEffect(() => {
     let cancelled = false
     setFailed(false)
+    setOpenFailed(false)
     setLoaded(false)
     setCanvasGone(false)
     setSrc(image && isInlineSrc(image) ? image : '')
@@ -95,16 +97,36 @@ export const GeneratedImage: FC<{ aspectRatio?: string; result?: unknown }> = ({
 
   if (failed && image) {
     return (
-      <a
-        className="mt-2 ref inline-block wrap-anywhere"
-        href="#"
-        onClick={event => {
-          event.preventDefault()
-          void window.hermesDesktop?.openExternal(mediaExternalUrl(image))
-        }}
-      >
-        {copy.openImage}: {mediaName(image)}
-      </a>
+      <span className="block">
+        <a
+          className="mt-2 ref inline-block wrap-anywhere"
+          href="#"
+          onClick={event => {
+            event.preventDefault()
+            setOpenFailed(false)
+
+            // Remote gateway: mediaExternalUrl would carry the session token
+            // in a ?token= query into the external browser's history and OS
+            // logs. Save through the authenticated native bridge instead;
+            // only inline/local sources keep the external open.
+            if (isRemoteGateway() && !isInlineSrc(image) && window.hermesDesktop?.saveGatewayFile) {
+              void window.hermesDesktop
+                .saveGatewayFile({ path: filePathFromMediaPath(image), suggestedName: mediaName(image) })
+                .then(result => {
+                  if (!result.saved && !result.canceled) {
+                    setOpenFailed(true)
+                  }
+                })
+                .catch(() => setOpenFailed(true))
+            } else {
+              void window.hermesDesktop?.openExternal(mediaExternalUrl(image))
+            }
+          }}
+        >
+          {copy.openImage}: {mediaName(image)}
+        </a>
+        {openFailed && <span className="mt-1 block text-xs text-muted-foreground">{copy.imageDownloadFailed}</span>}
+      </span>
     )
   }
 

@@ -30,6 +30,35 @@ export interface WriteStreamLike {
   once(event: 'drain', listener: () => void): unknown
 }
 
+// Upper bound for a gateway download body. The managed /api/files routes cap
+// server-side, but saveGatewayFile also talks to the broad /api/fs/download
+// route, and a client must not trust a remote peer to stay bounded: enforce
+// the limit locally, both on the announced Content-Length (before the save
+// dialog opens) and on the actual streamed byte count.
+export const GATEWAY_DOWNLOAD_MAX_BYTES = 5 * 1024 ** 3
+
+// Thrown when a gateway response announces or streams more than
+// GATEWAY_DOWNLOAD_MAX_BYTES bytes. Distinct type so callers can tell an
+// over-limit rejection apart from transport/IO failures.
+export class GatewayDownloadTooLargeError extends Error {
+  constructor() {
+    super(`Gateway download exceeds the ${GATEWAY_DOWNLOAD_MAX_BYTES}-byte client limit`)
+    this.name = 'GatewayDownloadTooLargeError'
+  }
+}
+
+// Pre-flight check against the response headers, run before the save dialog
+// opens so an over-limit download fails fast instead of after the user picks a
+// destination. Absent/invalid Content-Length is NOT a pass to skip the stream
+// count — pumpStreamToFile still enforces the bound while bytes flow.
+export function contentLengthExceedsLimit(headers: Record<string, unknown>, maxBytes = GATEWAY_DOWNLOAD_MAX_BYTES): boolean {
+  const raw = headers['content-length'] ?? headers['Content-Length']
+  const value = Array.isArray(raw) ? raw[0] : raw
+  const length = Number(value)
+
+  return Number.isFinite(length) && length > maxBytes
+}
+
 export interface PumpDeps {
   createWriteStream: (destPath: string) => WriteStreamLike
   unlink: (destPath: string) => Promise<unknown>
@@ -38,11 +67,13 @@ export interface PumpDeps {
 // Stream `res` into `destPath`, honoring backpressure. On any read/write error
 // the write stream is torn down and the (partial) destination file is removed
 // before the returned promise rejects, so a failed download never leaves a
-// truncated file behind.
-export function pumpStreamToFile(res: ReadableLike, destPath: string, deps: PumpDeps): Promise<void> {
+// truncated file behind. When maxBytes is given, the stream fails with
+// GatewayDownloadTooLargeError once more than maxBytes bytes arrive.
+export function pumpStreamToFile(res: ReadableLike, destPath: string, deps: PumpDeps, maxBytes?: number): Promise<void> {
   return new Promise((resolve, reject) => {
     const ws = deps.createWriteStream(destPath)
     let failed = false
+    let received = 0
 
     const fail = (err: Error) => {
       if (failed) {
@@ -77,6 +108,15 @@ export function pumpStreamToFile(res: ReadableLike, destPath: string, deps: Pump
       }
 
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array)
+
+      received += buffer.length
+
+      if (maxBytes !== undefined && received > maxBytes) {
+        fail(new GatewayDownloadTooLargeError())
+
+        return
+      }
+
       const ok = ws.write(buffer)
 
       // Backpressure: pause the source until the file stream drains so we never
@@ -99,6 +139,53 @@ export function pumpStreamToFile(res: ReadableLike, destPath: string, deps: Pump
       ws.end(() => resolve())
     })
   })
+}
+
+export interface AtomicPumpDeps extends PumpDeps {
+  mkdtemp: (prefix: string) => Promise<string>
+  rename: (oldPath: string, newPath: string) => Promise<unknown>
+  rm: (target: string, options: { force: boolean; recursive: boolean }) => Promise<unknown>
+}
+
+// Atomic variant of pumpStreamToFile: the body lands in a temp file inside the
+// destination directory and is renamed onto `destPath` only after the stream
+// completed in full. A failed download therefore leaves a pre-existing
+// destination byte-identical — writing directly into the final pathname and
+// unlinking it by name on error both corrupts the original mid-transfer and
+// races a concurrent replacement at the same path.
+//
+// POSIX rename(2) replaces an existing destination atomically. Windows refuses
+// to rename over an existing file, so there the destination is unlinked first
+// and then renamed into place: still never a partial file at the final path,
+// only a small no-file window after the user explicitly confirmed replacement.
+export async function pumpStreamToFileAtomically(
+  res: ReadableLike,
+  destPath: string,
+  deps: AtomicPumpDeps,
+  maxBytes?: number
+): Promise<void> {
+  const tempDir = await deps.mkdtemp(path.join(path.dirname(destPath), '.hermes-download-'))
+  const tempPath = path.join(tempDir, 'payload')
+
+  try {
+    await pumpStreamToFile(res, tempPath, deps, maxBytes)
+
+    try {
+      await deps.rename(tempPath, destPath)
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+
+      if (code !== 'EEXIST' && code !== 'EPERM' && code !== 'ENOTEMPTY') {
+        throw error
+      }
+
+      // Windows fallback documented above: replace after confirmed success.
+      await deps.unlink(destPath)
+      await deps.rename(tempPath, destPath)
+    }
+  } finally {
+    await deps.rm(tempDir, { force: true, recursive: true }).catch(() => undefined)
+  }
 }
 
 // Decode a `data:[<mime>][;base64],<payload>` URL into a Buffer. Used by the

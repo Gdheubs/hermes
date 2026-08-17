@@ -50,9 +50,26 @@ test('finalizeGatewayDownload prompts a save dialog then streams the response', 
   const fn = extract('async function finalizeGatewayDownload', '\nfunction readGatewayErrorText')
 
   assert.match(fn, /dialog\.showSaveDialog/)
-  assert.match(fn, /pumpStreamToFile\(/)
+  assert.match(fn, /pumpStreamToFileAtomically\(/)
   // HTTP errors carry their status so a 404 can trigger the fallback.
   assert.match(fn, /error\.statusCode = statusCode/)
+})
+
+test('finalizeGatewayDownload never saves a redirect body and bounds the download', () => {
+  const fn = extract('async function finalizeGatewayDownload', '\nfunction readGatewayErrorText')
+
+  // A 3xx (e.g. an auth interstitial) must fail the download, not become the file.
+  assert.match(fn, /statusCode >= 300 && statusCode < 400/)
+  // The announced body is rejected before the dialog; the stream is capped while flowing.
+  assert.match(fn, /contentLengthExceedsLimit\(headers, GATEWAY_DOWNLOAD_MAX_BYTES\)/)
+  assert.match(fn, /GATEWAY_DOWNLOAD_MAX_BYTES/)
+})
+
+test('finalizeGatewayDownload binds the save dialog to the requesting window', () => {
+  const fn = extract('async function finalizeGatewayDownload', '\nfunction readGatewayErrorText')
+
+  // The IPC sender's window wins; the global mainWindow is only the fallback.
+  assert.match(fn, /dialog\.showSaveDialog\(ctx\.window \?\? mainWindow/)
 })
 
 test('saveGatewayFile falls back to the data-url route only on 404', () => {

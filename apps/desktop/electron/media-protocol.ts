@@ -94,6 +94,21 @@ export function remoteMediaEndpoint(baseUrl: string, filePath: string): string {
   return url.toString()
 }
 
+// The gateway must answer media requests directly. A 3xx here would hand the
+// renderer attacker-chosen content under the trusted hermes-media: scheme (and
+// the fetch wrappers in main.ts already refuse to follow with redirect:
+// 'error', so a visible 3xx only appears if that wiring changes). Treat every
+// redirect as unavailable instead of following it across the gateway boundary.
+function rejectMediaRedirect(response: Response): Response {
+  if (response.status >= 300 && response.status < 400) {
+    response.body?.cancel().catch(() => undefined)
+
+    return new Response('Remote media unavailable', { status: 502 })
+  }
+
+  return response
+}
+
 export function createMediaProtocolHandler(dependencies: MediaProtocolDependencies) {
   return async (request: Pick<Request, 'headers' | 'method' | 'url'>): Promise<Response> => {
     if (request.method !== 'GET' && request.method !== 'HEAD') {
@@ -147,10 +162,10 @@ export function createMediaProtocolHandler(dependencies: MediaProtocolDependenci
         if (bearer) {
           headers.set('authorization', `Bearer ${bearer}`)
 
-          return await dependencies.fetchRemote(endpoint, headers, method)
+          return rejectMediaRedirect(await dependencies.fetchRemote(endpoint, headers, method))
         }
 
-        return await dependencies.fetchRemoteWithCookies(endpoint, headers, method)
+        return rejectMediaRedirect(await dependencies.fetchRemoteWithCookies(endpoint, headers, method))
       }
 
       if (!connection.token) {
@@ -159,7 +174,7 @@ export function createMediaProtocolHandler(dependencies: MediaProtocolDependenci
 
       headers.set('x-hermes-session-token', connection.token)
 
-      return await dependencies.fetchRemote(endpoint, headers, method)
+      return rejectMediaRedirect(await dependencies.fetchRemote(endpoint, headers, method))
     } catch {
       return new Response('Remote media unavailable', { status: 502 })
     }
