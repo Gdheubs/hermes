@@ -74,6 +74,60 @@ def test_partially_valid_platform_toolsets_no_runtime_warning(caplog):
     assert not any("#38798" in r.getMessage() for r in caplog.records)
 
 
+# ── F7: quoted-JSON / empty-list restriction values fail CLOSED ──────────────
+
+
+def test_quoted_json_platform_toolsets_string_parses_to_list():
+    """F7: a quoted-JSON string saved by a JSON-mode editor
+    (``platform_toolsets.cli: '["file","web"]'``) must be recovered to the
+    intended list — NOT silently ignored (which fell back to the FULL default
+    toolset, failing open)."""
+    config = {"platform_toolsets": {"cli": '["web", "time"]'}}
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+    assert "web" in enabled and "time" in enabled
+
+
+def test_malformed_quoted_json_platform_toolsets_fails_closed():
+    """F7: a restriction value that LOOKS like a list but is not valid
+    JSON/Python is a configuration error — refuse to resolve (fail closed)
+    instead of silently enabling the full default toolset."""
+    config = {"platform_toolsets": {"cli": '["web", time]'}}
+    with pytest.raises(ValueError, match="fail closed"):
+        _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+
+
+def test_empty_platform_toolsets_list_means_disable_all():
+    """F7: an explicitly saved EMPTY toolset list means NO toolsets for the
+    platform (disable all / fail closed) — not \"no restriction\", which
+    previously fell back to the full default composite + recovery pass."""
+    config = {"platform_toolsets": {"cli": []}}
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+    assert enabled == set()
+
+
+def test_unset_platform_toolsets_still_applies_defaults():
+    """F7 control: a genuinely UNSET restriction value keeps the historical
+    default resolution — only explicit values are fail-closed."""
+    config = {}  # no platform_toolsets at all
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+    # Default composite resolution yields the platform's default toolset.
+    assert "hermes-cli" in enabled or bool(enabled)
+
+
+def test_quoted_json_disabled_toolsets_recovered_and_empty_means_none_disabled():
+    """F7: quoted-JSON ``agent.disabled_toolsets`` strings are recovered to
+    lists (so the restriction applies), while an empty list means nothing is
+    disabled — matching the unset default. Only a MALFORMED structured string
+    fails closed."""
+    from agent.skill_utils import parse_config_string_list
+
+    assert parse_config_string_list('["memory", "web"]') == ["memory", "web"]
+    assert parse_config_string_list("[]") == []
+    assert parse_config_string_list(None) == []
+    with pytest.raises(ValueError, match="fail closed"):
+        parse_config_string_list('["memory", web]')
+
+
 
 
 
