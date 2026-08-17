@@ -143,6 +143,41 @@ class TestCwdHandling:
         assert config["cwd"] == "/workspace"
         assert config["host_cwd"] == "/home/user/project"
 
+    def test_posix_host_cwd_survives_windows_abspath_mangling(self, monkeypatch):
+        """POSIX-style TERMINAL_CWD must not be mangled by abspath on Windows.
+
+        On Windows, os.path.abspath() turns a POSIX-style host path such as
+        /Users/someone/projects into a Windows drive path (D:\\Users\\...),
+        which no longer matches the _HOST_CWD_PREFIXES. Simulate that
+        mangling on any platform by patching os.path.abspath; the expanded
+        (pre-abspath) form must win so host_cwd keeps the real host path.
+        """
+        monkeypatch.setattr(
+            os.path, "abspath",
+            lambda p: "D:\\Users\\someone\\projects" if p == "/Users/someone/projects" else p,
+        )
+        monkeypatch.setattr(os.path, "isdir", lambda _p: False)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("TERMINAL_CWD", "/Users/someone/projects")
+        monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
+        config = _tt_mod._get_env_config()
+        assert config["cwd"] == "/workspace"
+        assert config["host_cwd"] == "/Users/someone/projects", (
+            f"Expected POSIX host cwd, got {config['host_cwd']}. "
+            "abspath-mangled Windows drive form must not leak into host_cwd."
+        )
+
+    def test_windows_host_cwd_resolves_via_abspath_form(self, monkeypatch):
+        """Native Windows drive paths still map to /workspace via abspath form."""
+        monkeypatch.setattr(os.path, "abspath", lambda p: p)
+        monkeypatch.setattr(os.path, "isdir", lambda _p: False)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("TERMINAL_CWD", "C:\\Users\\alice\\projects")
+        monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
+        config = _tt_mod._get_env_config()
+        assert config["cwd"] == "/workspace"
+        assert config["host_cwd"] == "C:\\Users\\alice\\projects"
+
     def test_local_backend_uses_getcwd(self, monkeypatch):
         """Local backend should use os.getcwd(), not /root."""
         monkeypatch.setenv("TERMINAL_ENV", "local")
