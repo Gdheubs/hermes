@@ -9459,6 +9459,9 @@ def _call_llm_impl(
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
+            if max_tokens is not None:
+                retry_kwargs.pop("max_tokens", None)
+                retry_kwargs.pop("max_completion_tokens", None)
             logger.info(
                 "Auxiliary %s: provider rejected temperature; retrying once without it",
                 task or "call",
@@ -10175,6 +10178,9 @@ async def _async_call_llm_impl(
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
+            if max_tokens is not None:
+                retry_kwargs.pop("max_tokens", None)
+                retry_kwargs.pop("max_completion_tokens", None)
             logger.info(
                 "Auxiliary %s (async): provider rejected temperature; retrying once without it",
                 task or "call",
