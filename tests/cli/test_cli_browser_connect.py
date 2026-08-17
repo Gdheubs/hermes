@@ -10,6 +10,7 @@ from unittest.mock import patch
 from cli import HermesCLI
 from hermes_cli.browser_connect import (
     _wait_for_browser_debug_ready_or_exit,
+    chrome_debug_authorization_guidance,
     get_chrome_debug_candidates,
     is_browser_debug_ready,
     launch_chrome_debug,
@@ -171,5 +172,29 @@ class TestChromeDebugLaunch:
         # Windows uses cmd.exe-compatible quoting via subprocess.list2cmdline.
         assert command.startswith(f'"{chrome}" --remote-debugging-port=9222')
         assert "'" not in command
+
+
+class TestChromeDebugAuthorizationGuidance:
+    """Chrome 144+ remote-debugging gate guidance must explain that a
+    SEPARATE isolated instance is launched and chrome:// links cannot be
+    shell-opened (the Microsoft Store dialog confusion)."""
+
+    def test_explains_separate_instance_and_dedicated_profile(self):
+        text = chrome_debug_authorization_guidance("Linux")
+        assert "SEPARATE" in text
+        assert "chrome-debug" in text  # names the dedicated debug profile dir
+        assert "everyday Chrome" in text  # nothing to enable in the real browser
+        assert "Allow remote debugging for this browser instance" in text
+        assert "Chrome 144+" in text
+
+    def test_windows_mentions_store_dialog_for_chrome_links(self):
+        text = chrome_debug_authorization_guidance("Windows")
+        assert "Microsoft Store" in text
+        assert "How do you want to open this" in text
+
+    def test_linux_omits_windows_store_dialog(self):
+        text = chrome_debug_authorization_guidance("Linux")
+        assert "Microsoft Store" not in text
+        assert "chrome://inspect/#remote-debugging" in text
 
 

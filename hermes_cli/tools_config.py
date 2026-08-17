@@ -1795,7 +1795,11 @@ def _ensure_browser_use_cli(*, verbose_hints: bool = False) -> None:
         else:
             _print_info("    Install manually: uv tool install browser-use  (https://docs.astral.sh/uv/)")
     if verbose_hints:
-        _print_info("    Local Chrome needs remote debugging: chrome://inspect/#remote-debugging")
+        _print_info(
+            "    Local Chrome: Hermes launches a separate isolated Chrome instance with remote debugging. "
+            "On Chrome 144+, the first connection shows an \"Allow remote debugging for this browser "
+            "instance\" prompt in that instance's window - tick and click Allow there."
+        )
         _print_info("    Cloud browsers: browser-use auth login  (or set BROWSER_USE_API_KEY)")
 
 

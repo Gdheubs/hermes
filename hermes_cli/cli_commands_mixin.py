@@ -31,6 +31,7 @@ from hermes_constants import display_hermes_home, is_termux as _is_termux_enviro
 from agent.turn_context import extract_api_content_sidecar
 from hermes_cli.browser_connect import (
     DEFAULT_BROWSER_CDP_URL,
+    chrome_debug_authorization_guidance,
     discover_local_cdp_url,
     find_free_debug_port,
     is_browser_debug_ready,
@@ -2440,6 +2441,8 @@ class CLICommandsMixin:
                     else:
                         print(f"   ⚠ Browser launched but port {_launch_port} isn't responding yet")
                         print("     Try again in a few seconds — the debug instance may still be starting")
+                        print()
+                        print(chrome_debug_authorization_guidance(_plat.system()))
                 else:
                     print("   ⚠ Could not auto-launch a Chromium-family browser")
                     _hint = _launch.hint
@@ -2457,7 +2460,9 @@ class CLICommandsMixin:
 
             if not _already_open:
                 print()
-                print("Browser not connected — start a Chromium-family browser with remote debugging and retry /browser connect")
+                print("Browser not connected — no Chromium-family browser is serving CDP yet.")
+                print()
+                print(chrome_debug_authorization_guidance(_plat.system()))
                 print()
                 return
 
@@ -2472,6 +2477,14 @@ class CLICommandsMixin:
             print()
             print("🌐 Browser connected to live Chromium-family browser via CDP")
             print(f"   Endpoint: {cdp_url}")
+            print()
+            print(
+                "   Note: on Chrome 144+, the first browser action may show an "
+                "\"Allow remote debugging for this browser instance\" prompt in the "
+                "connected Chrome window — click Allow there. This is a SEPARATE, "
+                "isolated debug instance; nothing needs enabling in your everyday "
+                "Chrome."
+            )
             print()
 
             # Inject context message so the model knows this slash command

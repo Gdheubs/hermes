@@ -93,6 +93,50 @@ _IMAGE_PATH_RE = re.compile(
 _URL_RE = re.compile(r"https?://[^\s'\"\\)]+", re.IGNORECASE)
 
 
+# The browser-use CLI prints its own "tick 'Allow remote debugging for this
+# browser instance' and click Allow" instructions when Chrome 144+ blocks the
+# first CDP attach. Users routinely misread that as "set up my everyday
+# Chrome" — and on Windows, shell-opening a ``chrome://`` link from outside an
+# already-running Chrome opens the "How do you want to open this?" / Microsoft
+# Store dialog instead of a browser. This appended note clears both up.
+_AUTHORIZATION_GATE_GUIDANCE = (
+    "Note: the harness drives its OWN SEPARATE Chrome instance (isolated "
+    "profile) — nothing needs enabling in your everyday Chrome. On Chrome "
+    "144+ the first connection shows an \"Allow remote debugging for this "
+    "browser instance\" checkbox and an Allow popup INSIDE that instance's "
+    "window: tick the box and click Allow there. "
+    "chrome://inspect/#remote-debugging only works when typed into the "
+    "address bar of an already-running Chrome — on Windows, opening the "
+    "link from a shell or another app pops the Microsoft Store dialog "
+    "instead of a browser. If no Chrome window appeared at all, Chrome is "
+    "not installed where Hermes can find it."
+)
+
+
+def _authorization_gate_guidance(text: str) -> Optional[str]:
+    """Return the Chrome 144+ gate clarification when the CLI output shows it.
+
+    The browser-use CLI's own guidance appears when Chrome blocks the first
+    CDP attach behind the per-instance "Allow remote debugging" prompt. That
+    text is easy to misread as "configure your everyday Chrome" (and on
+    Windows, clicking the chrome:// link it names opens the Store dialog), so
+    when we see it we append a clarifying note. Returns ``None`` otherwise so
+    ordinary output passes through untouched.
+    """
+    if not text:
+        return None
+    low = text.lower()
+    if "remote debugging" not in low:
+        return None
+    if (
+        "allow remote debugging" in low
+        or "chrome://inspect" in low
+        or "authorization" in low
+    ):
+        return _AUTHORIZATION_GATE_GUIDANCE
+    return None
+
+
 def _blocked_url_in_code(code: str) -> Optional[str]:
     """Return an error if a URL literal fails the built-in navigation checks."""
     from tools.browser_tool import evaluate_url_safety
@@ -663,6 +707,16 @@ def browser_exec(
         if len(stderr) > _STDERR_CAP_CHARS:
             stderr = stderr[:_STDERR_CAP_CHARS] + "\n… (stderr truncated)"
         result["stderr"] = stderr
+
+    # Chrome 144+ gates the first CDP attach behind an in-browser "Allow
+    # remote debugging" prompt, and the CLI's own instructions for it are
+    # easy to misread as "set up your everyday Chrome". Append a clarifying
+    # note when the harness output carries that signature.
+    guidance = _authorization_gate_guidance(
+        f"{proc.stdout or ''}\n{proc.stderr or ''}"
+    )
+    if guidance:
+        result["guidance"] = guidance
 
     screenshot = _find_screenshot(proc.stdout, started)
     if screenshot:

@@ -836,6 +836,75 @@ class TestBrowserExec:
         assert "timed out" in result["error"]
 
 
+class TestAuthorizationGateGuidance:
+    """Chrome 144+ gates the first CDP attach behind an in-browser "Allow
+    remote debugging" prompt; the CLI's own instructions for it read like
+    "set up your everyday Chrome". We append a clarifying note whenever the
+    harness output carries the gate signature."""
+
+    def test_detects_allow_remote_debugging_phrasing(self):
+        out = (
+            "The browser needs your authorization. Chrome should have opened "
+            "chrome://inspect/#remote-debugging\n1. Tick \"Allow remote "
+            "debugging for this browser instance\"\n2. Click \"Allow\" on the popup"
+        )
+        assert bu_cli._authorization_gate_guidance(out) == bu_cli._AUTHORIZATION_GATE_GUIDANCE
+
+    def test_detects_chrome_inspect_with_remote_debugging(self):
+        out = "remote debugging is turned off — enable chrome://inspect/#remote-debugging"
+        assert bu_cli._authorization_gate_guidance(out) == bu_cli._AUTHORIZATION_GATE_GUIDANCE
+
+    def test_plain_output_gets_no_guidance(self):
+        assert bu_cli._authorization_gate_guidance("") is None
+        assert bu_cli._authorization_gate_guidance("page title: Amazon") is None
+        # "remote debugging" alone (e.g. a --help echo naming the flag with a
+        # space) is not the gate — none of the gate phrases follow it.
+        assert bu_cli._authorization_gate_guidance(
+            "usage: browser-use --remote debugging port [OPTIONS]"
+        ) is None
+
+    def test_guidance_explains_separate_instance_and_windows_link_limit(self):
+        g = bu_cli._AUTHORIZATION_GATE_GUIDANCE
+        assert "SEPARATE" in g
+        assert "everyday Chrome" in g
+        assert "Allow remote debugging for this browser instance" in g
+        assert "chrome://inspect/#remote-debugging" in g
+        assert "Microsoft Store" in g
+
+    def test_guidance_key_appended_when_cli_output_hits_gate(self, monkeypatch):
+        import types as _types
+
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["browser-use"])
+        monkeypatch.setattr(
+            bu_cli.subprocess, "run",
+            lambda *a, **k: _types.SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    "The browser needs your authorization. Tick \"Allow remote "
+                    "debugging for this browser instance\" and click Allow."
+                ),
+                stderr="",
+            ),
+        )
+        result = json.loads(bu_cli.browser_exec("print(1)"))
+        assert result["guidance"] == bu_cli._AUTHORIZATION_GATE_GUIDANCE
+
+    def test_no_guidance_key_on_normal_output(self, monkeypatch):
+        import types as _types
+
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: ["browser-use"])
+        monkeypatch.setattr(
+            bu_cli.subprocess, "run",
+            lambda *a, **k: _types.SimpleNamespace(
+                returncode=0,
+                stdout="page title: Amazon — extracted 12 items",
+                stderr="",
+            ),
+        )
+        result = json.loads(bu_cli.browser_exec("print(1)"))
+        assert "guidance" not in result
+
+
 class TestFindCliManagedBin:
     """MANAGED-FIRST: _find_cli probes $HERMES_HOME/bin before PATH and
     ~/.local/bin, so the Hermes-installed copy always wins."""

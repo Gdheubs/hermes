@@ -133,6 +133,52 @@ def chrome_debug_data_dir() -> str:
     return str(get_hermes_home() / "chrome-debug")
 
 
+# Chrome 144+ gates the first CDP connection to a ``--remote-debugging-port``
+# instance behind an in-browser authorization prompt. The client library (or
+# the browser-use CLI) surfaces that as "tick 'Allow remote debugging for this
+# browser instance' and click Allow", which users routinely misread as "set up
+# my everyday Chrome" — and on Windows, shell-opening a ``chrome://`` link from
+# outside an already-running Chrome opens the "How do you want to open this?"
+# / Microsoft Store dialog instead of a browser. This text clears both up.
+CHROME_AUTHORIZATION_GATE_NOTE = (
+    "Hermes launches a SEPARATE, isolated Chrome debug instance (its own "
+    "profile under {data_dir}) — NOT your everyday Chrome, so nothing needs "
+    "to be enabled in your normal Chrome. On Chrome 144+, the first "
+    "connection shows an \"Allow remote debugging for this browser "
+    "instance\" checkbox and an Allow popup INSIDE that instance's own "
+    "window: tick the box and click Allow there. "
+    "chrome://inspect/#remote-debugging only works when typed into the "
+    "address bar of an already-running Chrome{win_note}. If no Chrome "
+    "window appeared at all, Chrome is not installed where Hermes can find "
+    "it — install it from the normal Chrome website and retry."
+)
+
+
+def chrome_debug_authorization_guidance(system: str | None = None) -> str:
+    """Clear guidance for the Chrome 144+ remote-debugging authorization gate.
+
+    Hermes' ``launch_chrome_debug`` / ``/browser connect`` flow starts a
+    *separate* Chromium-family instance on a dedicated profile rather than
+    attaching to the user's everyday browser. On Chrome 144+ the first CDP
+    connection to that instance is gated behind an in-browser "Allow remote
+    debugging" prompt, and ``chrome://inspect`` links cannot be opened from a
+    shell or another app. This text explains both so a user stops trying to
+    configure their everyday Chrome (or hunt for a Store app) when the debug
+    instance merely needs a one-click Allow.
+    """
+    system = system or platform.system()
+    win_note = (
+        " — on Windows, opening a chrome:// link from a shell or another app "
+        "pops the \"How do you want to open this?\" / Microsoft Store dialog "
+        "instead of a browser"
+        if system == "Windows"
+        else ""
+    )
+    return CHROME_AUTHORIZATION_GATE_NOTE.format(
+        data_dir=chrome_debug_data_dir(), win_note=win_note
+    )
+
+
 def _chrome_debug_args(port: int) -> list[str]:
     return [
         f"--remote-debugging-port={port}",
