@@ -1,0 +1,15 @@
+{
+  "branch": "wr/task-07-effective-config",
+  "changed_files": [
+    "gateway/webhook_config.py",
+    "tests/gateway/test_webhook_effective_config.py"
+  ],
+  "head": "371639a63b1bc64a6bf37599f9ea06b447c8a18a",
+  "head_before_commit": "371639a63b1bc64a6bf37599f9ea06b447c8a18a",
+  "phase": "verification",
+  "repository": "D:\\HERMES-TEMP\\webhook-revolution\\task-07-effective-config",
+  "schema_version": 1,
+  "status": "pass",
+  "task": 7,
+  "timestamp": "2026-08-14T23:02:07Z"
+}
