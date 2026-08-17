@@ -128,6 +128,64 @@ def test_running_profile_is_registered_and_autostarted(tmp_path: Path) -> None:
     assert not (svc / "down").exists()
 
 
+def test_config_multiplexing_registers_running_named_profile_down(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Container boot must honor the config-only multiplexing opt-in."""
+    scandir = tmp_path / "run-service"
+    scandir.mkdir()
+    _make_profile(tmp_path, "coder", state="running")
+    (tmp_path / "config.yaml").write_text(
+        "multiplex_profiles: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("GATEWAY_MULTIPLEX_PROFILES", raising=False)
+
+    actions = reconcile_profile_gateways(
+        hermes_home=tmp_path,
+        scandir=scandir,
+        dry_run=False,
+    )
+
+    assert _named_actions(actions) == [ReconcileAction(
+        profile="coder",
+        prior_state="running",
+        action="registered",
+    )]
+    assert (scandir / "gateway-coder" / "down").exists()
+
+
+def test_multiplex_environment_override_wins_over_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A recognized operator override keeps precedence over config.yaml."""
+    scandir = tmp_path / "run-service"
+    scandir.mkdir()
+    _make_profile(tmp_path, "coder", state="running")
+    (tmp_path / "config.yaml").write_text(
+        "multiplex_profiles: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("GATEWAY_MULTIPLEX_PROFILES", "false")
+
+    actions = reconcile_profile_gateways(
+        hermes_home=tmp_path,
+        scandir=scandir,
+        dry_run=False,
+    )
+
+    assert _named_actions(actions) == [ReconcileAction(
+        profile="coder",
+        prior_state="running",
+        action="started",
+    )]
+    assert not (scandir / "gateway-coder" / "down").exists()
+
+
 def test_registered_profile_has_finish_script(tmp_path: Path) -> None:
     """The finish script must be written so s6 stops restarting on
     fatal config errors (exit 78 → exit 125).  See #51228."""
@@ -297,7 +355,6 @@ def _write_lifecycle_sentinel(profile_dir: Path, payload: dict) -> None:
     state_dir = profile_dir / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "gateway.lifecycle.json").write_text(json.dumps(payload))
-
 
 
 
