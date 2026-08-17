@@ -4590,6 +4590,15 @@ function fetchJson(url, token, options: any = {}) {
       return
     }
 
+    // If an AbortSignal is provided, abort the request when it fires.
+    // This destroys the underlying TCP socket so the backend HTTP handler
+    // sees the connection drop and can free its resources sooner.
+    if (options.signal?.aborted) {
+      reject(new Error('Request aborted by the client'))
+
+      return
+    }
+
     const req = client.request(
       parsed,
       {
@@ -4656,6 +4665,13 @@ function fetchJson(url, token, options: any = {}) {
     req.setTimeout(timeoutMs, () => {
       req.destroy(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
     })
+
+    // Wire the AbortSignal: destroy the request when the signal fires.
+    // Placed after req exists so onAbort can reference it.
+    if (options.signal) {
+      const onAbort = () => req.destroy(new Error('Request aborted by the client'))
+      options.signal.addEventListener('abort', onAbort, { once: true })
+    }
 
     if (body) {
       req.write(body)
@@ -12555,7 +12571,8 @@ ipcMain.handle('hermes:api', async (_event, request) => {
         method: request?.method,
         body: request?.body,
         timeoutMs,
-        bearer: restAuth.token
+        bearer: restAuth.token,
+        signal: request?.signal
       })
     }
 
@@ -12570,7 +12587,8 @@ ipcMain.handle('hermes:api', async (_event, request) => {
     method: request?.method,
     body: request?.body,
     upload: request?.upload,
-    timeoutMs
+    timeoutMs,
+    signal: request?.signal
   })
 })
 
