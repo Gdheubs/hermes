@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import type { SessionInfo } from '@/types/hermes'
 
+import { $goalsBySession, setSessionGoal } from './goals'
 import { $sessions, $unreadFinishedSessionIds, setSessions } from './session'
 import { $delegatingSessionIds, $sessionDotStateById, hasLiveTurn, showsRunningArc } from './session-dot-state'
 import { clearAllSessionStates, publishSessionState } from './session-states'
@@ -88,6 +89,53 @@ describe('$delegatingSessionIds', () => {
 
 const storedRow = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo =>
   ({ id, message_count: 1, source: 'cli', started_at: 0, title: id, ...extra }) as SessionInfo
+
+describe('standing Goals', () => {
+  beforeEach(() => {
+    clearAllSessionStates()
+    $goalsBySession.set({})
+    $sessions.set([storedRow('s1')])
+  })
+
+  afterEach(() => {
+    clearAllSessionStates()
+    $goalsBySession.set({})
+    $sessions.set([])
+  })
+
+  it('keeps an active Goal visible as background work', () => {
+    setSessionGoal('s1', { status: 'active', title: 'ship the feature', updatedAt: 0 })
+
+    expect($sessionDotStateById.get()['s1']).toBe('background')
+  })
+
+  it('keeps a waiting Goal visible as background work', () => {
+    setSessionGoal('s1', { status: 'waiting', title: 'ship the feature', updatedAt: 0 })
+
+    expect($sessionDotStateById.get()['s1']).toBe('background')
+  })
+
+  it('bridges a runtime Goal to its stored sidebar session', () => {
+    publishSessionState('runtime-1', { ...createClientSessionState('stored-1'), busy: false })
+    $sessions.set([storedRow('stored-1')])
+    setSessionGoal('runtime-1', { status: 'active', title: 'ship the feature', updatedAt: 0 })
+
+    expect($sessionDotStateById.get()['stored-1']).toBe('background')
+  })
+
+  it('lets a live turn outrank a standing Goal', () => {
+    setSessionGoal('s1', { status: 'active', title: 'ship the feature', updatedAt: 0 })
+    publishSessionState('runtime-1', { ...createClientSessionState('s1'), busy: true })
+
+    expect($sessionDotStateById.get()['s1']).toBe('working')
+  })
+
+  it('drops a paused Goal back to the idle state', () => {
+    setSessionGoal('s1', { status: 'paused', title: 'ship the feature', updatedAt: 0 })
+
+    expect($sessionDotStateById.get()['s1'] ?? 'idle').toBe('idle')
+  })
+})
 
 describe('persisted unread (backend watermark)', () => {
   beforeEach(() => {

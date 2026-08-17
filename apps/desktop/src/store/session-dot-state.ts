@@ -28,6 +28,7 @@ import { computed } from 'nanostores'
 import { stableArray, stableRecord } from '@/lib/stable-array'
 
 import { $backgroundRunningSessionIds } from './composer-status'
+import { $goalsBySession } from './goals'
 import { $sessions, $unreadFinishedSessionIds, lineageAliases } from './session'
 import {
   $attentionSessionIds,
@@ -99,9 +100,32 @@ export const sessionStatusRank = (state?: SessionDotState): number => STATUS_RAN
 
 let dotStates: Readonly<Record<string, SessionDotState>> = {}
 
+// Module-level on purpose: stableArray needs the previous result to preserve
+// identity when unrelated stream updates re-evaluate this projection.
+let standingGoalIds: readonly string[] = []
+const $standingGoalSessionIds = computed(
+  [$goalsBySession, $sessionStates, $sessions],
+  (goals, sessionStates, sessions) => {
+    const ids = new Set<string>()
+
+    for (const [runtimeId, goal] of Object.entries(goals)) {
+      if (goal.status !== 'active' && goal.status !== 'waiting') {
+        continue
+      }
+
+      for (const alias of lineageAliases(sessionStates[runtimeId]?.storedSessionId ?? runtimeId, sessions)) {
+        ids.add(alias)
+      }
+    }
+
+    return (standingGoalIds = stableArray(standingGoalIds, [...ids]))
+  }
+)
+
 export const $sessionDotStateById = computed(
   [
     $attentionSessionIds,
+    $standingGoalSessionIds,
     $workingSessionIds,
     $stalledSessionIds,
     $backgroundRunningSessionIds,
@@ -111,7 +135,7 @@ export const $sessionDotStateById = computed(
     $sessions,
     $unreadWriteGuard
   ],
-  (attention, working, stalled, background, delegating, unread, draft, sessions, unreadWriteGuard) => {
+  (attention, standingGoals, working, stalled, background, delegating, unread, draft, sessions, unreadWriteGuard) => {
     const next: Record<string, SessionDotState> = {}
 
     const claim = (ids: readonly string[], state: SessionDotState) => {
@@ -157,6 +181,10 @@ export const $sessionDotStateById = computed(
 
     claim(persistedUnread, 'unread')
 
+    // A standing Goal can keep working between model turns. Treat it as
+    // background work so the sidebar does not fall back to an idle dot while
+    // the Goal remains active; a live turn below still upgrades it to working.
+    claim(standingGoals, 'background')
     claim(background, 'background')
     // Async delegation: the parent turn has ended but its subagents are still
     // running, so the session's work continues in child sessions. Same visual
