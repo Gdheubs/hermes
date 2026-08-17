@@ -233,6 +233,11 @@ CREATE TABLE IF NOT EXISTS session_turn_leases (
     expires_at DOUBLE PRECISION NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS gateway_hygiene_state (
+    session_key TEXT PRIMARY KEY,
+    failure_streak INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE INDEX IF NOT EXISTS idx_session_turn_leases_expires ON session_turn_leases(expires_at);
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -556,6 +561,23 @@ _PG_ONLY_MIGRATIONS: List[PostgresMigration] = [
             "    git_metadata_generation INTEGER NOT NULL DEFAULT 0;\n"
             "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS\n"
             "    hidden INTEGER NOT NULL DEFAULT 0"
+        ),
+    ),
+    # v25 — gateway_hygiene_state, added upstream to SCHEMA_SQL. The table is
+    # read and written by SessionDB on the shared (backend-agnostic) path, so
+    # a Postgres-backed install needs it too. Caught by the schema-parity guard
+    # rather than by anyone noticing — which is the guard doing its job.
+    #
+    # reconcile_postgres_columns only ever ADDs columns, never CREATEs tables,
+    # so this needs an explicit migration or a live database never gets it.
+    PostgresMigration(
+        version=25,
+        optional=True,
+        sql=(
+            "CREATE TABLE IF NOT EXISTS gateway_hygiene_state (\n"
+            "    session_key TEXT PRIMARY KEY,\n"
+            "    failure_streak INTEGER NOT NULL DEFAULT 0\n"
+            ")"
         ),
     ),
 ]
