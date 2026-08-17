@@ -2184,9 +2184,22 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
 
     These env vars are deprecated — the canonical setting is terminal.cwd
     in config.yaml.  Prints a migration hint to stderr.
+
+    Reads the on-disk .env rather than ``os.environ``: TERMINAL_CWD is also
+    set at runtime (config.yaml bridge, session-cwd restore, worktree switch,
+    kanban workspace pinning), and warning on the process env told users to
+    delete a line that was never in their .env.  ``hermes doctor`` already
+    reads the file for the same reason.
     """
-    messaging_cwd = os.environ.get("MESSAGING_CWD")
-    terminal_cwd_env = os.environ.get("TERMINAL_CWD")
+    try:
+        env_file = load_env()
+    except Exception:
+        return
+
+    messaging_cwd = env_file.get("MESSAGING_CWD")
+    terminal_cwd_env = env_file.get("TERMINAL_CWD")
+    if not messaging_cwd and not terminal_cwd_env:
+        return
 
     if config is None:
         try:
