@@ -602,6 +602,39 @@ $gateway.subscribe(syncReposScanning)
 
 export async function scanAndRecordRepos(force = false): Promise<void> {
   if (isDesktopFsRemoteMode()) {
+    // On a remote backend the desktop can't crawl the host filesystem.
+    // Ask the host to scan its own discovery roots (`projects.discover_repos`
+    // with `scan: true` — added in #81723) so repos with zero Hermes
+    // sessions still surface, then refresh the tree so the sidebar picks up
+    // the merged session-derived + scanned list.
+    try {
+      const context = await activeProjectsContext()
+      const discovered = await gatewayRequestOn<{
+        repos?: unknown
+        discovery_policy?: unknown
+      }>(context.gateway, 'projects.discover_repos', { scan: true })
+
+      // A resolved response must be the discovery shape. Anything else (an
+      // error/`accepted:false` body, or a backend that ignored `scan` and
+      // returned no repo list) means the scan didn't happen — bail out without
+      // touching the tree so the sidebar keeps its last known list instead of
+      // being blanked back to the silent, unpopulated state of #81723.
+      if (discovered?.repos === undefined) {
+        markProjectsRpcFailure(new Error('projects.discover_repos returned no repo list'))
+        return
+      }
+
+      // Remote scan succeeded: refresh the tree so the merged session-derived +
+      // scanned list surfaces. `refreshProjectTreeOn` manages its own success /
+      // stale-backend failure state and keeps the cached tree on any error.
+      await refreshProjectTreeOn(context.gateway)
+    } catch (err) {
+      // Surface the failure (stale backend, RPC error, gateway drop) instead
+      // of swallowing it: a silent return is exactly the "sidebar goes quiet"
+      // symptom `scan:true` was meant to fix (#81723). Keep the old list and
+      // let the sidebar show the error/absent state.
+      markProjectsRpcFailure(err)
+    }
     return
   }
 

@@ -33,6 +33,13 @@ def _(rid, params: dict) -> dict:
                 policy_key,
                 preserve_unversioned=_repo_discovery_policy_is_default(policy),
             )
+            # `scan=true` (set by the desktop in remote-gateway mode): run a
+            # backend-side filesystem scan of the policy roots so repos with
+            # zero Hermes sessions still surface. The desktop's native scan
+            # only runs on the local filesystem; on a remote connection it
+            # must ask the host to scan itself (#81723).
+            if params.get("scan") and policy["enabled"]:
+                _scan_discovered_repos_remote(conn, policy)
             repos = _discover_repos_payload(
                 db, conn=conn, include_cached=policy["enabled"]
             )
