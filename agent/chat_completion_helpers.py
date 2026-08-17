@@ -1824,10 +1824,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 def resolve_qwen_preserve_thinking(agent) -> bool:
-    """Send parameters.preserve_thinking=true on Qwen wires (the quality
-    contract): the historical reasoning is always consumed. Default true;
-    a false setting makes the reasoning strippable (the strip gate must
-    align before the strip is applied). Non-Qwen models always return None."""
+    """Send parameters.preserve_thinking=true on Qwen wires so the historical
+    reasoning is always consumed. Default true; false makes it strippable
+    (the strip gate must align first). Non-Qwen models return False."""
     try:
         from agent.prompt_caching import is_qwen_model
         from hermes_cli.config import load_config_readonly

@@ -1,4 +1,4 @@
-"""The qwen preserve_thinking enforcement (the quality contract)."""
+"""The qwen preserve_thinking enforcement."""
 
 from unittest.mock import patch
 

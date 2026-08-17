@@ -1069,6 +1069,8 @@ _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 _FALLBACK_SUMMARY_MAX_CHARS = 8_000
 
 # Coding/tool-heavy signal set (the checkpoint + the strip share it).
+# ── Coding / tool-heavy signal set (the checkpoint + the preserve-thinking
+#    strip share it). Deterministic, no ML.
 _CODING_TOOL_NAMES = frozenset({
     "read_file", "write_file", "edit_file", "apply_patch", "replace_in_file",
     "grep", "rg", "glob", "search_files", "read_special_file", "run_tests",
@@ -6987,7 +6989,8 @@ This compaction should PRIORITISE preserving all information related to the focu
             merged.append(msg)
         return merged
 
-    def _span_tool_ratio(self, turns_to_summarize: List[Dict[str, Any]]) -> float:
+    @staticmethod
+    def _span_tool_ratio(turns_to_summarize: List[Dict[str, Any]]) -> float:
         """Share of the compressible span's TOKENS that are tool messages.
 
         Token share, not message count: a few giant tool results dominate a
@@ -7004,6 +7007,61 @@ This compaction should PRIORITISE preserving all information related to the focu
             if m.get("role") == "tool" or m.get("tool_call_id") or m.get("tool_calls")
         )
         return tool_tokens / total
+
+    @staticmethod
+    def _coding_tool_name_share(turns_to_summarize: List[Dict[str, Any]]) -> float:
+        """Share of the tool CALLS whose name is a known coding tool.
+
+        Catches a middle dominated by coding-tool activity even when the
+        result payloads are small (the token ratio would miss it).
+        """
+        calls = []
+        for m in turns_to_summarize:
+            for tc in m.get("tool_calls") or []:
+                name = ((tc.get("function") or {}).get("name") or "").lower()
+                if name:
+                    calls.append(name)
+            if m.get("name") and (m.get("role") == "tool" or m.get("tool_call_id")):
+                calls.append(str(m["name"]).lower())
+        if not calls:
+            return 0.0
+        return sum(1 for n in calls if n in _CODING_TOOL_NAMES) / len(calls)
+
+    @staticmethod
+    def _coding_prompt_hint(messages: List[Dict[str, Any]]) -> bool:
+        """True when a user or assistant message carries a coding hint
+        (code fences, file paths, coding verbs) — catches code-bearing turns
+        with no tool calls at all."""
+        for m in messages:
+            content = str(m.get("content") or "")
+            if not content:
+                continue
+            for pat in _CODING_PROMPT_PATTERNS:
+                if pat.search(content):
+                    return True
+        return False
+
+    @classmethod
+    def _tool_heavy_score(cls, turns_to_summarize) -> float:
+        """Tool-heavy score in [0,1]: the max of the tool-token ratio and the
+        coding-tool-name share. THE checkpoint signal — a conversational middle
+        quoting code (a coding hint) is NOT tool-heavy and must keep the LLM
+        summary."""
+        return max(
+            cls._span_tool_ratio(turns_to_summarize),
+            cls._coding_tool_name_share(turns_to_summarize),
+        )
+
+    @classmethod
+    def _coding_score(cls, turns_to_summarize, all_messages) -> float:
+        """Coding-heavy score in [0,1]: the tool signals plus the prompt-hint
+        indicator. The preserve-thinking strip's signal (a code-bearing turn
+        with no tools still counts as coding). The max keeps ANY strong signal
+        decisive."""
+        return max(
+            cls._tool_heavy_score(turns_to_summarize),
+            1.0 if cls._coding_prompt_hint(all_messages) else 0.0,
+        )
 
     def _build_compaction_checkpoint(
         self,
@@ -7468,7 +7526,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             summary = None  # No LLM call; Phase 4 inserts the deterministic fallback
         elif (
             self.checkpoint_mode
-            and self._span_tool_ratio(turns_to_summarize) >= self.checkpoint_tool_ratio
+            and self._tool_heavy_score(turns_to_summarize) >= self.checkpoint_tool_ratio
         ):
             # Tool-heavy middle: the deterministic checkpoint (no LLM call).
             summary = self._build_compaction_checkpoint(
