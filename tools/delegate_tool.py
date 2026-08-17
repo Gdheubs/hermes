@@ -17,6 +17,7 @@ The parent's context only sees the delegation call and the summary result,
 never the child's intermediate tool calls or reasoning.
 """
 
+import copy
 import enum
 import contextvars
 import json
@@ -1235,6 +1236,7 @@ def _build_child_progress_callback(
     model: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
     session_ref: Optional[Dict[str, Any]] = None,
+    route: Optional[str] = None,
 ) -> Optional[callable]:
     """Build a callback that relays child agent tool calls to the parent display.
 
@@ -1280,6 +1282,8 @@ def _build_child_progress_callback(
             kw["depth"] = depth
         if model is not None:
             kw["model"] = model
+        if route:
+            kw["route"] = str(route)
         if toolsets is not None:
             kw["toolsets"] = list(toolsets)
         # The child's own session id — filled into the shared ref once the
@@ -1479,6 +1483,7 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
+    override_reasoning_effort: Any = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1486,6 +1491,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    route: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1619,6 +1625,7 @@ def _build_child_agent(
         model=effective_model_for_cb,
         toolsets=child_toolsets,
         session_ref=child_session_ref,
+        route=route,
     )
 
     # Each subagent gets its own iteration budget capped at max_iterations
@@ -1714,7 +1721,11 @@ def _build_child_agent(
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
         # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
+        delegation_effort = (
+            override_reasoning_effort
+            if override_reasoning_effort is not None
+            else delegation_cfg.get("reasoning_effort")
+        )
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
 
@@ -2320,6 +2331,7 @@ def _run_single_child(
     owner_session_id: Optional[str] = None,
     owner_transport: Any = None,
     owner_session_record: Any = None,
+    route: Optional[str] = None,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -2490,6 +2502,7 @@ def _run_single_child(
                 "owner_session_id": owner_session_id,
                 "owner_transport": owner_transport,
                 "owner_session_record": owner_session_record,
+                "route": route,
             }
         )
 
@@ -3471,6 +3484,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    route: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     action: Optional[str] = None,
@@ -3483,8 +3497,8 @@ def delegate_task(
     already-running ones.
 
     Spawn modes (action='spawn' or omitted):
-      - Single: provide goal (+ optional context and role)
-      - Batch:  provide tasks array [{goal, context, role}, ...]
+      - Single: provide goal (+ optional context, role, and route alias)
+      - Batch:  provide tasks array [{goal, context, role, route}, ...]
 
     Control modes (synchronous, never backgrounded):
       - action='list'  -> live children of this conversation's spawn tree
@@ -3565,16 +3579,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -3601,7 +3605,12 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
+        single_task: Dict[str, Any] = {
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "route": route,
+        }
         if output_schema is not None:
             single_task["output_schema"] = output_schema
         task_list = [single_task]
@@ -3647,6 +3656,38 @@ def delegate_task(
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
 
+    # Resolve every child route before constructing any child. Aliases are an
+    # operator-owned allowlist under delegation.routes; raw routing fields are
+    # intentionally not accepted from the model. In batch mode a per-task alias
+    # overrides the top-level default.
+    try:
+        selected_aliases = [task.get("route") or route for task in task_list]
+        # Validate every requested alias before doing credential resolution so a
+        # malformed batch fails as one unit and never partially constructs work.
+        routes = _configured_routes(cfg)
+        safe_names = _safe_route_alias_names(cfg)
+        for alias in selected_aliases:
+            if alias and str(alias).strip() not in routes:
+                available = ", ".join(safe_names) if safe_names else "none configured"
+                raise ValueError(
+                    f"Unknown or disallowed delegation route alias '{str(alias).strip()}'. "
+                    f"Safe route aliases: {available}. Raw provider/model/base_url/api_key "
+                    "routing is not accepted per call."
+                )
+        default_creds = None
+        task_creds = []
+        for alias in selected_aliases:
+            if alias:
+                task_creds.append(
+                    _resolve_delegation_route_alias(cfg, str(alias), parent_agent)
+                )
+            else:
+                if default_creds is None:
+                    default_creds = _resolve_delegation_credentials(cfg, parent_agent)
+                task_creds.append(default_creds)
+    except ValueError as exc:
+        return tool_error(str(exc))
+
     overall_start = time.monotonic()
     results = []
 
@@ -3665,8 +3706,9 @@ def delegate_task(
         wrap_progress_callback,
     )
 
+    header_creds = task_creds[0] if task_creds else {}
     live_deleg_id, live_writers, live_paths = create_live_transcripts(
-        task_list, context, model=creds.get("model"), provider=creds.get("provider")
+        task_list, context, model=header_creds.get("model"), provider=header_creds.get("provider")
     )
 
     # Capture the ORIGINATING session's wake target BEFORE any child agent is
@@ -3716,19 +3758,21 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=task_creds[i]["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=task_creds[i]["provider"],
+                override_base_url=task_creds[i]["base_url"],
+                override_api_key=task_creds[i]["api_key"],
+                override_api_mode=task_creds[i]["api_mode"],
+                override_request_overrides=task_creds[i].get("request_overrides"),
+                override_max_tokens=task_creds[i].get("max_output_tokens"),
+                override_reasoning_effort=task_creds[i].get("reasoning_effort"),
+                override_acp_command=task_creds[i].get("command"),
+                override_acp_args=task_creds[i].get("args"),
                 role=effective_role,
+                route=(str(selected_aliases[i]).strip() if selected_aliases[i] else None),
             )
         except ValueError as exc:
             # Explicit-pin preflight failures (e.g. pinned delegation.command
@@ -3775,6 +3819,7 @@ def delegate_task(
                 owner_session_id=_origin_ui_session_id or None,
                 owner_transport=_origin_owner_transport,
                 owner_session_record=_origin_owner_session_record,
+                route=(str(selected_aliases[_i]).strip() if selected_aliases[_i] else None),
             )
             results.append(result)
         else:
@@ -3800,6 +3845,7 @@ def delegate_task(
                         owner_session_id=_origin_ui_session_id or None,
                         owner_transport=_origin_owner_transport,
                         owner_session_record=_origin_owner_session_record,
+                        route=(str(selected_aliases[i]).strip() if selected_aliases[i] else None),
                     )
                     futures[future] = i
 
@@ -4115,7 +4161,11 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=(
+                task_creds[0]["model"]
+                if all(c.get("model") == task_creds[0].get("model") for c in task_creds)
+                else "mixed routes"
+            ),
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
@@ -4279,6 +4329,249 @@ def _resolve_child_credential_pool(
             exc,
         )
     return None
+
+
+_ROUTE_ALLOWED_FIELDS = frozenset(
+    {
+        "provider",
+        "model",
+        "base_url",
+        "api_mode",
+        "reasoning_effort",
+        "max_output_tokens",
+        "request_overrides",
+    }
+)
+_ROUTE_FORBIDDEN_SECRET_FIELDS = frozenset(
+    {"api_key", "key", "token", "password", "secret", "command", "args"}
+)
+_ROUTE_REQUEST_OVERRIDE_ALLOWED_FIELDS = frozenset(
+    {
+        "frequency_penalty",
+        "logprobs",
+        "n",
+        "presence_penalty",
+        "seed",
+        "stop",
+        "temperature",
+        "top_logprobs",
+        "top_p",
+    }
+)
+_ROUTE_CREDENTIAL_KEY_MARKERS = frozenset(
+    {
+        "apikey",
+        "authorization",
+        "cookie",
+        "credential",
+        "password",
+        "passwd",
+        "proxyauthorization",
+        "secret",
+        "setcookie",
+        "token",
+    }
+)
+
+
+def _configured_routes(cfg: dict) -> Dict[str, dict]:
+    routes = cfg.get("routes") if isinstance(cfg, dict) else None
+    if not isinstance(routes, dict):
+        return {}
+    return {
+        str(alias): definition
+        for alias, definition in routes.items()
+        if isinstance(alias, str) and alias.strip() and isinstance(definition, dict)
+    }
+
+
+def _safe_route_alias_names(cfg: dict) -> List[str]:
+    safe = []
+    for alias, definition in _configured_routes(cfg).items():
+        try:
+            _validate_delegation_route_definition(alias, definition)
+        except ValueError:
+            continue
+        else:
+            safe.append(alias)
+    return sorted(safe)
+
+
+def _credential_key_path(value: Any, path: str = "request_overrides") -> Optional[str]:
+    """Return the first credential-shaped mapping key nested in *value*."""
+    if isinstance(value, dict):
+        for raw_key, nested in value.items():
+            key = str(raw_key)
+            normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+            key_path = f"{path}.{key}"
+            if normalized in _ROUTE_CREDENTIAL_KEY_MARKERS:
+                return key_path
+            found = _credential_key_path(nested, key_path)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for index, nested in enumerate(value):
+            found = _credential_key_path(nested, f"{path}[{index}]")
+            if found:
+                return found
+    return None
+
+
+def _validate_delegation_route_definition(alias: str, definition: Any) -> Dict[str, Any]:
+    """Validate one operator-owned route definition without resolving credentials."""
+    if not isinstance(definition, dict):
+        raise ValueError(f"Delegation route alias '{alias}' must be an object.")
+    forbidden = sorted(
+        key for key in definition if key in _ROUTE_FORBIDDEN_SECRET_FIELDS
+    )
+    unsupported = sorted(
+        key
+        for key in definition
+        if key not in _ROUTE_ALLOWED_FIELDS and key not in _ROUTE_FORBIDDEN_SECRET_FIELDS
+    )
+    if forbidden:
+        raise ValueError(
+            f"Delegation route alias '{alias}' contains forbidden credential or "
+            f"transport fields: {', '.join(forbidden)}. Credentials must remain "
+            "operator-owned in the provider credential store."
+        )
+    if unsupported:
+        raise ValueError(
+            f"Delegation route alias '{alias}' contains unsupported fields: "
+            f"{', '.join(unsupported)}. Supported fields: "
+            f"{', '.join(sorted(_ROUTE_ALLOWED_FIELDS))}."
+        )
+    provider = str(definition.get("provider") or "").strip()
+    model = str(definition.get("model") or "").strip()
+    if not provider or not model:
+        raise ValueError(
+            f"Delegation route alias '{alias}' must define both provider and model."
+        )
+    base_url = str(definition.get("base_url") or "").strip()
+    if base_url:
+        try:
+            parsed_url = urlsplit(base_url)
+        except ValueError as exc:
+            raise ValueError(
+                f"Delegation route alias '{alias}' base_url is invalid."
+            ) from exc
+        if (
+            parsed_url.scheme not in {"http", "https"}
+            or not parsed_url.hostname
+            or parsed_url.username is not None
+            or parsed_url.password is not None
+            or parsed_url.query
+            or parsed_url.fragment
+        ):
+            raise ValueError(
+                f"Delegation route alias '{alias}' base_url must be an http(s) "
+                "endpoint without embedded credentials, query parameters, or fragments."
+            )
+    api_mode = str(definition.get("api_mode") or "").strip().lower()
+    if api_mode and api_mode not in {
+        "chat_completions",
+        "codex_responses",
+        "anthropic_messages",
+    }:
+        raise ValueError(
+            f"Delegation route alias '{alias}' has unsupported api_mode '{api_mode}'."
+        )
+    max_output_tokens = definition.get("max_output_tokens")
+    if max_output_tokens is not None and (
+        isinstance(max_output_tokens, bool)
+        or not isinstance(max_output_tokens, int)
+        or max_output_tokens <= 0
+    ):
+        raise ValueError(
+            f"Delegation route alias '{alias}' max_output_tokens must be a positive integer."
+        )
+    reasoning_effort = definition.get("reasoning_effort")
+    if reasoning_effort is not None:
+        from hermes_constants import parse_reasoning_effort
+
+        if parse_reasoning_effort(reasoning_effort) is None:
+            raise ValueError(
+                f"Delegation route alias '{alias}' reasoning_effort is invalid."
+            )
+    request_overrides = definition.get("request_overrides")
+    if request_overrides is not None and not isinstance(request_overrides, dict):
+        raise ValueError(
+            f"Delegation route alias '{alias}' request_overrides must be an object."
+        )
+    if isinstance(request_overrides, dict):
+        credential_path = _credential_key_path(request_overrides)
+        if credential_path:
+            raise ValueError(
+                f"Delegation route alias '{alias}' request_overrides contains "
+                f"forbidden credential field '{credential_path}'."
+            )
+        unsupported_overrides = sorted(
+            key
+            for key in request_overrides
+            if key not in _ROUTE_REQUEST_OVERRIDE_ALLOWED_FIELDS
+        )
+        if unsupported_overrides:
+            raise ValueError(
+                f"Delegation route alias '{alias}' request_overrides contains "
+                f"unsupported fields: {', '.join(unsupported_overrides)}. "
+                "Only safe inference parameters are accepted."
+            )
+    return copy.deepcopy(definition)
+
+
+def validate_delegation_routes(routes: Any) -> Dict[str, Dict[str, Any]]:
+    """Validate and detach a complete alias map for persistent configuration."""
+    if not isinstance(routes, dict):
+        raise ValueError("Delegation routes must be an object keyed by alias.")
+    validated: Dict[str, Dict[str, Any]] = {}
+    for raw_alias, definition in routes.items():
+        alias = str(raw_alias or "").strip()
+        if not alias:
+            raise ValueError("Delegation route aliases must be non-empty strings.")
+        validated[alias] = _validate_delegation_route_definition(alias, definition)
+    return validated
+
+
+def _resolve_delegation_route_alias(cfg: dict, alias: str, parent_agent) -> dict:
+    """Resolve one operator-defined route alias without mutating global config."""
+    alias = str(alias or "").strip()
+    routes = _configured_routes(cfg)
+    safe_names = _safe_route_alias_names(cfg)
+    if alias not in routes:
+        available = ", ".join(safe_names) if safe_names else "none configured"
+        raise ValueError(
+            f"Unknown or disallowed delegation route alias '{alias}'. "
+            f"Safe route aliases: {available}. Raw provider/model/base_url/api_key "
+            "routing is not accepted per call."
+        )
+
+    definition = _validate_delegation_route_definition(alias, routes[alias])
+    provider = str(definition.get("provider") or "").strip()
+    model = str(definition.get("model") or "").strip()
+    max_output_tokens = definition.get("max_output_tokens")
+    reasoning_effort = definition.get("reasoning_effort")
+    request_overrides = definition.get("request_overrides")
+
+    route_cfg = definition
+    # Alias definitions never carry secrets. For a route with an endpoint
+    # override, first resolve the named provider through the normal credential
+    # store, then feed that operator-owned key into the existing direct-endpoint
+    # path internally.
+    if route_cfg.get("base_url"):
+        provider_creds = _resolve_delegation_credentials(
+            {"provider": provider, "model": model}, parent_agent
+        )
+        route_cfg["api_key"] = provider_creds.get("api_key")
+    creds = _resolve_delegation_credentials(route_cfg, parent_agent)
+    if max_output_tokens is not None:
+        creds["max_output_tokens"] = max_output_tokens
+    if reasoning_effort is not None:
+        creds["reasoning_effort"] = reasoning_effort
+    if request_overrides is not None:
+        inherited = dict(creds.get("request_overrides") or {})
+        inherited.update(copy.deepcopy(request_overrides))
+        creds["request_overrides"] = inherited
+    return creds
 
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
@@ -4466,6 +4759,55 @@ def _load_config() -> dict:
 # OpenAI Function-Calling Schema
 # ---------------------------------------------------------------------------
 
+_schema_parent_agent: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "delegation_schema_parent_agent", default=None
+)
+
+
+def _route_identity(provider: Any, model: Any) -> str:
+    provider_text = str(provider or "").strip()
+    model_text = str(model or "").strip()
+    if provider_text and model_text:
+        return f"provider '{provider_text}', model '{model_text}'"
+    if provider_text:
+        return f"provider '{provider_text}', inherited model"
+    if model_text:
+        return f"inherited provider, model '{model_text}'"
+    return "parent provider and model (inherited)"
+
+
+def _build_route_guidance(cfg: Optional[dict] = None, parent_agent=None) -> str:
+    cfg = cfg if isinstance(cfg, dict) else _load_config()
+    configured_provider = str(cfg.get("provider") or "").strip()
+    configured_model = str(cfg.get("model") or "").strip()
+    parent_agent = parent_agent or _schema_parent_agent.get()
+    if parent_agent is not None:
+        effective_provider = configured_provider or getattr(parent_agent, "provider", None)
+        effective_model = configured_model or getattr(parent_agent, "model", None)
+        effective = f"Current effective default child route: {_route_identity(effective_provider, effective_model)}."
+    elif configured_provider or configured_model:
+        effective = (
+            "Configured default child route: "
+            f"{_route_identity(configured_provider, configured_model)}. "
+            "Any inherited part comes from the parent agent at dispatch time; its identity "
+            "is not available while this schema is being built."
+        )
+    else:
+        effective = (
+            "Configured default child route: inherit parent provider and model. "
+            "Parent identity is unavailable while this schema is built."
+        )
+
+    aliases = _safe_route_alias_names(cfg)
+    alias_text = ", ".join(aliases) if aliases else "none"
+    return (
+        f"{effective} Approved route aliases: {alias_text}. route accepts ONLY these "
+        "operator aliases, never raw provider, model, base_url, api_key, or credentials. "
+        "Do not inspect or modify config for a one-off request. If none matches, say "
+        "per-call raw routing is unsupported and use delegation.provider / "
+        "delegation.model (or inheritance) unless the user requests a persistent change."
+    )
+
 
 def _build_top_level_description() -> str:
     """Compose the delegate_task tool description.
@@ -4479,19 +4821,15 @@ def _build_top_level_description() -> str:
     here, check it is not already stated in a parameter description.
     """
     return (
-        "Spawn subagents in isolated contexts; each gets its own conversation, "
-        "terminal session, and toolset, and only its final summary returns to "
-        "you. Provide 'goal' for a single task or 'tasks' for a parallel batch "
-        "(limits and nesting rules are in the parameter descriptions).\n\n"
+        "Spawn isolated subagents with their own conversation, terminal, and "
+        "toolset; only final summaries return. Use 'goal' for one task or "
+        "'tasks' for a parallel batch.\n\n"
         "Runs in the background: dispatch returns immediately with live "
-        "transcript paths, and the completed result (one consolidated message "
-        "for a batch) re-enters the conversation on its own. Do NOT wait or "
-        "poll; continue other work.\n\n"
-        "LIVE ORCHESTRATION: while children run, this tool also controls "
-        "them — action='list' (live children + ids), action='steer' "
-        "(subagent_id + message, redirect without stopping), action='stop' "
-        "(subagent_id, end early; partial result still returns). Steer when "
-        "a live transcript shows a child drifting.\n\n"
+        "transcript paths; one completed result re-enters the conversation. "
+        "Do NOT wait or poll; continue other work.\n\n"
+        "LIVE ORCHESTRATION: action='list' shows live children; action='steer' "
+        "redirects one without stopping; action='stop' ends one early and its "
+        "partial result still returns. Steer when a transcript shows drift.\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
         "with intermediate data, or independent parallel workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"
@@ -4505,18 +4843,14 @@ def _build_top_level_description() -> str:
         "- Children know nothing of this conversation: pass everything needed "
         "via 'context', including any required output language, tone, or "
         "style (e.g. \"respond in Chinese\").\n"
-        "- Child summaries are SELF-REPORTS, not verified facts: a child "
-        "claiming \"uploaded successfully\" or \"file written\" may be wrong. "
-        "For external side effects (uploads, remote writes, publishing), "
-        "require a verifiable handle (URL, ID, absolute path) and verify it "
-        "yourself — fetch the URL, stat the file, read back the content — "
-        "before telling the user the operation succeeded.\n"
+        "- Child summaries are SELF-REPORTS. For external side effects, require "
+        "a URL, ID, or absolute path and verify it yourself — fetch the URL, "
+        "stat the file, or read it back — before claiming success.\n"
         "- Leaf children (the default) cannot call delegate_task, clarify, "
         "memory, send_message, or cronjob; orchestrators regain only "
         "delegate_task.\n"
-        "- Children inherit the parent model and fallback chain unless pinned "
-        "globally via delegation.provider / delegation.model in config.yaml. "
-        "Results are returned as an array, one entry per task."
+        "- Results are returned as an array, one entry per task.\n"
+        + _build_route_guidance()
     )
 
 
@@ -4530,7 +4864,8 @@ def _build_tasks_param_description() -> str:
         f"Batch mode: tasks to run in parallel (up to {max_children} for this "
         f"user, set via delegation.max_concurrent_children). Each gets "
         "its own subagent with isolated context and terminal session. "
-        "When provided, top-level goal/context/role are ignored."
+        "When provided, top-level goal/context/role are ignored; top-level route "
+        "remains the default for tasks without their own route."
     )
 
 
@@ -4578,15 +4913,23 @@ def _build_dynamic_schema_overrides() -> dict:
     get_definitions() pass rewrites the description fields to the user's
     actual limits.
     """
-    overrides_params = {
-        **DELEGATE_TASK_SCHEMA["parameters"],
-    }
-    # Deep-copy properties so we don't mutate the static schema dict.
-    overrides_params["properties"] = {
-        k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()
-    }
+    # Route aliases are inserted into nested tasks[].route schemas, so copy the
+    # complete parameter tree rather than mutating the static registration.
+    overrides_params = copy.deepcopy(DELEGATE_TASK_SCHEMA["parameters"])
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+    cfg = _load_config()
+    aliases = _safe_route_alias_names(cfg)
+    route_schema = overrides_params["properties"]["route"]
+    task_route_schema = overrides_params["properties"]["tasks"]["items"]["properties"]["route"]
+    if aliases:
+        route_schema["enum"] = aliases
+        task_route_schema["enum"] = aliases
+    route_schema["description"] = _build_route_guidance(cfg)
+    task_route_schema["description"] = (
+        "Per-task operator-defined route alias. Overrides the top-level route default "
+        "for this child only. " + _build_route_guidance(cfg)
+    )
 
     return {
         "description": _build_top_level_description(),
@@ -4643,6 +4986,10 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "route": {
+                            "type": "string",
+                            "description": "Operator-defined route alias (rebuilt at get_definitions time).",
+                        },
                         "output_schema": {
                             "type": "object",
                             "description": (
@@ -4668,6 +5015,10 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "route": {
+                "type": "string",
+                "description": "Operator-defined route alias (rebuilt at get_definitions time).",
             },
             "output_schema": {
                 "type": "object",
@@ -4780,6 +5131,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        route=args.get("route"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
         action=args.get("action"),

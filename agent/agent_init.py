@@ -1499,6 +1499,7 @@ def init_agent(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        schema_parent_agent=agent,
     )
     
     # Show tool configuration and store valid tool names for validation

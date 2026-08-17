@@ -2402,6 +2402,16 @@ delegation:
   # base_url: "http://localhost:1234/v1"    # Direct OpenAI-compatible endpoint (takes precedence over provider)
   # api_key: "local-key"                    # API key for base_url (falls back to OPENAI_API_KEY)
   # api_mode: ""                            # Wire protocol for base_url: "chat_completions", "codex_responses", or "anthropic_messages". Empty = auto-detect from URL (e.g. /anthropic suffix → anthropic_messages). Set explicitly for non-standard endpoints the heuristic can't detect.
+  # routes:                                  # Optional operator-approved per-task aliases
+  #   grok:
+  #     provider: "openrouter"               # Required; credentials come from the provider credential store
+  #     model: "x-ai/grok-4.6"               # Required
+  #   careful:
+  #     provider: "anthropic"
+  #     model: "claude-opus-4-6"
+  #     reasoning_effort: high                 # Optional per-child reasoning level
+  #     max_output_tokens: 16000              # Optional
+  #     request_overrides: {temperature: 0}   # Optional trusted request settings
   max_concurrent_children: 3                # Parallel children per batch (floor 1, no ceiling). Also via DELEGATION_MAX_CONCURRENT_CHILDREN env var.
   worktree_isolation: false                 # Give each child its own git worktree branched from HEAD (local backend + git repos only; inspired by Muse Code). See Subagent Delegation → Worktree Isolation.
   max_spawn_depth: 1                        # Delegation tree depth cap (1-3, clamped). 1 = flat (default): parent spawns leaves that cannot delegate. 2 = orchestrator children can spawn leaf grandchildren. 3 = three levels.
@@ -2416,7 +2426,11 @@ delegation:
 
 The delegation provider uses the same credential resolution as CLI/gateway startup. All configured providers are supported: `openrouter`, `nous`, `copilot`, `zai`, `kimi-coding`, `minimax`, `minimax-cn`. When a provider is set, the system automatically resolves the correct base URL, API key, and API mode — no manual credential wiring needed.
 
-**Precedence:** `delegation.base_url` in config → `delegation.provider` in config → parent provider (inherited). `delegation.model` in config → parent model (inherited). Setting just `model` without `provider` changes only the model name while keeping the parent's credentials (useful for switching models within the same provider like OpenRouter).
+**Approved route aliases:** `delegation.routes` maps model-facing alias names to trusted route definitions. Each alias requires `provider` and `model`; optional supported fields are `reasoning_effort`, `base_url`, `api_mode`, `max_output_tokens`, and `request_overrides`. `request_overrides` accepts only safe inference parameters (`temperature`, `top_p`, `seed`, `frequency_penalty`, `presence_penalty`, `stop`, `n`, `logprobs`, and `top_logprobs`); headers, `extra_body`, and credential-shaped nested keys are rejected. The `delegate_task.route` parameter accepts only these names. For batches, top-level `route` supplies the default and `tasks[].route` overrides it per child. Alias selection never mutates configuration. Desktop users can manage aliases under **Settings → Model → Delegation routes** with the shared model/reasoning picker.
+
+Credentials remain operator-owned. Do not put `api_key`, tokens, passwords, subprocess commands, or arguments in route definitions; Hermes rejects such aliases and resolves provider credentials through the existing runtime provider system. The model cannot pass raw `provider`, `model`, `base_url`, or credential fields. If no alias matches a one-off model request, the agent should explain that arbitrary per-call routing is unsupported and use the configured/inherited route rather than inspect or edit config. Persistent delegation configuration changes only when the user explicitly requests them.
+
+**Precedence:** per-task `tasks[].route` alias → top-level `route` alias → `delegation.base_url` → `delegation.provider` → parent provider (inherited). The selected alias model → `delegation.model` → parent model (inherited). Setting just global `model` without `provider` changes only the model name while keeping the parent's credentials (useful for switching models within the same provider like OpenRouter).
 
 **Width and depth:** `max_concurrent_children` caps how many subagents run in parallel per batch (default `3`, floor of 1, no ceiling). Can also be set via the `DELEGATION_MAX_CONCURRENT_CHILDREN` env var. When the model submits a `tasks` array longer than the cap, `delegate_task` returns a tool error explaining the limit rather than silently truncating. `max_spawn_depth` controls the delegation tree depth (clamped to 1-3). At the default `1`, delegation is flat: children cannot spawn grandchildren, and passing `role="orchestrator"` silently degrades to `leaf`. Raise to `2` so orchestrator children can spawn leaf grandchildren; `3` for three-level trees. The agent opts into orchestration per call via `role="orchestrator"`; `orchestrator_enabled: false` forces every child back to leaf regardless. Cost scales multiplicatively — at `max_spawn_depth: 3` with `max_concurrent_children: 3`, the tree can reach 3×3×3 = 27 concurrent leaf agents. See [Subagent Delegation → Depth Limit and Nested Orchestration](features/delegation.md#depth-limit-and-nested-orchestration) for usage patterns.
 

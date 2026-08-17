@@ -166,9 +166,36 @@ delegation:
   provider: "openrouter"             # optional: route children to a different provider
 ```
 
-Resolution order: `delegation.base_url` (direct endpoint) takes precedence, then `delegation.provider` (full credential bundle resolved via the runtime provider system), and when neither is set children inherit the parent's provider and credentials; `delegation.model` applies in all cases, and when it is empty children inherit the parent's model.
+Resolution order: an approved `route` alias on a task → the top-level `route` default for batch tasks that omit one → `delegation.base_url` (direct endpoint) → `delegation.provider` → parent provider; the selected route's model → `delegation.model` → parent model.
 
-Note that the pin is global: `delegate_task` has no per-task model parameter, so every child in a batch runs on the configured delegation model. For quality-sensitive subtasks that need a stronger model, either leave `delegation.model` unset for that session or hand the task to the [kanban board](kanban.md#per-task-model-override), which does support a per-task model override.
+### Approved per-task route aliases
+
+Operators can expose a small allowlist of trusted routes without letting the model provide arbitrary provider names, model IDs, endpoints, or credentials:
+
+```yaml
+delegation:
+  model: "google/gemini-flash-2.0"  # unchanged global default
+  provider: "openrouter"
+  routes:
+    grok:
+      provider: "openrouter"
+      model: "x-ai/grok-4.6"
+    careful:
+      provider: "anthropic"
+      model: "claude-opus-4-6"
+      reasoning_effort: high
+      max_output_tokens: 16000
+      request_overrides:
+        temperature: 0
+```
+
+The model-facing `route` parameter accepts only the alias names (`grok`, `careful` above). For a single task, pass top-level `route: "grok"`. In a batch, top-level `route` is the default and each `tasks[].route` may override it, so different children can use different approved routes. Selecting an alias changes only that child and never mutates `config.yaml`.
+
+Route definitions require `provider` and `model`. The conservative optional fields are `reasoning_effort`, `base_url`, `api_mode`, `max_output_tokens`, and `request_overrides`. `reasoning_effort` accepts the normal Hermes levels (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`) and applies only to the selected child. `request_overrides` is restricted to safe inference knobs (`temperature`, `top_p`, `seed`, `frequency_penalty`, `presence_penalty`, `stop`, `n`, `logprobs`, and `top_logprobs`); headers, `extra_body`, and credential-shaped nested keys are rejected. Credentials are deliberately forbidden in aliases: Hermes resolves the named provider through the same operator-owned credential store used by normal CLI/gateway startup. `api_key`, tokens, subprocess commands, and raw model-facing provider/model/base URL fields are not accepted.
+
+In Hermes Desktop, open **Settings → Model → Delegation routes** to add, edit, or remove aliases with the same provider/model/reasoning picker used by chat sessions.
+
+If a requested model has no approved alias, Hermes uses the configured/inherited default. The agent should explain that arbitrary per-call routing is unsupported; it must not inspect or edit configuration merely to satisfy a one-off request. Persistent config should change only when the user explicitly asks for that persistent change.
 
 ## Inherited Tool Access
 

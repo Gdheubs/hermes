@@ -325,6 +325,7 @@ def get_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
+    schema_parent_agent: Any = None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -340,10 +341,26 @@ def get_tool_definitions(
             tool_search / tool_describe bridge handlers so they can read the
             real catalog, not the already-collapsed one. Public callers should
             leave this False.
+        schema_parent_agent: Optional parent identity used only to describe the
+            effective delegation route in delegate_task's model-facing schema.
 
     Returns:
         Filtered list of OpenAI-format tool definitions.
     """
+    schema_parent_token = None
+    if schema_parent_agent is not None:
+        try:
+            from tools.delegate_tool import _schema_parent_agent
+
+            schema_parent_token = _schema_parent_agent.set(schema_parent_agent)
+        except Exception:
+            schema_parent_token = None
+
+    schema_parent_identity = (
+        str(getattr(schema_parent_agent, "provider", "") or ""),
+        str(getattr(schema_parent_agent, "model", "") or ""),
+    ) if schema_parent_agent is not None else None
+
     # Fast path: memoized result when the caller doesn't need stdout prints.
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
@@ -374,6 +391,7 @@ def get_tool_definitions(
                 _is_delegated_child_context(),
                 _is_dispatcher_owned_worker(),
                 profile_scope,
+                schema_parent_identity,
             )
         with _tool_defs_cache_lock:
             cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
@@ -382,12 +400,22 @@ def get_tool_definitions(
             # consistent state even on a cache hit.
             global _last_resolved_tool_names
             _last_resolved_tool_names = [t["function"]["name"] for t in cached]
+            if schema_parent_token is not None:
+                _schema_parent_agent.reset(schema_parent_token)
             # Return a shallow copy of the list but share the dict references —
             # schemas are treated as read-only by all known callers.
             return list(cached)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+    try:
+        result = _compute_tool_definitions(
+            enabled_toolsets,
+            disabled_toolsets,
+            quiet_mode,
+            skip_tool_search_assembly=skip_tool_search_assembly,
+        )
+    finally:
+        if schema_parent_token is not None:
+            _schema_parent_agent.reset(schema_parent_token)
     if quiet_mode and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool

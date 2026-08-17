@@ -20,6 +20,11 @@ class ConfigUpdate(BaseModel):
     profile: Optional[str] = None
 
 
+class DelegationRoutesUpdate(BaseModel):
+    routes: Dict[str, Dict[str, Any]] = {}
+    profile: Optional[str] = None
+
+
 class EnvVarUpdate(BaseModel):
     key: str
     value: str

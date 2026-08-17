@@ -355,6 +355,18 @@ export interface HermesConfig {
 
 export type HermesConfigRecord = Record<string, unknown>
 
+export interface DelegationRouteConfig {
+  api_mode?: string
+  base_url?: string
+  max_output_tokens?: number
+  model: string
+  provider: string
+  reasoning_effort?: string
+  request_overrides?: Record<string, unknown>
+}
+
+export type DelegationRoutesConfig = Record<string, DelegationRouteConfig>
+
 export interface ModelInfoResponse {
   auto_context_length?: number
   capabilities?: Record<string, unknown>

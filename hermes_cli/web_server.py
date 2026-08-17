@@ -1495,6 +1495,7 @@ def _schema_with_dynamic_provider_options() -> Dict[str, Dict[str, Any]]:
 
 from hermes_cli.web_models import (  # noqa: F401
     ConfigUpdate,
+    DelegationRoutesUpdate,
     EnvVarUpdate,
     EnvVarDelete,
     EnvVarReveal,
@@ -7524,6 +7525,40 @@ async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
         raise
     except Exception:
         _log.exception("PUT /api/config failed")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.put("/api/config/delegation-routes")
+async def update_delegation_routes(
+    body: DelegationRoutesUpdate, profile: Optional[str] = None
+):
+    """Replace the profile's complete operator-approved delegation route map."""
+    from tools.delegate_tool import validate_delegation_routes
+
+    try:
+        routes = validate_delegation_routes(body.routes or {})
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def _run():
+        with _profile_scope(body.profile or profile):
+            with _CONFIG_MUTATION_LOCK:
+                config = read_raw_config()
+                delegation = config.get("delegation")
+                if not isinstance(delegation, dict):
+                    delegation = {}
+                delegation = dict(delegation)
+                delegation["routes"] = routes
+                config["delegation"] = delegation
+                save_config(config)
+        return {"ok": True, "routes": routes}
+
+    try:
+        return await asyncio.to_thread(_run)
+    except HTTPException:
+        raise
+    except Exception:
+        _log.exception("PUT /api/config/delegation-routes failed")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 

@@ -29,6 +29,32 @@ runtime:
   nofile_soft_limit: 4096
 
 # =============================================================================
+# Delegation routing aliases (optional)
+# =============================================================================
+# The normal delegation.provider / delegation.model settings remain the default
+# route for every child. `routes` exposes only operator-approved aliases to the
+# model-facing delegate_task.route parameter; aliases do not mutate config.
+# Credentials are never allowed here and are resolved from the named provider's
+# existing credential store. Supported optional alias fields: base_url,
+# api_mode, max_output_tokens, and request_overrides.
+# delegation:
+#   routes:
+#     grok:
+#       provider: "openrouter"
+#       model: "x-ai/grok-4.6"
+#     careful:
+#       provider: "anthropic"
+#       model: "claude-opus-4-6"
+#       reasoning_effort: high
+#       max_output_tokens: 16000
+#       request_overrides:
+#         temperature: 0
+#
+# Precedence: tasks[].route -> top-level route -> global delegation route ->
+# parent route. A missing alias means raw per-call routing is unsupported; do
+# not add provider/model/base_url/api_key arguments to delegate_task.
+
+# =============================================================================
 # Model Configuration
 # =============================================================================
 model:

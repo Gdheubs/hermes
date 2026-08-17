@@ -42,7 +42,7 @@ afterEach(() => {
 
 // A minimal controller — these tests are about the CATALOG's own behaviour
 // (what it lists, what it offers), not about what any host does with a pick.
-function renderMenu() {
+function renderMenu({ allowFast = true }: { allowFast?: boolean } = {}) {
   const select = vi.fn()
 
   const controller: ModelMenuController = {
@@ -59,13 +59,13 @@ function renderMenu() {
     <QueryClientProvider client={client}>
       <DropdownMenu open>
         <DropdownMenuContent>
-          <ModelCatalogMenu controller={controller} />
+          <ModelCatalogMenu allowFast={allowFast} controller={controller} />
         </DropdownMenuContent>
       </DropdownMenu>
     </QueryClientProvider>
   )
 
-  return select
+  return { controller, select }
 }
 
 // Curation is ONE global preference, so it belongs to the catalog rather than
@@ -104,5 +104,30 @@ describe('the catalog owns model curation', () => {
     fireEvent.click(screen.getByText('Edit Models…'))
 
     expect($modelVisibilityOpen.get()).toBe(true)
+  })
+})
+
+describe('surface capability controls', () => {
+  it('does not apply fast mode on a surface that cannot persist it', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          capabilities: { 'gemini-3.1-pro': { fast: true, reasoning: true } },
+          models: ['gemini-3.1-pro'],
+          name: 'Google',
+          slug: 'google'
+        }
+      ]
+    })
+    const { controller } = renderMenu({ allowFast: false })
+
+    fireEvent.click(await screen.findByText(/Gemini 3\.1 Pro/i))
+
+    await vi.waitFor(() =>
+      expect(controller.applyPreset).toHaveBeenCalledWith(
+        { effort: 'medium', fast: undefined },
+        { model: 'gemini-3.1-pro', provider: 'google' }
+      )
+    )
   })
 })

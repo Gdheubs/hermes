@@ -817,6 +817,23 @@ export interface Translations {
       reasoning: string
       reasoningOff: string
       defaultsFailed: string
+      delegationRoutes: {
+        title: string
+        description: string
+        add: string
+        empty: string
+        change: string
+        remove: string
+        removeAria: (alias: string) => string
+        aliasLabel: string
+        aliasPlaceholder: string
+        selectModel: string
+        save: string
+        saveFailed: string
+        aliasError: string
+        modelError: string
+        duplicateError: string
+      }
       auxiliaryTitle: string
       resetAllToMain: string
       auxiliaryDesc: string

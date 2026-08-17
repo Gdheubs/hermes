@@ -25,7 +25,7 @@ const saveHermesConfig = vi.fn()
 const startManualLocalEndpoint = vi.fn()
 const startManualOnboarding = vi.fn()
 const startManualProviderOAuth = vi.fn()
-let profileSwitchHandler: (() => void) | null = null
+let profileSwitchHandlers: Array<() => void> = []
 
 vi.mock('@/hermes', () => ({
   getGlobalModelInfo: () => getGlobalModelInfo(),
@@ -50,7 +50,9 @@ vi.mock('@/store/onboarding', () => ({
 
 vi.mock('../hooks/use-on-profile-switch', () => ({
   useOnProfileSwitch: (handler: () => void) => {
-    profileSwitchHandler = handler
+    if (profileSwitchHandlers.length < 1) {
+      profileSwitchHandlers.push(handler)
+    }
   }
 }))
 
@@ -82,7 +84,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   vi.clearAllMocks()
-  profileSwitchHandler = null
+  profileSwitchHandlers = []
 })
 
 async function renderModelSettings() {
@@ -205,7 +207,7 @@ describe('ModelSettings', () => {
     expect((await screen.findAllByRole('combobox'))[0].textContent).toContain('Custom A')
 
     await act(async () => {
-      profileSwitchHandler?.()
+      profileSwitchHandlers.forEach(handler => handler())
     })
 
     await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalledTimes(2))

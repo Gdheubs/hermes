@@ -2331,6 +2331,76 @@ class TestConfigRoundTrip:
         reloaded = self.client.get("/api/config").json()
         assert reloaded["terminal"]["font_family"] == "MesloLGS NF"
 
+    def test_desktop_replaces_delegation_routes_without_touching_siblings(self):
+        from hermes_cli.config import read_raw_config, save_config
+
+        save_config({
+            "delegation": {
+                "max_spawn_depth": 3,
+                "routes": {
+                    "old": {"provider": "nous", "model": "hermes-4"},
+                },
+            },
+        })
+
+        response = self.client.put(
+            "/api/config/delegation-routes",
+            json={
+                "routes": {
+                    "careful": {
+                        "provider": "anthropic",
+                        "model": "claude-opus-4-6",
+                        "reasoning_effort": "high",
+                    }
+                }
+            },
+        )
+
+        assert response.status_code == 200
+        delegation = read_raw_config()["delegation"]
+        assert delegation["routes"] == {
+            "careful": {
+                "provider": "anthropic",
+                "model": "claude-opus-4-6",
+                "reasoning_effort": "high",
+            }
+        }
+        assert delegation["max_spawn_depth"] == 3
+
+    def test_desktop_rejects_invalid_delegation_route(self):
+        response = self.client.put(
+            "/api/config/delegation-routes",
+            json={
+                "routes": {
+                    "unsafe": {
+                        "provider": "openrouter",
+                        "model": "x-ai/grok-4.6",
+                        "api_key": "must-not-be-accepted",
+                    }
+                }
+            },
+        )
+
+        assert response.status_code == 400
+
+    def test_desktop_rejects_credentials_nested_in_route_overrides(self):
+        response = self.client.put(
+            "/api/config/delegation-routes",
+            json={
+                "routes": {
+                    "unsafe": {
+                        "provider": "openrouter",
+                        "model": "x-ai/grok-4.6",
+                        "request_overrides": {
+                            "headers": {"Authorization": "Bearer route-secret"}
+                        },
+                    }
+                }
+            },
+        )
+
+        assert response.status_code == 400
+
 
 # ---------------------------------------------------------------------------
 # New feature endpoint tests

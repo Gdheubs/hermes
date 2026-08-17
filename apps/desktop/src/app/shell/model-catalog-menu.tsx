@@ -89,6 +89,8 @@ export interface ModelMenuController {
 }
 
 interface ModelCatalogMenuProps {
+  /** Whether this surface can persist fast-mode choices. Detached routes cannot. */
+  allowFast?: boolean
   controller: ModelMenuController
   /** Rows appended under the catalog (Refresh Models, Edit Models, …). */
   footer?: ReactNode
@@ -117,6 +119,7 @@ interface ProviderGroup {
  * can never drift apart.
  */
 export function ModelCatalogMenu({
+  allowFast = true,
   controller,
   footer,
   gateway,
@@ -208,7 +211,7 @@ export function ModelCatalogMenu({
     controller.applyPreset(
       {
         effort: (caps?.reasoning ?? true) ? (preset.effort ?? defaultEffort) : undefined,
-        fast: (caps?.fast ?? false) ? (preset.fast ?? false) : undefined
+        fast: allowFast && (caps?.fast ?? false) ? (preset.fast ?? false) : undefined
       },
       { model: family.id, provider: provider.slug }
     )
@@ -412,12 +415,14 @@ export function ModelCatalogMenu({
                     const effEffort = isCurrent ? current.effort : (preset.effort ?? '')
                     const effFast = isCurrent ? current.fast : (preset.fast ?? false)
 
-                    const fastControl: FastControl = resolveFastControl(
-                      activeId ?? family.id,
-                      group.provider.models ?? [],
-                      caps?.fast ?? false,
-                      effFast
-                    )
+                    const fastControl: FastControl = allowFast
+                      ? resolveFastControl(
+                          activeId ?? family.id,
+                          group.provider.models ?? [],
+                          caps?.fast ?? false,
+                          effFast
+                        )
+                      : { kind: 'none' }
 
                     const meta = [
                       fastControl.kind !== 'none' && fastControl.on ? copy.fast : null,

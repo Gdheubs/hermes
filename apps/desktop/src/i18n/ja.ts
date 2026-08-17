@@ -918,6 +918,23 @@ export const ja = defineLocale({
       provider: 'プロバイダー',
       model: 'モデル',
       applying: '適用中...',
+      delegationRoutes: {
+        title: '委任ルート',
+        description: 'delegate_task が使用できる承認済みモデルルートです。変更は新しいセッションに適用されます。',
+        add: 'ルートを追加',
+        empty: '承認済みルートはありません。委任された子は設定済みの既定値を使用します。',
+        change: '変更',
+        remove: '削除',
+        removeAria: alias => `${alias} を削除`,
+        aliasLabel: 'ルート別名',
+        aliasPlaceholder: 'fast-review',
+        selectModel: 'モデルを選択',
+        save: 'ルートを保存',
+        saveFailed: '委任ルートを保存できませんでした',
+        aliasError: '1～64 文字の英数字、ハイフン、アンダースコアを使用し、英数字で始めてください。',
+        modelError: 'プロバイダーとモデルを選択してください。',
+        duplicateError: 'そのルート別名は既に存在します。'
+      },
       auxiliaryTitle: '補助モデル',
       resetAllToMain: 'すべてメインにリセット',
       auxiliaryDesc:
