@@ -11,7 +11,7 @@ def test_first_failure_alerts_and_repeated_failure_is_suppressed(monkeypatch):
 
     first = scheduler._prepare_cron_failure_alert(job, "provider timeout request 12345678")
     assert first is not None
-    job["failure_alert"] = persisted[-1]["failure_alert"]
+    scheduler._confirm_cron_failure_alert(job)
 
     repeated = scheduler._prepare_cron_failure_alert(job, "provider timeout request 87654321")
     assert repeated is None
@@ -26,7 +26,7 @@ def test_repeated_failure_gets_daily_reminder(monkeypatch):
     monkeypatch.setattr(scheduler.time, "time", lambda: now[0])
 
     assert scheduler._prepare_cron_failure_alert(job, "provider timeout") is not None
-    job["failure_alert"] = persisted[-1]["failure_alert"]
+    scheduler._confirm_cron_failure_alert(job)
     assert scheduler._prepare_cron_failure_alert(job, "provider timeout") is None
     job["failure_alert"] = persisted[-1]["failure_alert"]
 
@@ -34,6 +34,19 @@ def test_repeated_failure_gets_daily_reminder(monkeypatch):
     reminder = scheduler._prepare_cron_failure_alert(job, "provider timeout")
     assert reminder is not None
     assert "1 repeated failure(s) suppressed" in reminder
+
+
+def test_failed_delivery_is_retried_on_the_next_failure(monkeypatch):
+    job = {"id": "job-1", "name": "Example"}
+    persisted = []
+    monkeypatch.setattr(scheduler, "update_job", lambda _id, values: persisted.append(values))
+    monkeypatch.setattr(scheduler.time, "time", lambda: 1000.0)
+
+    assert scheduler._prepare_cron_failure_alert(job, "provider timeout") is not None
+    # No _confirm_cron_failure_alert call: the transport failed.
+    retry = scheduler._prepare_cron_failure_alert(job, "provider timeout")
+    assert retry is not None
+    assert persisted[-1]["failure_alert"]["pending"] is True
 
 
 def test_recovery_notice_reports_and_clears_after_success(monkeypatch):
