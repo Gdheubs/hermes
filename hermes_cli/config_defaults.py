@@ -1902,6 +1902,9 @@ DEFAULT_CONFIG = {
         # negatives (goal actually done but judge says continue) and
         # unbounded model spend on fuzzy / unachievable goals.
         "max_turns": 20,
+        "evidence_pack": {
+            "enabled": False,
+        },
     },
 
 
