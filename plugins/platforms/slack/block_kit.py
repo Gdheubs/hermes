@@ -42,6 +42,180 @@ MAX_TABLE_CHARS = 10000  # aggregate across all cells
 
 Block = Dict[str, Any]
 
+# Todo progress is deliberately rendered with ordinary, non-streaming Block Kit
+# primitives.  Slack's token-stream APIs are a separate transport and caused
+# permanent WIP-message spam when combined with tool calls.  Keeping this
+# projection pure also makes the privacy boundary testable before any API call.
+_TODO_STATUS = {
+    "pending": ("○", "pending"),
+    "in_progress": ("🔄", "in progress"),
+    "completed": ("✅", "complete"),
+    "cancelled": ("❌", "cancelled"),
+}
+_TODO_TERMINAL = frozenset({"completed", "cancelled"})
+_TODO_INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
+_TODO_FENCED_CODE_RE = re.compile(r"```.*?```|~~~.*?~~~", re.DOTALL)
+_TODO_LOCAL_PATH_RE = re.compile(
+    r"(?:"
+    r"(?:/Users|/home|/private/var|/tmp)/[^\s,;:]+"
+    r"|~/[^\s,;:]+"
+    r"|[A-Za-z]:\\[^\s,;]+"
+    r"|\\\\[^\s,;]+"
+    r")"
+)
+_TODO_SECRET_RE = re.compile(
+    r"(?i)\b(api[_-]?key|token|secret|password)\s*[:=]\s*[^\s,;]+"
+)
+_TODO_CREDENTIAL_RE = re.compile(
+    r"(?i)\b(?:bearer\s+)?(?:sk-[a-z0-9_-]{12,}|xox[baprs]-[a-z0-9-]{12,}|gh[pousr]_[a-z0-9]{12,})"
+)
+
+
+def _todo_text(value: Any, *, limit: int = 180) -> str:
+    """Return public-safe, bounded text for a todo row.
+
+    Todo content is model-authored and may contain a copied command, local path,
+    tool argument, or credential-shaped value.  The Slack plan surface is a
+    shared-channel UI, not a trace viewer, so those details are removed here.
+    """
+    text = str(value or "")
+    text = _TODO_FENCED_CODE_RE.sub("[command hidden]", text)
+    text = _TODO_INLINE_CODE_RE.sub("[command hidden]", text)
+    text = _TODO_LOCAL_PATH_RE.sub("[local path hidden]", text)
+    text = _TODO_SECRET_RE.sub(lambda m: f"{m.group(1)}=[hidden]", text)
+    text = _TODO_CREDENTIAL_RE.sub("[credential hidden]", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    # Slack mrkdwn requires these three characters to be escaped.
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    if not text:
+        text = "working step"
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip() + "…"
+    return text
+
+
+def _todo_rows(snapshot: Any) -> Optional[List[Dict[str, str]]]:
+    """Validate the authoritative todo-tool snapshot and return safe rows."""
+    if not isinstance(snapshot, dict):
+        return None
+    raw = snapshot.get("todos")
+    if not isinstance(raw, list) or not raw:
+        return None
+    rows: List[Dict[str, str]] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "pending").strip().lower()
+        if status not in _TODO_STATUS:
+            status = "pending"
+        rows.append(
+            {
+                "id": str(item.get("id") or index)[:80],
+                "content": _todo_text(item.get("content")),
+                "status": status,
+            }
+        )
+    return rows or None
+
+
+def todo_progress_eligible(snapshot: Any) -> bool:
+    """Long-work gate: short tasks stay on Slack's native ephemeral status."""
+    rows = _todo_rows(snapshot)
+    if not rows:
+        return False
+    non_terminal = sum(row["status"] not in _TODO_TERMINAL for row in rows)
+    return non_terminal > 0 and (len(rows) >= 3 or non_terminal >= 2)
+
+
+def render_todo_progress(
+    snapshot: Any,
+    *,
+    active: bool = True,
+    terminal_status: Optional[str] = None,
+    generation: int = 0,
+    revision: int = 0,
+    action_token: Optional[str] = None,
+) -> Optional[Tuple[str, List[Block]]]:
+    """Render one bounded Slack progress surface from canonical todo state.
+
+    Returns ``(fallback_text, blocks)`` or ``None`` when the snapshot is too
+    small or invalid.  Revisions rotate ``block_id`` as required by Slack when
+    a message is updated in place.
+    """
+    rows = _todo_rows(snapshot)
+    if not rows:
+        return None
+
+    visible = rows[:20]
+    lines = []
+    for row in visible:
+        symbol, _label = _TODO_STATUS[row["status"]]
+        lines.append(f"{symbol} {row['content']}")
+    if len(rows) > len(visible):
+        lines.append(f"… plus {len(rows) - len(visible)} more steps")
+
+    completed = sum(row["status"] == "completed" for row in rows)
+    cancelled = sum(row["status"] == "cancelled" for row in rows)
+    terminal = str(terminal_status or "").strip().lower()
+    if not active:
+        if terminal in {"complete", "completed", "success"}:
+            fallback = f"completed {completed}/{len(rows)} steps"
+            context = "✅ finished"
+        elif terminal == "restarting":
+            fallback = f"restarting after {completed}/{len(rows)} steps"
+            context = "🔄 restarting"
+        elif terminal in {"cancelled", "canceled", "stopped"}:
+            fallback = f"stopped after {completed}/{len(rows)} steps"
+            context = "⛔ stopped"
+        else:
+            fallback = f"failed after {completed}/{len(rows)} steps"
+            context = "❌ failed"
+    else:
+        fallback = f"working through {len(rows)} steps ({completed} complete)"
+        context = f"{completed}/{len(rows)} complete"
+        if cancelled:
+            context += f" · {cancelled} cancelled"
+
+    block_id = f"hermes_todo_{int(generation)}_{int(revision)}"[:255]
+    body = "\n".join(lines)
+    if len(body) > MAX_SECTION_TEXT:
+        body = body[: MAX_SECTION_TEXT - 1].rstrip() + "…"
+    blocks: List[Block] = [
+        {
+            "type": "section",
+            "block_id": block_id,
+            "text": {"type": "mrkdwn", "text": body},
+        },
+        {
+            "type": "context",
+            "block_id": f"{block_id}_status"[:255],
+            "elements": [{"type": "mrkdwn", "text": context}],
+        },
+    ]
+    if active and action_token:
+        blocks.append(
+            {
+                "type": "actions",
+                "block_id": f"{block_id}_actions"[:255],
+                "elements": [
+                    {
+                        "type": "button",
+                        "action_id": "hermes_todo_stop",
+                        "text": {"type": "plain_text", "text": "stop"},
+                        "style": "danger",
+                        "value": action_token,
+                    },
+                    {
+                        "type": "button",
+                        "action_id": "hermes_todo_restart",
+                        "text": {"type": "plain_text", "text": "restart"},
+                        "value": action_token,
+                    },
+                ],
+            }
+        )
+    return fallback, blocks
+
 # ----------------------------------------------------------------------------
 # Line classification
 # ----------------------------------------------------------------------------

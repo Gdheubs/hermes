@@ -4190,6 +4190,43 @@ class TurnRunner:
                     ctx._live_status_adapter.set_status_text(ctx.source.chat_id, None)
             except Exception as _ls_err:
                 logger.debug("live status update failed: %s", _ls_err)
+        # EZ-525: completed todo results are the authoritative full snapshot.
+        # Project them through a platform capability seam before the ordinary
+        # progress-bubble gates, because Slack intentionally keeps tool_progress
+        # off. Never inspect tool.started args: merge calls contain partial state.
+        if (
+            event_type == "tool.completed"
+            and tool_name == "todo"
+            and ctx._run_still_current()
+        ):
+            _todo_adapter = ctx._status_adapter or ctx._live_status_adapter
+            _project_todo = getattr(_todo_adapter, "project_todo_progress", None)
+            if callable(_project_todo):
+                try:
+                    _todo_result = kwargs.get("result")
+                    if isinstance(_todo_result, str):
+                        _todo_snapshot = json.loads(_todo_result)
+                    elif isinstance(_todo_result, dict):
+                        _todo_snapshot = _todo_result
+                    else:
+                        _todo_snapshot = None
+                    if isinstance(_todo_snapshot, dict):
+                        safe_schedule_threadsafe(
+                            _project_todo(
+                                ctx.source.chat_id,
+                                _todo_snapshot,
+                                metadata=ctx._status_thread_metadata,
+                                session_key=ctx.session_key or "",
+                                generation=ctx.run_generation or 0,
+                                user_id=ctx.source.user_id or "",
+                                chat_type=ctx.source.chat_type or "group",
+                            ),
+                            ctx._loop_for_step,
+                            logger=logger,
+                            log_message="Slack todo projection scheduling error",
+                        )
+                except Exception as _todo_err:
+                    logger.debug("todo progress projection failed: %s", _todo_err)
         # "log" mode: append tool.started lines to the log queue and stay
         # silent in chat. Handled before the progress_queue guard because
         # log mode runs without a chat progress queue.
@@ -5659,6 +5696,9 @@ class TurnRunner:
                 ctx.needs_progress_queue
                 or ctx.log_mode_enabled
                 or ctx._live_status_adapter is not None
+                or callable(
+                    getattr(ctx._status_adapter, "project_todo_progress", None)
+                )
             )
             else None
         )
@@ -9990,6 +10030,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         running_agent = _busy_state.turn.agent if _busy_state else None
 
         busy_text_mode = self._effective_busy_text_mode(event.source)
+        # Keep the profile-routed mode from above. Overwriting with the
+        # workspace-wide default would break multiplex steer/queue (#83648).
+        # EZ-525: authorized Slack thread replies steer unless the routed
+        # mode is already queue. Media, internal completions, approvals,
+        # and commands keep their existing paths.
+        _slack_plain_text_reply = bool(
+            event.source.platform == Platform.SLACK
+            and event.source.thread_id
+            and event.message_type == MessageType.TEXT
+            and not event.media_urls
+            and not event.media_types
+        )
+        _queue_configured = (
+            effective_mode == "queue" or busy_text_mode == "queue"
+        )
+        if _slack_plain_text_reply and not _queue_configured:
+            effective_mode = "steer"
         if (
             event.message_type == MessageType.TEXT
             and busy_text_mode == "queue"
@@ -10130,6 +10187,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 pass  # don't let interrupt failure block the ack
 
+        # Slack thread steering (including FIFO fallback) is intentionally
+        # silent: native activity status remains the only working UI.
+        if _slack_plain_text_reply:
+            logger.debug("Slack busy input ack suppressed for session %s", session_key)
+            return True
+
         # Check if busy ack is disabled — skip sending but still process the input.
         # Placed before debounce so we don't stamp a "last ack" timestamp that was
         # never actually delivered.
@@ -10143,7 +10206,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # read just to discover that no ack will be sent.
         _BUSY_ACK_COOLDOWN = 30
         now = time.time()
-        last_ack = _busy_state.turn.busy_ack_ts if _busy_state else 0
+        last_ack = getattr(getattr(_busy_state, "turn", None), "busy_ack_ts", 0)
+        if not isinstance(last_ack, (int, float)):
+            last_ack = getattr(self, "_busy_ack_ts", {}).get(session_key, 0)
         if now - last_ack < _BUSY_ACK_COOLDOWN:
             return True  # interrupt sent (if not queue), ack already delivered recently
 
@@ -15961,6 +16026,175 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from hermes_cli.proxy_cli import format_status_text
 
         return format_status_text()
+
+    async def handle_slack_todo_action(
+        self,
+        action: str,
+        payload: Dict[str, Any],
+    ) -> bool:
+        """Execute a validated Slack todo-card control via canonical gateway paths."""
+        if action not in {"stop", "restart"}:
+            return False
+
+        team_id = str(payload.get("team_id") or "")
+        channel_id = str(payload.get("channel_id") or "")
+        thread_ts = str(payload.get("thread_ts") or "")
+        user_id = str(payload.get("user_id") or "")
+        session_key = str(payload.get("session_key") or "")
+        try:
+            generation = int(payload.get("generation") or 0)
+        except (TypeError, ValueError):
+            return False
+        if not channel_id or not user_id or not session_key or not generation:
+            return False
+
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id=channel_id,
+            chat_type=str(payload.get("chat_type") or "group"),
+            user_id=user_id,
+            scope_id=team_id or None,
+            thread_id=thread_ts or None,
+        )
+        if not self._is_user_authorized(source):
+            return False
+        if self._session_key_for_source(source) != session_key:
+            return False
+
+        adapter = self._adapter_for_source(source)
+        active = getattr(adapter, "_active_sessions", {}).get(session_key) if adapter else None
+        if getattr(active, "_hermes_run_generation", None) != generation:
+            return False
+
+        active_task = (
+            getattr(adapter, "_session_tasks", {}).get(session_key)
+            if adapter is not None
+            else None
+        )
+        expected_session_id = ""
+        if action == "restart":
+            if active_task is None or active_task.done():
+                return False
+            try:
+                session_entry = await self.async_session_store.get_or_create_session(source)
+                expected_session_id = str(session_entry.session_id or "")
+            except Exception:
+                logger.warning(
+                    "Slack todo restart could not resolve the active transcript",
+                    exc_info=True,
+                )
+                return False
+            if not expected_session_id:
+                return False
+
+        control_event = MessageEvent(
+            text="/stop" if action == "stop" else "/retry",
+            message_type=MessageType.COMMAND,
+            source=source,
+            message_id=str(payload.get("message_ts") or ""),
+            raw_message={"hermes_todo_control": action},
+        )
+        await self._busy_stop_command(control_event, session_key, source)
+        if action == "stop":
+            return True
+
+        # Restart means retry the current turn, never restart the gateway.
+        # Do not truncate/rewrite its transcript until the interrupted adapter
+        # task has fully unwound and flushed. The retry re-enters through the
+        # canonical /retry command under the adapter's normal session guard.
+        # Read the generation stop actually produced — do not assume +1.
+        post_stop = self._peek_session_state(session_key)
+        expected_invalidation_generation = (
+            int(post_stop.persistent.run_generation)
+            if post_stop is not None
+            else None
+        )
+        if expected_invalidation_generation is None:
+            return False
+        handle_message = getattr(adapter, "handle_message", None) if adapter is not None else None
+        if active_task is None or not callable(handle_message):
+            return False
+
+        async def _mark_restart_failed() -> None:
+            try:
+                finalizer = getattr(adapter, "finalize_todo_progress", None)
+                if not callable(finalizer):
+                    return
+                result = finalizer(
+                    session_key,
+                    generation,
+                    "failure",
+                    overwrite_closed=True,
+                )
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.debug(
+                    "Failed to mark deferred Slack todo restart as failed",
+                    exc_info=True,
+                )
+
+        async def _restart_after_old_turn() -> None:
+            try:
+                try:
+                    await asyncio.shield(active_task)
+                except asyncio.CancelledError:
+                    current_task = asyncio.current_task()
+                    if current_task is not None and current_task.cancelling():
+                        raise
+                    # The old session task itself was cancelled; its finally
+                    # path has still completed before the task became done.
+                except Exception:
+                    # A failed old turn is still safe to retry once finalized.
+                    pass
+
+                if not self._is_session_run_current(
+                    session_key, expected_invalidation_generation
+                ):
+                    logger.info(
+                        "Dropping stale Slack todo restart for session %s",
+                        session_key,
+                    )
+                    await _mark_restart_failed()
+                    return
+                if session_key in getattr(adapter, "_active_sessions", {}):
+                    logger.info(
+                        "Dropping Slack todo restart because session %s is active again",
+                        session_key,
+                    )
+                    await _mark_restart_failed()
+                    return
+                current_entry = await self.async_session_store.get_or_create_session(source)
+                if str(current_entry.session_id or "") != expected_session_id:
+                    logger.info(
+                        "Dropping Slack todo restart after conversation changed for %s",
+                        session_key,
+                    )
+                    await _mark_restart_failed()
+                    return
+                retry_dispatch = handle_message(control_event)
+                if inspect.isawaitable(retry_dispatch):
+                    await retry_dispatch
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Deferred Slack todo restart failed for session %s",
+                    session_key,
+                    exc_info=True,
+                )
+                await _mark_restart_failed()
+
+        restart_task = asyncio.create_task(_restart_after_old_turn())
+        tracker = getattr(adapter, "_background_tasks", None)
+        if not isinstance(tracker, set):
+            tracker = getattr(self, "_slack_todo_restart_tasks", None)
+            if not isinstance(tracker, set):
+                tracker = set()
+                self._slack_todo_restart_tasks = tracker
+        tracker.add(restart_task)
+        restart_task.add_done_callback(tracker.discard)
+        return True
 
     async def _busy_stop_command(self, event: MessageEvent, quick_key: str, source):
         # /stop must hard-kill the session when an agent is running.

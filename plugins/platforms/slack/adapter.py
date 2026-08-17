@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -60,9 +61,19 @@ from gateway.platforms.base import (
 )
 
 try:  # sibling module; support both package and flat plugin-dir import
-    from .block_kit import render_blocks, sanitize_blocks
+    from .block_kit import (
+        render_blocks,
+        render_todo_progress,
+        sanitize_blocks,
+        todo_progress_eligible,
+    )
 except ImportError:  # pragma: no cover - plugin loaded outside package context
-    from block_kit import render_blocks, sanitize_blocks  # type: ignore
+    from block_kit import (  # type: ignore
+        render_blocks,
+        render_todo_progress,
+        sanitize_blocks,
+        todo_progress_eligible,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -891,6 +902,26 @@ def _is_slack_voice_clip(file_obj: Dict[str, Any]) -> bool:
     return name.startswith("audio_message")
 
 
+@dataclass
+class _TodoProgressState:
+    """One server-owned Slack plan card, reused across todo updates/retries."""
+
+    team_id: str
+    channel_id: str
+    chat_type: str
+    thread_ts: str
+    session_key: str
+    generation: int
+    user_id: str
+    message_ts: str
+    token: str
+    snapshot: Dict[str, Any]
+    revision: int = 1
+    action_consumed: bool = False
+    closed: bool = False
+    updated_at: float = field(default_factory=time.monotonic)
+
+
 class SlackAdapter(BasePlatformAdapter):
     """
     Slack bot adapter using Socket Mode.
@@ -1021,6 +1052,17 @@ class SlackAdapter(BasePlatformAdapter):
         # dozens of out-of-order status messages.
         self._status_message_ids: Dict[Tuple[str, str, str], str] = {}
         self._STATUS_MESSAGE_IDS_MAX = 2000
+        # EZ-525: one bounded, non-streaming todo card per Slack thread/session.
+        # The opaque action token is only a lookup key; routing, ownership, and
+        # generation are validated against this server-side state.
+        self._todo_progress_states: Dict[
+            Tuple[str, str, str, str], _TodoProgressState
+        ] = {}
+        self._todo_progress_tokens: Dict[
+            str, Tuple[str, str, str, str]
+        ] = {}
+        self._todo_progress_lock = asyncio.Lock()
+        self._TODO_PROGRESS_MAX = 2000
         # Cache for _fetch_thread_context results: cache_key → _ThreadContextCache
         self._thread_context_cache: Dict[str, _ThreadContextCache] = {}
         self._THREAD_CACHE_TTL = 60.0
@@ -2148,6 +2190,12 @@ class SlackAdapter(BasePlatformAdapter):
 
             self._app.action("hermes_feedback")(self._handle_feedback_action)
 
+            # EZ-525 long-run plan controls. Values are opaque tokens; the
+            # handler validates route, owner, message id, and run generation
+            # against adapter-owned state before touching the gateway.
+            self._app.action("hermes_todo_stop")(self._handle_todo_action)
+            self._app.action("hermes_todo_restart")(self._handle_todo_action)
+
             # Register Block Kit action handlers for clarify buttons
             # (interactive multiple-choice prompts; see tools/clarify_gateway.py).
             # Choice buttons use indexed action IDs so each ID is unique within
@@ -2970,6 +3018,331 @@ class SlackAdapter(BasePlatformAdapter):
                     self._status_message_ids.pop(stale, None)
             self._status_message_ids[key] = str(result.message_id)
         return result
+
+    def _ensure_todo_progress_state(self) -> None:
+        """Initialize EZ-525 state for partial test doubles and old pickles."""
+        if not hasattr(self, "_todo_progress_states"):
+            self._todo_progress_states = {}
+        if not hasattr(self, "_todo_progress_tokens"):
+            self._todo_progress_tokens = {}
+        if not hasattr(self, "_todo_progress_lock"):
+            self._todo_progress_lock = asyncio.Lock()
+        if not hasattr(self, "_TODO_PROGRESS_MAX"):
+            self._TODO_PROGRESS_MAX = 2000
+        if not hasattr(self, "_todo_progress_by_run"):
+            self._todo_progress_by_run = {}
+
+    def _trim_todo_progress_states(self) -> None:
+        if len(self._todo_progress_states) <= self._TODO_PROGRESS_MAX:
+            return
+        stale = sorted(
+            self._todo_progress_states.items(), key=lambda pair: pair[1].updated_at
+        )[: self._TODO_PROGRESS_MAX // 2]
+        for key, state in stale:
+            self._todo_progress_states.pop(key, None)
+            self._todo_progress_tokens.pop(state.token, None)
+            self._todo_progress_by_run.pop((state.session_key, state.generation), None)
+
+    def _open_todo_generation(self, session_key: str) -> int:
+        """Return the newest still-open card generation for a session, if any."""
+        self._ensure_todo_progress_state()
+        open_generations = [
+            state.generation
+            for state in self._todo_progress_states.values()
+            if state.session_key == str(session_key) and not state.closed
+        ]
+        return max(open_generations) if open_generations else 0
+
+    async def project_todo_progress(
+        self,
+        chat_id: str,
+        snapshot: Dict[str, Any],
+        *,
+        metadata: Optional[Dict[str, Any]],
+        session_key: str,
+        generation: int,
+        user_id: str,
+        chat_type: str = "group",
+    ) -> bool:
+        """Post/update the one non-streaming todo card for a Slack run.
+
+        The first eligible snapshot may create one message. Every later
+        snapshot, including a newer retry generation, edits that same ts. Once
+        a state is terminal, late callbacks are ignored. Slack failures are
+        best-effort and never fall back to a replacement post.
+        """
+        self._ensure_todo_progress_state()
+        if not self._app or self._is_ignored_channel(chat_id):
+            return False
+        team_id = str(self._metadata_team_id(metadata) or self._channel_team.get(chat_id, ""))
+        thread_ts = str(self._resolve_thread_ts(None, metadata) or "")
+        route = (team_id, str(chat_id), thread_ts, str(session_key))
+        try:
+            generation = int(generation)
+        except (TypeError, ValueError):
+            return False
+
+        async with self._todo_progress_lock:
+            state = self._todo_progress_states.get(route)
+            if state is not None:
+                if generation < state.generation or (
+                    generation == state.generation and state.closed
+                ):
+                    return False
+                if generation > state.generation:
+                    self._todo_progress_tokens.pop(state.token, None)
+                    self._todo_progress_by_run.pop(
+                        (state.session_key, state.generation), None
+                    )
+                    state.generation = generation
+                    state.user_id = str(user_id or "")
+                    state.token = secrets.token_urlsafe(18)
+                    state.action_consumed = False
+                    state.closed = False
+                    self._todo_progress_tokens[state.token] = route
+                    self._todo_progress_by_run[
+                        (state.session_key, state.generation)
+                    ] = route
+                else:
+                    self._todo_progress_by_run[
+                        (state.session_key, state.generation)
+                    ] = route
+                state.snapshot = snapshot
+                state.revision += 1
+                state.updated_at = time.monotonic()
+                rendered = render_todo_progress(
+                    snapshot,
+                    active=True,
+                    generation=state.generation,
+                    revision=state.revision,
+                    action_token=state.token,
+                )
+                if rendered is None:
+                    return False
+                text, blocks = rendered
+                try:
+                    await self._get_client(
+                        chat_id, team_id=team_id or None
+                    ).chat_update(
+                        channel=chat_id,
+                        ts=state.message_ts,
+                        text=text,
+                        blocks=sanitize_blocks(blocks),
+                    )
+                    return True
+                except Exception as exc:
+                    logger.debug(
+                        "[Slack] todo progress update failed; preserving single-card state: %s",
+                        exc,
+                    )
+                    return False
+
+            if not todo_progress_eligible(snapshot):
+                return False
+            token = secrets.token_urlsafe(18)
+            rendered = render_todo_progress(
+                snapshot,
+                active=True,
+                generation=generation,
+                revision=1,
+                action_token=token,
+            )
+            if rendered is None:
+                return False
+            text, blocks = rendered
+            kwargs: Dict[str, Any] = {
+                "channel": chat_id,
+                "text": text,
+                "blocks": sanitize_blocks(blocks),
+            }
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+            try:
+                result = await self._get_client(
+                    chat_id, team_id=team_id or None
+                ).chat_postMessage(**kwargs)
+            except Exception as exc:
+                # Do not retry as plain text: that would leave an untracked WIP
+                # message and defeat the native-status fallback.
+                logger.debug("[Slack] todo progress post failed; using native status: %s", exc)
+                return False
+            message_ts = str((result or {}).get("ts") or "")
+            if not message_ts:
+                return False
+            state = _TodoProgressState(
+                team_id=team_id,
+                channel_id=str(chat_id),
+                chat_type=str(chat_type or "group"),
+                thread_ts=thread_ts,
+                session_key=str(session_key),
+                generation=generation,
+                user_id=str(user_id or ""),
+                message_ts=message_ts,
+                token=token,
+                snapshot=snapshot,
+            )
+            self._todo_progress_states[route] = state
+            self._todo_progress_tokens[token] = route
+            self._todo_progress_by_run[(state.session_key, state.generation)] = route
+            self._trim_todo_progress_states()
+            return True
+
+    async def finalize_todo_progress(
+        self,
+        session_key: str,
+        generation: int,
+        terminal_status: str,
+        *,
+        overwrite_closed: bool = False,
+    ) -> bool:
+        """Make the owned plan card terminal and remove active controls."""
+        self._ensure_todo_progress_state()
+        try:
+            generation = int(generation)
+        except (TypeError, ValueError):
+            return False
+        async with self._todo_progress_lock:
+            route = self._todo_progress_by_run.get((str(session_key), generation))
+            state = self._todo_progress_states.get(route) if route is not None else None
+            if (
+                state is None
+                or state.session_key != str(session_key)
+                or state.generation != generation
+                or (state.closed and not overwrite_closed)
+            ):
+                return False
+            state.closed = True
+            state.action_consumed = True
+            state.revision += 1
+            state.updated_at = time.monotonic()
+            self._todo_progress_tokens.pop(state.token, None)
+            rendered = render_todo_progress(
+                state.snapshot,
+                active=False,
+                terminal_status=terminal_status,
+                generation=state.generation,
+                revision=state.revision,
+            )
+            if rendered is None:
+                return False
+            text, blocks = rendered
+            try:
+                await self._get_client(
+                    state.channel_id, team_id=state.team_id or None
+                ).chat_update(
+                    channel=state.channel_id,
+                    ts=state.message_ts,
+                    text=text,
+                    blocks=sanitize_blocks(blocks),
+                )
+                return True
+            except Exception as exc:
+                logger.debug("[Slack] todo progress finalization failed: %s", exc)
+                return False
+
+    async def _handle_todo_action(self, ack, body, action) -> None:
+        """Validate and dispatch stop/restart for the exact owned run."""
+        await ack()
+        self._ensure_todo_progress_state()
+        action_id = str((action or {}).get("action_id") or "")
+        if action_id not in {"hermes_todo_stop", "hermes_todo_restart"}:
+            return
+        token = str((action or {}).get("value") or "")
+        team_id = str((body.get("team") or {}).get("id") or "")
+        channel_id = str((body.get("channel") or {}).get("id") or "")
+        user_id = str((body.get("user") or {}).get("id") or "")
+        message = body.get("message") or {}
+        container = body.get("container") or {}
+        message_ts = str(message.get("ts") or container.get("message_ts") or "")
+        thread_ts = str(message.get("thread_ts") or container.get("thread_ts") or "")
+
+        payload: Optional[Dict[str, Any]] = None
+        async with self._todo_progress_lock:
+            route = self._todo_progress_tokens.get(token)
+            state = self._todo_progress_states.get(route) if route else None
+            if state is None or state.closed or state.action_consumed:
+                return
+            if not self._is_interactive_user_authorized(
+                user_id,
+                channel_id=channel_id,
+                team_id=team_id,
+                user_name=(body.get("user") or {}).get("name"),
+            ):
+                return
+            if (
+                team_id != state.team_id
+                or channel_id != state.channel_id
+                or thread_ts != state.thread_ts
+                or message_ts != state.message_ts
+                or user_id != state.user_id
+            ):
+                return
+            active = self._active_sessions.get(state.session_key)
+            if getattr(active, "_hermes_run_generation", None) != state.generation:
+                return
+            state.action_consumed = True
+            state.closed = True
+            state.revision += 1
+            state.updated_at = time.monotonic()
+            self._todo_progress_tokens.pop(state.token, None)
+            label = "stopped" if action_id == "hermes_todo_stop" else "restarting"
+            rendered = render_todo_progress(
+                state.snapshot,
+                active=False,
+                terminal_status=label,
+                generation=state.generation,
+                revision=state.revision,
+            )
+            if rendered is not None:
+                text, blocks = rendered
+                try:
+                    await self._get_client(
+                        state.channel_id, team_id=state.team_id or None
+                    ).chat_update(
+                        channel=state.channel_id,
+                        ts=state.message_ts,
+                        text=text,
+                        blocks=sanitize_blocks(blocks),
+                    )
+                except Exception:
+                    logger.debug("[Slack] todo control UI update failed", exc_info=True)
+            payload = {
+                "team_id": state.team_id,
+                "channel_id": state.channel_id,
+                "chat_type": state.chat_type,
+                "thread_ts": state.thread_ts,
+                "session_key": state.session_key,
+                "generation": state.generation,
+                "user_id": state.user_id,
+                "message_ts": state.message_ts,
+            }
+
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        handler = getattr(runner, "handle_slack_todo_action", None)
+        dispatch_ok = False
+        if callable(handler) and payload is not None:
+            try:
+                result = handler(
+                    "stop" if action_id == "hermes_todo_stop" else "restart",
+                    payload,
+                )
+                if inspect.isawaitable(result):
+                    result = await result
+                dispatch_ok = bool(result)
+            except Exception:
+                logger.warning("[Slack] todo action dispatch failed", exc_info=True)
+        if not dispatch_ok and payload is not None:
+            # The control was already consumed and closed above so the old
+            # run's completion cannot overwrite it. If dispatch itself failed,
+            # replace that terminal label explicitly without reopening it.
+            await self.finalize_todo_progress(
+                payload["session_key"],
+                payload["generation"],
+                terminal_status="failure",
+                overwrite_closed=True,
+            )
 
     async def edit_message(
         self,
@@ -4265,7 +4638,30 @@ class SlackAdapter(BasePlatformAdapter):
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
     ) -> None:
-        """Swap the in-progress reaction for a final success/failure reaction."""
+        """Resolve todo UI, then swap the optional outcome reaction."""
+        # Finalize only a card owned by this completing generation. A late
+        # callback must not close a newer retry's card: finalize matches
+        # session+generation and ignores already-closed states.
+        try:
+            runner = getattr(self, "gateway_runner", None)
+            if runner is None:
+                runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+            session_key_fn = getattr(runner, "_session_key_for_source", None)
+            if callable(session_key_fn):
+                session_key = str(session_key_fn(event.source))
+                active = self._active_sessions.get(session_key)
+                generation = getattr(active, "_hermes_run_generation", None)
+                if not generation:
+                    generation = self._open_todo_generation(session_key)
+                if generation:
+                    await self.finalize_todo_progress(
+                        session_key,
+                        int(generation),
+                        terminal_status=outcome.value,
+                    )
+        except Exception:
+            logger.debug("[Slack] todo progress finalization failed", exc_info=True)
+
         if not self._reactions_enabled():
             return
         ts = getattr(event, "message_id", None)
@@ -7169,7 +7565,9 @@ class SlackAdapter(BasePlatformAdapter):
         if not normalized_user_id:
             return False
 
-        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
             try:

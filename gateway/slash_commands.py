@@ -2633,58 +2633,46 @@ class GatewaySlashCommandsMixin:
         self._ephemeral_system_prompt = new_prompt
         return t("gateway.personality.set_to", name=name)
 
-    async def _handle_retry_command(self, event: MessageEvent) -> str:
-        """Handle /retry command - re-send the last user message."""
+    async def _prepare_retry_event(self, event: MessageEvent) -> Optional[MessageEvent]:
+        """Truncate the failed turn and build its canonical retry event."""
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
         history = await self.async_session_store.load_transcript(session_entry.session_id)
-        
-        # Find the last *real* user message. Timeline bookkeeping rows carry
-        # role=user + display_kind (model_switch / async_delegation_complete /
-        # auto_continue / hidden); clients never count them as user turns.
-        # Without this filter /retry rewrote the transcript around a marker
-        # and re-sent opaque bookkeeping text (same class as the TUI ordinal).
-        last_user_msg = None
-        last_user_idx = None
-        # is_user_originated_turn: excludes display_kind bookkeeping AND
-        # compaction handoffs (durable role=user, sometimes without
-        # display_kind on legacy sessions; #80622) — /retry must never
-        # re-send a reference-only summary as if the user asked it.
+
+        # Skip bookkeeping and compaction handoff rows; only retry a real user turn.
         from agent.context_compressor import is_user_originated_turn
 
+        last_user_msg = None
+        last_user_idx = None
         for i in range(len(history) - 1, -1, -1):
             msg = history[i]
             if is_user_originated_turn(msg):
                 last_user_msg = msg.get("content", "")
                 last_user_idx = i
                 break
-        
-        if not last_user_msg:
-            return t("gateway.retry.no_previous")
-        
-        # Truncate history to before the last user message and persist only the
-        # live view. After in-place compaction the pre-compaction transcript
-        # lives on as active=0/compacted=1 rows under this same session id, and
-        # a bare rewrite (active_only=False) would DELETE them (same class as
-        # #61145). /retry never intends to purge archived history, so avoid a
-        # separate existence probe: it could fail open or race with the write.
-        truncated = history[:last_user_idx]
-        await self.async_session_store.rewrite_transcript(
-            session_entry.session_id, truncated, active_only=True
-        )
-        # Reset stored token count — transcript was truncated
-        session_entry.last_prompt_tokens = 0
+        if not last_user_msg or last_user_idx is None:
+            return None
 
-        # Re-send by creating a fake text event with the old message
-        retry_event = MessageEvent(
+        # Preserve archived compacted rows; only rewrite the active transcript.
+        await self.async_session_store.rewrite_transcript(
+            session_entry.session_id,
+            history[:last_user_idx],
+            active_only=True,
+        )
+        session_entry.last_prompt_tokens = 0
+        return MessageEvent(
             text=last_user_msg,
             message_type=MessageType.TEXT,
             source=source,
             raw_message=event.raw_message,
             channel_prompt=event.channel_prompt,
         )
-        
-        # Let the normal message handler process it
+
+    async def _handle_retry_command(self, event: MessageEvent) -> str:
+        """Handle /retry command - re-send the last user message."""
+        retry_event = await self._prepare_retry_event(event)
+        if retry_event is None:
+            return t("gateway.retry.no_previous")
         return await self._handle_message(retry_event)
 
     async def _handle_goal_command(self, event: "MessageEvent") -> str:
