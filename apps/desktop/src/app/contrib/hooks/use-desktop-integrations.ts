@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react'
 
 import { closeActiveTab } from '@/app/chat/close-tab'
 import { openSession } from '@/app/open-session'
+import { SETTINGS_ROUTE } from '@/app/routes'
 import { storedSessionIdForNotification } from '@/lib/session-ids'
 import { requestMcpInstallFromDeepLink } from '@/store/mcp-deeplink-install'
 import { startMcpHealthChecker, stopMcpHealthChecker } from '@/store/mcp-health'
@@ -72,6 +73,12 @@ export function useDesktopIntegrations({
       stopMcpHealthChecker()
     }
   }, [])
+
+  // The tray menu's "Open Settings…" item routes here — surface the settings
+  // overlay in the main window (the window is already shown/focused by main).
+  useEffect(() => {
+    return window.hermesDesktop?.onOpenSettingsRequested?.(() => navigate(SETTINGS_ROUTE))
+  }, [navigate])
 
   // The renderer OWNS ⌘W: on macOS the native menu accelerator would else
   // close the window, so claim it unconditionally — the menu then routes ⌘W
