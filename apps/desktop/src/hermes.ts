@@ -1220,6 +1220,77 @@ export function editLearningNode(
   })
 }
 
+/** Safe, provenance-tagged draft text for recalling a journey node into a
+ *  session as reference context. The recalled body is scanned, delimiter-
+ *  defanged, and wrapped in an untrusted-data block server-side — the caller
+ *  stashes `text` as the target session's composer draft (user reviews + sends). */
+export interface LearningRecallDraft {
+  connected_count: number
+  /** Threat-scan pattern ids matched in the recalled body (empty = clean). */
+  findings: string[]
+  id: string
+  kind: 'memory' | 'skill'
+  label: string
+  ok: boolean
+  text: string
+  truncated: boolean
+}
+
+export function getLearningRecallDraft(id: string): Promise<LearningRecallDraft> {
+  return window.hermesDesktop.api<LearningRecallDraft>({
+    ...profileScoped(),
+    path: `/api/learning/recall-draft?id=${encodeURIComponent(id)}`
+  })
+}
+
+/** One raw message from a provider-side session (journey source corpus). */
+export interface ProviderSessionMessage {
+  content: string
+  peer: string
+  /** 'user' | 'assistant' when the provider knows which peer is the human. */
+  role?: string
+  /** Unix seconds, or null when the provider didn't record a time. */
+  timestamp: null | number
+}
+
+export interface ProviderSessionResponse {
+  messages: ProviderSessionMessage[]
+  provider: null | string
+  session_id: string
+}
+
+/** Source corpus behind a provider-contributed journey node — the raw
+ *  provider-side conversation a derived fact (e.g. a Honcho conclusion)
+ *  came from. Empty `messages` means unavailable, not an error. */
+export function getLearningProviderSession(sessionId: string): Promise<ProviderSessionResponse> {
+  return window.hermesDesktop.api<ProviderSessionResponse>({
+    ...profileScoped(),
+    path: `/api/learning/provider-session?session_id=${encodeURIComponent(sessionId)}`
+  })
+}
+
+export interface MaterializedProviderSession {
+  created: boolean
+  message_count: number
+  ok: boolean
+  provider: null | string
+  session_id: string
+  title: string
+}
+
+/** Recreate a provider-side conversation (journey source corpus) as a real
+ *  Hermes session, so it can be read and continued like any other session.
+ *  Idempotent: an already-materialized conversation returns `created: false`
+ *  with the same session id. */
+export function materializeLearningProviderSession(sessionId: string): Promise<MaterializedProviderSession> {
+  return window.hermesDesktop.api<MaterializedProviderSession>({
+    ...profileScoped(),
+    path: '/api/learning/provider-session/materialize',
+    method: 'POST',
+    body: { session_id: sessionId }
+  })
+}
+
 export function setSkillEnabled(
   name: string,
   enabled: boolean,
