@@ -52,6 +52,8 @@ def _make_args(**kwargs):
         "auth": None,
         "preset": None,
         "env": None,
+        "tools": None,
+        "all": False,
         "mcp_action": None,
     }
     defaults.update(kwargs)
@@ -339,6 +341,167 @@ class TestMcpTest:
         assert captured["inner_timeout"] == 300.0
         assert captured["outer_timeout"] == 310.0
         assert captured["shutdown"] is True
+
+
+# ---------------------------------------------------------------------------
+# Tests: cmd_mcp_configure
+# ---------------------------------------------------------------------------
+
+class TestMcpConfigure:
+    @staticmethod
+    def _seed_server(tmp_path):
+        _seed_config(tmp_path, {
+            "ink": {
+                "url": "https://mcp.ml.ink/mcp",
+                "tools": {"include": ["create_service"]},
+            },
+        })
+
+    @staticmethod
+    def _mock_tools(monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config._probe_single_server",
+            lambda name, config: [
+                ("create_service", "Deploy"),
+                ("list_services", "List all"),
+                ("delete_service", "Delete"),
+            ],
+        )
+
+    def test_tools_selects_named_tools_without_tty(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        self._seed_server(tmp_path)
+        self._mock_tools(monkeypatch)
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+        from hermes_cli.config import read_raw_config
+        from hermes_cli.mcp_config import cmd_mcp_configure
+
+        cmd_mcp_configure(
+            _make_args(name="ink", tools="list_services, delete_service")
+        )
+
+        assert read_raw_config()["mcp_servers"]["ink"]["tools"] == {
+            "include": ["list_services", "delete_service"]
+        }
+        assert "Updated config: 2/3 tools enabled" in capsys.readouterr().out
+
+    def test_all_enables_every_tool_without_tty(
+        self, tmp_path, monkeypatch
+    ):
+        self._seed_server(tmp_path)
+        self._mock_tools(monkeypatch)
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+        from hermes_cli.config import read_raw_config
+        from hermes_cli.mcp_config import cmd_mcp_configure
+
+        cmd_mcp_configure(_make_args(name="ink", all=True))
+
+        assert "tools" not in read_raw_config()["mcp_servers"]["ink"]
+
+    def test_all_preserves_utility_tool_settings(
+        self, tmp_path, monkeypatch
+    ):
+        _seed_config(tmp_path, {
+            "ink": {
+                "url": "https://mcp.ml.ink/mcp",
+                "tools": {
+                    "include": ["create_service"],
+                    "prompts": False,
+                    "resources": False,
+                },
+            },
+        })
+        self._mock_tools(monkeypatch)
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+        from hermes_cli.config import read_raw_config
+        from hermes_cli.mcp_config import cmd_mcp_configure
+
+        cmd_mcp_configure(_make_args(name="ink", all=True))
+
+        assert read_raw_config()["mcp_servers"]["ink"]["tools"] == {
+            "prompts": False,
+            "resources": False,
+        }
+
+    def test_unknown_tools_fail_without_changing_config(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        self._seed_server(tmp_path)
+        self._mock_tools(monkeypatch)
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+        from hermes_cli.config import read_raw_config
+        from hermes_cli.mcp_config import cmd_mcp_configure
+
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_mcp_configure(_make_args(name="ink", tools="missing_tool"))
+
+        assert exc_info.value.code == 1
+        assert "Unknown tool for 'ink': missing_tool" in capsys.readouterr().err
+        assert read_raw_config()["mcp_servers"]["ink"]["tools"] == {
+            "include": ["create_service"]
+        }
+
+    @pytest.mark.parametrize("tools", ["", ",", " , "])
+    def test_empty_tools_fail_without_changing_config(
+        self, tools, tmp_path, capsys, monkeypatch
+    ):
+        self._seed_server(tmp_path)
+        self._mock_tools(monkeypatch)
+
+        from hermes_cli.config import read_raw_config
+        from hermes_cli.mcp_config import cmd_mcp_configure
+
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_mcp_configure(_make_args(name="ink", tools=tools))
+
+        assert exc_info.value.code == 1
+        assert "--tools requires at least one tool name" in capsys.readouterr().err
+        assert read_raw_config()["mcp_servers"]["ink"]["tools"] == {
+            "include": ["create_service"]
+        }
+
+    def test_unchanged_explicit_selection_does_not_write_config(
+        self, tmp_path, capsys, monkeypatch
+    ):
+        self._seed_server(tmp_path)
+        self._mock_tools(monkeypatch)
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config.save_config",
+            lambda config: pytest.fail("unchanged selection must not write config"),
+        )
+
+        from hermes_cli.mcp_config import cmd_mcp_configure
+
+        cmd_mcp_configure(_make_args(name="ink", tools="create_service"))
+
+        assert "No changes made." in capsys.readouterr().out
+
+    def test_flagless_non_tty_still_fails_before_discovery(
+        self, tmp_path, monkeypatch
+    ):
+        self._seed_server(tmp_path)
+        probe_called = False
+
+        def probe(name, config):
+            nonlocal probe_called
+            probe_called = True
+            return []
+
+        monkeypatch.setattr("hermes_cli.mcp_config._probe_single_server", probe)
+        monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+
+        from hermes_cli.mcp_config import cmd_mcp_configure
+
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_mcp_configure(_make_args(name="ink"))
+
+        assert exc_info.value.code == 1
+        assert probe_called is False
 
 
 # ---------------------------------------------------------------------------

@@ -987,9 +987,23 @@ def cmd_mcp_reauth(args):
 def cmd_mcp_configure(args):
     """Reconfigure which tools are enabled for an existing MCP server."""
     import sys as _sys
-    if not _sys.stdin.isatty():
+    requested_tools = getattr(args, "tools", None)
+    select_all = getattr(args, "all", False)
+    non_interactive = requested_tools is not None or select_all
+    if not non_interactive and not _sys.stdin.isatty():
         print("Error: 'hermes mcp configure' requires an interactive terminal.", file=_sys.stderr)
         _sys.exit(1)
+    requested_names = None
+    if requested_tools is not None:
+        requested_names = list(dict.fromkeys(
+            part.strip() for part in requested_tools.split(",") if part.strip()
+        ))
+        if not requested_names:
+            print(
+                "Error: --tools requires at least one tool name.",
+                file=_sys.stderr,
+            )
+            _sys.exit(1)
     name = args.name
     servers = _get_mcp_servers()
 
@@ -1055,16 +1069,27 @@ def cmd_mcp_configure(args):
     _info(f"Currently {currently}/{total} tools enabled for '{name}'.")
     print()
 
-    # Interactive checklist
-    from hermes_cli.curses_ui import curses_checklist
+    if requested_tools is not None:
+        unknown = [tool for tool in requested_names if tool not in tool_names]
+        if unknown:
+            label = "tool" if len(unknown) == 1 else "tools"
+            print(
+                f"Error: Unknown {label} for '{name}': {', '.join(unknown)}",
+                file=_sys.stderr,
+            )
+            _sys.exit(1)
+        chosen = {tool_names.index(tool) for tool in requested_names}
+    elif select_all:
+        chosen = set(range(total))
+    else:
+        from hermes_cli.curses_ui import curses_checklist
 
-    labels = [f"{t[0]}  —  {t[1]}" for t in all_tools]
-
-    chosen = curses_checklist(
-        f"Select tools for '{name}'",
-        labels,
-        pre_selected,
-    )
+        labels = [f"{t[0]}  —  {t[1]}" for t in all_tools]
+        chosen = curses_checklist(
+            f"Select tools for '{name}'",
+            labels,
+            pre_selected,
+        )
 
     if chosen == pre_selected:
         _info("No changes made.")
@@ -1075,8 +1100,14 @@ def cmd_mcp_configure(args):
     server_entry = cfg_get(config, "mcp_servers", name, default={})
 
     if len(chosen) == total:
-        # All selected → remove include/exclude (register all)
-        server_entry.pop("tools", None)
+        # All selected → remove only selection filters (register all). Preserve
+        # independent utility-family toggles such as tools.prompts/resources.
+        tools_entry = server_entry.get("tools")
+        if isinstance(tools_entry, dict):
+            tools_entry.pop("include", None)
+            tools_entry.pop("exclude", None)
+            if not tools_entry:
+                server_entry.pop("tools", None)
     else:
         chosen_names = [tool_names[i] for i in sorted(chosen)]
         server_entry.setdefault("tools", {})

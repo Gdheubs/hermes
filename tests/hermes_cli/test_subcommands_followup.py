@@ -64,3 +64,33 @@ def test_mcp_and_acp_accept_hooks_flag():
     # acp takes --accept-hooks at top level
     ns = parser.parse_args(["acp", "--accept-hooks"])
     assert ns.accept_hooks is True
+
+
+def test_mcp_configure_accepts_noninteractive_tool_selection():
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    build_mcp_parser(sub, cmd_mcp=_h("mcp"))
+
+    selected = parser.parse_args(
+        ["mcp", "configure", "ink", "--tools", "create_service,list_services"]
+    )
+    assert selected.tools == "create_service,list_services"
+    assert selected.all is False
+
+    all_tools = parser.parse_args(["mcp", "configure", "ink", "--all"])
+    assert all_tools.all is True
+    assert all_tools.tools is None
+
+
+def test_mcp_configure_rejects_conflicting_tool_selection(capsys):
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    build_mcp_parser(sub, cmd_mcp=_h("mcp"))
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(
+            ["mcp", "configure", "ink", "--tools", "search", "--all"]
+        )
+
+    assert exc_info.value.code == 2
+    assert "not allowed with argument" in capsys.readouterr().err

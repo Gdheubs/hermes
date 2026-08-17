@@ -84,6 +84,16 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
         "configure", aliases=["config"], help="Toggle tool selection"
     )
     mcp_cfg_p.add_argument("name", help="Server name to configure")
+    mcp_cfg_selection = mcp_cfg_p.add_mutually_exclusive_group()
+    mcp_cfg_selection.add_argument(
+        "--tools",
+        help="Comma-separated tool names to enable (non-interactive)",
+    )
+    mcp_cfg_selection.add_argument(
+        "--all",
+        action="store_true",
+        help="Enable every discovered tool (non-interactive)",
+    )
 
     mcp_login_p = mcp_sub.add_parser(
         "login",
