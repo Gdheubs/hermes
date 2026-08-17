@@ -3015,6 +3015,25 @@ DEFAULT_CONFIG = {
     # reports 384MB+ databases with 68K+ messages, which slows down FTS5
     # inserts, /resume listing, and insights queries.
     "sessions": {
+        # Durable session/state backend selector. "sqlite" (default) keeps the
+        # single-file state.db. "postgres" routes session/state storage to an
+        # external PostgreSQL database, opt-in for installs where the
+        # single-file backend is unsuitable (multi-host deployments, shared
+        # state). The connection string is supplied via postgres_dsn (or an
+        # env override) and carries its own TLS/credential settings.
+        "state_backend": "sqlite",
+        # PostgreSQL connection string (DSN), consulted only when
+        # state_backend is "postgres". Empty by default. The DSN is passed
+        # through unchanged to the driver, so sslmode, host, port, and
+        # credentials all come from this value.
+        #
+        # A DSN normally carries a password, and secrets belong in .env rather
+        # than here. Prefer the HERMES_STATE_DATABASE_URL or
+        # HERMES_STATE_POSTGRES_DSN environment variables, which take
+        # precedence over this key. This setting exists for local development
+        # and for deployments whose DSN carries no embedded secret (peer,
+        # ident, or client-certificate authentication).
+        "postgres_dsn": "",
         # When true, prune ended sessions inactive for retention_days once
         # per (roughly) min_interval_hours at CLI/gateway/cron startup.
         # Activity is the latest message timestamp, falling back to creation
@@ -4333,6 +4352,29 @@ OPTIONAL_ENV_VARS = {
         "description": "Langfuse server URL (default: https://cloud.langfuse.com)",
         "prompt": "Langfuse server URL (leave empty for cloud.langfuse.com)",
         "url": None,
+        "password": False,
+        "category": "tool",
+        "advanced": True,
+    },
+
+    # ── PostgreSQL state backend ──
+    "HERMES_STATE_DATABASE_URL": {
+        "description": "PostgreSQL DSN for the optional Postgres session/state backend (overrides sessions.postgres_dsn)",
+        "prompt": "PostgreSQL state DSN",
+        "password": True,
+        "category": "tool",
+        "advanced": True,
+    },
+    "HERMES_STATE_POSTGRES_DSN": {
+        "description": "Alternate name for HERMES_STATE_DATABASE_URL (either is accepted)",
+        "prompt": "PostgreSQL state DSN (alias)",
+        "password": True,
+        "category": "tool",
+        "advanced": True,
+    },
+    "HERMES_STATE_BACKEND": {
+        "description": "Session/state backend override: 'sqlite' (default) or 'postgres'; takes precedence over sessions.state_backend",
+        "prompt": "State backend (sqlite | postgres)",
         "password": False,
         "category": "tool",
         "advanced": True,

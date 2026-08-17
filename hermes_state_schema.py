@@ -11,7 +11,7 @@ module-level constants live in hermes_state_common.
 import logging
 import json
 import sqlite3
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_state_common import (
@@ -550,7 +550,7 @@ class SessionSchemaMixin:
                 pass  # cache write is best-effort
         return table_columns
 
-    def _reconcile_columns(self, cursor: sqlite3.Cursor) -> None:
+    def _reconcile_columns(self, cursor: sqlite3.Cursor) -> List[str]:
         """Ensure live tables have every column declared in SCHEMA_SQL.
 
         Follows the Beets/sqlite-utils pattern: the CREATE TABLE definition
@@ -562,8 +562,13 @@ class SessionSchemaMixin:
         This makes column additions a declarative operation — just add
         the column to SCHEMA_SQL and it appears on the next startup.
         Version-gated migration blocks are no longer needed for ADD COLUMN.
+
+        Returns the ``table.column`` names that were added, for logging and
+        tests to assert on — the same contract as
+        ``hermes_state_postgres.reconcile_postgres_columns``.
         """
         expected = self._parse_schema_columns(SCHEMA_SQL)
+        added: List[str] = []
         for table_name, declared_cols in expected.items():
             # Get current columns from the live table
             try:
@@ -585,6 +590,7 @@ class SessionSchemaMixin:
                         cursor.execute(
                             f'ALTER TABLE "{table_name}" ADD COLUMN "{safe_name}" {col_type}'
                         )
+                        added.append(f"{table_name}.{col_name}")
                     except sqlite3.OperationalError as exc:
                         message = str(exc).lower()
                         if "duplicate column" in message:
@@ -616,6 +622,13 @@ class SessionSchemaMixin:
                             "reconcile %s.%s failed; store remains behind "
                             "SCHEMA_SQL: %s", table_name, col_name, exc,
                         )
+
+        if added:
+            # INFO, not DEBUG: a column appearing here means the declarative
+            # schema moved and SQLite caught up on its own.  Mirrors the INFO
+            # log in reconcile_postgres_columns.
+            logger.info("sqlite reconcile: added missing columns: %s", ", ".join(added))
+        return added
 
     def _heal_gateway_routing_pk(self, cursor: sqlite3.Cursor) -> None:
         """Rebuild ``gateway_routing`` when its PRIMARY KEY predates scoping.

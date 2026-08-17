@@ -1750,6 +1750,29 @@ class SessionSearchMixin:
         """
         result_fields = self._search_message_fields(fields)
 
+        if self._is_postgres:
+            # PostgreSQL has no FTS5; dispatch to the Postgres search helper,
+            # which uses native tsvector full-text search once the backfill is
+            # complete and falls back to ILIKE while rows remain unindexed.
+            # Placed before every FTS gate below, which would otherwise
+            # short-circuit to [] on the PostgreSQL backend.
+            # NOTE: the PG helper predates the ``fields`` projection and always
+            # returns the complete legacy result shape.
+            from hermes_state_postgres import search_messages_postgres
+
+            return search_messages_postgres(
+                self._conn,
+                self._decode_content,
+                query,
+                source_filter=source_filter,
+                exclude_sources=exclude_sources,
+                role_filter=role_filter,
+                limit=limit,
+                offset=offset,
+                sort=sort,
+                include_inactive=include_inactive,
+            )
+
         if not query or not query.strip():
             return []
 
