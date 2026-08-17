@@ -180,6 +180,7 @@ def _run_and_exit_oneshot(
     provider: object = None,
     toolsets: object = None,
     usage_file: object = None,
+    ignore_rules: bool = False,
 ) -> None:
     try:
         from hermes_cli.oneshot import run_oneshot
@@ -190,6 +191,7 @@ def _run_and_exit_oneshot(
             provider=provider,
             toolsets=toolsets,
             usage_file=usage_file,
+            ignore_rules=ignore_rules,
         )
     except KeyboardInterrupt:
         rc = 130
@@ -219,6 +221,16 @@ def _run_and_exit_oneshot(
         # during best-effort cleanup must not fall back into interpreter
         # finalization, where the reported native SIGABRT occurs.
         _exit_after_oneshot(rc)
+
+
+def _oneshot_ignore_rules(args) -> bool:
+    """Map CLI flags onto one-shot isolation.
+
+    ``--safe-mode`` implies ``--ignore-rules`` (it skips context files and
+    memory injection too), so both flags feed the same skip contract and are
+    resolved here once instead of at each dispatch site.
+    """
+    return bool(getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False))
 
 
 def _project_root_str_fast() -> str:
@@ -11794,6 +11806,7 @@ def _try_termux_fast_cli_launch() -> bool:
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            ignore_rules=_oneshot_ignore_rules(args),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -13588,6 +13601,7 @@ def main():
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            ignore_rules=_oneshot_ignore_rules(args),
         )
 
     # Handle top-level --resume / --continue as shortcut to chat
