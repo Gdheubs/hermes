@@ -79,13 +79,121 @@ def test_installed_entry_is_executable(tmp_path, xdg_home, monkeypatch):
 def test_exec_falls_back_to_interpreter_module(tmp_path, xdg_home, monkeypatch):
     root = _make_project(tmp_path)
     monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: None)
+    # A venv-style interpreter: sys.executable is a symlink and must
+    # appear verbatim, never realpath()ed onto the base interpreter.
+    monkeypatch.setattr(lde.sys, "executable", str(tmp_path / "venv" / "bin" / "python"))
     monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
 
     entry = lde.install_desktop_entry(root)
     exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
 
-    assert exec_line.endswith("-m hermes_cli.main desktop")
-    assert Path(exec_line.split(" ")[0]).is_absolute()
+    assert exec_line == f"{tmp_path}/venv/bin/python -m hermes_cli.main desktop"
+
+
+def test_exec_runs_python_script_bins_via_interpreter(tmp_path, xdg_home, monkeypatch):
+    """A python-script binary must be launched through sys.executable.
+
+    The desktop entry runs with a minimal PATH, so the script's bare
+    ``env python3`` shebang would resolve to the *system* interpreter,
+    which lacks the venv's dependencies — the dock launch then dies with
+    ModuleNotFoundError before any window appears.
+    """
+    root = _make_project(tmp_path)
+    script = tmp_path / "bin" / "hermes"
+    script.parent.mkdir()
+    script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(script))
+    monkeypatch.setattr(lde.sys, "executable", "/opt/venvs/hermes/bin/python")
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line == "/opt/venvs/hermes/bin/python %s desktop" % script
+
+
+def test_exec_uses_sys_executable_verbatim_not_realpath(tmp_path, xdg_home, monkeypatch):
+    """sys.executable must appear in Exec exactly as given.
+
+    venv pythons are symlinks; realpath()ing one lands on the *base*
+    interpreter, which breaks venv site-packages discovery (pyvenv.cfg is
+    found via the symlink's directory).
+    """
+    root = _make_project(tmp_path)
+    script = tmp_path / "bin" / "hermes"
+    script.parent.mkdir()
+    script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    script.chmod(0o755)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(script))
+    # A venv-style interpreter: a symlink that must not be resolved.
+    monkeypatch.setattr(lde.sys, "executable", str(tmp_path / "venv" / "bin" / "python"))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line.startswith(f"{tmp_path}/venv/bin/python ")
+
+
+def test_exec_keeps_non_python_binary_direct(tmp_path, xdg_home, monkeypatch):
+    """A real executable (e.g. a bash wrapper) stays as the Exec target."""
+    root = _make_project(tmp_path)
+    wrapper = tmp_path / "bin" / "hermes"
+    wrapper.parent.mkdir()
+    wrapper.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    monkeypatch.setattr("hermes_cli.relaunch.resolve_hermes_bin", lambda: str(wrapper))
+    monkeypatch.setattr(lde, "refresh_desktop_databases", lambda _dir: [])
+
+    entry = lde.install_desktop_entry(root)
+    exec_line = _parse(entry.read_text(encoding="utf-8"))["Exec"]
+
+    assert exec_line == f"{wrapper} desktop"
+
+
+@pytest.mark.parametrize(
+    "shebang",
+    [
+        b"#!/usr/bin/env python\n",
+        b"#!/usr/bin/env python3\n",
+        b"#!/usr/bin/env python3.11\n",
+        b"#!/usr/bin/env -S python3 -u\n",
+        b"#!/usr/bin/python3\n",
+        b"#!/opt/venvs/hermes/bin/python\n",
+    ],
+)
+def test_is_python_script_accepts_cpython_shebangs(tmp_path, shebang):
+    script = tmp_path / "hermes"
+    script.write_bytes(shebang)
+    script.chmod(0o755)
+
+    assert lde._is_python_script(script)
+
+
+@pytest.mark.parametrize(
+    "shebang",
+    [
+        b"#!/usr/bin/env bash\n",
+        b"#!/usr/bin/env sh\n",
+        b"#!/usr/bin/env pypy3\n",
+        b"#!/usr/bin/env python2\n",
+        b"#!/usr/bin/python-wrapper\n",  # path contains "python", basename doesn't
+        b"#!/bin/true\n",
+        b"not a shebang\n",
+        b"",
+    ],
+)
+def test_is_python_script_rejects_other_interpreters(tmp_path, shebang):
+    script = tmp_path / "hermes"
+    script.write_bytes(shebang)
+    script.chmod(0o755)
+
+    assert not lde._is_python_script(script)
+
+
+def test_is_python_script_missing_file(tmp_path):
+    assert not lde._is_python_script(tmp_path / "no-such-bin")
 
 
 def test_install_is_idempotent_and_skips_cache_refresh(tmp_path, xdg_home, monkeypatch):
