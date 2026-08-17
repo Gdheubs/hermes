@@ -74,6 +74,20 @@ def test_unparseable_json_fails_closed_and_preserves_a_copy(store_file):
     assert corrupt.read_text(encoding="utf-8") == "{ not json"
 
 
+def test_empty_store_file_returns_empty_store(store_file):
+    """F10/P2: a zero-byte / whitespace-only store is an initialized-but-
+    EMPTY store, not corruption — first-run / ``> auth.json`` flows must not
+    brick auth with a false "corrupt" error (availability regression)."""
+    store_file.write_text("", encoding="utf-8")
+    result = auth._load_auth_store(store_file)
+    assert result == {"version": auth.AUTH_STORE_VERSION, "providers": {}}
+    assert not store_file.with_suffix(".json.corrupt").exists()
+
+    store_file.write_text("   \n\t  ", encoding="utf-8")
+    result = auth._load_auth_store(store_file)
+    assert result == {"version": auth.AUTH_STORE_VERSION, "providers": {}}
+
+
 def test_healthy_store_is_returned_unchanged(store_file):
     result = auth._load_auth_store(store_file)
     assert result["providers"]["nous"]["api_key"] == "secret"

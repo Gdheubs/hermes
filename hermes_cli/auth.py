@@ -1283,7 +1283,15 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
     try:
-        raw = json.loads(auth_file.read_text(encoding="utf-8-sig"))
+        raw_text = auth_file.read_text(encoding="utf-8-sig")
+        # F10/P2 (Purple round 2): an EMPTY or whitespace-only store is a
+        # legitimately-initialized-but-empty store — NOT corruption. Treat
+        # it like the missing-file path so first-run / ``> auth.json`` flows
+        # do not brick auth with a false "corrupt" error (availability
+        # regression).
+        if not raw_text.strip():
+            return {"version": AUTH_STORE_VERSION, "providers": {}}
+        raw = json.loads(raw_text)
     except OSError:
         # The file exists (checked above) but could not be READ: EMFILE under
         # fd exhaustion, EACCES, EIO, a stalled network mount. None of those
