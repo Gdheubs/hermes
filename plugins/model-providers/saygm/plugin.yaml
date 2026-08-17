@@ -1,0 +1,5 @@
+name: saygm-provider
+kind: model-provider
+version: 1.0.0
+description: SayGM — multi-model gateway
+author: SayGM

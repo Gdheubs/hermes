@@ -478,6 +478,27 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "anthropic/claude-sonnet-4.6",
         "openai/gpt-5.4",
     ],
+    # saygm — multi-model gateway (https://api.saygm.com/v1). Curated to the
+    # OpenAI-compatible chat (cc) models that are servable AND work through
+    # Hermes' chat_completions transport with function tools (verified live
+    # 2026-08-07). Claude ids are Anthropic-wire-only on SayGM ("unknown model"
+    # on cc), Gemini ids are Gemini-wire-only (and available:false), and
+    # gpt-5.5-pro is Responses-only — none belong here. gpt-5.6-sol is
+    # included because the plugin pins reasoning_effort="none" for it (the
+    # only way cc accepts its tools). Ordered with the default main model
+    # first; the live catalog (unauthenticated) is merged after this list in
+    # the picker, so newly-available models and open-weight TEE SKUs appear.
+    "saygm": [
+        "gpt-5.4",
+        "gpt-5.4-mini",
+        "gpt-5.4-nano",
+        "gpt-5.5",
+        "gpt-5.6-sol",
+        "gpt-5.6-terra",
+        "gpt-5.6-luna",
+        "o3",
+        "o4-mini",
+    ],
     "opencode-zen": [
         "kimi-k2.5",
         "kimi-k2.6",
