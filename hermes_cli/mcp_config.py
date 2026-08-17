@@ -984,20 +984,73 @@ def cmd_mcp_reauth(args):
 
 # ─── hermes mcp configure ────────────────────────────────────────────────────
 
+def _clear_mcp_tool_name_filters(server_entry):
+    """Enable every server tool while preserving capability settings."""
+    tools_config = server_entry.get("tools")
+    if not isinstance(tools_config, dict):
+        changed = "tools" in server_entry
+        server_entry.pop("tools", None)
+        return changed
+
+    changed = "include" in tools_config or "exclude" in tools_config
+    tools_config.pop("include", None)
+    tools_config.pop("exclude", None)
+    if not tools_config:
+        server_entry.pop("tools", None)
+    return changed
+
+
 def cmd_mcp_configure(args):
     """Reconfigure which tools are enabled for an existing MCP server."""
     import sys as _sys
-    if not _sys.stdin.isatty():
+
+    requested_tools = getattr(args, "tools", None)
+    select_all = bool(getattr(args, "all", False))
+    flag_selection = requested_tools is not None or select_all
+
+    if requested_tools is not None and select_all:
+        print("Error: --tools and --all cannot be used together.", file=_sys.stderr)
+        _sys.exit(2)
+
+    requested_names = []
+    if requested_tools is not None:
+        requested_names = list(dict.fromkeys(
+            part.strip() for part in requested_tools.split(",") if part.strip()
+        ))
+        if not requested_names:
+            print("Error: --tools requires at least one tool name.", file=_sys.stderr)
+            _sys.exit(2)
+
+    if not flag_selection and not _sys.stdin.isatty():
         print("Error: 'hermes mcp configure' requires an interactive terminal.", file=_sys.stderr)
         _sys.exit(1)
     name = args.name
     servers = _get_mcp_servers()
 
     if name not in servers:
-        _error(f"Server '{name}' not found in config.")
+        message = f"Server '{name}' not found in config."
+        if flag_selection:
+            print(f"Error: {message}", file=_sys.stderr)
+        else:
+            _error(message)
         available = list(servers.keys())
         if available:
             _info(f"Available: {', '.join(available)}")
+        if flag_selection:
+            _sys.exit(1)
+        return
+
+    if select_all:
+        config = load_config()
+        server_entry = cfg_get(config, "mcp_servers", name, default={})
+        if not _clear_mcp_tool_name_filters(server_entry):
+            _info("No changes made.")
+            return
+
+        config.setdefault("mcp_servers", {})[name] = server_entry
+        save_config(config)
+        _success("Updated config: all tools enabled")
+        _info("Start a new session for changes to take effect.")
         return
 
     cfg = servers[name]
@@ -1009,10 +1062,17 @@ def cmd_mcp_configure(args):
     try:
         all_tools = _probe_single_server(name, cfg)
     except Exception as exc:
-        _error(f"Failed to connect: {exc}")
+        message = f"Failed to connect: {exc}"
+        if flag_selection:
+            print(f"Error: {message}", file=_sys.stderr)
+            _sys.exit(1)
+        _error(message)
         return
 
     if not all_tools:
+        if flag_selection:
+            print("Error: Server reports no tools.", file=_sys.stderr)
+            _sys.exit(1)
         _warning("Server reports no tools.")
         return
 
@@ -1055,16 +1115,34 @@ def cmd_mcp_configure(args):
     _info(f"Currently {currently}/{total} tools enabled for '{name}'.")
     print()
 
-    # Interactive checklist
-    from hermes_cli.curses_ui import curses_checklist
+    if requested_tools is not None:
+        available_names = set(tool_names)
+        unknown = [
+            tool_name for tool_name in requested_names
+            if tool_name not in available_names
+        ]
+        if unknown:
+            print(
+                f"Error: Unknown tool(s) for '{name}': {', '.join(unknown)}",
+                file=_sys.stderr,
+            )
+            print(f"Available tools: {', '.join(tool_names)}", file=_sys.stderr)
+            _sys.exit(1)
+        requested_name_set = set(requested_names)
+        chosen = {
+            i for i, tool_name in enumerate(tool_names)
+            if tool_name in requested_name_set
+        }
+    else:
+        # Keep the existing checklist for the interactive, no-flag path.
+        from hermes_cli.curses_ui import curses_checklist
 
-    labels = [f"{t[0]}  —  {t[1]}" for t in all_tools]
-
-    chosen = curses_checklist(
-        f"Select tools for '{name}'",
-        labels,
-        pre_selected,
-    )
+        labels = [f"{t[0]}  —  {t[1]}" for t in all_tools]
+        chosen = curses_checklist(
+            f"Select tools for '{name}'",
+            labels,
+            pre_selected,
+        )
 
     if chosen == pre_selected:
         _info("No changes made.")
@@ -1075,8 +1153,8 @@ def cmd_mcp_configure(args):
     server_entry = cfg_get(config, "mcp_servers", name, default={})
 
     if len(chosen) == total:
-        # All selected → remove include/exclude (register all)
-        server_entry.pop("tools", None)
+        # All selected → remove name filters (register all).
+        _clear_mcp_tool_name_filters(server_entry)
     else:
         chosen_names = [tool_names[i] for i in sorted(chosen)]
         server_entry.setdefault("tools", {})
