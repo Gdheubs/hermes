@@ -504,6 +504,7 @@ def init_agent(
     max_iterations: int = 90,  # Default tool-calling iterations (shared with subagents)
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
+    skip_tool_search_assembly: bool = False,
     save_trajectories: bool = False,
     verbose_logging: bool = False,
     quiet_mode: bool = False,
@@ -1499,6 +1500,7 @@ def init_agent(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
     )
     
     # Show tool configuration and store valid tool names for validation

@@ -325,6 +325,7 @@ def _run_agent(
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    skip_tool_search_assembly: bool = False,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
@@ -443,6 +444,7 @@ def _run_agent(
             api_mode=runtime.get("api_mode"),
             model=effective_model,
             enabled_toolsets=toolsets_list,
+            skip_tool_search_assembly=skip_tool_search_assembly,
             quiet_mode=True,
             platform="cli",
             session_db=session_db,
