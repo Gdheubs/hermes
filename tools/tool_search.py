@@ -227,6 +227,36 @@ def is_deferrable_tool_name(name: str) -> bool:
         return False
 
 
+def _resolve_deferrable_tool_name(name: str) -> Optional[str]:
+    """Resolve a bridge-supplied name to its registered deferrable name.
+
+    MCP registration normalizes each server/tool component for provider-safe
+    wire names. Models can nevertheless reconstruct a name from the raw MCP
+    server or tool name, so retry unresolved ``mcp__`` names with that same
+    normalization. Exact registry entries always win, and a normalized alias
+    is accepted only when it resolves to a real MCP-owned entry.
+    """
+    try:
+        from tools.registry import registry
+
+        if registry.get_entry(name) is not None:
+            return name if is_deferrable_tool_name(name) else None
+        if not name.startswith("mcp__"):
+            return None
+
+        from tools.mcp_tool import MCP_TOOL_NAME_PREFIX, sanitize_mcp_name_component
+
+        normalized = MCP_TOOL_NAME_PREFIX + sanitize_mcp_name_component(
+            name[len(MCP_TOOL_NAME_PREFIX):]
+        )
+        entry = registry.get_entry(normalized)
+        if entry is None or not entry.toolset.startswith("mcp-"):
+            return None
+        return normalized if is_deferrable_tool_name(normalized) else None
+    except Exception:
+        return None
+
+
 def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Split a tool-defs list into (visible, deferrable).
 
@@ -924,7 +954,8 @@ def dispatch_tool_describe(args: Dict[str, Any],
     name = str(args.get("name") or "").strip()
     if not name:
         return tool_error("name is required")
-    if not is_deferrable_tool_name(name):
+    resolved_name = _resolve_deferrable_tool_name(name)
+    if resolved_name is None:
         return tool_error(
             f"'{name}' is not a deferrable tool. If you see it in the tools list "
             "already, call it directly; otherwise check the spelling against tool_search."
@@ -932,9 +963,9 @@ def dispatch_tool_describe(args: Dict[str, Any],
     _, deferrable = classify_tools(current_tool_defs)
     for td in deferrable:
         fn = td.get("function") or {}
-        if fn.get("name") == name:
+        if fn.get("name") == resolved_name:
             return json.dumps({
-                "name": name,
+                "name": resolved_name,
                 "description": fn.get("description", ""),
                 "parameters": fn.get("parameters", {}),
             }, ensure_ascii=False)
@@ -1041,12 +1072,13 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
             return None, {}, f"tool_call 'arguments' is not valid JSON: {e}"
     if not isinstance(raw_args, dict):
         return None, {}, "tool_call 'arguments' must be an object"
-    if not is_deferrable_tool_name(name):
+    resolved_name = _resolve_deferrable_tool_name(name)
+    if resolved_name is None:
         return None, {}, (
             f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
             "list already, call it directly instead of via tool_call."
         )
-    return name, raw_args, None
+    return resolved_name, raw_args, None
 
 
 __all__ = [

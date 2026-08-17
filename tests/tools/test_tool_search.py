@@ -226,6 +226,23 @@ class TestAssembly:
 
 
 class TestBridgeDispatch:
+    @staticmethod
+    def _register(name, toolset="mcp-issue82876-graph"):
+        from tools.registry import registry
+
+        tool_def = _td(
+            name,
+            "Read a note from the connected graph.",
+            {"path": {"type": "string"}},
+        )
+        registry.register(
+            name=name,
+            handler=lambda args, **kwargs: json.dumps({"path": args.get("path")}),
+            schema=tool_def,
+            toolset=toolset,
+        )
+        return tool_def
+
     def test_tool_search_requires_query(self):
         from tools.tool_search import dispatch_tool_search
         result = dispatch_tool_search({}, current_tool_defs=[])
@@ -278,6 +295,51 @@ class TestBridgeDispatch:
         assert err is not None
         assert "bridge tool" in err.lower()
 
+    def test_hyphenated_mcp_name_resolves_for_describe_and_call(self):
+        from tools.tool_search import dispatch_tool_describe, resolve_underlying_call
+
+        canonical = "mcp__issue82876_graph__vault_read"
+        raw = "mcp__issue82876-graph__vault-read"
+        tool_def = self._register(canonical)
+
+        described = json.loads(dispatch_tool_describe(
+            {"name": raw},
+            current_tool_defs=[tool_def],
+        ))
+        assert described["name"] == canonical
+        assert described["parameters"] == tool_def["function"]["parameters"]
+
+        resolved, call_args, err = resolve_underlying_call({
+            "name": raw,
+            "arguments": {"path": "notes/demo.md"},
+        })
+        assert err is None
+        assert resolved == canonical
+        assert call_args == {"path": "notes/demo.md"}
+
+    def test_mcp_name_normalization_preserves_exact_entry_precedence(self):
+        from tools.tool_search import resolve_underlying_call
+
+        raw = "mcp__issue82876-precedence__vault_read"
+        canonical = "mcp__issue82876_precedence__vault_read"
+        self._register(raw, toolset="mcp-issue82876-raw")
+        self._register(canonical, toolset="mcp-issue82876-canonical")
+
+        resolved, _, err = resolve_underlying_call({"name": raw, "arguments": {}})
+        assert err is None
+        assert resolved == raw
+
+    def test_unregistered_hyphenated_mcp_name_remains_unresolved(self):
+        from tools.tool_search import resolve_underlying_call
+
+        resolved, _, err = resolve_underlying_call({
+            "name": "mcp__issue82876-missing__vault-read",
+            "arguments": {},
+        })
+        assert resolved is None
+        assert err is not None
+        assert "not a deferrable tool" in err
+
 
 # ---------------------------------------------------------------------------
 # End-to-end via the real handle_function_call (smoke test).
@@ -285,6 +347,29 @@ class TestBridgeDispatch:
 
 
 class TestHandleFunctionCallIntegration:
+    def test_hyphenated_mcp_tool_call_dispatches_canonical_entry(self):
+        import model_tools
+        from tools.registry import registry
+
+        canonical = "mcp__issue82876_integration__vault_read"
+        registry.register(
+            name=canonical,
+            handler=lambda args, **kwargs: json.dumps({"path": args["path"]}),
+            schema=_td(canonical, "Read a graph note.", {"path": {"type": "string"}}),
+            toolset="mcp-issue82876-integration",
+        )
+
+        result = model_tools.handle_function_call(
+            function_name="tool_call",
+            function_args={
+                "name": "mcp__issue82876-integration__vault-read",
+                "arguments": {"path": "notes/demo.md"},
+            },
+            enabled_toolsets=["mcp-issue82876-integration"],
+        )
+
+        assert json.loads(result) == {"path": "notes/demo.md"}
+
     def test_tool_search_dispatch_through_handle_function_call(self):
         """The dispatcher recognizes the bridge tool by name."""
         import model_tools
