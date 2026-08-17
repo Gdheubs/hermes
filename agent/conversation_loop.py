@@ -2271,6 +2271,9 @@ def run_conversation(
                         moa_config.get("degraded_reference_policy") or "loud"
                     ),
                     agent=agent,
+                    reference_view=str(moa_config.get("reference_view") or "digest"),
+                    reference_detail_tools=moa_config.get("reference_detail_tools"),
+                    reference_prose_budget=moa_config.get("reference_prose_budget"),
                 )
                 if _moa_context:
                     for _msg in reversed(api_messages):
