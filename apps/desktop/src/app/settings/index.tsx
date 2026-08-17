@@ -314,7 +314,7 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
           ) : activeView === 'about' ? (
             <AboutSettings />
           ) : activeView === 'gateway' ? (
-            <GatewaySettings />
+            <GatewaySettings onManageConnections={() => setActiveView('connections')} />
           ) : activeView === 'connections' ? (
             <ConnectionsSettings />
           ) : activeView === 'keybinds' ? (

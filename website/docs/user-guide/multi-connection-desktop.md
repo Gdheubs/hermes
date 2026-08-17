@@ -51,10 +51,16 @@ Rules worth knowing:
 - The **local** entry is managed by the app (it wears a **This device** pill)
   and cannot be removed. Removing any other connection tears down its live
   backends and tunnels; the instance itself is untouched.
-- One connection is always the **Primary** (pill on its row): it owns the
-  app-managed window backend — boot overlay and install/update machinery.
-  **Make primary** on any row retargets that; removing the primary falls back
-  to the local entry.
+- One connection is always the **Primary** (pill on its row): it is the
+  registry fallback for multi-source calls that do not name a source.
+  **Make primary** does not switch the current Sessions workspace; removing
+  the primary falls back to the local entry.
+- **Open on launch** controls which source Sessions opens after a full app
+  restart. **Primary source** preserves the established Desktop behavior and
+  remains the default for existing and new installs. Choose **Last used** to
+  resume the most recent source that connected successfully. A failed switch
+  is never remembered, and a removed or unavailable saved source falls back
+  to Primary.
 - **Test** probes the connection's own HTTP *and* WebSocket legs, so a pass
   (the *"Reachable"* toast) means chat will actually work — not just that the
   host pinged.
@@ -62,9 +68,9 @@ Rules worth knowing:
   (Settings → Gateway), not a hand-typed URL — which is why the add-connection
   editor only offers **Remote gateway** and **SSH**.
 
-As the pane's own caption notes: *"Chats and the agent roster follow the
-source you pick; the app-managed window backend is still chosen in
-Settings → Gateway."*
+As the pane's own caption notes: switch sources from the **Sessions** sidebar.
+Profiles, chats, messaging, and cron stay scoped to that source; **Primary** is
+the registry default and does not switch the current workspace.
 
 ## Adding a connection, step by step
 
@@ -137,19 +143,57 @@ keep streaming while you look at another source.
 
 ### Switching and scoping
 
-Switching agents is the same gesture as switching profiles:
+The sidebar foot follows one hierarchy: **source → profile → sessions**.
+Sources are machines or hosted backends; profiles are isolated Hermes agents
+that live on one source.
 
-- **The profile rail** at the sidebar foot switches the active profile; the
-  home pill returns to the default profile and the layers pill shows the
-  **All profiles** view. **Cmd/Ctrl+1–9** switch profiles from the keyboard.
-- The sidebar's session list, cron jobs, and messaging status are **scoped to
-  the active profile** — and, for agents on another source, to that source's
-  machine. Sessions you see under `@research-homelab` live on the Homelab;
-  its cron jobs run there; its messaging channels are the ones its gateway
-  hosts. The **All profiles** view merges every profile's sessions into one
-  list, with per-profile tags.
-- Hovering an agent pre-warms its backend so the switch doesn't pay a cold
-  boot.
+- With one registered source, no source control is added. Local-only Desktop
+  keeps the same profile rail and keyboard flow as before.
+- With several sources, the sidebar shows one named source selector. Its device,
+  cloud, network, or terminal icon identifies the connection type; profile
+  avatars remain a separate control after the divider. The same selector scales
+  from two sources to a larger fleet without turning backends into profile-like
+  glyphs or crowding profile actions out of the rail.
+- Selecting a source restores the last profile used there. The profile rail
+  then shows only that source's profiles; the home pill returns to its default
+  profile and the layers pill shows **All profiles on this source**.
+  **Cmd/Ctrl+1–9** continue to switch profiles within the active source.
+- The selected source survives a quit and relaunch only when **Settings →
+  Connections → Open on launch** is set to **Last used**. The preference and
+  source id live in the app's user-data registry, so replacing or updating the
+  application bundle does not reset them.
+- With more than thirteen profiles on the active source, their avatar strip
+  condenses into a named profile selector. Large source and profile sets can
+  therefore coexist without changing the **source → profile → sessions** model.
+- **This device** remains a first-class source even when a remote connection is
+  Primary. It can keep local sessions available during a remote outage, but the
+  app does not call it "offline mode": the selected model or tools may still
+  require internet access.
+- The session list, messaging channels, cron jobs, settings, files, and memory
+  are all scoped to the active `(source, profile)`. Switching from a Telegram
+  source to a Signal source cannot leave the previous source's channel groups
+  or sessions in the sidebar.
+- Merely displaying the switcher reads Electron's local connection registry.
+  Remote gateways are opened only when selected; there is no periodic fleet
+  polling.
+
+Add, test, rename, or remove sources in **Settings → Connections**. The plug
+button beside the profile actions is a shortcut to that single management
+home, not a second add flow.
+
+### Sessions and Bot Mode
+
+Sessions intentionally show one active source at a time: this keeps files,
+tools, channels, cron, and session history in one understandable execution
+context. Bot Mode serves a different job and may present the union roster,
+grouped by source, so a user can open one agent on a NAS and another on a VPS
+from one surface. Opening a bot still activates its exact `(source, profile)`
+route.
+
+Direct bot mentions and delegation remain source-local by default. Crossing a
+backend boundary changes filesystem, credentials, tools, and trust context, so
+cross-source execution should be an explicit bridge rather than an accidental
+side effect of sharing one Desktop window.
 
 ## Updating every instance at once
 

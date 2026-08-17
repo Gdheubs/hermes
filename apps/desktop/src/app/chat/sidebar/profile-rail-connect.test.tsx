@@ -4,8 +4,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { ProfileRail } from './profile-switcher'
 
-afterEach(cleanup)
-
 // The rail's discoverability pills are navigation, not identity — assert the
 // multi-gateway entry point deep-links to Settings → Connections instead of
 // relying on someone finding the pane three levels into Settings (the exact
@@ -57,6 +55,10 @@ vi.mock('@/store/profile', () => ({
   sortByProfileOrder: (profiles: unknown[]) => profiles
 }))
 
+vi.mock('@/store/connections', () => ({ $hasMultipleConnections: atom(false) }))
+
+vi.mock('./connection-switcher', () => ({ ConnectionSwitcher: () => null }))
+
 vi.mock('@/store/profile-share', () => ({
   runExportProfileFlow: vi.fn(),
   runImportProfileFlow: vi.fn()
@@ -76,6 +78,17 @@ vi.mock('../../profiles/create-profile-dialog', () => ({ CreateProfileDialog: ()
 vi.mock('../../profiles/delete-profile-dialog', () => ({ DeleteProfileDialog: () => null }))
 vi.mock('../../profiles/rename-profile-dialog', () => ({ RenameProfileDialog: () => null }))
 
+const { $hasMultipleConnections } = await import('@/store/connections')
+const hasMultipleConnections = $hasMultipleConnections as ReturnType<typeof atom<boolean>>
+const { $profiles } = await import('@/store/profile')
+const profiles = $profiles as ReturnType<typeof atom<Array<{ is_default: boolean; name: string }>>>
+
+afterEach(() => {
+  cleanup()
+  hasMultipleConnections.set(false)
+  profiles.set([{ is_default: true, name: 'default' }])
+})
+
 describe('ProfileRail multi-gateway entry point', () => {
   it('deep-links to Settings → Connections from the rail', () => {
     render(<ProfileRail />)
@@ -93,5 +106,46 @@ describe('ProfileRail multi-gateway entry point', () => {
     // gated behind multiProfile the way the default↔all toggle is.
     expect(screen.getByRole('button', { name: 'Connect another Hermes gateway…' })).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Manage profiles…' })).toBeTruthy()
+  })
+
+  it('does not duplicate the default home when source buttons identify multiple single-profile backends', () => {
+    hasMultipleConnections.set(true)
+    render(<ProfileRail />)
+
+    expect(screen.queryByRole('button', { name: 'default' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Connect another Hermes gateway…' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Manage profiles…' })).toBeTruthy()
+  })
+
+  it('keeps thirteen profiles direct and condenses the fourteenth', () => {
+    profiles.set([
+      { is_default: true, name: 'default' },
+      ...Array.from({ length: 12 }, (_, index) => ({ is_default: false, name: `Profile ${index + 1}` }))
+    ])
+    const { unmount } = render(<ProfileRail />)
+
+    expect(screen.queryByRole('button', { name: 'Profiles' })).toBeNull()
+    expect(screen.getByRole('button', { name: 'Profile 12' })).toBeTruthy()
+    unmount()
+
+    profiles.set([
+      { is_default: true, name: 'default' },
+      ...Array.from({ length: 13 }, (_, index) => ({ is_default: false, name: `Profile ${index + 1}` }))
+    ])
+    render(<ProfileRail />)
+
+    expect(screen.getByRole('button', { name: 'Profiles' })).toBeTruthy()
+  })
+
+  it('stays shrinkable when source and condensed profile controls coexist', () => {
+    hasMultipleConnections.set(true)
+    profiles.set([
+      { is_default: true, name: 'default' },
+      ...Array.from({ length: 13 }, (_, index) => ({ is_default: false, name: `Profile ${index + 1}` }))
+    ])
+    render(<ProfileRail />)
+
+    expect(screen.getByRole('group', { name: 'Profiles' }).className).toContain('min-w-0')
+    expect(screen.getByRole('button', { name: 'Profiles' })).toBeTruthy()
   })
 })

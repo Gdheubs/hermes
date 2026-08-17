@@ -19,6 +19,7 @@ import {
   Loader2,
   LogIn,
   Monitor,
+  Network,
   RefreshCw,
   Terminal
 } from '@/lib/icons'
@@ -156,7 +157,10 @@ function ScopeChip({ active, label, onSelect }: { active: boolean; label: string
 // card: the outer title/intro, the "Save for next restart" action, and the
 // Diagnostics row are redundant there (the card owns its header + a single
 // reconnect action), so only the connection controls render.
-export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {}) {
+export function GatewaySettings({
+  embedded = false,
+  onManageConnections
+}: { embedded?: boolean; onManageConnections?: () => void } = {}) {
   const { t } = useI18n()
   const g = t.settings.gateway
   const [loading, setLoading] = useState(true)
@@ -1061,10 +1065,18 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
     <SettingsContent bare={embedded}>
       {embedded ? null : (
         <div className="mb-5">
-          <div className="flex items-center gap-2 text-[length:var(--conversation-text-font-size)] font-medium">
-            <Globe className="size-4 text-muted-foreground" />
-            {g.title}
-            {state.envOverride ? <Pill tone="primary">{g.envOverride}</Pill> : null}
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-[length:var(--conversation-text-font-size)] font-medium">
+              <Globe className="size-4 text-muted-foreground" />
+              {g.title}
+              {state.envOverride ? <Pill tone="primary">{g.envOverride}</Pill> : null}
+            </div>
+            {onManageConnections ? (
+              <Button onClick={onManageConnections} size="sm" variant="textStrong">
+                <Network />
+                {g.manageConnections}
+              </Button>
+            ) : null}
           </div>
           <p className="mt-2 max-w-2xl text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) text-(--ui-text-tertiary)">
             {g.intro}

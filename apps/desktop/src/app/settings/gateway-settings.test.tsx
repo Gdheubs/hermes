@@ -59,6 +59,21 @@ afterEach(() => {
 })
 
 describe('GatewaySettings', () => {
+  it('links launch routing to the named connection manager', async () => {
+    const onManageConnections = vi.fn()
+    const { GatewaySettings } = await import('./gateway-settings')
+
+    render(<GatewaySettings onManageConnections={onManageConnections} />)
+    expect(
+      await screen.findByText(
+        'Choose the gateway used at launch, after recovery, and for profile overrides. Manage named sources in Connections, then switch the current workspace from Sessions.'
+      )
+    ).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Manage connections' }))
+    expect(onManageConnections).toHaveBeenCalledTimes(1)
+  })
+
   it('labels local mode as default inheritance for a named profile', async () => {
     const { GatewaySettings } = await import('./gateway-settings')
 

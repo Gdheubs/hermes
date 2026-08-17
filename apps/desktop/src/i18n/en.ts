@@ -649,10 +649,15 @@ export const en: Translations = {
     connections: {
       title: 'Connections',
       intro:
-        'Register every place your agents live — this device, remote gateways on your network, and Hermes Cloud instances. All of them are stored here.',
+        'Manage this device, remote gateways, SSH hosts, and Hermes Cloud sources.',
       stagedNote:
-        'Chats and the agent roster follow the source you pick; the app-managed window backend is still chosen in Settings → Gateway.',
+        'Switch sources from Sessions. Profiles, chats, messaging, and cron jobs stay with their source; work on other sources keeps running.',
+      launchModeTitle: 'Open on launch',
+      launchModeDesc: 'Choose whether Hermes opens your primary source or the last source that connected successfully.',
+      launchPrimary: 'Primary source',
+      launchLastUsed: 'Last used',
       loadFailed: 'Could not load connections',
+      currentPill: 'Current',
       primaryPill: 'Primary',
       managedPill: 'This device',
       addConnection: 'Add connection',
@@ -704,7 +709,8 @@ export const en: Translations = {
       title: 'Gateway Connection',
       envOverride: 'env override',
       intro:
-        'Local by default. Use remote when this app should drive a Hermes backend elsewhere. Per-profile overrides below.',
+        'Choose the gateway used at launch, after recovery, and for profile overrides. Manage named sources in Connections, then switch the current workspace from Sessions.',
+      manageConnections: 'Manage connections',
       appliesTo: 'Applies to',
       allProfiles: 'All profiles',
       defaultConnection: 'Default connection for every profile that has no override of its own.',
@@ -1700,6 +1706,8 @@ export const en: Translations = {
     allProfiles: 'All profiles',
     showAllProfiles: 'Show all profiles',
     switchToProfile: name => `Switch to ${name}`,
+    switchToConnection: name => `Switch to ${name}`,
+    switchConnectionFailed: name => `Could not connect to ${name}`,
     manageProfiles: 'Manage profiles…',
     connectGateway: 'Connect another Hermes gateway…',
     actions: 'Actions',
