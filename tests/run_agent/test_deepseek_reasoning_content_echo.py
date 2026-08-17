@@ -78,6 +78,30 @@ class TestNeedsDeepSeekToolReasoning:
         agent = _make_agent(provider="deepseek", model="deepseek-v4-flash")
         assert agent._needs_deepseek_tool_reasoning() is True
 
+    def test_nvidia_route_model_substring(self) -> None:
+        # DeepSeek V4 flash served through NVIDIA NIM. The nvidia provider
+        # hosts deepseek-ai/deepseek-v4-flash-<date> model IDs; detection
+        # must key off the model substring (not the provider name) so the
+        # nvidia route gets the same reasoning_content echo-back treatment
+        # as the official deepseek provider.
+        agent = _make_agent(
+            provider="nvidia",
+            model="deepseek-ai/deepseek-v4-flash-0731",
+            base_url="https://integrate.api.nvidia.com/v1",
+        )
+        assert agent._needs_deepseek_tool_reasoning() is True
+        assert agent._needs_thinking_reasoning_pad() is True
+
+    def test_nvidia_route_non_deepseek_model(self) -> None:
+        # Other NVIDIA NIM models (nemotron, minimax, llama) must NOT be
+        # treated as DeepSeek thinking mode.
+        agent = _make_agent(
+            provider="nvidia",
+            model="nvidia/nemotron-3-ultra-550b-a55b",
+            base_url="https://integrate.api.nvidia.com/v1",
+        )
+        assert agent._needs_deepseek_tool_reasoning() is False
+        assert agent._needs_thinking_reasoning_pad() is False
 
 
 

@@ -1,5 +1,7 @@
 """Tests for the provider module registry and profiles."""
 
+import pytest
+
 from providers import get_provider_profile, _REGISTRY
 from providers.base import ProviderProfile, OMIT_TEMPERATURE
 
@@ -24,6 +26,87 @@ class TestNvidiaProfile:
         p = get_provider_profile("nvidia")
         assert "nvidia.com" in p.base_url
 
+
+
+class TestNvidiaDeepSeekV4FlashReasoning:
+    """DeepSeek V4 flash served through NIM speaks DeepSeek's wire format.
+
+    NVIDIA NIM hosts ``deepseek-ai/deepseek-v4-flash-<date>`` model IDs. The
+    profile must emit the same extra_body.thinking + reasoning_effort shape as
+    the official DeepSeek profile — but ONLY for deepseek-v4-flash. Every
+    other NVIDIA model must be left untouched (no DeepSeek-specific fields).
+    """
+
+    def _extras(self, model, reasoning_config=None):
+        p = get_provider_profile("nvidia")
+        return p.build_api_kwargs_extras(
+            reasoning_config=reasoning_config, model=model
+        )
+
+    def test_deepseek_v4_flash_enabled_default(self):
+        eb, tl = self._extras("deepseek-ai/deepseek-v4-flash-0731")
+        assert eb == {"thinking": {"type": "enabled"}}
+        assert tl == {}
+
+    def test_deepseek_v4_flash_enabled_with_effort(self):
+        eb, tl = self._extras(
+            "deepseek-ai/deepseek-v4-flash-0731",
+            {"enabled": True, "effort": "high"},
+        )
+        assert eb == {"thinking": {"type": "enabled"}}
+        assert tl == {"reasoning_effort": "high"}
+
+    def test_deepseek_v4_flash_disabled(self):
+        eb, tl = self._extras(
+            "deepseek-ai/deepseek-v4-flash-0731",
+            {"enabled": False},
+        )
+        assert eb == {"thinking": {"type": "disabled"}}
+        assert tl == {}
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "high"])
+    def test_standard_efforts_pass_through(self, effort):
+        _, tl = self._extras(
+            "deepseek-ai/deepseek-v4-flash-0731",
+            {"enabled": True, "effort": effort},
+        )
+        assert tl == {"reasoning_effort": effort}
+
+    @pytest.mark.parametrize("effort", ["xhigh", "max", "MAX", "  Max  "])
+    def test_xhigh_and_max_normalize_to_max(self, effort):
+        _, tl = self._extras(
+            "deepseek-ai/deepseek-v4-flash-0731",
+            {"enabled": True, "effort": effort},
+        )
+        assert tl == {"reasoning_effort": "max"}
+
+    def test_unknown_effort_omits_top_level(self):
+        _, tl = self._extras(
+            "deepseek-ai/deepseek-v4-flash-0731",
+            {"enabled": True, "effort": "garbage"},
+        )
+        assert tl == {}
+
+    def test_bare_model_name_matches(self):
+        eb, _ = self._extras("deepseek-v4-flash")
+        assert eb == {"thinking": {"type": "enabled"}}
+
+    def test_other_nvidia_models_untouched(self):
+        for model in (
+            "nvidia/nemotron-3-ultra-550b-a55b",
+            "minimaxai/minimax-m3",
+            "nvidia/llama-3.1-nemotron-70b-instruct",
+            "deepseek/deepseek-chat",  # V3 alias — no thinking mode
+            "deepseek-ai/deepseek-r1",  # legacy reasoner name not on NIM flash route
+        ):
+            eb, tl = self._extras(model, {"enabled": True, "effort": "high"})
+            assert eb == {}, f"non-deepseek-v4-flash model {model} must not get thinking"
+            assert tl == {}, f"non-deepseek-v4-flash model {model} must not get reasoning_effort"
+
+    def test_missing_model_untouched(self):
+        eb, tl = self._extras(None, {"enabled": True, "effort": "high"})
+        assert eb == {}
+        assert tl == {}
 
 
 class TestKimiProfile:
