@@ -936,6 +936,25 @@ class TestGetModelContextLength:
         )
         assert result == 202752  # "glm" entry in DEFAULT_CONTEXT_LENGTHS
 
+    @patch("agent.model_metadata.fetch_model_metadata")
+    @patch("agent.model_metadata.fetch_endpoint_model_metadata")
+    def test_glm_5_3_resolves_to_1m(self, mock_endpoint_fetch, mock_fetch):
+        """GLM-5.3 ships with a 1M context window (like 5.2).
+
+        Z.AI's /v1/models returns no context_length metadata, so resolution
+        falls through to DEFAULT_CONTEXT_LENGTHS. Without an explicit entry,
+        "glm-5.3" substring-matched the generic "glm" fallback (202,752) and
+        Hermes compressed context ~5x too early on the coding endpoint.
+        Verified empirically: needle-in-a-haystack retrieval at 1,010,121
+        prompt tokens on api.z.ai/api/coding/paas/v4 succeeded; docs
+        https://docs.z.ai/guides/llm/glm-5.3.md lists Context Length: 1M.
+        """
+        mock_fetch.return_value = {}
+        mock_endpoint_fetch.return_value = {}
+
+        result = get_model_context_length("glm-5.3")
+        assert result == 1_048_576
+
 
 
 
