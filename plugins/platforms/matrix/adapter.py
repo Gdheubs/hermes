@@ -1276,7 +1276,7 @@ class MatrixAdapter(BasePlatformAdapter):
         # If non-empty, bot ONLY responds in these rooms (whitelist); DMs exempt.
         allowed_rooms_raw = config.extra.get("allowed_rooms")
         if allowed_rooms_raw is None:
-            allowed_rooms_raw = os.getenv("MATRIX_ALLOWED_ROOMS", "")
+            allowed_rooms_raw = _startup_env_secret("MATRIX_ALLOWED_ROOMS")
         if isinstance(allowed_rooms_raw, list):
             self._allowed_rooms: Set[str] = {
                 str(r).strip() for r in allowed_rooms_raw if str(r).strip()
@@ -1363,7 +1363,7 @@ class MatrixAdapter(BasePlatformAdapter):
             self._approval_timeout_seconds = 300
         self._model_picker_prompts_by_event: Dict[str, _MatrixModelPickerPrompt] = {}
         self._choice_picker_prompts_by_event: Dict[str, _MatrixChoicePickerPrompt] = {}
-        allowed_users_raw = os.getenv("MATRIX_ALLOWED_USERS", "")
+        allowed_users_raw = _startup_env_secret("MATRIX_ALLOWED_USERS")
         self._allowed_user_ids: Set[str] = {
             u.strip() for u in allowed_users_raw.split(",") if u.strip()
         }

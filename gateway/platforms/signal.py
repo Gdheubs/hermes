@@ -57,8 +57,18 @@ from gateway.platforms.signal_rate_limit import (
     _signal_send_timeout,
     get_scheduler,
 )
+from agent.secret_scope import UnscopedSecretError, get_secret
 
 logger = logging.getLogger(__name__)
+
+
+def _startup_env_secret(name: str, default: str = "") -> str:
+    """Scope-aware Signal gate read with the default-profile startup fallback."""
+    try:
+        val = get_secret(name, default)
+        return ("" if val is None else str(val)).strip()
+    except UnscopedSecretError:
+        return os.getenv(name, default).strip()
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -268,7 +278,7 @@ class SignalAdapter(BasePlatformAdapter):
         self.ignore_stories = extra.get("ignore_stories", True)
 
         # Parse allowlists — group policy is derived from presence of group allowlist
-        group_allowed_str = os.getenv("SIGNAL_GROUP_ALLOWED_USERS", "")
+        group_allowed_str = _startup_env_secret("SIGNAL_GROUP_ALLOWED_USERS", "")
         self.group_allow_from = set(_parse_comma_list(group_allowed_str))
 
         # Mention filter — only respond in groups when the bot account is @mentioned.
@@ -277,7 +287,7 @@ class SignalAdapter(BasePlatformAdapter):
         if _rm_cfg is not None:
             self.require_mention = bool(_rm_cfg)
         else:
-            self.require_mention = os.getenv("SIGNAL_REQUIRE_MENTION", "false").lower() in ("true", "1", "yes", "on")
+            self.require_mention = _startup_env_secret("SIGNAL_REQUIRE_MENTION", "false").lower() in ("true", "1", "yes", "on")
 
         # DM allowlist — mirrors SIGNAL_ALLOWED_USERS checked by run.py.
         # Stored here so the reaction hooks can skip unauthorized senders
@@ -285,7 +295,7 @@ class SignalAdapter(BasePlatformAdapter):
         # every inbound DM from any contact gets a 👀 reaction).
         # "*" means all users allowed (open mode); empty means no restriction
         # recorded at adapter level (run.py still enforces auth separately).
-        dm_allowed_str = os.getenv("SIGNAL_ALLOWED_USERS", "*")
+        dm_allowed_str = _startup_env_secret("SIGNAL_ALLOWED_USERS", "*")
         self.dm_allow_from = set(_parse_comma_list(dm_allowed_str))
 
         # HTTP client
