@@ -4481,12 +4481,18 @@ def normalize_opencode_model_id(provider_id: Optional[str], model_id: Optional[s
     """Normalize OpenCode config IDs to the bare model slug used in API requests."""
     provider = normalize_provider(provider_id)
     current = str(model_id or "").strip()
-    if not current or provider not in {"opencode-zen", "opencode-go"}:
+    is_opencode = provider in {"opencode-zen", "opencode-go"} or (
+        isinstance(provider_id, str) and provider_id.lower().startswith(("opencode-go", "opencode-zen"))
+    )
+    if not current or not is_opencode:
         return current
 
-    prefix = f"{provider}/"
-    if current.lower().startswith(prefix):
+    prefix = f"{provider_id}/" if provider_id else f"{provider}/"
+    if current.lower().startswith(prefix.lower()):
         return current[len(prefix):]
+    fallback_prefix = f"{provider}/"
+    if current.lower().startswith(fallback_prefix.lower()):
+        return current[len(fallback_prefix):]
     return current
 
 
@@ -4495,8 +4501,8 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
 
     OpenCode routes different models behind different API surfaces:
 
-    - GPT-5 / Codex models on Zen use ``/v1/responses``
-    - GPT models on Go (gpt-5.6-luna) use ``/v1/responses``
+    - GPT-5 / Codex / Grok models on Zen use ``/v1/responses``
+    - GPT / Grok models on Go (gpt-5.6-luna, grok-4.5) use ``/v1/responses``
     - Claude models on Zen use ``/v1/messages``
     - MiniMax and Qwen models on Go use ``/v1/messages``
     - GLM / Kimi / DeepSeek / MiMo on Go use ``/v1/chat/completions``
@@ -4512,9 +4518,12 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
     if not normalized:
         return "chat_completions"
 
-    if provider == "opencode-go":
-        if normalized.startswith("gpt-"):
-            # GPT models on Go (gpt-5.6-luna) are served via /v1/responses
+    is_opencode_go = provider == "opencode-go" or (
+        isinstance(provider_id, str) and provider_id.lower().startswith("opencode-go")
+    )
+    if is_opencode_go:
+        if normalized.startswith("gpt-") or normalized.startswith("grok-"):
+            # GPT and Grok models on Go (gpt-5.6-luna, grok-4.5) are served via /v1/responses
             # per the published Go endpoint table, same as GPT on Zen:
             # https://opencode.ai/docs/go/#endpoints
             return "codex_responses"
@@ -4526,10 +4535,13 @@ def opencode_model_api_mode(provider_id: Optional[str], model_id: Optional[str])
             return "anthropic_messages"
         return "chat_completions"
 
-    if provider == "opencode-zen":
+    is_opencode_zen = provider == "opencode-zen" or (
+        isinstance(provider_id, str) and provider_id.lower().startswith("opencode-zen")
+    )
+    if is_opencode_zen:
         if normalized.startswith("claude-"):
             return "anthropic_messages"
-        if normalized.startswith("gpt-"):
+        if normalized.startswith("gpt-") or normalized.startswith("grok-"):
             return "codex_responses"
         if normalized.startswith("qwen"):
             # Qwen models on Zen moved to /v1/messages per the published
@@ -4565,7 +4577,10 @@ def normalize_opencode_base_url(
     if not url:
         return url
     provider = normalize_provider(provider_id)
-    if provider not in {"opencode-zen", "opencode-go"}:
+    is_opencode = provider in {"opencode-zen", "opencode-go"} or (
+        isinstance(provider_id, str) and provider_id.lower().startswith(("opencode-go", "opencode-zen"))
+    )
+    if not is_opencode:
         return url
 
     import re as _re
