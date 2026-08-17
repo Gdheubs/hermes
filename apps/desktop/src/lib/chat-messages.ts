@@ -67,6 +67,7 @@ export type GatewayEventPayload = {
   inline_diff?: string
   duration_s?: number
   todos?: unknown
+  names?: string[]
   model?: string
   provider?: string
   reasoning_effort?: string

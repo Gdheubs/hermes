@@ -2386,6 +2386,17 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
             current["agent"] = agent
+
+            # Issue #1433 (agent transparency): once per session build, tell
+            # the client which config-gated tools failed their check_fn (the
+            # model never sees them) so the UI can surface a
+            # "Run `hermes tools`" hint. Computed during the agent build;
+            # check_fn results are TTL-cached so no extra probes here.
+            # quiet builds (messaging gateway runs) skip the event — those
+            # surfaces have no interactive tool-config UI to point at.
+            _unavailable = getattr(agent, "_config_gated_unavailable_tools", None)
+            if _unavailable and not getattr(agent, "quiet_mode", False):
+                _emit("tools.unavailable", sid, {"names": _unavailable})
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()

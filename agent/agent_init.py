@@ -1500,6 +1500,21 @@ def init_agent(
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
+
+    # Issue #1433 (agent transparency): capture which config-gated tools
+    # (browser, vision, tts, web, image_gen, ...) failed their check_fn so
+    # surfaces can tell the user what they could configure — the model never
+    # sees those tools, so the user otherwise has no idea they exist.
+    # check_fn results are TTL-cached, so this re-resolution is cheap.
+    try:
+        from model_tools import get_unavailable_config_gated_tools
+
+        agent._config_gated_unavailable_tools = get_unavailable_config_gated_tools(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+        )
+    except Exception:  # pragma: no cover — never break agent init
+        agent._config_gated_unavailable_tools = []
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
@@ -1515,6 +1530,19 @@ def init_agent(
                 print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
     elif not agent.quiet_mode:
         print("🛠️  No tools loaded (all tools filtered out or unavailable)")
+
+    # Issue #1433: surface config-gated tools that exist but failed their
+    # check_fn — the user can close those gaps with `hermes tools`, and
+    # without this line they'd never know the tools exist.
+    _unavailable = getattr(agent, "_config_gated_unavailable_tools", None) or []
+    if _unavailable and not agent.quiet_mode:
+        _shown = ", ".join(_unavailable[:3])
+        if len(_unavailable) > 3:
+            _shown += f", +{len(_unavailable) - 3} more"
+        print(
+            f"ⓘ {len(_unavailable)} {'tool' if len(_unavailable) == 1 else 'tools'} unavailable (missing config/deps): {_shown}. "
+            "Run `hermes tools` to configure."
+        )
 
     # Kanban worker/orchestrator lifecycle guidance is session-static:
     # the dispatcher decides at spawn time whether this process is a kanban

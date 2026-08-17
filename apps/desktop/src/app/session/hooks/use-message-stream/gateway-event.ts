@@ -85,6 +85,7 @@ import { requestScrollToBottom } from '@/store/thread-scroll'
 import { clearActiveSessionTodos } from '@/store/todos'
 import { recordToolDiff } from '@/store/tool-diffs'
 import { setSessionDraftingTool } from '@/store/tool-drafting'
+import { setToolsUnavailable } from '@/store/tools-unavailable'
 import { reportInstallMethodWarning } from '@/store/updates'
 import { notifyWorkspaceChanged, toolChangedPath, toolMayMutateFiles } from '@/store/workspace-events'
 // Leaf import (not the `@/themes` barrel) to avoid pulling the ThemeProvider
@@ -775,6 +776,14 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           if (isActiveEvent) {
             setCurrentUsage(current => ({ ...current, ...payload.usage }))
           }
+        }
+      } else if (event.type === 'tools.unavailable') {
+        // Issue #1433 Phase 2: config-gated tools (browser, vision, tts, ...)
+        // failed their check_fn — store the names so the fresh-session empty
+        // state can surface a "Run `hermes tools`" hint. The model never sees
+        // these tools, so this is the user's only signal they exist.
+        if (sessionId && Array.isArray(payload?.names)) {
+          setToolsUnavailable(sessionId, payload.names.filter((n): n is string => typeof n === 'string'))
         }
       } else if (event.type === 'message.start') {
         if (!sessionId) {

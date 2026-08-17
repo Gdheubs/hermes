@@ -104,12 +104,25 @@ _HERMES_WEBHOOK_SAFE_TOOLS = [
 
 # Core toolset definitions
 # These can include individual tools or reference other toolsets
+#
+# Optional per-toolset metadata keys:
+#   config_gated: True  — the toolset's availability depends on user
+#       configuration (API keys, provider credentials, service endpoints).
+#       model_tools._CONFIG_GATED_TOOLSETS is DERIVED from this flag, so a
+#       new service-gated toolset is surfaced by #1433's "tools unavailable"
+#       session-start notice automatically once it declares the flag.
+#       Deliberately NOT flagged (never nagged about): environment/install-
+#       gated toolsets (``computer_use`` — cua-driver install), pure opt-in
+#       toolsets with no credential gap (``video``, ``a2a``), and config-only
+#       capabilities that ship zero tool schemas (``stt`` — they can never
+#       appear in a missing-tools diff).
 TOOLSETS = {
     # Basic toolsets - individual tool categories
     "web": {
         "description": "Web research and content extraction tools",
         "tools": ["web_search", "web_extract"],
-        "includes": []  # No other toolsets included
+        "includes": [],  # No other toolsets included
+        "config_gated": True,
     },
     
     "search": {
@@ -128,13 +141,15 @@ TOOLSETS = {
             "X (Twitter) Search."
         ),
         "tools": ["x_search"],
-        "includes": []
+        "includes": [],
+        "config_gated": True,
     },
-    
+
     "vision": {
         "description": "Image analysis and vision tools",
         "tools": ["vision_analyze"],
-        "includes": []
+        "includes": [],
+        "config_gated": True,
     },
 
     "video": {
@@ -146,7 +161,8 @@ TOOLSETS = {
     "image_gen": {
         "description": "Creative generation tools (images)",
         "tools": ["image_generate"],
-        "includes": []
+        "includes": [],
+        "config_gated": True,
     },
 
     "video_gen": {
@@ -158,7 +174,8 @@ TOOLSETS = {
             "``hermes tools`` → Video Generation."
         ),
         "tools": ["video_generate", "xai_video_edit", "xai_video_extend"],
-        "includes": []
+        "includes": [],
+        "config_gated": True,
     },
 
     "bfl": {
@@ -211,7 +228,8 @@ TOOLSETS = {
             "browser_vision", "browser_console", "browser_cdp",
             "browser_dialog", "browser_exec", "web_search"
         ],
-        "includes": []
+        "includes": [],
+        "config_gated": True,
     },
     
     "cronjob": {
@@ -230,7 +248,8 @@ TOOLSETS = {
     "tts": {
         "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",
         "tools": ["text_to_speech"],
-        "includes": []
+        "includes": [],
+        "config_gated": True,
     },
     
     "todo": {
@@ -308,7 +327,8 @@ TOOLSETS = {
     "homeassistant": {
         "description": "Home Assistant smart home control and monitoring",
         "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service"],
-        "includes": []
+        "includes": [],
+        "config_gated": True,
     },
 
     "kanban": {
@@ -337,12 +357,14 @@ TOOLSETS = {
         "description": "Discord read and participate tools (fetch messages, search members, create threads)",
         "tools": ["discord"],
         "includes": [],
+        "config_gated": True,
     },
 
     "discord_admin": {
         "description": "Discord server management (list channels/roles, pin messages, assign roles)",
         "tools": ["discord_admin"],
         "includes": [],
+        "config_gated": True,
     },
 
     "yuanbao": {
@@ -378,7 +400,8 @@ TOOLSETS = {
             "spotify_playback", "spotify_devices", "spotify_queue", "spotify_search",
             "spotify_playlists", "spotify_albums", "spotify_library",
         ],
-        "includes": []
+        "includes": [],
+        "config_gated": True,
     },
 
 

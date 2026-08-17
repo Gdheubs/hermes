@@ -1,6 +1,7 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
 import json
+import importlib
 from unittest.mock import ANY, call, patch
 
 
@@ -8,10 +9,14 @@ from model_tools import (
     handle_function_call,
     get_all_tool_names,
     get_toolset_for_tool,
+    get_unavailable_config_gated_tools,
     _AGENT_LOOP_TOOLS,
+    _CONFIG_GATED_TOOLSETS,
     _LEGACY_TOOLSET_MAP,
+    _resolve_tool_names,
     TOOL_TO_TOOLSET_MAP,
 )
+from toolsets import TOOLSETS, resolve_toolset
 
 
 # =========================================================================
@@ -509,3 +514,167 @@ class TestDisabledToolsetsPostureToolset:
             )
         }
         assert "write_file" not in no_file
+
+
+# =========================================================================
+# get_unavailable_config_gated_tools (issue #1433, Phase 2)
+# =========================================================================
+
+class TestResolveToolNames:
+    def test_unions_enabled_and_subtracts_disabled(self):
+        with (
+            patch("model_tools.validate_toolset", return_value=True),
+            patch(
+                "model_tools.resolve_toolset",
+                side_effect=lambda ts: {
+                    "web": {"web_search", "web_extract"},
+                    "terminal": {"terminal"},
+                }[ts],
+            ),
+        ):
+            result = _resolve_tool_names(
+                enabled_toolsets=["web", "terminal"],
+                disabled_toolsets=["terminal"],
+            )
+        assert result == {"web_search", "web_extract"}
+
+
+class TestGetUnavailableConfigGatedTools:
+    def test_reports_config_gated_missing_tools_sorted(self):
+        with (
+            patch(
+                "model_tools._resolve_tool_names",
+                return_value={"web_search", "browser_navigate", "terminal", "read_file"},
+            ),
+            patch(
+                "model_tools.registry.get_definitions",
+                return_value=[
+                    {"type": "function", "function": {"name": "terminal"}},
+                    {"type": "function", "function": {"name": "read_file"}},
+                ],
+            ),
+            patch(
+                "model_tools.registry.get_toolset_for_tool",
+                side_effect=lambda name: {
+                    "web_search": "web",
+                    "browser_navigate": "browser",
+                    "terminal": "terminal",
+                    "read_file": "file",
+                }.get(name),
+            ),
+        ):
+            result = get_unavailable_config_gated_tools()
+        # browser/web are config-gated and missing -> reported, sorted.
+        assert result == ["browser_navigate", "web_search"]
+
+    def test_empty_when_nothing_missing(self):
+        with (
+            patch(
+                "model_tools._resolve_tool_names",
+                return_value={"web_search", "terminal"},
+            ),
+            patch(
+                "model_tools.registry.get_definitions",
+                return_value=[
+                    {"type": "function", "function": {"name": "web_search"}},
+                    {"type": "function", "function": {"name": "terminal"}},
+                ],
+            ),
+        ):
+            result = get_unavailable_config_gated_tools()
+        assert result == []
+
+    def test_excludes_non_config_gated_missing_tools(self):
+        # `terminal` is dropped by check_fn but its toolset is not
+        # config-gated (environment condition, not a setup gap) -> silent.
+        with (
+            patch(
+                "model_tools._resolve_tool_names",
+                return_value={"terminal", "web_search"},
+            ),
+            patch(
+                "model_tools.registry.get_definitions",
+                return_value=[
+                    {"type": "function", "function": {"name": "web_search"}},
+                ],
+            ),
+            patch(
+                "model_tools.registry.get_toolset_for_tool",
+                side_effect=lambda name: {
+                    "terminal": "terminal",
+                    "web_search": "web",
+                }.get(name),
+            ),
+        ):
+            result = get_unavailable_config_gated_tools()
+        assert result == []
+
+    def test_disabled_toolset_tools_never_reported(self):
+        # Tools removed via agent.disabled_toolsets are subtracted during
+        # name resolution, so they never appear in the missing set at all.
+        with (
+            patch(
+                "model_tools._resolve_tool_names",
+                return_value={"web_search"},
+            ),
+            patch(
+                "model_tools.registry.get_definitions",
+                return_value=[
+                    {"type": "function", "function": {"name": "web_search"}},
+                ],
+            ),
+        ):
+            result = get_unavailable_config_gated_tools(
+                enabled_toolsets=["web", "browser"],
+                disabled_toolsets=["browser"],
+            )
+        assert result == []
+
+
+class TestConfigGatedToolsetContract:
+    """Issue #1433 Phase 2: the availability whitelist is DERIVED from the
+    ``config_gated`` flag on toolset definitions (toolsets.py). These tests
+    pin the derivation contract so the flag can't silently reference a
+    renamed toolset, or a toolset whose tools can never fail their check_fn
+    (which would make the flag dead weight).
+    """
+
+    def test_config_gated_flags_resolve_to_real_toolsets(self):
+        for ts in _CONFIG_GATED_TOOLSETS:
+            assert ts in TOOLSETS, (
+                f"{ts!r} is config_gated but missing from toolsets.TOOLSETS"
+            )
+            assert resolve_toolset(ts), (
+                f"{ts!r} is config_gated but resolves to no tools"
+            )
+
+    def test_config_gated_tools_all_carry_check_fn(self):
+        # model_tools import registers every core tool module, so registry
+        # lookups below are live entries, not stubs.
+        from tools.registry import registry
+
+        class _PluginCtx:
+            """Shim the bundled-plugin loader (see tests/plugins/test_a2a_plugin.py)."""
+
+            def register_tool(self, name, toolset, schema, handler, **kw):
+                registry.register(
+                    name=name, toolset=toolset, schema=schema,
+                    handler=handler, override=True, **kw,
+                )
+
+        for ts in _CONFIG_GATED_TOOLSETS:
+            tools = resolve_toolset(ts)
+            if any(registry.get_entry(t) is None for t in tools):
+                # Plugin-hosted toolset (currently: spotify): its tools
+                # register through the bundled-plugin loader, which the test
+                # env does not run. Load the plugin the way the loader does.
+                plugin_mod = importlib.import_module(f"plugins.{ts}")
+                plugin_mod.register(_PluginCtx())
+
+        for ts in _CONFIG_GATED_TOOLSETS:
+            for tool in resolve_toolset(ts):
+                entry = registry.get_entry(tool)
+                assert entry is not None, f"{tool!r} (toolset {ts!r}) not registered"
+                assert entry.check_fn is not None, (
+                    f"{tool!r} (toolset {ts!r}) is config_gated but has no check_fn"
+                )

@@ -1,3 +1,4 @@
+import { useStore } from '@nanostores/react'
 import { createContext, memo, useCallback, useContext, useMemo, useRef, useState } from 'react'
 
 import { AssistantMessage } from '@/components/assistant-ui/thread/assistant-message'
@@ -13,6 +14,7 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { notifyError } from '@/store/notifications'
+import { $toolsUnavailable } from '@/store/tools-unavailable'
 
 type ThreadLoadingState = 'response' | 'session'
 
@@ -116,6 +118,17 @@ export const Thread = memo(function Thread({
   // re-renders for unrelated reasons never re-render the composer.
   const editContext = useMemo(() => ({ cwd, gateway, sessionId }), [cwd, gateway, sessionId])
 
+  // Issue #1433 Phase 2: config-gated tools (browser, vision, tts, ...) that
+  // failed their check_fn for this session — surfaced once in the fresh-
+  // session empty state. The model never sees these tools, so this is the
+  // user's only signal they exist.
+  const toolsUnavailableMap = useStore($toolsUnavailable)
+  const unavailableNames = sessionId ? (toolsUnavailableMap[sessionId] ?? []) : []
+
+  const unavailableLine = unavailableNames.length
+    ? `ⓘ ${unavailableNames.length} ${unavailableNames.length === 1 ? 'tool' : 'tools'} unavailable (missing config/deps): ${unavailableNames.slice(0, 3).join(', ')}${unavailableNames.length > 3 ? `, +${unavailableNames.length - 3} more` : ''}. Run \`hermes tools\` to configure.`
+    : ''
+
   const hasBranchInNewChat = Boolean(onBranchInNewChat)
   const hasCancel = Boolean(onCancel)
   const hasDismissError = Boolean(onDismissError)
@@ -150,6 +163,11 @@ export const Thread = memo(function Thread({
   const emptyPlaceholder = intro ? (
     <div className="flex min-h-0 w-full flex-col items-center justify-center pt-[var(--composer-measured-height)]">
       <Intro {...intro} />
+      {unavailableLine && (
+        <p className="mt-3 max-w-md px-4 text-center text-[0.78rem] leading-5 text-[var(--ui-text-secondary)]">
+          {unavailableLine}
+        </p>
+      )}
     </div>
   ) : undefined
 

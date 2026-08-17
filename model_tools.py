@@ -38,7 +38,7 @@ from tools.registry import (
     registry,
     tool_error,
 )
-from toolsets import resolve_toolset, validate_toolset
+from toolsets import TOOLSETS, resolve_toolset, validate_toolset
 
 logger = logging.getLogger(__name__)
 
@@ -414,13 +414,20 @@ def get_tool_definitions(
     return result
 
 
-def _compute_tool_definitions(
+def _resolve_tool_names(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
-    skip_tool_search_assembly: bool = False,
-) -> List[Dict[str, Any]]:
-    """Uncached implementation of :func:`get_tool_definitions`."""
+) -> set:
+    """Resolve the requested tool-name set after toolset filtering.
+
+    Shared by :func:`get_tool_definitions` (which asks the registry for
+    schemas) and :func:`get_unavailable_config_gated_tools` (which needs the
+    requested set to compute what check_fn dropped). Mirrors the effective
+    toolset resolution: enabled toolsets are unioned, then disabled toolsets
+    are subtracted (core tools inside disabled platform bundles are preserved
+    — see #33924).
+    """
     # Determine which tool names the caller wants
     tools_to_include: set = set()
 
@@ -505,6 +512,18 @@ def _compute_tool_definitions(
     # all check the tool registry for plugin-provided toolsets.  No bypass
     # needed; plugins respect enabled_toolsets / disabled_toolsets like any
     # other toolset.
+
+    return tools_to_include
+
+
+def _compute_tool_definitions(
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
+    quiet_mode: bool = False,
+    skip_tool_search_assembly: bool = False,
+) -> List[Dict[str, Any]]:
+    """Uncached implementation of :func:`get_tool_definitions`."""
+    tools_to_include = _resolve_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode)
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
@@ -650,6 +669,53 @@ def _compute_tool_definitions(
         logger.warning("Tool search assembly skipped: %s", e)
 
     return filtered_tools
+
+
+# Toolsets whose unavailability is a configuration/setup gap the user can
+# close (API keys, provider credentials, service endpoints) rather than an
+# environment condition (no browser binary, no Docker daemon, platform
+# worker mode, ...). Used by :func:`get_unavailable_config_gated_tools` to
+# decide which check_fn-dropped tools are worth surfacing with a
+# "Run `hermes tools`" hint.
+#
+# DERIVED from the ``config_gated`` flag on the toolset definitions in
+# ``toolsets.py`` (single source of truth — a new service-gated toolset is
+# surfaced automatically once it declares the flag). Deliberately NOT
+# flagged there: environment/install-gated toolsets (``computer_use`` —
+# cua-driver install), pure opt-in toolsets with no credential gap
+# (``video``, ``a2a``), and config-only capabilities that ship zero tool
+# schemas (``stt`` — they can never appear in a missing-tools diff).
+_CONFIG_GATED_TOOLSETS = frozenset(
+    name for name, spec in TOOLSETS.items() if spec.get("config_gated")
+)
+
+
+def get_unavailable_config_gated_tools(
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
+) -> List[str]:
+    """Return sorted names of config-gated tools unavailable this session.
+
+    A tool is "unavailable" when its ``check_fn`` fails, so no schema is
+    exposed to the model (the model never sees it — see issue #1433). Only
+    tools belonging to :data:`_CONFIG_GATED_TOOLSETS` are returned: those are
+    the gaps a user can close via ``hermes tools``/config, which is exactly
+    the case #1433 wants surfaced ("Firecrawl not configured, falling back to
+    browser"). check_fn results are TTL-cached inside the registry, so this
+    is cheap to call right after :func:`get_tool_definitions`.
+    """
+    tools_to_include = _resolve_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode=True)
+    if not tools_to_include:
+        return []
+    available = {
+        t["function"]["name"] for t in registry.get_definitions(tools_to_include, quiet=True)
+    }
+    missing = tools_to_include - available
+    if not missing:
+        return []
+    return sorted(
+        name for name in missing if registry.get_toolset_for_tool(name) in _CONFIG_GATED_TOOLSETS
+    )
 
 
 def _resolve_active_context_length() -> int:

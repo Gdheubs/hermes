@@ -49,7 +49,16 @@ const buildCtx = (appended: Msg[]) =>
       appendMessage: (msg: Msg) => appended.push(msg),
       panel: (title: string, sections: any[]) =>
         appended.push({ kind: 'panel', panelData: { sections, title }, role: 'system', text: '' }),
-      setHistoryItems: vi.fn()
+      // Functional like the real setHistoryItems (useMainApp routes
+      // appendMessage through it too), so updater-form calls — e.g. the
+      // tools.unavailable fresh-session guard — execute against `appended`.
+      setHistoryItems: (value: Msg[] | ((prev: Msg[]) => Msg[])) => {
+        if (typeof value === 'function') {
+          appended.splice(0, appended.length, ...(value as (prev: Msg[]) => Msg[])(appended))
+        } else {
+          appended.splice(0, appended.length, ...value)
+        }
+      }
     },
     voice: {
       setProcessing: vi.fn(),
@@ -747,6 +756,74 @@ describe('createGatewayEventHandler', () => {
     expect(appended[0]?.tools?.[0]).not.toContain('--- a/foo.ts')
     expect(appended[1]?.text).toBe('done')
     expect(appended[1]?.tools ?? []).toEqual([])
+  })
+
+  it('surfaces unavailable config-gated tools once at the top of a fresh session', () => {
+    const appended: Msg[] = [{ kind: 'intro', role: 'system', text: '' }]
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: { names: ['browser_navigate', 'web_search', 'tts_speak'] },
+      type: 'tools.unavailable'
+    } as any)
+
+    // The notice lands right after the intro, before any real content.
+    expect(appended).toHaveLength(2)
+    expect(appended[0]?.kind).toBe('intro')
+    expect(appended[1]?.kind).toBe('event')
+    expect(appended[1]?.role).toBe('system')
+    expect(appended[1]?.text).toBe(
+      'ⓘ 3 tools unavailable (missing config/deps): browser_navigate, web_search, tts_speak. Run `hermes tools` to configure.'
+    )
+  })
+
+  it('caps the unavailable-tool list at three names with a +N more tail', () => {
+    const appended: Msg[] = [{ kind: 'intro', role: 'system', text: '' }]
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+    const names = ['browser_navigate', 'web_search', 'tts_speak', 'image_gen', 'vision_analyze']
+
+    onEvent({ payload: { names }, type: 'tools.unavailable' } as any)
+
+    expect(appended[1]?.text).toBe(
+      'ⓘ 5 tools unavailable (missing config/deps): browser_navigate, web_search, tts_speak, +2 more. Run `hermes tools` to configure.'
+    )
+  })
+
+  it('uses singular wording when exactly one tool is unavailable', () => {
+    const appended: Msg[] = [{ kind: 'intro', role: 'system', text: '' }]
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: { names: ['tts_speak'] }, type: 'tools.unavailable' } as any)
+
+    expect(appended[1]?.text).toBe(
+      'ⓘ 1 tool unavailable (missing config/deps): tts_speak. Run `hermes tools` to configure.'
+    )
+  })
+
+  it('does not surface the notice when a non-intro item already exists', () => {
+    // A single pre-existing system item (e.g. a setup panel) makes the
+    // transcript non-fresh even though the history length is still small.
+    const appended: Msg[] = [{ kind: 'panel', role: 'system', text: '' }]
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: { names: ['browser_navigate'] }, type: 'tools.unavailable' } as any)
+
+    // Match the notice regardless of singular/plural wording (the line reads
+    // "1 tool unavailable" for a single name, "N tools unavailable" otherwise).
+    expect(appended.some(msg => /\d+ tools? unavailable/.test(msg.text ?? ''))).toBe(false)
+  })
+
+  it('does not surface unavailable tools into an in-progress session', () => {
+    const appended: Msg[] = [{ kind: 'intro', role: 'system', text: '' }]
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    // A session that already has content: the notice would land mid-chat.
+    onEvent({ payload: { text: 'existing reply' }, type: 'message.complete' } as any)
+    onEvent({ payload: { names: ['browser_navigate'] }, type: 'tools.unavailable' } as any)
+
+    // Regex (not a 'tools unavailable' substring) so the assertion survives
+    // the singular "1 tool unavailable" wording.
+    expect(appended.some(msg => /\d+ tools? unavailable/.test(msg.text ?? ''))).toBe(false)
   })
 
   it('shows setup panel for missing provider startup error', () => {
