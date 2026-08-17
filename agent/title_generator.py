@@ -131,6 +131,17 @@ _CONTROL_WRAPPERS = (
     ("<ide_selection>", "</ide_selection>"),
 )
 
+# Speech-barge-in note prepended to the model-bound user message by the
+# CLI/TUI submit paths when the user interrupts a spoken reply
+# (tools.tts_streaming.SPEECH_INTERRUPTED_NOTE). The note is API-call
+# local and never persisted, but the turn prologue titles from the model
+# input, so it reaches us as the first line. Unlike _MACHINE_PREFIXES it
+# wraps REAL user text (the request typed after the barge), so it is
+# stripped in _summarize_user_message instead of skipping the turn.
+_SPEECH_INTERRUPTED_PREFIX = (
+    "[Note: the user interrupted your previous spoken reply before it finished.]"
+)
+
 # Hermes' own machine-authored openers. A compaction handoff or a resumed
 # session must not be titled after the scaffolding that carried it. The legacy
 # summary prefix comes from the compressor rather than a fourth local copy —
@@ -238,7 +249,14 @@ def _summarize_user_message(user_message: str) -> str:
     except Exception:
         logger.debug("Skill-scaffolding summary failed; titling raw", exc_info=True)
     text = described if described is not None else user_message
-    return strip_control_wrappers(text)
+    text = strip_control_wrappers(text)
+    # A speech-barge-in note (SPEECH_INTERRUPTED_NOTE) arrives as the first
+    # line of the model-bound message. It is scaffolding, not intent: drop it
+    # and title from the words the user actually typed after interrupting.
+    stripped = text.lstrip()
+    if stripped.startswith(_SPEECH_INTERRUPTED_PREFIX):
+        text = stripped[len(_SPEECH_INTERRUPTED_PREFIX):].lstrip("\n").strip()
+    return text
 
 
 def is_titleable_user_message(user_message: str) -> bool:
@@ -400,17 +418,42 @@ def generate_title(
     ]
 
     try:
-        response = call_llm(
-            task="title_generation",
-            messages=messages,
-            # A title is a handful of tokens. The old 500-token ceiling let a
-            # chatty model burn seconds generating prose we then threw away.
-            max_tokens=64,
-            temperature=0.3,
-            timeout=timeout,
-            main_runtime=main_runtime,
-            extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
-        )
+        try:
+            response = call_llm(
+                task="title_generation",
+                messages=messages,
+                # A title is a handful of tokens. The old 500-token ceiling let a
+                # chatty model burn seconds generating prose we then threw away.
+                max_tokens=64,
+                temperature=0.3,
+                timeout=timeout,
+                main_runtime=main_runtime,
+                extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
+            )
+        except Exception as e:
+            # Some providers (e.g. DeepSeek) reject json_schema response_format
+            # with HTTP 400 ("This response_format type is unavailable now").
+            # Fall back to a plain completion — _extract_title_text already
+            # handles prose output — so auto-titling still works.
+            msg = str(e)
+            if "response_format" in msg and any(
+                token in msg
+                for token in ("400", "unavailable", "not supported", "Unsupported")
+            ):
+                logger.warning(
+                    "Provider rejected json_schema response_format; retrying without it: %s",
+                    e,
+                )
+                response = call_llm(
+                    task="title_generation",
+                    messages=messages,
+                    max_tokens=64,
+                    temperature=0.3,
+                    timeout=timeout,
+                    main_runtime=main_runtime,
+                )
+            else:
+                raise
         content = response.choices[0].message.content or ""
         title = _clean_title(_extract_title_text(content))
         # Answer-shaped output guard: titling is a 3-7 word task, so a title
