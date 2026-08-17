@@ -149,10 +149,34 @@ function buildDesktopBackendEnv({
   }
 }
 
+// A pooled backend is started for a different profile but inherits Electron's
+// process environment. TERMINAL_CWD is profile-scoped configuration, so carrying
+// it over would make an unset/placeholder target profile execute in the source
+// profile's workspace. Remove it from both inherited and runtime-provided env
+// mappings and let the target profile resolve its own config after --profile.
+function buildPooledProfileBackendEnv({
+  hermesHome,
+  currentEnv = process.env,
+  backendEnv = {},
+  platform = process.platform
+}: any = {}): Record<string, string | undefined> {
+  const isTerminalCwd = (key: string) =>
+    platform === 'win32' ? key.toUpperCase() === 'TERMINAL_CWD' : key === 'TERMINAL_CWD'
+  const withoutTerminalCwd = (env: Record<string, string | undefined> = {}) =>
+    Object.fromEntries(Object.entries(env).filter(([key]) => !isTerminalCwd(key)))
+
+  return {
+    ...withoutTerminalCwd(currentEnv),
+    HERMES_HOME: hermesHome,
+    ...withoutTerminalCwd(backendEnv)
+  }
+}
+
 export {
   appendUniquePathEntries,
   buildDesktopBackendEnv,
   buildDesktopBackendPath,
+  buildPooledProfileBackendEnv,
   delimiterForPlatform,
   hermesManagedNodePathEntries,
   normalizeHermesHomeRoot,

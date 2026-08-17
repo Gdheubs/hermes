@@ -7,6 +7,7 @@ import {
   appendUniquePathEntries,
   buildDesktopBackendEnv,
   buildDesktopBackendPath,
+  buildPooledProfileBackendEnv,
   hermesManagedNodePathEntries,
   normalizeHermesHomeRoot,
   pathEnvKey,
@@ -145,6 +146,38 @@ test('buildDesktopBackendEnv forces PYTHONUTF8 unless the user set it explicitly
   })
 
   assert.equal(optedOut.PYTHONUTF8, '0')
+})
+
+test('pooled profile backend drops inherited terminal cwd before profile config resolves it', () => {
+  const env = buildPooledProfileBackendEnv({
+    hermesHome: '/Users/test/.hermes',
+    currentEnv: { PATH: '/usr/bin', TERMINAL_CWD: '/source/profile-workspace', KEEP_ME: 'parent' },
+    backendEnv: {
+      HERMES_HOME: '/backend-specific-home',
+      PYTHONPATH: '/repo',
+      TERMINAL_CWD: '/stale/backend-workspace',
+      KEEP_BACKEND: 'backend'
+    }
+  })
+
+  assert.equal(env.HERMES_HOME, '/backend-specific-home')
+  assert.equal(env.KEEP_ME, 'parent')
+  assert.equal(env.KEEP_BACKEND, 'backend')
+  assert.equal(env.PYTHONPATH, '/repo')
+  assert.equal(env.TERMINAL_CWD, undefined)
+})
+
+test('pooled profile backend removes case-insensitive terminal cwd on Windows', () => {
+  const env = buildPooledProfileBackendEnv({
+    hermesHome: 'C:\\Hermes',
+    currentEnv: { Terminal_Cwd: 'C:\\source', Path: 'C:\\Windows' },
+    backendEnv: { terminal_cwd: 'C:\\backend' },
+    platform: 'win32'
+  })
+
+  assert.equal(env.Terminal_Cwd, undefined)
+  assert.equal(env.terminal_cwd, undefined)
+  assert.equal(env.HERMES_HOME, 'C:\\Hermes')
 })
 
 test('normalizeHermesHomeRoot maps profile homes back to the global Hermes root', () => {
