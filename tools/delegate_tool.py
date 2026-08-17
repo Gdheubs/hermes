@@ -3983,9 +3983,8 @@ def delegate_task(
                 logger.info(
                     "delegate_task: async delivery unsupported on this "
                     "session, but a session id is bound (%s) — dispatching "
-                    "in the background and waking the session via self-post "
-                    "when it completes instead of forcing synchronous "
-                    "execution.",
+                    "in the background and deferring the result to the next "
+                    "real client turn instead of forcing synchronous execution.",
                     _wake_sid,
                 )
                 _async_ok = True

@@ -174,9 +174,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         ("delivery_claim", "TEXT"),
         ("delivery_claimed_at", "REAL"),
         # Raw api_server session id (X-Hermes-Session-Id) of the ORIGINATING
-        # request — the wake self-post target. Without persisting it,
-        # completions recovered after a process restart are unroutable on
-        # api_server (the in-memory record that carried it is gone).
+        # request. The gateway parks non-push completions by this id so the
+        # next real client turn can consume them after a restart.
         ("origin_session_id", "TEXT"),
     ):
         if name not in columns:
@@ -560,6 +559,83 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
+def defer_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+    """Park a claimed API completion until the next real client turn."""
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations SET delivery_state='deferred',
+                      updated_at=?, delivery_claim=NULL,
+                      delivery_claimed_at=NULL
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_claim=?""",
+            (now, delegation_id, claim_id),
+        )
+        return cur.rowcount == 1
+
+
+def consume_deferred_completions(
+    origin_session_id: str,
+    *,
+    prepare: Optional[Callable[[Dict[str, Any]], Any]] = None,
+) -> List[Any]:
+    """Atomically prepare and take deferred completions for one client turn.
+
+    ``prepare`` runs before the durable row is acknowledged. If preparation
+    fails, the transaction rolls back so a formatting failure cannot lose a
+    completion that never reached the model.
+    """
+    if not origin_session_id:
+        return []
+    now = time.time()
+    events: List[Dict[str, Any]] = []
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, event_json
+               FROM async_delegations
+               WHERE delivery_state='deferred' AND event_json IS NOT NULL
+                 AND (origin_session_id=? OR
+                      (origin_session_id='' AND origin_session=?))
+               ORDER BY completed_at, delegation_id""",
+            (origin_session_id, origin_session_id),
+        ).fetchall()
+        for delegation_id, payload in rows:
+            try:
+                event = json.loads(payload)
+            except (TypeError, ValueError):
+                event = None
+            if not isinstance(event, dict):
+                conn.execute(
+                    """UPDATE async_delegations SET delivery_state='dropped',
+                              updated_at=? WHERE delegation_id=?
+                       AND delivery_state='deferred'""",
+                    (now, delegation_id),
+                )
+                continue
+            try:
+                prepared = prepare(event) if prepare is not None else event
+            except Exception as exc:
+                # A durable row may outlive the code version that produced it.
+                # Keep that row retryable, but do not let one unformattable
+                # payload suppress every later completion for the session.
+                logger.warning(
+                    "Could not prepare deferred async completion %s; leaving "
+                    "it deferred while continuing with later rows: %s",
+                    delegation_id,
+                    type(exc).__name__,
+                )
+                continue
+            cur = conn.execute(
+                """UPDATE async_delegations SET delivery_state='delivered',
+                          delivered_at=?, updated_at=?
+                   WHERE delegation_id=? AND delivery_state='deferred'""",
+                (now, now, delegation_id),
+            )
+            if cur.rowcount == 1:
+                events.append(prepared)
+    return events
+
+
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
     if claim_id and evt.get("type") == "async_delegation":
         complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
@@ -750,6 +826,16 @@ def _current_origin_session_id() -> str:
         return ""
 
 
+def _current_api_async_resume() -> bool:
+    """Capture the request's X-Hermes-Async-Resume opt-in for durable wake."""
+    try:
+        from gateway.session_context import api_async_resume_enabled
+
+        return bool(api_async_resume_enabled())
+    except Exception:
+        return False
+
+
 def dispatch_async_delegation(
     *,
     goal: str,
@@ -821,6 +907,7 @@ def dispatch_async_delegation(
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
+        "api_async_resume": _current_api_async_resume(),
         **_capture_routing_origin(),
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -969,6 +1056,7 @@ def _push_completion_event(
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
         "origin_session_id": record.get("origin_session_id", ""),
         "parent_session_id": record.get("parent_session_id"),
+        "api_async_resume": bool(record.get("api_async_resume")),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
         "toolsets": record.get("toolsets"),
@@ -1068,6 +1156,7 @@ def dispatch_async_delegation_batch(
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
+        "api_async_resume": _current_api_async_resume(),
         **_capture_routing_origin(),
         "status": "running",
         "dispatched_at": dispatched_at,
@@ -1181,6 +1270,7 @@ def _push_batch_completion_event(
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
         "origin_session_id": event_record.get("origin_session_id", ""),
         "parent_session_id": event_record.get("parent_session_id"),
+        "api_async_resume": bool(event_record.get("api_async_resume")),
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
         "context": event_record.get("context"),

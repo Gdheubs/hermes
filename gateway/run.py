@@ -24544,15 +24544,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict,
-    ) -> Optional[bool]:
+    ) -> Optional[bool | str]:
         """Inject a watch/completion notification as a synthetic message event.
 
         Routing must come from the queued event itself, not from whatever
         foreground message happened to be active when the queue was drained.
-        Returns ``True`` after adapter acceptance, ``False`` after a retryable
-        adapter failure, and ``None`` when the event has no gateway route. This
-        is not a transactional boundary: a process crash after adapter
-        acceptance can still cause durable at-least-once replay.
+        Returns ``True`` after adapter acceptance, ``"deferred"`` when an
+        api_server delegation should wait for a real client turn (default
+        unless the durable event carries ``api_async_resume``), ``False``
+        after a retryable adapter failure, and ``None`` when the event has no
+        gateway route. Opt-in resume is stamped at dispatch from
+        ``X-Hermes-Async-Resume``. This is not a transactional boundary: a
+        process crash after adapter acceptance can still cause durable
+        at-least-once replay.
         """
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if not source:
@@ -24570,8 +24574,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     raw_sid = _sk
             if raw_sid:
                 adapter = self.adapters.get(Platform.API_SERVER)
-                from gateway.wake import adapter_supports_push, deliver_wake
+                from gateway.wake import (
+                    adapter_supports_push,
+                    deliver_wake,
+                    event_requests_api_async_resume,
+                )
                 if adapter is not None and not adapter_supports_push(adapter):
+                    if evt.get("type") == "async_delegation":
+                        if not event_requests_api_async_resume(evt):
+                            logger.info(
+                                "Async delegation %s completed for api_server "
+                                "session %s; deferring until the next client "
+                                "turn (no X-Hermes-Async-Resume opt-in)",
+                                evt.get("delegation_id") or "<legacy>", raw_sid,
+                            )
+                            return "deferred"
+                        try:
+                            logger.info(
+                                "Async delegation %s completed for api_server "
+                                "session %s; waking parent turn "
+                                "(X-Hermes-Async-Resume)",
+                                evt.get("delegation_id") or "<legacy>", raw_sid,
+                            )
+                            await deliver_wake(
+                                adapter, text=synth_text, session_id=raw_sid,
+                            )
+                            return True
+                        except Exception as e:
+                            logger.warning(
+                                "Async delegation self-post wake failed for "
+                                "session %s: %s",
+                                raw_sid, e,
+                            )
+                            return False
                     try:
                         logger.info(
                             "Watch pattern notification — waking api_server "
@@ -24637,8 +24672,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # which binds chat_id = session_id). handle_message would run the
             # wake under a build_session_key()-derived key that never matches
             # the raw X-Hermes-Session-Id session — self-post instead.
-            from gateway.wake import deliver_wake
+            from gateway.wake import deliver_wake, event_requests_api_async_resume
             raw_sid = str(evt.get("origin_session_id") or "").strip() or str(source.chat_id or "")
+            if evt.get("type") == "async_delegation":
+                if not event_requests_api_async_resume(evt):
+                    logger.info(
+                        "Async delegation %s completed for api_server session "
+                        "%s; deferring until the next client turn "
+                        "(no X-Hermes-Async-Resume opt-in)",
+                        evt.get("delegation_id") or "<legacy>", raw_sid,
+                    )
+                    return "deferred"
+                try:
+                    logger.info(
+                        "Async delegation %s completed for api_server session "
+                        "%s; waking parent turn (X-Hermes-Async-Resume)",
+                        evt.get("delegation_id") or "<legacy>", raw_sid,
+                    )
+                    await deliver_wake(
+                        adapter, text=synth_text, session_id=raw_sid,
+                    )
+                    return True
+                except Exception as e:
+                    logger.warning(
+                        "Async delegation self-post wake failed for session "
+                        "%s: %s",
+                        raw_sid, e,
+                    )
+                    return False
             try:
                 logger.info(
                     "Watch pattern notification — waking api_server session "
@@ -24886,9 +24947,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._completion_deliveries_inflight.add(identity)
 
         accepted = False
+        deferred = False
         try:
             injection_result = await self._inject_watch_notification(synth_text, evt)
-            if injection_result is not True:
+            if injection_result == "deferred":
+                if not durable_claim_id:
+                    return False
+                from tools.async_delegation import defer_completion_delivery
+
+                if not defer_completion_delivery(
+                    durable_delegation_id, durable_claim_id,
+                ):
+                    return False
+                deferred = True
+                evt["_api_server_deferred"] = True
+            elif injection_result is not True:
                 return injection_result
             accepted = True
 
@@ -24904,8 +24977,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # If the durable async-delegation producer branch is present, its
             # SQLite row remains the authoritative replay state. Acknowledge it
-            # after adapter acceptance; this gateway keeps no parallel ledger.
-            if durable_claim_id:
+            # after adapter acceptance; deferred API completions stay parked
+            # until a real client request consumes them.
+            if durable_claim_id and not deferred:
                 try:
                     from tools.async_delegation import complete_completion_delivery
 
@@ -25221,6 +25295,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from tools.async_delegation import (
             claim_event_delivery,
             complete_event_delivery,
+            defer_completion_delivery,
             release_event_delivery,
         )
 
@@ -25249,9 +25324,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         finally:
             if delivered is True:
+                deferred = bool(primary_evt.pop("_api_server_deferred", False))
                 for evt, claim_id in siblings:
                     try:
-                        complete_event_delivery(evt, claim_id)
+                        if deferred:
+                            defer_completion_delivery(
+                                str(evt.get("delegation_id") or ""), claim_id,
+                            )
+                        else:
+                            complete_event_delivery(evt, claim_id)
                     except Exception:
                         logger.debug(
                             "Could not acknowledge coalesced durable completion",

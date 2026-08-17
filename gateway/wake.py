@@ -42,6 +42,19 @@ WAKE_TURN_TIMEOUT_SECONDS = 600.0
 _RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0)
 
 
+def event_requests_api_async_resume(evt: Any) -> bool:
+    """True when a durable async completion opted into api_server self-POST wake.
+
+    Default is False: api_server owns the next client turn, so completions
+    stay deferred until a real request. Orchestrators that need parent
+    write-back without a follow-up user message stamp ``api_async_resume``
+    at dispatch time via the ``X-Hermes-Async-Resume`` request header.
+    """
+    if not isinstance(evt, dict):
+        return False
+    return bool(evt.get("api_async_resume"))
+
+
 def adapter_supports_push(adapter: Any) -> bool:
     """Whether this adapter can push a message to the user after a turn ends.
 

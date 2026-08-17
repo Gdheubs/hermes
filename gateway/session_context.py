@@ -129,6 +129,15 @@ _CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 # propagates that into this contextvar at session-bind time.
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
 
+# Opt-in for api_server async-delegation self-POST wake after the parent turn
+# ends. Default _UNSET/False keeps the client-owned-next-turn contract (defer
+# completions until a real request). Clients that need parent write-back
+# without a follow-up user message send ``X-Hermes-Async-Resume: 1``; the
+# flag is stamped onto the durable completion at dispatch time.
+_SESSION_API_ASYNC_RESUME: ContextVar = ContextVar(
+    "HERMES_API_ASYNC_RESUME", default=_UNSET,
+)
+
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
 _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
@@ -230,6 +239,7 @@ def set_session_vars(
     profile: str = "",
     cwd: str = "",
     async_delivery: bool = True,
+    api_async_resume: bool = False,
     ui_session_id: str = "",
     cron_session: Any = _UNSET,
 ) -> list:
@@ -247,6 +257,10 @@ def set_session_vars(
     background completion back to the agent after the turn ends (see
     ``_SESSION_ASYNC_DELIVERY`` / ``async_delivery_supported``). Stateless
     request/response adapters (the API server) pass ``False``.
+
+    ``api_async_resume`` opts the current api_server turn into self-POST wake
+    for background ``delegate_task`` completions (see
+    ``api_async_resume_enabled``). Default False preserves client-owned turns.
 
     ``cron_session`` is tri-state: ``_UNSET`` preserves legacy
     ``os.environ["HERMES_CRON_SESSION"]`` fallback, ``"1"`` marks a cron job,
@@ -275,6 +289,7 @@ def set_session_vars(
         _SESSION_PROFILE.set(profile),
         _CRON_SESSION.set(cron_session),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        _SESSION_API_ASYNC_RESUME.set(bool(api_async_resume)),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -320,6 +335,7 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _SESSION_API_ASYNC_RESUME.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -368,6 +384,7 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _SESSION_API_ASYNC_RESUME.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -508,4 +525,18 @@ def async_delivery_supported() -> bool:
     value = _SESSION_ASYNC_DELIVERY.get()
     if value is _UNSET:
         return True
+    return bool(value)
+
+
+def api_async_resume_enabled() -> bool:
+    """Whether this api_server turn opted into post-turn async self-POST wake.
+
+    Driven by ``X-Hermes-Async-Resume`` on the request that dispatched the
+    background work. Default False: completions stay deferred until a real
+    client turn. True stamps ``api_async_resume`` onto the durable completion
+    so the gateway may wake the parent session without a follow-up user message.
+    """
+    value = _SESSION_API_ASYNC_RESUME.get()
+    if value is _UNSET:
+        return False
     return bool(value)

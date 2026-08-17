@@ -2366,6 +2366,49 @@ class TestSessionIdHeader:
             assert call_kwargs["conversation_history"] == db_history
             assert call_kwargs["user_message"] == "new question"
 
+    @pytest.mark.asyncio
+    async def test_real_chat_turn_receives_deferred_completion_as_context(
+        self, auth_adapter, monkeypatch,
+    ):
+        from tools import async_delegation
+
+        monkeypatch.setattr(
+            async_delegation,
+            "consume_deferred_completions",
+            lambda session_id, *, prepare: [prepare({
+                "type": "async_delegation",
+                "delegation_id": "deleg_chat_context",
+                "status": "completed",
+                "summary": f"result for {session_id}",
+                "goal": "research",
+            })],
+        )
+        mock_result = {"final_response": "OK", "messages": [], "api_calls": 1}
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                response = await cli.post(
+                    "/v1/chat/completions",
+                    headers={
+                        "X-Hermes-Session-Id": "existing-session",
+                        "Authorization": "Bearer sk-secret",
+                    },
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "real request"}],
+                    },
+                )
+
+        assert response.status == 200
+        user_message = mock_run.call_args.kwargs["user_message"]
+        assert "DEFERRED BACKGROUND CONTEXT" in user_message
+        assert "result for existing-session" in user_message
+        assert user_message.endswith("[CURRENT USER MESSAGE]\nreal request")
+
 
 # ---------------------------------------------------------------------------
 # X-Hermes-Session-Key header (long-term memory scoping)

@@ -151,8 +151,8 @@ class TestStartRun:
     async def test_start_binds_chat_id_for_delegation_wake_target(self, adapter):
         """/v1/runs must bind the raw session id as the api_server chat_id
         (like every other agent-entry route does via _run_agent): the async
-        delegation dispatch reads HERMES_SESSION_CHAT_ID to pick its wake
-        self-post target, and an empty binding forces background delegations
+        delegation dispatch reads HERMES_SESSION_CHAT_ID to pick its deferred
+        delivery target, and an empty binding forces background delegations
         on this route back to synchronous execution."""
         app = _create_runs_app(adapter)
         captured = {}
@@ -191,6 +191,58 @@ class TestStartRun:
         assert captured.get("origin_session_id") == "runs-raw-sid", (
             "runs route must bind chat_id so delegation dispatch sees a wake target"
         )
+
+    @pytest.mark.asyncio
+    async def test_real_run_receives_deferred_completion_as_context(
+        self, adapter, monkeypatch,
+    ):
+        from tools import async_delegation
+
+        monkeypatch.setattr(
+            async_delegation,
+            "consume_deferred_completions",
+            lambda session_id, *, prepare: [prepare({
+                "type": "async_delegation",
+                "delegation_id": "deleg_run_context",
+                "status": "completed",
+                "summary": f"result for {session_id}",
+                "goal": "research",
+            })],
+        )
+        app = _create_runs_app(adapter)
+        captured = {}
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+
+                def _capture_run(user_message=None, conversation_history=None, task_id=None):
+                    captured["user_message"] = user_message
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _capture_run
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "real request", "session_id": "runs-raw-sid"},
+                )
+                data = await response.json()
+                for _ in range(40):
+                    status_response = await cli.get(f"/v1/runs/{data['run_id']}")
+                    status = await status_response.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert response.status == 202
+        user_message = captured["user_message"]
+        assert "DEFERRED BACKGROUND CONTEXT" in user_message
+        assert "result for runs-raw-sid" in user_message
+        assert user_message.endswith("[CURRENT USER MESSAGE]\nreal request")
 
 
     @pytest.mark.asyncio

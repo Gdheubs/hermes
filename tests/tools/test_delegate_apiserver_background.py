@@ -109,8 +109,8 @@ def _patch_delegate(monkeypatch):
 
 def test_apiserver_session_with_id_dispatches_background(monkeypatch):
     """async_delivery=False + a raw session id (HERMES_SESSION_ID) →
-    background dispatch (the completion wakes the session via the
-    api_server self-post), NOT the forced-sync fallback."""
+    background dispatch (the completion is deferred to the next real API
+    turn), NOT the forced-sync fallback."""
     dt = _patch_delegate(monkeypatch)
     monkeypatch.setenv("HERMES_SESSION_ID", "raw-sid-7")
     set_session_vars(
@@ -132,9 +132,9 @@ def test_apiserver_session_with_id_dispatches_background(monkeypatch):
     evt = _drain_one()
     assert evt is not None
     assert evt["type"] == "async_delegation"
-    # The raw session id is stamped so the gateway drain can self-post the
-    # wake to the REAL session (session_key alone is the raw id here, which
-    # carries no parseable routing metadata). Crucially this is the SPAWNER's
+    # The raw session id is stamped so the gateway can defer the completion
+    # for the REAL session (session_key alone is the raw id here, which carries
+    # no parseable routing metadata). Crucially this is the SPAWNER's
     # id, not the subagent-internal id the child build clobbered
     # HERMES_SESSION_ID with (see clobbering_build_child).
     assert evt["origin_session_id"] == "raw-sid-7"
