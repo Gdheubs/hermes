@@ -809,6 +809,99 @@ def test_board_param_none_falls_back_to_env(worker_env):
 #   even when the session has a delivery channel.
 # ---------------------------------------------------------------------------
 
+
+def test_create_records_explicit_workspace_request(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = json.loads(
+        kt._handle_create(
+            {
+                "title": "explicit directory",
+                "assignee": "peer",
+                "workspace_kind": "dir",
+                "workspace_path": "/tmp/explicit-directory",
+            }
+        )
+    )
+
+    with kb.connect_closing() as conn:
+        created = next(
+            event
+            for event in kb.list_events(conn, out["task_id"])
+            if event.kind == "created"
+        )
+    assert created.payload is not None
+    assert created.payload["requested_workspace"] == "dir:/tmp/explicit-directory"
+
+
+def test_create_records_omitted_workspace_request_as_null(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = json.loads(
+        kt._handle_create({"title": "implicit scratch", "assignee": "peer"})
+    )
+
+    with kb.connect_closing() as conn:
+        created = next(
+            event
+            for event in kb.list_events(conn, out["task_id"])
+            if event.kind == "created"
+        )
+    assert created.payload is not None
+    assert created.payload["requested_workspace"] is None
+
+
+def test_create_returns_warning_for_explicit_project_workspace_supersession(
+    worker_env, tmp_path
+):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with pdb.connect_closing() as conn:
+        project_id = pdb.create_project(conn, name="Tool Project", folders=[str(repo)])
+    kb.write_board_metadata("default", project_id=project_id)
+
+    out = json.loads(
+        kt._handle_create(
+            {
+                "title": "explicit project scratch",
+                "assignee": "peer",
+                "workspace_kind": "scratch",
+            }
+        )
+    )
+
+    assert out["warning"] == (
+        "requested workspace 'scratch' was superseded by project-linked "
+        f"workspace 'worktree:{out['workspace_path']}'"
+    )
+
+
+def test_create_omitted_project_workspace_inherits_without_warning(worker_env, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with pdb.connect_closing() as conn:
+        project_id = pdb.create_project(conn, name="Tool Project", folders=[str(repo)])
+    kb.write_board_metadata("default", project_id=project_id)
+
+    out = json.loads(
+        kt._handle_create({"title": "implicit project workspace", "assignee": "peer"})
+    )
+
+    assert out["workspace_kind"] == "worktree"
+    assert out["workspace_path"].startswith(str(repo / ".worktrees"))
+    assert out["warning"] is None
+
+
 def _list_subs_for_task(task_id):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()

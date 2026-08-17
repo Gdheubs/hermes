@@ -3201,9 +3201,10 @@
         .map(function (s) { return s.trim(); })
         .filter(function (s) { return s.length > 0; });
       if (skillList.length > 0) body.skills = skillList;
-      // Only send workspace_kind when it's non-default. Keeps the request
-      // shape small and interoperable with older dispatcher versions.
-      if (workspaceKind && workspaceKind !== "scratch") {
+      // Always send the selected kind. In particular, an explicit switch to
+      // scratch on a project-bound board must remain distinguishable from an
+      // omitted workspace so the API can preserve and warn on supersession.
+      if (workspaceKind) {
         body.workspace_kind = workspaceKind;
       }
       const wpTrim = workspacePath.trim();
