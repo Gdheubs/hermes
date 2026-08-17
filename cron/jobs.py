@@ -2130,7 +2130,17 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 # F3: same create-time script-content gate through the
                 # update door — an update that swaps in a dangerous
                 # no_agent script must not bypass the create-time scan.
-                from cron.lifecycle_guard import check_cron_script_content
+                from cron.lifecycle_guard import (
+                    check_cron_script_content,
+                    check_gateway_lifecycle,
+                )
+                # F3/P2: the create door runs BOTH gates; the update door
+                # must too — a script swap that trips the lifecycle guard
+                # (oversized-sentinel, gateway-restart pattern) must not
+                # bypass the create-time scan.
+                check_gateway_lifecycle(
+                    updates.get("prompt") or "", _upd_script or None
+                )
                 check_cron_script_content(_upd_script or None)
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(

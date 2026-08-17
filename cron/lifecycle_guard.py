@@ -847,6 +847,11 @@ _CRON_SCRIPT_THREAT_PATTERNS: list[tuple[str, str]] = [
     # ── Destructive ───────────────────────────────────────────────────
     (r'rm\s+-rf\s+/(?:\s|$)', "destructive root rm"),
     (r'mkfs\b|format-volume\b|clear-disk\b', "filesystem destruction"),
+    # ── F3/P2 (Purple round 2): obfuscation / alternative exfil shapes ──
+    (r'base64\s*(?:-d|--decode)\b[^\n]*\|\s*(?:sh|bash|python)|b64decode\s*\(|openssl\s+enc[^\n]*-d\b|certutil\s+[^\n]*-decode\b', "encoded payload decode"),
+    (r'\beval\s*\(|\bexec\s*\(', "dynamic code construction"),
+    (r'(?:curl|wget)\s+[^\n]*(?:-d|-F|--data|--data-binary|--form)\s+[^@\s]*@[^\s]*(?:\.hermes|auth\.json|\.env|credentials|token)', "file-upload exfil of secrets"),
+    (r'(?:curl|wget)\s+[^\n]*@\s*[^\s]*(?:\.hermes|auth\.json|\.env)', "file-read exfil via curl/wget"),
 ]
 
 
@@ -868,12 +873,36 @@ def check_cron_script_content(script: Optional[str]) -> None:
     if not script:
         return
     script_text = _read_script_for_scanning(script)
+    if script_text == "hermes gateway restart":
+        # F3/P2: the lifecycle guard's sentinel for oversized / non-regular
+        # scripts must NOT silently pass the content scan (an update-door
+        # script could otherwise swap in an oversized payload that evades
+        # this gate). Refuse loudly instead.
+        raise CronScriptContentBlocked(
+            "Blocked: cron script is oversized or not a regular readable "
+            "text file; refusing to scan it (fail closed)."
+        )
     if not script_text:
-        # Unreadable/missing script is reported by normal path validation;
-        # an oversized/binary file fails closed like the lifecycle guard.
+        # Unreadable/missing script is reported by normal path validation.
         return
+    scan_text = script_text
+    # F3/P2: also scan base64-encoded blobs — a payload can hide the raw
+    # ASCII patterns inside a base64 string (``echo <b64> | base64 -d | sh``).
+    # Only decoded text that references security targets is added, keeping
+    # the scan narrow (no false positives on random base64 tokens).
+    import base64 as _b64
+    for _tok in re.findall(r"[A-Za-z0-9+/=]{40,}", script_text):
+        try:
+            _decoded = _b64.b64decode(_tok).decode("utf-8", "ignore")
+        except Exception:
+            continue
+        if _decoded and any(
+            _marker in _decoded
+            for _marker in ("config.yaml", "cron_mode", ".env", "auth.json")
+        ):
+            scan_text = f"{scan_text}\n{_decoded}"
     for pattern, label in _CRON_SCRIPT_THREAT_PATTERNS:
-        if re.search(pattern, script_text, re.IGNORECASE):
+        if re.search(pattern, scan_text, re.IGNORECASE):
             raise CronScriptContentBlocked(
                 f"Blocked: cron script contains a {label} payload. "
                 "no_agent scripts run in a subprocess with no approval "
