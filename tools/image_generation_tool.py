@@ -1462,8 +1462,10 @@ IMAGE_GENERATE_SCHEMA = {
         "edit / transform an existing image (image-to-image) when the active "
         "model supports it. Pass `image_url` to edit that image; add "
         "`reference_image_urls` for style/composition references; omit both "
-        "for text-to-image. The underlying backend (FAL, OpenAI, xAI, etc.) "
-        "and model are user-configured and not selectable by the agent. "
+        "for text-to-image. The underlying backend (FAL, OpenAI, xAI, etc.) is "
+        "user-configured and not selectable by the agent; `model` may be "
+        "overridden per call when the active backend supports it, but omitting "
+        "it uses the configured default and is almost always right. "
         "Returns the result in the `image` field — either a URL or an absolute "
         "file path. To show it to the user, reference that path/URL in your "
         "response using the file-delivery convention for the current platform "
@@ -1509,6 +1511,27 @@ IMAGE_GENERATE_SCHEMA = {
                     "(style, character, or composition references) to guide an "
                     "image-to-image edit. Supported only by some models and "
                     "capped per-model; the description above indicates the max."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional image-API catalog id; omit for the configured "
+                    "default. Honored by plugin-backed providers, which "
+                    "validate the id themselves and return a typed error for "
+                    "an unknown one — the in-tree FAL path always uses the "
+                    "configured model. Only pass this when the user named a "
+                    "specific model or asked for a capability the default "
+                    "lacks."
+                ),
+            },
+            "seed": {
+                "type": "integer",
+                "description": (
+                    "Optional seed for reproducible output. Supported only by "
+                    "some models; providers that lack it ignore the value. "
+                    "Pass the same seed with the same prompt and model to "
+                    "re-roll a variation of an earlier image."
                 ),
             },
             "upscale": {
@@ -1567,12 +1590,26 @@ def _read_configured_image_provider():
     return None
 
 
+def _finalize_plugin_result(result: Any) -> str:
+    """Serialize a provider result, enforcing the dict contract of the ABC."""
+    if not isinstance(result, dict):
+        return json.dumps({
+            "success": False,
+            "image": None,
+            "error": "Provider returned a non-dict result",
+            "error_type": "provider_contract",
+        })
+    return json.dumps(result)
+
+
 def _dispatch_to_plugin_provider(
     prompt: str,
     aspect_ratio: str,
     image_url: Optional[str] = None,
     reference_image_urls: Optional[list] = None,
     upscale: Optional[bool] = None,
+    model: Optional[str] = None,
+    seed: Optional[int] = None,
 ):
     """Route the call to a plugin-registered provider when one is selected.
 
@@ -1590,6 +1627,14 @@ def _dispatch_to_plugin_provider(
     route to its edit endpoint. ``upscale`` (when explicitly set) requests a
     post-generation high-resolution pass; providers without upscale support
     ignore it via their ``**kwargs`` (the ABC contract).
+
+    ``model`` overrides ``image_gen.model`` for this one call. It is passed
+    through verbatim rather than validated here: the catalog belongs to the
+    provider, which already answers an unknown id with a typed
+    ``error_response``. Validating centrally would mean maintaining every
+    backend's catalog in the core tool and would reject ids that a provider
+    legitimately accepts (a newly released model, say). ``seed`` is forwarded
+    the same way and ignored by providers that have no such knob.
     """
     configured = _read_configured_image_provider()
     if not configured or configured == "fal":
@@ -1632,10 +1677,16 @@ def _dispatch_to_plugin_provider(
             "error_type": "provider_not_registered",
         })
 
+    # A per-call override beats config; an absent or blank one falls back to
+    # it, so omitting `model` keeps the pre-existing behaviour exactly.
+    chosen_model = model.strip() if isinstance(model, str) and model.strip() else configured_model
+
     kwargs: Dict[str, Any] = {"prompt": prompt, "aspect_ratio": aspect_ratio}
     try:
-        if configured_model:
-            kwargs["model"] = configured_model
+        if chosen_model:
+            kwargs["model"] = chosen_model
+        if seed is not None:
+            kwargs["seed"] = seed
         if isinstance(image_url, str) and image_url.strip():
             kwargs["image_url"] = image_url.strip()
         norm_refs = None
@@ -1649,6 +1700,32 @@ def _dispatch_to_plugin_provider(
             kwargs["upscale"] = bool(upscale)
         result = provider.generate(**kwargs)
     except TypeError as exc:
+        # `seed` is optional and additive: a provider whose signature predates
+        # it must not lose a call that used to work. Drop it and retry once
+        # before treating the TypeError as fatal — checked first, because
+        # otherwise a seeded edit would be misreported as "editing
+        # unsupported".
+        if "seed" in kwargs:
+            logger.debug(
+                "image_gen provider '%s' rejected seed; retrying without it: %s",
+                getattr(provider, "name", "?"), exc,
+            )
+            kwargs.pop("seed")
+            try:
+                result = provider.generate(**kwargs)
+            except Exception as retry_exc:
+                logger.warning(
+                    "Image gen provider '%s' raised after dropping seed: %s",
+                    getattr(provider, "name", "?"), retry_exc,
+                )
+                return json.dumps({
+                    "success": False,
+                    "image": None,
+                    "error": f"Provider '{getattr(provider, 'name', '?')}' error: {retry_exc}",
+                    "error_type": "provider_exception",
+                })
+            return _finalize_plugin_result(result)
+
         # A provider whose generate() signature predates image_url support
         # (third-party plugin not yet updated) — retry without the new kwargs
         # so text-to-image keeps working, but surface a clear note when the
@@ -1692,14 +1769,7 @@ def _dispatch_to_plugin_provider(
             "error": f"Provider '{getattr(provider, 'name', '?')}' error: {exc}",
             "error_type": "provider_exception",
         })
-    if not isinstance(result, dict):
-        return json.dumps({
-            "success": False,
-            "image": None,
-            "error": "Provider returned a non-dict result",
-            "error_type": "provider_contract",
-        })
-    return json.dumps(result)
+    return _finalize_plugin_result(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1866,6 +1936,19 @@ def _handle_image_generate(args, **kw):
     upscale = args.get("upscale")
     if not isinstance(upscale, bool):
         upscale = None
+
+    # Only a non-blank string counts as a model override; anything else falls
+    # back to image_gen.model. The id itself is not validated here — see
+    # _dispatch_to_plugin_provider.
+    model = args.get("model")
+    if not (isinstance(model, str) and model.strip()):
+        model = None
+
+    # bool is a subclass of int, so `seed: true` must not become seed=1.
+    seed = args.get("seed")
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        seed = None
+
     task_id = kw.get("task_id")
 
     # Terminal-backend confinement chokepoint: convert path-like sources to
@@ -1885,6 +1968,8 @@ def _handle_image_generate(args, **kw):
         image_url=image_url,
         reference_image_urls=reference_image_urls,
         upscale=upscale,
+        model=model,
+        seed=seed,
     )
     if dispatched is not None:
         return _postprocess_image_generate_result(dispatched, task_id=task_id)

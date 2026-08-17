@@ -360,12 +360,21 @@ class TestRegistryIntegration:
     def test_schema_exposes_expected_agent_params(self, image_tool):
         """The agent-facing schema exposes the unified text+image surface:
         prompt (required), aspect_ratio, the image-to-image inputs
-        image_url + reference_image_urls, and the opt-in upscale pass. Model
-        selection stays a user-level config choice, never an agent-level arg."""
+        image_url + reference_image_urls, the opt-in upscale pass, and the
+        optional per-call model / seed overrides.
+
+        NOTE — `model` and `seed` reverse this test's previous invariant
+        ("model selection ... never an agent-level arg"). The *backend* stays
+        a user-level config choice; what changed is that a backend whose
+        catalog spans models with different capabilities (transparent
+        background, exact aspect ratios, reproducible seeds) cannot express
+        "use the one that can do this" through config alone. Both params are
+        optional and both fall back to the configured default, so a caller
+        that omits them gets the previous behaviour exactly."""
         props = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]
         assert set(props.keys()) == {
             "prompt", "aspect_ratio", "image_url", "reference_image_urls",
-            "upscale",
+            "upscale", "model", "seed",
         }
         assert image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["required"] == ["prompt"]
 
@@ -658,3 +667,125 @@ class TestUpscaleDispatchForwarding:
 
         image_tool._dispatch_to_plugin_provider("a cat", "square")
         assert "upscale" not in fake_provider.generate.call_args.kwargs
+
+
+class TestModelAndSeedOverride:
+    """`model` / `seed` from the tool schema reach the plugin provider.
+
+    The core deliberately does not validate a model id: catalogs belong to
+    providers, which answer an unknown id with a typed error_response.
+    """
+
+    def _wire(self, image_tool, monkeypatch, *, configured_model=None, generate=None):
+        from unittest.mock import MagicMock
+
+        monkeypatch.setattr(image_tool, "_read_configured_image_provider", lambda: "openrouter")
+        monkeypatch.setattr(image_tool, "_read_configured_image_model", lambda: configured_model)
+        provider = MagicMock()
+        provider.name = "openrouter"
+        if generate is not None:
+            provider.generate.side_effect = generate
+        else:
+            provider.generate.return_value = {"success": True, "image": "/tmp/x.png"}
+        monkeypatch.setattr(
+            "agent.image_gen_registry.get_provider", lambda name: provider
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins._ensure_plugins_discovered", lambda *a, **k: None
+        )
+        return provider
+
+    # -- schema ----------------------------------------------------------
+
+    def test_schema_exposes_model_and_seed(self, image_tool):
+        props = image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["properties"]
+        assert props["model"]["type"] == "string"
+        assert "catalog id" in props["model"]["description"]
+        assert props["seed"]["type"] == "integer"
+        # Both stay optional — omitting them must keep the configured default.
+        assert image_tool.IMAGE_GENERATE_SCHEMA["parameters"]["required"] == ["prompt"]
+
+    # -- forwarding ------------------------------------------------------
+
+    def test_model_is_forwarded_when_given(self, image_tool, monkeypatch):
+        provider = self._wire(image_tool, monkeypatch)
+        image_tool._handle_image_generate(
+            {"prompt": "a cat", "model": "openai/gpt-image-2"}
+        )
+        assert provider.generate.call_args.kwargs["model"] == "openai/gpt-image-2"
+
+    def test_model_is_absent_when_not_given(self, image_tool, monkeypatch):
+        provider = self._wire(image_tool, monkeypatch, configured_model=None)
+        image_tool._handle_image_generate({"prompt": "a cat"})
+        assert "model" not in provider.generate.call_args.kwargs
+
+    def test_configured_model_is_used_when_arg_omitted(self, image_tool, monkeypatch):
+        provider = self._wire(image_tool, monkeypatch, configured_model="krea/krea-2-medium")
+        image_tool._handle_image_generate({"prompt": "a cat"})
+        assert provider.generate.call_args.kwargs["model"] == "krea/krea-2-medium"
+
+    def test_per_call_model_beats_configured(self, image_tool, monkeypatch):
+        provider = self._wire(image_tool, monkeypatch, configured_model="krea/krea-2-medium")
+        image_tool._handle_image_generate(
+            {"prompt": "a cat", "model": "qwen/qwen-image-3-pro"}
+        )
+        assert provider.generate.call_args.kwargs["model"] == "qwen/qwen-image-3-pro"
+
+    def test_blank_model_falls_back_to_configured(self, image_tool, monkeypatch):
+        provider = self._wire(image_tool, monkeypatch, configured_model="krea/krea-2-medium")
+        image_tool._handle_image_generate({"prompt": "a cat", "model": "   "})
+        assert provider.generate.call_args.kwargs["model"] == "krea/krea-2-medium"
+
+    def test_non_string_model_is_ignored(self, image_tool, monkeypatch):
+        provider = self._wire(image_tool, monkeypatch, configured_model=None)
+        image_tool._handle_image_generate({"prompt": "a cat", "model": 42})
+        assert "model" not in provider.generate.call_args.kwargs
+
+    # -- an unknown id is the provider's problem, not a crash -------------
+
+    def test_unknown_model_surfaces_provider_error_without_raising(self, image_tool, monkeypatch):
+        import json as _json
+
+        self._wire(
+            image_tool, monkeypatch,
+            generate=lambda **kw: {
+                "success": False, "image": None,
+                "error": "no such model", "error_type": "model_access",
+            },
+        )
+        out = _json.loads(image_tool._handle_image_generate(
+            {"prompt": "a cat", "model": "nope/not-real"}
+        ))
+        assert out["success"] is False
+        assert out["error_type"] == "model_access"
+
+    # -- seed -------------------------------------------------------------
+
+    def test_seed_is_forwarded(self, image_tool, monkeypatch):
+        provider = self._wire(image_tool, monkeypatch)
+        image_tool._handle_image_generate({"prompt": "a cat", "seed": 424242})
+        assert provider.generate.call_args.kwargs["seed"] == 424242
+
+    def test_boolean_seed_is_rejected(self, image_tool, monkeypatch):
+        """bool subclasses int — `seed: true` must not become seed=1."""
+        provider = self._wire(image_tool, monkeypatch)
+        image_tool._handle_image_generate({"prompt": "a cat", "seed": True})
+        assert "seed" not in provider.generate.call_args.kwargs
+
+    def test_provider_without_seed_support_still_generates(self, image_tool, monkeypatch):
+        """A narrow third-party signature must not lose a call that worked."""
+        import json as _json
+
+        calls = []
+
+        def _generate(**kwargs):
+            calls.append(dict(kwargs))
+            if "seed" in kwargs:
+                raise TypeError("generate() got an unexpected keyword argument 'seed'")
+            return {"success": True, "image": "/tmp/x.png"}
+
+        self._wire(image_tool, monkeypatch, generate=_generate)
+        out = _json.loads(image_tool._handle_image_generate({"prompt": "a cat", "seed": 7}))
+
+        assert out["success"] is True
+        assert len(calls) == 2 and "seed" not in calls[1]
