@@ -1,0 +1,675 @@
+"""Static SQLite/PostgreSQL schema-parity guard.
+
+This is the CI gate that keeps the two backends from drifting apart again.
+
+Background
+----------
+The two backends managed schema by different mechanisms and only one was
+self-healing: SQLite's ``_reconcile_columns()`` diffs live columns against
+``SCHEMA_SQL`` on every startup and ADDs what is missing, while Postgres
+carried a hand-maintained list of ``ALTER TABLE ... ADD COLUMN`` statements.
+The standing invariant was therefore *any column added to SCHEMA_SQL is
+automatically live on SQLite and silently absent on Postgres*. Four columns and
+one whole table drifted before anyone noticed, because the failure logged at
+WARNING and the turn completed normally — the deployment lost its entire session
+history to it.
+
+``reconcile_postgres_columns`` closes that at runtime. This file closes it at
+CI time, which matters because the runtime fix repairs a *live database* while
+this catches the mistake in the *diff*.
+
+Why this file is deliberately Docker-free
+-----------------------------------------
+``tests/test_pg_parity_smoke.py`` is the behavioral oracle, but it skips
+entirely when Docker is unreachable — and it skipped on the machine where this
+drift shipped. A guard that only runs when a daemon happens to be up is not a
+guard. Everything here is pure string/AST analysis of the two schema literals,
+so it runs everywhere, always. The one exception is
+``test_reconciler_converges_live_database``, which needs a real server and skips
+cleanly without one.
+"""
+
+import re
+import sqlite3
+
+import pytest
+
+from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
+from hermes_state_postgres import (
+    SCHEMA_SQL_POSTGRES,
+    _PG_ONLY_MIGRATIONS,
+    _pg_column_type,
+    reconcile_postgres_columns,
+)
+
+# ---------------------------------------------------------------------------
+# Tables in SCHEMA_SQL that intentionally do NOT exist on PostgreSQL.
+#
+# ``async_delegations`` is SQLite-local by design: tools/async_delegation.py
+# opens its own ``sqlite3.connect(HERMES_HOME/state.db)`` and never routes
+# through SessionDB, so it is never read or written on the Postgres path.
+#
+# This is an allowlist, not a blanket exemption — a NEW table added to
+# SCHEMA_SQL and not to SCHEMA_SQL_POSTGRES fails the table-parity test until
+# someone either adds it to Postgres or justifies it here. That is the point:
+# the exemption has to be argued, not inherited.
+# ---------------------------------------------------------------------------
+SQLITE_LOCAL_TABLES = {"async_delegations"}
+
+
+def _sqlite_tables() -> dict:
+    """Table -> ordered column names, parsed from SCHEMA_SQL by SQLite itself."""
+    ref = sqlite3.connect(":memory:")
+    try:
+        ref.executescript(SCHEMA_SQL)
+        out = {}
+        for (tbl,) in ref.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall():
+            out[tbl] = [r[1] for r in ref.execute(f'PRAGMA table_info("{tbl}")')]
+        return out
+    finally:
+        ref.close()
+
+
+def _pg_ddl_tables() -> dict:
+    """Table -> column names declared in the SCHEMA_SQL_POSTGRES literal.
+
+    Hand-parsed rather than executed: the literal is PostgreSQL dialect, so
+    SQLite cannot run it and no PG server is required.
+
+    Two things the parse must get right, both of which silently produce phantom
+    columns if skipped: ``--`` line comments are stripped first (comment prose
+    contains commas, which would fracture into fake column entries), and the
+    column list is split on TOP-LEVEL commas only, so inline
+    ``REFERENCES``/``PRIMARY KEY (...)`` clauses stay attached to their column.
+    """
+    # Strip -- line comments before any splitting; their prose contains commas.
+    schema = re.sub(r"--[^\n]*", "", SCHEMA_SQL_POSTGRES)
+
+    tables = {}
+    for match in re.finditer(
+        r"CREATE TABLE IF NOT EXISTS (\w+)\s*\((.*?)\n\);", schema, re.S
+    ):
+        table, body = match.group(1), match.group(2)
+        parts, depth, current = [], 0, ""
+        for ch in body:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            if ch == "," and depth == 0:
+                parts.append(current)
+                current = ""
+            else:
+                current += ch
+        parts.append(current)
+
+        columns = []
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            head = part.split()[0].upper()
+            if head in {"PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "CONSTRAINT"}:
+                continue
+            columns.append(part.split()[0])
+        tables[table] = columns
+    return tables
+
+
+def _migration_added_columns() -> dict:
+    """Table -> columns added by ``ALTER TABLE ... ADD COLUMN`` in the migrations.
+
+    A column may legitimately live only in a migration (it converges an
+    existing database) as long as it is ALSO in the CREATE TABLE literal, which
+    is what a fresh database gets. ``test_migrations_are_not_the_only_home``
+    enforces that pairing.
+    """
+    added = {}
+    for migration in _PG_ONLY_MIGRATIONS:
+        for match in re.finditer(
+            r"ALTER TABLE (\w+)\s+ADD COLUMN IF NOT EXISTS\s+(\w+)",
+            migration.sql,
+        ):
+            added.setdefault(match.group(1), set()).add(match.group(2))
+    return added
+
+
+def test_every_sqlite_table_exists_on_postgres():
+    """No table may be declared for SQLite and silently missing on Postgres.
+
+    ``session_model_usage`` was exactly this failure: declared in SCHEMA_SQL,
+    written by ``_record_model_usage`` through the shared SessionDB write path,
+    and entirely absent from the Postgres schema. It never reached the error
+    logs only because session creation failed first and masked it.
+    """
+    missing = sorted(
+        set(_sqlite_tables()) - set(_pg_ddl_tables()) - SQLITE_LOCAL_TABLES
+    )
+    assert not missing, (
+        f"tables declared in SCHEMA_SQL but absent from SCHEMA_SQL_POSTGRES: "
+        f"{missing}. Add them to SCHEMA_SQL_POSTGRES (plus a migration so "
+        f"existing databases converge), or add them to SQLITE_LOCAL_TABLES "
+        f"with a comment explaining why the Postgres path never touches them."
+    )
+
+
+def test_every_sqlite_column_exists_on_postgres():
+    """The core invariant: declaring a column must reach BOTH backends.
+
+    Counts a column as present if it is in the CREATE TABLE literal or added by
+    a migration — either path gets it onto a live database.
+    """
+    sqlite_tables = _sqlite_tables()
+    pg_tables = _pg_ddl_tables()
+    migration_added = _migration_added_columns()
+
+    drift = {}
+    for table, columns in sqlite_tables.items():
+        if table not in pg_tables:
+            continue  # covered by the table-parity test above
+        present = set(pg_tables[table]) | migration_added.get(table, set())
+        missing = [c for c in columns if c not in present]
+        if missing:
+            drift[table] = missing
+
+    assert not drift, (
+        f"columns declared in SCHEMA_SQL but absent from the Postgres schema: "
+        f"{drift}. Add them to SCHEMA_SQL_POSTGRES and to a migration. "
+        f"reconcile_postgres_columns() would heal a live database at runtime, "
+        f"but the declaration should not be missing in the first place."
+    )
+
+
+def test_migrations_are_not_the_only_home_for_a_column():
+    """A column added by migration must also be in the CREATE TABLE literal.
+
+    Otherwise a *fresh* database is created without it and only converges on a
+    later connect — the exact asymmetry (fresh-vs-existing databases having
+    different shapes) this whole guard exists to prevent.
+    """
+    pg_tables = _pg_ddl_tables()
+    orphans = {}
+    for table, columns in _migration_added_columns().items():
+        if table not in pg_tables:
+            continue
+        missing = sorted(columns - set(pg_tables[table]))
+        if missing:
+            orphans[table] = missing
+
+    assert not orphans, (
+        f"columns added only by migration and missing from the CREATE TABLE "
+        f"literal: {orphans}. A fresh database would not have them."
+    )
+
+
+def test_every_declared_sqlite_type_maps_to_postgres():
+    """Every type in SCHEMA_SQL must have a Postgres mapping.
+
+    ``_pg_column_type`` returns None for an unmapped type and the reconciler
+    then SKIPS the column — safe, but it means a new type silently disables
+    reconciliation for that column. Failing here makes that visible in the diff
+    that introduces the type, rather than in a WARNING nobody reads.
+    """
+    unmapped = []
+    for table, columns in SessionDB._parse_schema_columns(SCHEMA_SQL).items():
+        for column, declared in columns.items():
+            if _pg_column_type(declared) is None:
+                unmapped.append(f"{table}.{column} ({declared!r})")
+
+    assert not unmapped, (
+        f"column types with no entry in _PG_TYPE_MAP: {unmapped}. "
+        f"reconcile_postgres_columns() will skip these columns. Add the type "
+        f"to _PG_TYPE_MAP in hermes_state_postgres.py."
+    )
+
+
+def test_pg_type_mapping_preserves_constraints():
+    """The type is translated; the NOT NULL / DEFAULT tail is passed through."""
+    assert _pg_column_type("TEXT") == "TEXT"
+    assert _pg_column_type("REAL") == "DOUBLE PRECISION"
+    assert _pg_column_type("REAL NOT NULL DEFAULT 0") == (
+        "DOUBLE PRECISION NOT NULL DEFAULT 0"
+    )
+    assert _pg_column_type("INTEGER NOT NULL DEFAULT 1") == (
+        "INTEGER NOT NULL DEFAULT 1"
+    )
+    # A typeless SQLite column is a real possibility; TEXT is the safe analogue.
+    assert _pg_column_type("") == "TEXT"
+    # An unknown type is refused, not guessed at.
+    assert _pg_column_type("GEOMETRY") is None
+
+
+def test_drifted_columns_are_declared_and_migrated():
+    """Regression lock for the four columns that caused the deployment-wide loss.
+
+    Named explicitly rather than left to the generic tests: these are the ones
+    that actually cost data, and a test that names them makes the reason for
+    this file legible to whoever reads it next. Asserts both homes — the
+    CREATE TABLE literal (fresh databases) and a migration (existing ones).
+    """
+    pg_tables = _pg_ddl_tables()
+    migration_added = _migration_added_columns()
+
+    for table, column in [
+        ("sessions", "profile_name"),
+        ("sessions", "compression_fallback_streak"),
+        ("messages", "effect_disposition"),
+        ("messages", "api_content"),
+    ]:
+        assert column in pg_tables[table], (
+            f"{table}.{column} missing from SCHEMA_SQL_POSTGRES — a fresh "
+            f"database would not have it"
+        )
+        assert column in migration_added.get(table, set()), (
+            f"{table}.{column} has no migration — existing databases "
+            f"would never converge"
+        )
+
+
+def test_session_model_usage_is_created_by_a_migration():
+    """The missing table must converge on existing databases, not just fresh ones.
+
+    It is absent from every already-deployed database, so a CREATE TABLE in
+    the literal alone would leave every existing installation without it.
+    """
+    assert "session_model_usage" in _pg_ddl_tables()
+    assert any(
+        "CREATE TABLE IF NOT EXISTS session_model_usage" in m.sql
+        for m in _PG_ONLY_MIGRATIONS
+    ), (
+        "session_model_usage is declared for fresh databases but no migration "
+        "creates it, so existing databases never get it"
+    )
+
+
+def test_migration_versions_are_unique_and_ordered():
+    """Duplicate or out-of-order versions silently skip a migration.
+
+    ``plan_postgres_migrations`` selects ``version > current``, so a duplicate
+    version means the second one never applies.
+    """
+    versions = [m.version for m in _PG_ONLY_MIGRATIONS]
+    assert len(versions) == len(set(versions)), f"duplicate versions: {versions}"
+    assert versions == sorted(versions), f"versions out of order: {versions}"
+
+
+def test_migration_sql_has_no_semicolons_in_literals():
+    """``_apply_single_migration`` splits statements on a naive ``;``.
+
+    A semicolon inside a quoted literal or a ``$$`` block would fracture a
+    statement into invalid halves. The migrations use ``DEFAULT ''`` (empty
+    literals) which is safe; this locks that in so a future migration carrying
+    a semicolon inside a literal fails loudly here instead of at deploy time.
+    """
+    for migration in _PG_ONLY_MIGRATIONS:
+        assert "$$" not in migration.sql, (
+            f"v{migration.version} uses a $$ block; the naive ';' split in "
+            f"_apply_single_migration would fracture it"
+        )
+        for literal in re.findall(r"'([^']*)'", migration.sql):
+            assert ";" not in literal, (
+                f"v{migration.version} has ';' inside the literal {literal!r}; "
+                f"the naive split in _apply_single_migration would break it"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Reconciler behaviour against a recorded connection.
+#
+# These need no Docker: a fake connection reports the live columns and records
+# the DDL emitted. That is enough to assert WHAT the reconciler does (which
+# ALTERs, which tables it refuses to touch, idempotency) even where a real
+# server is unavailable — which is most CI runners and was the machine the
+# original drift shipped from. ``test_reconciler_converges_live_database``
+# below is the real-server counterpart.
+# ---------------------------------------------------------------------------
+
+class _RecordingCursor:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return self._rows
+
+
+class _RecordingConn:
+    """A connection that reports *live_columns* and records executed DDL."""
+
+    def __init__(self, live_columns):
+        self.live_columns = live_columns
+        self.executed = []
+
+    def execute(self, sql, params=None):
+        self.executed.append(sql)
+        if "information_schema.columns" in sql:
+            return _RecordingCursor(
+                [(t, c) for t, cols in self.live_columns.items() for c in cols]
+            )
+        return _RecordingCursor([])
+
+
+def _live_shape(drop=()):
+    """The SQLite-declared shape, minus *drop*, and minus the SQLite-local tables.
+
+    Models a real Postgres database: the shared tables exist, and the tables
+    that are SQLite-local (or not yet created) simply are not there.
+    """
+    tables = _sqlite_tables()
+    shape = {}
+    for table, columns in tables.items():
+        if table in SQLITE_LOCAL_TABLES or table == "session_model_usage":
+            continue  # absent on the drifted database, by construction
+        shape[table] = [c for c in columns if (table, c) not in drop]
+    return shape
+
+
+def test_reconciler_adds_exactly_the_missing_columns():
+    """Reproduces schema drift on a live database and asserts the emitted DDL.
+
+    The reconciler must add the four drifted columns with correct Postgres
+    types — note ``compression_fallback_streak`` carries its NOT NULL DEFAULT
+    across, so existing rows get 0 rather than a constraint violation.
+    """
+    dropped = (
+        ("sessions", "profile_name"),
+        ("sessions", "compression_fallback_streak"),
+        ("messages", "effect_disposition"),
+        ("messages", "api_content"),
+    )
+    conn = _RecordingConn(_live_shape(drop=dropped))
+
+    added = reconcile_postgres_columns(conn, SCHEMA_SQL)
+
+    assert sorted(added) == sorted(f"{t}.{c}" for t, c in dropped)
+
+    alters = [s for s in conn.executed if s.startswith("ALTER")]
+    assert any(
+        'ADD COLUMN IF NOT EXISTS "profile_name" TEXT' in s for s in alters
+    )
+    assert any(
+        'ADD COLUMN IF NOT EXISTS "compression_fallback_streak"'
+        " INTEGER NOT NULL DEFAULT 0" in s
+        for s in alters
+    )
+
+
+def test_reconciler_never_creates_a_table():
+    """ADD COLUMN only — the Chesterton's-fence boundary.
+
+    ``async_delegations`` is declared in SCHEMA_SQL but is SQLite-local; a
+    reconciler that created every declared table would provision it on
+    Postgres where nothing reads it. ``session_model_usage`` is also absent
+    from the fake live shape here, and must likewise be left to the migration
+    rather than conjured by the reconciler.
+    """
+    conn = _RecordingConn(_live_shape())
+
+    reconcile_postgres_columns(conn, SCHEMA_SQL)
+
+    assert not [s for s in conn.executed if "CREATE TABLE" in s.upper()]
+    assert not [s for s in conn.executed if "async_delegations" in s]
+    assert not [s for s in conn.executed if "session_model_usage" in s]
+
+
+def test_reconciler_is_idempotent_on_a_converged_database():
+    """A converged database must produce zero DDL — it runs on every connect."""
+    conn = _RecordingConn(_live_shape())
+
+    assert reconcile_postgres_columns(conn, SCHEMA_SQL) == []
+    assert not [s for s in conn.executed if s.startswith("ALTER")]
+
+
+def test_reconciler_skips_an_unmappable_type_without_emitting_ddl():
+    """An unmapped type is skipped, not guessed at.
+
+    A wrong ADD COLUMN is worse than a missing one: it is not idempotently
+    repairable. ``test_every_declared_sqlite_type_maps_to_postgres`` is what
+    stops such a column from being introduced silently in the first place.
+    """
+    schema = """
+    CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        exotic GEOMETRY
+    );
+    """
+    conn = _RecordingConn({"sessions": ["id"]})
+
+    added = reconcile_postgres_columns(conn, schema)
+
+    assert added == []
+    assert not [s for s in conn.executed if s.startswith("ALTER")]
+
+
+def test_reconciler_continues_after_one_column_fails():
+    """One failing ALTER must not abort the rest — partial convergence beats none.
+
+    The failing column is forced to be the FIRST one attempted, and a second
+    missing column follows it in the same table. If the loop broke instead of
+    continuing, the later column would never be attempted — which is precisely
+    what this asserts. (An earlier version of this test let declaration order
+    decide, so the failing column landed last and the assertion held even with
+    ``break``; it passed a mutation it should have caught.)
+    """
+    order = list(SessionDB._parse_schema_columns(SCHEMA_SQL)["sessions"])
+    first_missing, second_missing = order[-2], order[-1]
+
+    class _FlakyConn(_RecordingConn):
+        def execute(self, sql, params=None):
+            if f'"{first_missing}"' in sql and sql.startswith("ALTER"):
+                self.executed.append(sql)
+                raise RuntimeError("simulated ALTER failure")
+            return super().execute(sql, params)
+
+    conn = _FlakyConn(
+        _live_shape(
+            drop=(("sessions", first_missing), ("sessions", second_missing))
+        )
+    )
+
+    added = reconcile_postgres_columns(conn, SCHEMA_SQL)
+
+    assert f"sessions.{first_missing}" not in added   # the one that failed
+    assert f"sessions.{second_missing}" in added      # attempted anyway
+
+
+# ---------------------------------------------------------------------------
+# Live-server convergence. Skips cleanly without Docker (see module docstring)
+# — but when it does run, it is the proof that the reconciler actually repairs
+# a drifted database rather than merely being well-formed.
+# ---------------------------------------------------------------------------
+
+def test_reconciler_converges_live_database():
+    """Drop a column from a live database; the reconciler must put it back.
+
+    This is the end-to-end proof: it reproduces the real failure shape
+    (a column present in SCHEMA_SQL and absent from the live table) and asserts
+    the reconciler heals it, rather than asserting the healing code merely
+    exists.
+    """
+    psycopg = pytest.importorskip("psycopg", reason="psycopg not installed")
+    tc = pytest.importorskip("testcontainers.postgres", reason="testcontainers absent")
+
+    import os
+    import socket
+    from pathlib import Path
+
+    os.environ.setdefault("TESTCONTAINERS_RYUK_DISABLED", "true")
+
+    endpoint = os.environ.get("DOCKER_HOST")
+    if not endpoint:
+        for sock in (
+            Path("/var/run/docker.sock"),
+            Path.home() / ".colima" / "default" / "docker.sock",
+            Path.home() / ".docker" / "run" / "docker.sock",
+        ):
+            if sock.exists():
+                endpoint = "unix://" + str(sock)
+                break
+    if not endpoint:
+        pytest.skip("no docker endpoint")
+    if endpoint.startswith("unix://"):
+        path = endpoint[len("unix://"):]
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(2.0)
+                s.connect(path)
+        except OSError:
+            pytest.skip("docker daemon not reachable")
+    os.environ["DOCKER_HOST"] = endpoint
+
+    from hermes_state_postgres import (
+        SCHEMA_SQL_POSTGRES as pg_schema,
+        reconcile_postgres_columns,
+    )
+
+    with tc.PostgresContainer("postgres:16") as pg:
+        url = pg.get_connection_url()
+        scheme, sep, rest = url.partition("://")
+        if sep and scheme in ("postgresql+psycopg2", "postgresql+psycopg"):
+            url = "postgresql" + sep + rest
+
+        with psycopg.connect(url, autocommit=True) as conn:
+            for statement in pg_schema.split(";"):
+                statement = statement.strip()
+                if statement:
+                    conn.execute(statement)
+
+            # Reproduce the production shape: the column is declared in
+            # SCHEMA_SQL but missing from the live table.
+            conn.execute("ALTER TABLE sessions DROP COLUMN profile_name")
+            conn.execute("ALTER TABLE messages DROP COLUMN effect_disposition")
+
+            added = reconcile_postgres_columns(conn, SCHEMA_SQL)
+
+            assert "sessions.profile_name" in added
+            assert "messages.effect_disposition" in added
+
+            live = {
+                (t, c)
+                for t, c in conn.execute(
+                    "SELECT table_name, column_name FROM information_schema.columns"
+                    " WHERE table_schema = current_schema()"
+                ).fetchall()
+            }
+            assert ("sessions", "profile_name") in live
+            assert ("messages", "effect_disposition") in live
+
+            # Idempotent: a second pass is a no-op, not a duplicate-column error.
+            assert reconcile_postgres_columns(conn, SCHEMA_SQL) == []
+
+            # And it must NOT have created the SQLite-local table.
+            assert not any(t == "async_delegations" for t, _ in live), (
+                "reconciler created async_delegations, which is SQLite-local "
+                "by design and never read on the Postgres path"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Migration-ledger separation
+#
+# Postgres-only migrations are numbered in their own small sequence (starting
+# at 17) and are recorded in ``pg_migration_version``. The shared
+# ``SCHEMA_VERSION`` is recorded in ``schema_version`` and climbs with every
+# upstream column addition.
+#
+# These were once the same table. The moment the shared version passed the
+# highest Postgres-only migration number, ``MAX(version)`` made every
+# Postgres-only migration look already-applied, and they stopped running.
+# The column reconciler hid it for ADD COLUMN, so the visible symptom was only
+# the absence of things a reconciler never creates: the pg_trgm extension, the
+# GIN indexes, and whole tables.
+#
+# These tests assert the invariant (two namespaces, never merged), not any
+# particular version number, so they stay valid as both counters advance.
+# ---------------------------------------------------------------------------
+
+
+def test_pg_migration_ledger_is_a_separate_table():
+    """The Postgres migration ledger must not share ``schema_version``."""
+    assert "CREATE TABLE IF NOT EXISTS pg_migration_version" in SCHEMA_SQL_POSTGRES, (
+        "pg_migration_version is missing from SCHEMA_SQL_POSTGRES; without it "
+        "the Postgres-only migration ledger falls back into schema_version and "
+        "collides with the shared SCHEMA_VERSION"
+    )
+
+
+def test_pg_migrations_record_into_the_separate_ledger():
+    """``_apply_single_migration`` must write to ``pg_migration_version``.
+
+    Behavioural check via the module's own source of truth: the INSERT target.
+    A regression here is silent — migrations would still 'succeed' while
+    recording into the shared namespace again.
+    """
+    import inspect
+
+    from hermes_state_postgres import _apply_single_migration
+
+    src = inspect.getsource(_apply_single_migration)
+    assert "INSERT INTO pg_migration_version" in src
+    assert "INSERT INTO schema_version" not in src, (
+        "_apply_single_migration records the pg-only version into the shared "
+        "schema_version table — this is the collision that disabled every "
+        "Postgres-only migration"
+    )
+
+
+def test_pg_migration_planning_does_not_read_the_shared_version():
+    """``apply_postgres_migrations`` must plan from the pg-only ledger."""
+    import inspect
+
+    from hermes_state_postgres import apply_postgres_migrations
+
+    src = inspect.getsource(apply_postgres_migrations)
+    assert "postgres_migration_version(" in src
+    assert "postgres_schema_version(" not in src, (
+        "apply_postgres_migrations plans from the shared schema_version; once "
+        "the shared version exceeds the highest pg-only migration number, "
+        "every pg-only migration is skipped"
+    )
+
+
+def test_shared_version_has_overtaken_the_pg_only_range():
+    """Documents WHY the ledgers must stay separate.
+
+    Not a snapshot of either number: it asserts the relationship that makes a
+    single shared namespace unsafe. If this ever fails it means the shared
+    version fell below the pg-only range, which would be its own bug.
+    """
+    highest_pg_only = max(m.version for m in _PG_ONLY_MIGRATIONS)
+    assert SCHEMA_VERSION > highest_pg_only, (
+        f"shared SCHEMA_VERSION ({SCHEMA_VERSION}) no longer exceeds the "
+        f"highest pg-only migration ({highest_pg_only}); the two counters "
+        "overlap, which is exactly the condition that made one shared "
+        "MAX(version) unsafe"
+    )
+
+
+def test_every_pg_only_migration_statement_is_idempotent():
+    """Re-running the list must be a no-op where objects already exist.
+
+    A database predating the ledger split has no ``pg_migration_version`` row,
+    so it replans from 0 and replays every migration. That is only safe — and
+    only self-healing for a database whose ledger claimed versions its objects
+    never got — if every creating statement is guarded.
+    """
+    unguarded = []
+    for migration in _PG_ONLY_MIGRATIONS:
+        for statement in migration.sql.split(";"):
+            normalized = " ".join(statement.split())
+            if not normalized:
+                continue
+            upper = normalized.upper()
+            if not upper.startswith(("CREATE", "ALTER TABLE")):
+                continue
+            if "IF NOT EXISTS" in upper or "OR REPLACE" in upper:
+                continue
+            unguarded.append(f"v{migration.version}: {normalized[:80]}")
+
+    assert not unguarded, (
+        "unguarded statement(s) in the Postgres-only migrations; replaying the "
+        "list on a database that already has these objects would fail:\n  "
+        + "\n  ".join(unguarded)
+    )
