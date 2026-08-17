@@ -174,7 +174,8 @@ test('full (non-shallow) clone keeps the exact count path unchanged', () => {
       countStr: '7',
       currentSha: 'aaa',
       targetSha: 'bbb',
-      isShallow: false
+      isShallow: false,
+      headIsAncestorOfTarget: true
     }),
     7
   )
@@ -198,7 +199,53 @@ test('non-numeric count falls back to 0 (defensive, unchanged behaviour)', () =>
       countStr: '',
       currentSha: 'aaa',
       targetSha: 'bbb',
-      isShallow: false
+      isShallow: false,
+      headIsAncestorOfTarget: true
+    }),
+    0
+  )
+})
+
+test('diverged full clone reports UPDATE_DIVERGED (-2), not a tip count', () => {
+  assert.equal(
+    resolveBehindCount({
+      countStr: '1',
+      currentSha: 'aaa',
+      targetSha: 'bbb',
+      isShallow: false,
+      headIsAncestorOfTarget: false,
+      targetIsAncestorOfHead: false
+    }),
+    -2
+  )
+})
+
+test('diverged full clone with zero count reports UPDATE_DIVERGED, not up-to-date', () => {
+  // Regression for #68484: a diverged branch can show HEAD..origin/main == 0
+  // when neither tip is an ancestor of the other. The old code read that as
+  // "up to date"; it must report the named sentinel instead.
+  assert.equal(
+    resolveBehindCount({
+      countStr: '0',
+      currentSha: 'aaa',
+      targetSha: 'bbb',
+      isShallow: false,
+      headIsAncestorOfTarget: false,
+      targetIsAncestorOfHead: false
+    }),
+    -2
+  )
+})
+
+test('local-ahead full clone (target is ancestor of HEAD) reports 0', () => {
+  assert.equal(
+    resolveBehindCount({
+      countStr: '0',
+      currentSha: 'local-child',
+      targetSha: 'origin-parent',
+      isShallow: false,
+      headIsAncestorOfTarget: false,
+      targetIsAncestorOfHead: true
     }),
     0
   )

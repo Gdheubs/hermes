@@ -9,10 +9,23 @@ function shouldCountCommits({ isShallow }) {
   return !isShallow
 }
 
+// Sentinel when HEAD and origin/<branch> have diverged (neither tip is an
+// ancestor of the other). A tip-only behind count would mislead (e.g. "1
+// commit behind" on a long-lived feature branch), and a zero count would read
+// as "up to date". See #68484.
+const UPDATE_DIVERGED = -2
+
 // Resolve how many commits the local checkout is behind origin for the desktop
 // update indicator. Shallow checkouts use SHA equality plus any positively
 // proven local-ahead ancestry; exact counts remain exclusive to full clones.
-function resolveBehindCount({ countStr, currentSha, targetSha, isShallow, targetIsAncestorOfHead = false }) {
+function resolveBehindCount({
+  countStr,
+  currentSha,
+  targetSha,
+  isShallow,
+  targetIsAncestorOfHead = false,
+  headIsAncestorOfTarget = false
+}) {
   if (!shouldCountCommits({ isShallow })) {
     if (currentSha && targetSha && (currentSha === targetSha || targetIsAncestorOfHead)) {
       return 0
@@ -25,7 +38,23 @@ function resolveBehindCount({ countStr, currentSha, targetSha, isShallow, target
     return null
   }
 
-  return Number.parseInt(countStr, 10) || 0
+  // Up-to-date: identical tips.
+  if (currentSha && targetSha && currentSha === targetSha) {
+    return 0
+  }
+
+  const count = Number.parseInt(countStr, 10) || 0
+
+  // A full clone can still sit on a diverged branch: neither tip is an
+  // ancestor of the other. `rev-list --count` then reports a misleading tiny
+  // count (or 0 when the divergence is only on the local side), which the UI
+  // would read as a small fast-forward — or as up-to-date (#68484). Report the
+  // named sentinel instead of a tip count.
+  if (!headIsAncestorOfTarget && !targetIsAncestorOfHead) {
+    return UPDATE_DIVERGED
+  }
+
+  return count
 }
 
 // Shallow history can also contaminate the changelog range. Trust the fetched

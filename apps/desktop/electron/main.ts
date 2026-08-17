@@ -2747,17 +2747,24 @@ async function checkUpdates() {
 
   // A positive directional ancestry result remains trustworthy in a shallow
   // graph and prevents a local commit on top of origin from looking outdated.
+  // For full clones, both directions are needed to detect a diverged branch
+  // (neither tip an ancestor of the other) — see #68484.
   const targetIsAncestorOfHead =
-    isShallow &&
     currentSha !== targetSha &&
     (await runGit(['merge-base', '--is-ancestor', `origin/${branch}`, 'HEAD'], { cwd: updateRoot })).code === 0
+
+  const headIsAncestorOfTarget =
+    !isShallow &&
+    currentSha !== targetSha &&
+    (await runGit(['merge-base', '--is-ancestor', 'HEAD', `origin/${branch}`], { cwd: updateRoot })).code === 0
 
   let behind = resolveBehindCount({
     countStr,
     currentSha,
     targetSha,
     isShallow,
-    targetIsAncestorOfHead
+    targetIsAncestorOfHead,
+    headIsAncestorOfTarget
   })
 
   // Recover the exact count a shallow clone can't compute: the GitHub compare
@@ -2779,7 +2786,7 @@ async function checkUpdates() {
     branch,
     currentBranch,
     behind,
-    updateAvailable: behind === null || behind > 0,
+    updateAvailable: behind === null || behind > 0 || behind === -2,
     currentSha,
     targetSha,
     commits,

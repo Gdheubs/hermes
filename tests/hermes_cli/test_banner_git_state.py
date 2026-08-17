@@ -126,3 +126,90 @@ def test_check_via_local_git_ssh_fastpath_offline_keeps_sentinel(tmp_path):
         behind = banner._check_via_local_git(repo_dir)
 
     assert behind == banner.UPDATE_AVAILABLE_NO_COUNT
+
+
+def test_check_via_local_git_full_clone_zero_count_diverged(tmp_path):
+    """A diverged full clone with HEAD..origin/main == 0 is UPDATE_DIVERGED.
+
+    Regression for #68484: a diverged feature branch can report a zero tip
+    count (neither tip is an ancestor of the other), which the old code read
+    as "up to date". The ancestry check must run for every successful
+    full-clone count and return the named sentinel.
+    """
+    from unittest.mock import MagicMock
+
+    from hermes_cli import banner
+
+    repo_dir = tmp_path / "repo"
+    (repo_dir / ".git").mkdir(parents=True)
+
+    def fake_git_stdout(args, *, cwd, timeout=5):
+        if args == ["remote", "get-url", "origin"]:
+            return "https://github.com/NousResearch/hermes-agent.git"
+        if args == ["rev-parse", "--is-shallow-repository"]:
+            return "false"
+        raise AssertionError(f"unexpected git call: {args}")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ["git", "fetch"]:
+            return MagicMock(returncode=0)
+        if cmd[:3] == ["git", "rev-list", "--count"]:
+            return MagicMock(returncode=0, stdout="0\n")
+        raise AssertionError(f"unexpected subprocess: {cmd}")
+
+    with (
+        patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
+        patch.object(banner.subprocess, "run", side_effect=fake_run),
+        # Neither tip is an ancestor of the other -> diverged.
+        patch.object(banner, "_git_is_ancestor", return_value=False),
+    ):
+        behind = banner._check_via_local_git(repo_dir)
+
+    assert behind == banner.UPDATE_DIVERGED
+
+
+def test_check_via_local_git_full_clone_fast_forward_keeps_count(tmp_path):
+    """A genuine fast-forward full clone keeps its exact behind count."""
+    from unittest.mock import MagicMock
+
+    from hermes_cli import banner
+
+    repo_dir = tmp_path / "repo"
+    (repo_dir / ".git").mkdir(parents=True)
+
+    def fake_git_stdout(args, *, cwd, timeout=5):
+        if args == ["remote", "get-url", "origin"]:
+            return "https://github.com/NousResearch/hermes-agent.git"
+        if args == ["rev-parse", "--is-shallow-repository"]:
+            return "false"
+        raise AssertionError(f"unexpected git call: {args}")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ["git", "fetch"]:
+            return MagicMock(returncode=0)
+        if cmd[:3] == ["git", "rev-list", "--count"]:
+            return MagicMock(returncode=0, stdout="7\n")
+        raise AssertionError(f"unexpected subprocess: {cmd}")
+
+    def fake_is_ancestor(maybe_ancestor, rev, repo_dir):
+        # HEAD is an ancestor of origin/main -> fast-forward behind.
+        return maybe_ancestor == "HEAD"
+
+    with (
+        patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
+        patch.object(banner.subprocess, "run", side_effect=fake_run),
+        patch.object(banner, "_git_is_ancestor", side_effect=fake_is_ancestor),
+    ):
+        behind = banner._check_via_local_git(repo_dir)
+
+    assert behind == 7
+
+
+def test_format_update_notice_diverged():
+    """The diverged sentinel renders a non-fast-forward warning, not a count."""
+    from hermes_cli import banner
+
+    notice = banner._format_update_notice(banner.UPDATE_DIVERGED)
+
+    assert "diverged" in notice
+    assert "behind" not in notice
