@@ -3144,7 +3144,10 @@ def _text_to_speech_single(
     The public :func:`text_to_speech_tool` wrapper owns long-form splitting,
     delivery packing, and post-encoding size enforcement.
     """
-    if not text or not text.strip():
+    # Strict providers may send int/list fillers; bare ``.strip()`` after a
+    # truthiness check AttributeErrors (null/"" already fail ``not text``).
+    # Require a real non-empty string — do not str()-coerce fillers into speech.
+    if not isinstance(text, str) or not text.strip():
         return tool_error("Text is required", success=False)
 
     # The wrapper already normalizes text via prepare_spoken_text; the inner
@@ -3158,11 +3161,17 @@ def _text_to_speech_single(
     # When the model supplies a speed parameter, inject it into the config
     # so all downstream provider functions pick it up uniformly.
     if speed is not None:
-        clamped = max(0.25, min(4.0, float(speed)))
-        tts_config = dict(tts_config)  # shallow copy to avoid mutating the cache
-        tts_config["speed"] = clamped
+        try:
+            clamped = max(0.25, min(4.0, float(speed)))
+        except (TypeError, ValueError):
+            clamped = None
+        if clamped is not None:
+            tts_config = dict(tts_config)  # shallow copy to avoid mutating the cache
+            tts_config["speed"] = clamped
 
     # Allow per-call provider override; fall back to the configured default.
+    if provider is not None and not isinstance(provider, str):
+        return tool_error("provider must be a string", success=False)
     if provider:
         provider = provider.lower().strip()
     else:
