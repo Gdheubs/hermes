@@ -613,6 +613,13 @@ async def get_session_messages(
             detail="order must be one of: oldest, latest",
         )
 
+    from hermes_cli.config import load_config_readonly
+
+    display = (load_config_readonly() or {}).get("display", {})
+    show_commentary = bool(
+        display.get("show_commentary", True) if isinstance(display, dict) else True
+    )
+
     def _read():
         db = _open_session_db_for_profile(profile, read_only=True)
         try:
@@ -642,9 +649,22 @@ async def get_session_messages(
     if result is None:
         raise HTTPException(status_code=404, detail="Session not found")
     sid, _limit, messages = result
+    from agent.agent_runtime_helpers import public_codex_commentary
+
+    projected_messages = []
+    for message in messages:
+        projected = dict(message)
+        commentary = public_codex_commentary(
+            projected, show_commentary=show_commentary
+        )
+        if commentary:
+            projected["display_content"] = commentary
+        # The opaque provider replay carrier never crosses the Desktop API.
+        projected.pop("codex_message_items", None)
+        projected_messages.append(projected)
     return {
         "session_id": sid,
-        "messages": messages,
+        "messages": projected_messages,
         "pagination": {
             "limit": _limit,
             "offset": offset,

@@ -1375,6 +1375,17 @@ class APIServerAdapter(BasePlatformAdapter):
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.API_SERVER)
         extra = config.extra or {}
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            display = (load_config_readonly() or {}).get("display", {})
+            self._show_commentary = bool(
+                display.get("show_commentary", True)
+                if isinstance(display, dict)
+                else True
+            )
+        except Exception:
+            self._show_commentary = True
         self._host: str = extra.get("host", os.getenv("API_SERVER_HOST", DEFAULT_HOST))
         raw_port = extra.get("port")
         if raw_port is None:
@@ -3322,13 +3333,29 @@ class APIServerAdapter(BasePlatformAdapter):
         return payload
 
     @staticmethod
-    def _message_response(message: Dict[str, Any]) -> Dict[str, Any]:
+    def _message_response(
+        message: Dict[str, Any],
+        *,
+        show_commentary: bool = True,
+    ) -> Dict[str, Any]:
         safe_keys = (
             "id", "session_id", "role", "content", "tool_call_id", "tool_calls",
             "tool_name", "timestamp", "token_count", "finish_reason", "reasoning",
             "reasoning_content",
         )
-        return {key: message.get(key) for key in safe_keys if key in message}
+        payload = {key: message.get(key) for key in safe_keys if key in message}
+
+        # Keep replay state private; expose only the shared, privacy-filtered
+        # public transcript projection.
+        from agent.agent_runtime_helpers import public_codex_commentary
+
+        commentary = public_codex_commentary(
+            message, show_commentary=show_commentary
+        )
+        if commentary:
+            payload["display_content"] = commentary
+
+        return payload
 
     async def _read_json_body(self, request: "web.Request") -> tuple[Dict[str, Any], Optional["web.Response"]]:
         try:
@@ -3628,7 +3655,10 @@ class APIServerAdapter(BasePlatformAdapter):
         return web.json_response({
             "object": "list",
             "session_id": resolved_id,
-            "data": [self._message_response(m) for m in messages],
+            "data": [
+                self._message_response(m, show_commentary=self._show_commentary)
+                for m in messages
+            ],
             "pagination": {
                 "limit": limit,
                 "offset": offset,
@@ -6106,9 +6136,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return len(prior)
         return 0
 
-    @classmethod
     def _turn_transcript_messages(
-        cls,
+        self,
         conversation_history: List[Dict[str, Any]],
         user_message: Any,
         result: Dict[str, Any],
@@ -6131,7 +6160,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_messages = result.get("messages") if isinstance(result, dict) else None
         if not isinstance(agent_messages, list) or not agent_messages:
             return []
-        start = cls._response_messages_turn_start_index(
+        start = self._response_messages_turn_start_index(
             conversation_history, user_message, result
         )
         turn = agent_messages[start:]
@@ -6141,7 +6170,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 continue
             if msg.get("role") not in {"assistant", "tool"}:
                 continue
-            out.append(cls._message_response(msg))
+            out.append(
+                self._message_response(msg, show_commentary=self._show_commentary)
+            )
         return out
 
     @staticmethod

@@ -65,6 +65,15 @@ const complete = (text: string) =>
 const completePreviewed = (text: string) =>
   act(() => handleEvent!({ payload: { text, response_previewed: true }, session_id: SID, type: 'message.complete' }))
 
+const toolStart = () =>
+  act(() =>
+    handleEvent!({
+      payload: { args: {}, name: 'terminal', tool_id: 'tc-1' },
+      session_id: SID,
+      type: 'tool.start'
+    })
+  )
+
 function getState(): ClientSessionState {
   return sessionStates.get(SID) ?? createClientSessionState()
 }
@@ -109,6 +118,23 @@ describe('useMessageStream interim text sealing', () => {
     const texts = assistantMessages()
     expect(texts).toContain('awaaaaa clean!! tsc zero errors')
     expect(texts).toContain('All checks passed.')
+  })
+
+  it('preserves distinct commentary that seals after a tool has already started', async () => {
+    await mountStream()
+    await start()
+
+    // Codex can announce the tool before its completed commentary item reaches
+    // message.interim. That orders the live parts as tool → commentary. The
+    // commentary is sealed public text, not a trailing draft for completion to
+    // replace.
+    await toolStart()
+    await interim('Start this task now.')
+    await complete('Maintenance finished.')
+
+    const texts = assistantMessages()
+    expect(texts).toContain('Start this task now.')
+    expect(texts).toContain('Maintenance finished.')
   })
 
   it('marks sealed interim bubbles interim and leaves the final reply unmarked', async () => {

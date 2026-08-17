@@ -253,13 +253,14 @@ const normalizeWs = (value: string) => value.replace(/\s+/g, ' ').trim()
 /**
  * Merge the final assistant text into a message's parts.
  *
- * - Removes all existing `text` parts (they were streamed deltas, now superseded
- *   by the authoritative final response).
+ * - Preserves text before the last tool boundary: it was already presented as
+ *   actionable pre-tool narration and must not disappear at completion.
+ * - Replaces only trailing text after the last tool call with the authoritative
+ *   final response. With no tool call, all streamed text remains replaceable.
  * - Keeps `reasoning` parts, but drops one that the final text fully covers
  *   (reasoning ⊆ final) — the final restates it. A short final ("Done.") must
  *   NOT swallow a longer reasoning block that merely starts with it (#61447).
  * - Keeps all other part types (tool-call, image, etc.).
- * - Appends the final text as a new text part.
  */
 export function mergeFinalAssistantText(
   parts: ChatMessagePart[],
@@ -281,15 +282,16 @@ export function mergeFinalAssistantText(
     return parts
   }
 
-  const previousText = parts.findLast(part => part.type === 'text')
+  const lastToolIndex = parts.findLastIndex(part => part.type === 'tool-call')
+  const previousText = parts.findLast(
+    (part, index) => part.type === 'text' && (lastToolIndex < 0 || index > lastToolIndex)
+  )
 
-  const kept = parts.filter(part => {
+  const kept = parts.filter((part, index) => {
     if (part.type === 'text') {
-      // Sealed text parts were already finalized into their own bubbles —
-      // this filter only runs on the LAST streaming bubble, so there are no
-      // sealed parts here. All text parts are streamed deltas that get
-      // replaced by the authoritative final text.
-      return false
+      // Text before a tool boundary was already a complete, actionable segment.
+      // Only the open trailing segment is superseded by message.complete.
+      return lastToolIndex >= 0 && index < lastToolIndex
     }
 
     if (part.type !== 'reasoning' || !dedupeReference) {
@@ -1120,7 +1122,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       return
     }
 
-    const content = message.content || message.text || message.context || message.name
+    const content = message.display_content || message.content || message.text || message.context || message.name
 
     const rawDisplayContent = transcriptContent(
       message.display_kind,

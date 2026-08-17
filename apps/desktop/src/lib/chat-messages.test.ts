@@ -19,6 +19,22 @@ import {
 } from './chat-messages'
 
 describe('toChatMessages', () => {
+  it('hydrates public Codex commentary before its stored tool call', () => {
+    const messages = toChatMessages([
+      {
+        role: 'assistant',
+        content: '',
+        display_content: "I'll inspect the repo first.",
+        timestamp: 1,
+        tool_calls: [{ id: 'tc', function: { name: 'terminal', arguments: '{}' } }]
+      }
+    ])
+
+    expect(messages).toHaveLength(1)
+    expect(messages[0].parts.map(part => part.type)).toEqual(['text', 'tool-call'])
+    expect(chatMessageText(messages[0])).toBe("I'll inspect the repo first.")
+  })
+
   it('rebuilds the full command from a gateway tool row carrying args', () => {
     // Gateway watch-window hydration projects tool rows as
     // {role:'tool', name, context, args?}. `context` is an 80-char preview;
@@ -1132,18 +1148,50 @@ describe('mergeFinalAssistantText', () => {
     expect(result[0]).toMatchObject({ text: 'final answer', timestamp: 12.5, type: 'text' })
   })
 
-  it('removes all text parts and appends the final text', () => {
+  it('preserves provider-neutral pre-tool text and appends the final text', () => {
     const parts = [
-      { type: 'text' as const, text: 'streamed delta 1' },
-      { type: 'text' as const, text: 'streamed delta 2' },
+      { type: 'text' as const, text: 'Start this task now.' },
       { type: 'tool-call' as const, toolCallId: 'tc1', toolName: 'terminal', args: {} as never, argsText: '{}' }
     ]
 
-    const result = mergeFinalAssistantText(parts, 'final answer')
+    const result = mergeFinalAssistantText(parts, 'Maintenance finished.')
 
-    expect(result.filter(p => p.type === 'text')).toHaveLength(1)
-    expect(result.filter(p => p.type === 'text')[0]).toMatchObject({ text: 'final answer' })
-    expect(result.some(p => p.type === 'tool-call')).toBe(true)
+    expect(result.filter(p => p.type === 'text')).toHaveLength(2)
+    expect(result.map(p => p.type)).toEqual(['text', 'tool-call', 'text'])
+    expect(result.filter(p => p.type === 'text').map(p => p.text)).toEqual([
+      'Start this task now.',
+      'Maintenance finished.'
+    ])
+  })
+
+  it('preserves narration between multiple tools but replaces trailing text', () => {
+    const parts = [
+      { type: 'text' as const, text: 'First task.' },
+      { type: 'tool-call' as const, toolCallId: 'tc1', toolName: 'terminal', args: {} as never, argsText: '{}' },
+      { type: 'text' as const, text: 'Second task.' },
+      { type: 'tool-call' as const, toolCallId: 'tc2', toolName: 'read_file', args: {} as never, argsText: '{}' },
+      { type: 'text' as const, text: 'unfinished draft' }
+    ]
+
+    const result = mergeFinalAssistantText(parts, 'Finished.')
+
+    expect(result.filter(p => p.type === 'text').map(p => p.text)).toEqual([
+      'First task.',
+      'Second task.',
+      'Finished.'
+    ])
+  })
+
+  it('keeps pre-tool narration when completion has no final text', () => {
+    const parts = [
+      { type: 'text' as const, text: 'Start now.' },
+      { type: 'tool-call' as const, toolCallId: 'tc1', toolName: 'terminal', args: {} as never, argsText: '{}' },
+      { type: 'text' as const, text: 'unfinished draft' }
+    ]
+
+    const result = mergeFinalAssistantText(parts, '')
+
+    expect(result.filter(p => p.type === 'text').map(p => p.text)).toEqual(['Start now.'])
   })
 
   it('drops reasoning that the final text fully covers (reasoning ⊆ final)', () => {

@@ -1892,6 +1892,93 @@ class TestWebServerEndpoints:
         assert payload["limit"] == 3
         assert len(payload["sessions"]) == 3
 
+    def test_get_session_messages_projects_public_codex_commentary_for_desktop(self):
+        """Desktop's real HTTP hydration path preserves public pre-tool text."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="codex-commentary-display", source="desktop")
+            db.append_message(
+                session_id="codex-commentary-display",
+                role="assistant",
+                content="",
+                tool_calls=[
+                    {
+                        "id": "tc-1",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }
+                ],
+                codex_message_items=[
+                    {
+                        "type": "message",
+                        "phase": "commentary",
+                        "content": [
+                            {"type": "output_text", "text": "Start this task now."}
+                        ],
+                    },
+                    {
+                        "type": "message",
+                        "phase": "analysis",
+                        "content": [
+                            {"type": "output_text", "text": "private scratchpad"}
+                        ],
+                    },
+                ],
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get(
+            "/api/sessions/codex-commentary-display/messages?limit=20&order=latest"
+        )
+
+        assert resp.status_code == 200
+        message = resp.json()["messages"][0]
+        assert message["content"] == ""
+        assert message["display_content"] == "Start this task now."
+        assert "private scratchpad" not in message["display_content"]
+        assert "codex_message_items" not in message
+
+    def test_get_session_messages_hides_codex_commentary_when_disabled(self, monkeypatch):
+        from hermes_state import SessionDB
+        import hermes_cli.config as config
+
+        monkeypatch.setattr(
+            config,
+            "load_config_readonly",
+            lambda: {"display": {"show_commentary": False}},
+        )
+        db = SessionDB()
+        try:
+            db.create_session(session_id="codex-commentary-hidden", source="desktop")
+            db.append_message(
+                session_id="codex-commentary-hidden",
+                role="assistant",
+                content="",
+                codex_message_items=[
+                    {
+                        "type": "message",
+                        "phase": "commentary",
+                        "content": [
+                            {"type": "output_text", "text": "Must remain hidden."}
+                        ],
+                    }
+                ],
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get(
+            "/api/sessions/codex-commentary-hidden/messages?limit=20&order=latest"
+        )
+
+        assert resp.status_code == 200
+        message = resp.json()["messages"][0]
+        assert "display_content" not in message
+        assert "codex_message_items" not in message
+
     def test_get_session_messages_rejects_negative_limit(self):
         """limit=-1 previously bypassed the documented 500-row clamp because
         min(-1, 500) == -1, which SQLite treats as 'no limit'."""

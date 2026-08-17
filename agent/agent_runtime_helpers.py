@@ -919,6 +919,57 @@ def strip_think_blocks(agent, content: str) -> str:
     return content
 
 
+def public_codex_commentary(
+    message: Dict[str, Any], *, show_commentary: bool = True
+) -> str:
+    """Return safe, user-visible Codex commentary for transcript display.
+
+    Canonical assistant ``content`` and the raw replay sidecar remain unchanged.
+    Only explicit ``phase=commentary`` output-text parts cross this display
+    boundary; analysis is never projected.
+    """
+    if not show_commentary or message.get("role") != "assistant" or message.get("content"):
+        return ""
+
+    items = message.get("codex_message_items")
+    if isinstance(items, str):
+        try:
+            items = json.loads(items)
+        except (json.JSONDecodeError, TypeError):
+            return ""
+    if not isinstance(items, list):
+        return ""
+
+    from agent.redact import redact_sensitive_text
+
+    commentary: List[str] = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        phase = item.get("phase")
+        if not isinstance(phase, str) or phase.strip().lower() != "commentary":
+            continue
+        parts = item.get("content")
+        if not isinstance(parts, list):
+            continue
+        text = "".join(
+            part.get("text", "")
+            for part in parts
+            if isinstance(part, dict)
+            and part.get("type") == "output_text"
+            and isinstance(part.get("text"), str)
+        ).strip()
+        if text:
+            text = redact_sensitive_text(
+                strip_think_blocks(None, text),
+                force=True,
+                redact_url_credentials=True,
+            ).strip()
+        if text:
+            commentary.append(text)
+    return "\n\n".join(commentary)
+
+
 
 def sync_credential_pool_entry_id(agent) -> None:
     """Rebind ``agent._credential_pool_entry_id`` from the current pool + key.

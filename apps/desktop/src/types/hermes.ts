@@ -565,6 +565,8 @@ export interface SessionMessage {
   codex_reasoning_items?: unknown
   content: unknown
   context?: unknown
+  /** Public transcript-only text projected by the backend; never model history. */
+  display_content?: unknown
   name?: string
   reasoning?: null | string
   reasoning_content?: null | string

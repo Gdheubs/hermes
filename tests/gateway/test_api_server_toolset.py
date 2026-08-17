@@ -1,4 +1,5 @@
 """Tests for hermes-api-server toolset and API server tool availability."""
+import json
 from unittest.mock import patch, MagicMock
 
 
@@ -50,6 +51,68 @@ class TestApiServerPlatformConfig:
 
 
 class TestApiServerAdapterToolset:
+    def test_message_response_projects_public_codex_commentary_for_display(self):
+        """Codex commentary stays out of canonical content but survives hydration."""
+        from gateway.platforms.api_server import APIServerAdapter
+
+        payload = APIServerAdapter._message_response({
+            "id": 7,
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "tc-1", "function": {"name": "terminal", "arguments": "{}"}}],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "I'll inspect the repo first."}],
+                },
+                {
+                    "type": "message",
+                    "phase": "analysis",
+                    "content": [{"type": "output_text", "text": "private scratchpad"}],
+                },
+            ],
+        })
+
+        assert payload["content"] == ""
+        assert payload["display_content"] == "I'll inspect the repo first."
+        assert "private scratchpad" not in payload["display_content"]
+        assert "codex_message_items" not in payload
+
+    def test_message_response_honors_commentary_visibility(self):
+        from gateway.platforms.api_server import APIServerAdapter
+
+        payload = APIServerAdapter._message_response({
+            "role": "assistant",
+            "content": "",
+            "codex_message_items": [{
+                "type": "message",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "Public while enabled."}],
+            }],
+        }, show_commentary=False)
+
+        assert "display_content" not in payload
+        assert "codex_message_items" not in payload
+
+    def test_message_response_forces_secret_redaction_at_projection_boundary(self):
+        from gateway.platforms.api_server import APIServerAdapter
+
+        secret = "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+        with patch("agent.redact._REDACT_ENABLED", False):
+            payload = APIServerAdapter._message_response({
+                "role": "assistant",
+                "content": "",
+                "codex_message_items": json.dumps([{
+                    "type": "message",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": f"Token: {secret}"}],
+                }]),
+            })
+
+        assert secret not in payload["display_content"]
+        assert "codex_message_items" not in payload
+
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", True)
     def test_create_agent_reads_config_toolsets(self):
         """API server resolves toolsets from config like all other platforms."""
