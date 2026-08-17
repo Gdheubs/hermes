@@ -605,6 +605,177 @@ class TestMediaDeliveryDefaultMode:
     @pytest.mark.parametrize(
         "rel",
         [
+            "Documents/tax-return.pdf",
+            "Desktop/screenshot.png",
+            "Downloads/bank-statement.csv",
+            "AppData/Roaming/credentials.txt",
+            "Pictures/vacation.jpg",
+            "OneDrive/notes.md",
+            "Library/Application Support/creds.json",
+            "iCloud Drive/private.txt",
+        ],
+        ids=[
+            "documents",
+            "desktop",
+            "downloads",
+            "appdata",
+            "pictures",
+            "onedrive",
+            "library",
+            "icloud-drive",
+        ],
+    )
+    def test_default_mode_denies_user_data_dirs(self, tmp_path, monkeypatch, rel):
+        """F6: user-data trees are not deliverable in default mode.
+
+        A prompt-injected chat user must not be able to exfil the host's
+        personal files via ``MEDIA:~/Documents/...`` etc. (strict:false
+        previously accepted any non-credential file — Na'zurak verified
+        AppData/Documents/Desktop/Downloads were absent from the denylist).
+        """
+        self._patch_roots(monkeypatch)
+        fake_home = self._pin_home(tmp_path, monkeypatch)
+
+        target = fake_home / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"%PDF-1.4")
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(target)) is None
+
+    def test_default_mode_denies_direct_home_root_files(self, tmp_path, monkeypatch):
+        """F6: files sitting directly in the home root (~/secret.txt) are
+        user data and must not be deliverable, even though the home-tree
+        exception un-blocks working subdirectories (~/work/...)."""
+        self._patch_roots(monkeypatch)
+        fake_home = self._pin_home(tmp_path, monkeypatch)
+
+        secret = fake_home / "secret.txt"
+        secret.write_text("password hunter2\n")
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
+
+    def test_default_mode_still_accepts_work_subdir_of_home(self, tmp_path, monkeypatch):
+        """F6 control: a deliverable in a home SUBDIRECTORY the agent works
+        in (~/work/report.docx) keeps the existing home-tree exception."""
+        self._patch_roots(monkeypatch)
+        fake_home = self._pin_home(tmp_path, monkeypatch)
+
+        workdir = fake_home / "work"
+        workdir.mkdir(parents=True)
+        doc = workdir / "report.docx"
+        doc.write_bytes(b"PK\x03\x04")
+
+        assert (
+            BasePlatformAdapter.validate_media_delivery_path(str(doc))
+            == str(doc.resolve())
+        )
+
+    def test_user_data_dir_still_denied_when_recent(self, tmp_path, monkeypatch):
+        """F6: recency/allowlist must not resurrect a user-data file even in
+        strict mode — the denylist is absolute."""
+        self._patch_roots(monkeypatch)
+        monkeypatch.setenv("HERMES_MEDIA_DELIVERY_STRICT", "1")
+        monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "1")
+        monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_SECONDS", "600")
+        fake_home = self._pin_home(tmp_path, monkeypatch)
+
+        target = fake_home / "Documents" / "fresh.pdf"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"%PDF-1.4")  # mtime = now
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(target)) is None
+
+    def test_temp_dir_deliverable_still_allowed(self, tmp_path, monkeypatch):
+        """F6 control: an agent-produced deliverable written to the OS scratch
+        dir must keep delivering even though the scratch dir lives under a
+        user-data deny prefix on Windows (``%TEMP%`` = AppData\\Local\\Temp).
+
+        This is the exact layout the F6 temp exemption exists for: the file
+        is inside the deny prefix (home/AppData) AND inside the OS temp dir,
+        so it is scratch, not personal data. A credential under temp is still
+        denied by its own (non-user-data) denylist entry.
+        """
+        self._patch_roots(monkeypatch)
+        fake_home = tmp_path / "f6home"
+        fake_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
+        # Mirror Windows: %TEMP% = <home>\AppData\Local\Temp.
+        temp_root = fake_home / "AppData" / "Local" / "Temp"
+        temp_root.mkdir(parents=True)
+        import tempfile
+
+        # tempfile.gettempdir() caches its result in tempfile.tempdir after
+        # the first call (pytest's tmp_path fixture already triggered it), so
+        # TMP/TEMP env vars alone cannot move it. Pin the cached value.
+        monkeypatch.setattr(tempfile, "tempdir", str(temp_root))
+
+        deliverable = temp_root / "report.pdf"
+        deliverable.write_bytes(b"%PDF-1.4")
+
+        assert (
+            BasePlatformAdapter.validate_media_delivery_path(str(deliverable))
+            == str(deliverable.resolve())
+        )
+
+    def test_allow_dirs_override_delivers_user_data_dir(self, tmp_path, monkeypatch):
+        """F6 control: an operator who EXPLICITLY allowlists a user-data tree
+        (``HERMES_MEDIA_ALLOW_DIRS=~/Documents``) gets it delivered — the
+        allowlist is matched before the denylist and is absolute. The F6
+        denial only closes the *implicit* delivery path; explicit operator
+        opt-in still wins (documented escape hatch)."""
+        self._patch_roots(monkeypatch)
+        fake_home = self._pin_home(tmp_path, monkeypatch)
+
+        docs = fake_home / "Documents"
+        docs.mkdir(parents=True, exist_ok=True)
+        target = docs / "approved.pdf"
+        target.write_bytes(b"%PDF-1.4")
+        monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(docs))
+
+        assert (
+            BasePlatformAdapter.validate_media_delivery_path(str(target))
+            == str(target.resolve())
+        )
+
+    @staticmethod
+    def _pin_home(tmp_path, monkeypatch):
+        """Point HOME (and USERPROFILE on Windows) at a fake home OUTSIDE the
+        OS temp dir, so the deny resolution sees the fake home and the F6 temp
+        exemption (tempfile.gettempdir()) does not swallow the fixture files.
+
+        ``os.path.expanduser("~")`` prefers USERPROFILE on Windows and pytest's
+        tmp_path lives under the real AppData\\Local\\Temp — without pinning
+        both, the deny list would resolve against the REAL user home and the
+        temp exemption would treat these fixtures as scratch.
+
+        ``tempfile.gettempdir()`` caches its result in the module global
+        ``tempfile.tempdir`` after the first call (pytest's tmp_path fixture
+        already triggered it during session setup), so setting TMP/TEMP env
+        vars alone cannot move it. Pin the cached global to a fake temp dir
+        that does NOT contain the fixtures.
+        """
+        fake_home = tmp_path / "f6home"
+        fake_home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HOME", str(fake_home))
+        # On Windows os.path.expanduser("~") prefers USERPROFILE; on POSIX
+        # it reads HOME. Set both so the deny resolution sees the fake home.
+        monkeypatch.setenv("USERPROFILE", str(fake_home))
+        # Keep tempfile.gettempdir() away from the fixtures so the F6 temp
+        # exemption cannot fire on them.
+        fake_temp = tmp_path / "realtmp"
+        fake_temp.mkdir(exist_ok=True)
+        monkeypatch.setenv("TMP", str(fake_temp))
+        monkeypatch.setenv("TEMP", str(fake_temp))
+        import tempfile
+
+        monkeypatch.setattr(tempfile, "tempdir", str(fake_temp))
+        return fake_home
+
+
+    @pytest.mark.parametrize(
+        "rel",
+        [
             "mcp-tokens/github.json",
             "mcp-tokens/github.client.json",
             "mcp-tokens/github.meta.json",

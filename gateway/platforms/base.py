@@ -1249,6 +1249,33 @@ _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS = (
     "Library/Keychains",  # macOS
 )
 
+# F6: user-data directories under $HOME. A prompt-injected chat user must
+# not be able to exfil the host's personal files via ``MEDIA:~/Documents/...``,
+# ``MEDIA:~/Desktop/...``, ``MEDIA:~/Downloads/...`` or Windows ``AppData``
+# (which also holds per-user credentials and browser data). These are user
+# DATA, not agent-produced deliverables — they only belong in a chat if the
+# operator explicitly allowlists them via ``media_delivery_allow_dirs``.
+#
+# Kept separate from the credential subpaths above because the OS scratch
+# dir lives under one of them on Windows (``%TEMP%`` = AppData\Local\Temp):
+# a fresh agent-produced deliverable in the temp dir must still deliver
+# (see _path_under_denied_prefix's temp exemption), while personal data in
+# Documents/Desktop/Downloads/AppData-Roaming stays blocked.
+_MEDIA_DELIVERY_DENIED_USER_DATA_SUBPATHS = (
+    "AppData",              # Windows per-user app data (Roaming/Local/LocalLow)
+    "Application Data",     # legacy Windows per-user app data junction
+    "Documents and Settings",  # legacy Windows profile root
+    "Documents",
+    "Desktop",
+    "Downloads",
+    "OneDrive",             # Windows cloud-synced user data
+    "Pictures",
+    "Videos",
+    "Music",
+    "Library",              # macOS user Library (Application Support, Mail, ...)
+    "iCloud Drive",         # macOS cloud-synced user data
+)
+
 
 # Canonical cache subdirectories that hold deliverable artifacts. Used both
 # for the top-level safe roots above and to enumerate per-profile cache roots
@@ -1365,6 +1392,10 @@ def _media_delivery_denied_paths() -> List[Path]:
     home = Path(os.path.expanduser("~"))
     for sub in _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS:
         denied.append(home / sub)
+    # F6: user-data trees (Documents/Desktop/Downloads/AppData/...). Same
+    # home-relative resolution as the credential subpaths above.
+    for sub in _MEDIA_DELIVERY_DENIED_USER_DATA_SUBPATHS:
+        denied.append(home / sub)
     # The active Hermes profile and shared Hermes root both contain control
     # files and credentials. Only cache subdirectories under them are
     # explicitly allowlisted above (matched BEFORE this denylist in
@@ -1432,11 +1463,41 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
     denied paths, so they stay blocked regardless of this exception — it can
     only un-block a plain file sitting in the running user's home tree, never a
     credential location or another user's home.
+
+    F6 addition: a file sitting DIRECTLY in the home root (``~/secret.txt``,
+    ``~/notes.md``, ``~/tax-return.pdf``) is user data, not a working-dir
+    deliverable — deny it even for the running user. The exception above only
+    un-blocks files in home SUBDIRECTORIES (``~/work/...``), never the home
+    root itself.
     """
     try:
         home = Path(os.path.expanduser("~")).resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
         home = None
+    # F6: deny files directly in the user's home root. Do this before the
+    # loop so the home-tree exception (which un-denies /root for a root-run
+    # gateway) cannot rescue a bare home-root file.
+    if home is not None and resolved.parent == home:
+        return True
+    # OS scratch dir (tempfile.gettempdir()) — on Windows this lives under
+    # AppData\Local\Temp, which is inside a user-data deny prefix. Temp is
+    # scratch, not personal data: an agent-produced deliverable written to
+    # the temp dir (e.g. ``pandoc -o /tmp/report.pdf`` on a Windows host)
+    # must keep delivering, exactly like a fresh file in the working dir.
+    try:
+        import tempfile
+        _temp_root = Path(tempfile.gettempdir()).resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        _temp_root = None
+    in_temp = _temp_root is not None and _path_is_within(resolved, _temp_root)
+    # The user-data deny paths (for the temp exemption below).
+    _user_data_denied = []
+    if home is not None:
+        for _sub in _MEDIA_DELIVERY_DENIED_USER_DATA_SUBPATHS:
+            try:
+                _user_data_denied.append((home / _sub).resolve(strict=False))
+            except (OSError, RuntimeError, ValueError):
+                continue
     for denied in _media_delivery_denied_paths():
         try:
             resolved_denied = denied.expanduser().resolve(strict=False)
@@ -1447,6 +1508,14 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
         # Allow the running user's own home tree; its credential sub-dirs are
         # caught by their own (more-specific) denylist entries above.
         if home is not None and resolved_denied == home:
+            continue
+        # F6: a file in the OS temp dir that only matches a USER-DATA deny
+        # (AppData on Windows, etc.) is scratch, not personal data — allow
+        # it. Credential / system prefixes (~/.ssh, ~/.aws, Hermes secrets,
+        # /etc, /proc) are checked in the same loop and stay absolute; the
+        # exemption only fires for user-data prefixes, so a credential under
+        # temp is still denied by its own entry.
+        if in_temp and resolved_denied in _user_data_denied:
             continue
         return True
     return False
@@ -1745,12 +1814,15 @@ def validate_media_delivery_path(path: str) -> Optional[str]:
             return str(resolved)
 
     # Non-strict mode (default): accept anything not on the denylist.
-    # The denylist still blocks /etc, /proc, ~/.ssh, ~/.aws, and the
+    # The denylist still blocks /etc, /proc, ~/.ssh, ~/.aws, the
     # credential/secret stores under the Hermes root (~/.hermes/.env,
-    # auth.json, .anthropic_oauth.json, google_token.json, pairing/, ...) —
-    # so the obvious prompt-injection / credential-exfil sites
+    # auth.json, .anthropic_oauth.json, google_token.json, pairing/, ...),
+    # the user-data trees (~/Documents, ~/Desktop, ~/Downloads, Windows
+    # AppData, ...) and files directly in the home root — so the obvious
+    # prompt-injection / credential-exfil / personal-data-exfil sites
     # (``MEDIA:/etc/passwd``, ``MEDIA:~/.ssh/id_rsa``,
-    # ``MEDIA:~/.hermes/google_token.json``) remain rejected.
+    # ``MEDIA:~/.hermes/google_token.json``, ``MEDIA:~/Documents/tax.pdf``)
+    # remain rejected.
     if not _media_delivery_strict_mode():
         if _path_under_denied_prefix(resolved):
             return None
