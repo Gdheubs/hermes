@@ -2293,6 +2293,180 @@ def _expand_routing_tokens(part: str) -> List[str]:
     return expanded
 
 
+# F9: colon-form delivery targets (``platform:chat_id``) must resolve to a
+# chat the operator owns or has explicitly allowlisted for that platform.
+# A raw chat id typed into ``deliver`` is otherwise handed straight to the
+# adapter at fire time (pass_unresolved_references=True), letting any chat
+# user who can create a job exfil its output to an arbitrary chat on the
+# same platform — the platform's allow_from / group allowlists are never
+# consulted. Home channels, channel-directory entries, and the creating
+# session's own chat are all operator-owned and accepted; everything else is
+# rejected at create time (fail closed).
+
+# Per-platform env allowlists consulted for the ownership check. Mirrors the
+# gateway authorization env maps (gateway/authz_mixin.py) so a colon-form
+# target only counts as "known" when the operator allowed that user/chat.
+_PLATFORM_USER_ALLOWLIST_ENV = {
+    "telegram": "TELEGRAM_ALLOWED_USERS",
+    "discord": "DISCORD_ALLOWED_USERS",
+    "whatsapp": "WHATSAPP_ALLOWED_USERS",
+    "whatsapp_cloud": "WHATSAPP_CLOUD_ALLOWED_USERS",
+    "slack": "SLACK_ALLOWED_USERS",
+    "signal": "SIGNAL_ALLOWED_USERS",
+    "email": "EMAIL_ALLOWED_USERS",
+    "sms": "SMS_ALLOWED_USERS",
+    "mattermost": "MATTERMOST_ALLOWED_USERS",
+    "matrix": "MATRIX_ALLOWED_USERS",
+    "dingtalk": "DINGTALK_ALLOWED_USERS",
+    "feishu": "FEISHU_ALLOWED_USERS",
+    "wecom": "WECOM_ALLOWED_USERS",
+    "wecom_callback": "WECOM_CALLBACK_ALLOWED_USERS",
+    "weixin": "WEIXIN_ALLOWED_USERS",
+    "bluebubbles": "BLUEBUBBLES_ALLOWED_USERS",
+    "qqbot": "QQ_ALLOWED_USERS",
+    "yuanbao": "YUANBAO_ALLOWED_USERS",
+}
+_PLATFORM_CHAT_ALLOWLIST_ENV = {
+    "telegram": "TELEGRAM_GROUP_ALLOWED_CHATS",
+    "qqbot": "QQ_GROUP_ALLOWED_USERS",
+}
+
+
+def _delivery_chat_is_operator_owned(
+    platform_name: str, chat_id: str, origin: Optional[dict]
+) -> bool:
+    """Return True when a colon-form cron delivery chat is operator-owned.
+
+    Accepted sources (fail-closed: anything else is unknown):
+      1. the platform's configured home channel chat_id
+      2. the creating session's own chat (origin)
+      3. a channel-directory entry (operator-registered name/id)
+      4. the platform's allowlists — env vars ({PLATFORM}_ALLOWED_USERS,
+         {PLATFORM}_GROUP_ALLOWED_CHATS, GATEWAY_ALLOWED_USERS) and
+         config.yaml ``allow_from`` / ``group_allow_from`` /
+         ``group_allowed_chats`` under the platform's extra block.
+    """
+    platform_lower = platform_name.lower()
+
+    # 1. Home channel — explicitly operator-configured.
+    try:
+        if str(chat_id) == str(_get_home_target_chat_id(platform_lower)):
+            return True
+    except Exception:
+        pass
+
+    # 2. The creating session's own chat (origin ownership). Also covers
+    #    cron-context creates, where the creating run's own persistent
+    #    target is published via HERMES_CRON_AUTO_DELIVER_* contextvars
+    #    (that IS the operator-owned chat the parent job delivers to).
+    if origin:
+        try:
+            if (
+                str(origin.get("platform") or "").lower() == platform_lower
+                and str(origin.get("chat_id")) == str(chat_id)
+            ):
+                return True
+        except Exception:
+            pass
+    try:
+        from gateway.session_context import get_session_env
+
+        if (
+            str(get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM", "") or "").strip().lower()
+            == platform_lower
+            and str(get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "") or "").strip()
+            == str(chat_id)
+        ):
+            return True
+    except Exception:
+        pass
+
+    # 3. Channel directory — operator-registered names/ids.
+    try:
+        from gateway.channel_directory import resolve_channel_name
+
+        if resolve_channel_name(platform_lower, chat_id):
+            return True
+    except Exception:
+        pass
+
+    # 4a. Env allowlists.
+    allowed: set = set()
+    env_vars = [
+        _PLATFORM_USER_ALLOWLIST_ENV.get(platform_lower, ""),
+        _PLATFORM_CHAT_ALLOWLIST_ENV.get(platform_lower, ""),
+        "GATEWAY_ALLOWED_USERS",
+    ]
+    for env_var in env_vars:
+        if not env_var:
+            continue
+        try:
+            from gateway.authz_mixin import _platform_gate_env, _coerce_allow_set
+
+            raw = _platform_gate_env(env_var)
+        except Exception:
+            raw = os.getenv(env_var, "") or ""
+        if raw:
+            allowed |= _coerce_allow_set(raw)
+
+    # 4b. config.yaml allow_from / group_allow_from / group_allowed_chats.
+    try:
+        from gateway.config import load_gateway_config
+
+        cfg = load_gateway_config()
+        platform_cfg = cfg.platforms.get(platform_lower)
+        if platform_cfg is not None:
+            extra = getattr(platform_cfg, "extra", None) or {}
+            for key in ("allow_from", "group_allow_from", "group_allowed_chats"):
+                raw = extra.get(key)
+                if raw:
+                    from gateway.authz_mixin import _coerce_allow_set
+
+                    allowed |= _coerce_allow_set(raw)
+    except Exception:
+        pass
+
+    if "*" in allowed or str(chat_id) in allowed:
+        return True
+    return False
+
+
+def _validate_deliver_targets_owned(deliver_value: Optional[str], origin: Optional[dict]) -> Optional[str]:
+    """Return an error string when a colon-form ``deliver`` element targets a
+    chat that isn't operator-owned/allowlisted, else None (F9).
+
+    ``local`` / ``origin`` / ``all`` / bare platform names need no concrete
+    chat validation (they resolve to the operator's own home channel or the
+    creating session at fire time). Only ``platform:chat_id`` colon forms are
+    checked. Callers should run this at CREATE/UPDATE time so an unknown
+    target is rejected before the job is stored.
+    """
+    if not deliver_value:
+        return None
+    for part in str(deliver_value).split(","):
+        part = part.strip()
+        if not part or part.lower() in {"local", "origin", "all"}:
+            continue
+        if ":" not in part:
+            continue  # bare platform name → home channel at fire time
+        platform_name, rest = part.split(":", 1)
+        platform_name = platform_name.strip()
+        chat_id = rest.split(":", 1)[0].strip()  # strip optional :thread
+        if not platform_name or not chat_id:
+            continue
+        if _delivery_chat_is_operator_owned(platform_name, chat_id, origin):
+            continue
+        return (
+            f"deliver target '{part}' is not a chat you own or have allowlisted "
+            f"for {platform_name}. Colon-form delivery targets must be the "
+            f"platform's home channel, a channel-directory entry, a chat in the "
+            f"platform's allowlist (allow_from / group_allow_from / "
+            f"group_allowed_chats / {platform_name.upper()}_ALLOWED_USERS), or "
+            f"the chat this job was created from."
+        )
+    return None
+
+
 def _resolve_delivery_targets(job: dict) -> List[dict]:
     """Resolve all concrete auto-delivery targets for a cron job.
 
@@ -6679,6 +6853,17 @@ def create_job_with_scheduler_registration(**kwargs) -> dict:
     """Persist one job and register its first trigger with the active provider."""
     from cron.jobs import create_job
     from cron.scheduler_provider import resolve_cron_scheduler
+
+    # F9: reject colon-form delivery targets that aren't operator-owned /
+    # allowlisted BEFORE the job is stored. Fire-time resolution hands raw
+    # colon-form ids straight to the adapter (pass_unresolved_references),
+    # so an unchecked ``deliver=telegram:<arbitrary>`` would let any chat
+    # user exfil job output to a chat they don't own.
+    _deliver_error = _validate_deliver_targets_owned(
+        kwargs.get("deliver"), kwargs.get("origin")
+    )
+    if _deliver_error:
+        raise ValueError(_deliver_error)
 
     job = create_job(**kwargs)
     try:

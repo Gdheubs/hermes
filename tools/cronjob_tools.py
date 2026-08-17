@@ -1469,9 +1469,20 @@ def cronjob(
             if name is not None:
                 updates["name"] = name
             if deliver is not None:
-                updates["deliver"] = _resolve_cron_context_deliver(
+                _new_deliver = _resolve_cron_context_deliver(
                     _normalize_deliver_param(deliver)
                 )
+                # F9: same create-time ownership check — updating a job's
+                # colon-form deliver target to an arbitrary chat would bypass
+                # the platform allowlist just like creating one would.
+                from cron.scheduler import _validate_deliver_targets_owned
+
+                _deliver_error = _validate_deliver_targets_owned(
+                    _new_deliver, job.get("origin")
+                )
+                if _deliver_error:
+                    return tool_error(_deliver_error, success=False)
+                updates["deliver"] = _new_deliver
             if skills is not None or skill is not None:
                 canonical_skills = _canonical_skills(skill, skills)
                 updates["skills"] = canonical_skills

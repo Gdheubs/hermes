@@ -13,6 +13,8 @@ origin to resolve at fire time).
 
 import json
 
+from unittest.mock import patch
+
 import pytest
 
 from gateway.session_context import _VAR_MAP, clear_session_vars, set_session_vars
@@ -117,11 +119,19 @@ class TestCronContextDeliveryResolution:
         assert result["deliver"] == "telegram:-100123456:17,all"
 
     def test_explicit_target_passes_through_verbatim(self, temp_cron_home):
-        tokens, extra = _enter_cron_context("telegram", "-100999", "3")
-        try:
-            result = _create(deliver="discord:#engineering")
-        finally:
-            _exit_cron_context(tokens, extra)
+        # F9: the target must be an operator-owned chat — here the channel
+        # directory entry the operator registered. The cron-context resolver
+        # must still pass the explicit target through verbatim (not rewrite
+        # it to the creator's telegram target).
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="123456789012345678",
+        ):
+            tokens, extra = _enter_cron_context("telegram", "-100999", "3")
+            try:
+                result = _create(deliver="discord:#engineering")
+            finally:
+                _exit_cron_context(tokens, extra)
         assert result["deliver"] == "discord:#engineering"
 
     def test_local_passes_through(self, temp_cron_home):
@@ -131,6 +141,62 @@ class TestCronContextDeliveryResolution:
         finally:
             _exit_cron_context(tokens, extra)
         assert result["deliver"] == "local"
+
+
+# ── F9: colon-form delivery targets must be operator-owned/allowlisted ───────
+
+
+class TestColonFormDeliveryTargetOwnership:
+    """F9: ``deliver=platform:chat_id`` colon forms must resolve to a chat the
+    operator owns or explicitly allowlisted — otherwise any chat user who can
+    create a job could point its output at an arbitrary chat on the same
+    platform (the platform's allow_from / group allowlists were never
+    consulted; fire-time resolution handed raw ids to the adapter)."""
+
+    def test_unknown_colon_target_rejected_at_create(self, temp_cron_home, monkeypatch):
+        """No home channel, no directory entry, no allowlist, no origin match
+        for a telegram:... target → the create must fail closed."""
+        monkeypatch.delenv("TELEGRAM_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("TELEGRAM_GROUP_ALLOWED_CHATS", raising=False)
+        monkeypatch.delenv("GATEWAY_ALLOWED_USERS", raising=False)
+        result = _create(deliver="telegram:-1001234567890")
+        assert result["success"] is False
+        assert "not a chat you own" in result.get("error", "")
+
+    def test_origin_chat_target_accepted(self, temp_cron_home):
+        """The creating session's own chat is operator-owned by definition."""
+        tokens, extra = _enter_cron_context("telegram", "-100123456", "17")
+        try:
+            result = _create(deliver="telegram:-100123456:17")
+        finally:
+            _exit_cron_context(tokens, extra)
+        assert result["success"] is True
+        assert result["deliver"] == "telegram:-100123456:17"
+
+    def test_allowlisted_chat_target_accepted(self, temp_cron_home, monkeypatch):
+        """A chat in the platform's env allowlist is operator-owned."""
+        monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "111,222")
+        result = _create(deliver="telegram:222")
+        assert result["success"] is True
+        assert result["deliver"] == "telegram:222"
+
+    def test_directory_entry_target_accepted(self, temp_cron_home):
+        """A channel-directory entry (operator-registered) is owned."""
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="9876543210",
+        ):
+            result = _create(deliver="telegram:ops-room")
+        assert result["success"] is True
+        assert result["deliver"] == "telegram:ops-room"
+
+    def test_bare_platform_and_routing_tokens_always_accepted(self, temp_cron_home):
+        """Bare platform names / local / origin / all resolve to the operator's
+        own home channel or creating session at fire time — never rejected."""
+        for deliver in ("local", "origin", "telegram", "all", "origin,all"):
+            result = _create(deliver=deliver)
+            assert result["success"] is True, (deliver, result)
+
 
     def test_stored_deliver_never_literal_origin_in_cron_context(self, temp_cron_home):
         from cron.jobs import get_job
