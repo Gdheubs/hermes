@@ -24,6 +24,10 @@ from __future__ import annotations
 
 import logging
 import os
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from run_agent import AIAgent
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
@@ -118,7 +122,7 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
 
 
 def finalize_turn(
-    agent,
+    agent: AIAgent,
     *,
     final_response,
     api_call_count,

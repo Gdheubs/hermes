@@ -25,7 +25,10 @@ import threading
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
+
+if TYPE_CHECKING:
+    from run_agent import AIAgent
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
@@ -512,7 +515,7 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
     return _chars(api_payload) // 4
 
 
-def _is_openai_codex_backend(agent) -> bool:
+def _is_openai_codex_backend(agent: AIAgent) -> bool:
     base_url_lower = str(getattr(agent, "_base_url_lower", "") or "")
     base_url_hostname = str(getattr(agent, "_base_url_hostname", "") or "")
     return (
@@ -560,7 +563,7 @@ def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
     return None
 
 
-def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
+def _provider_preferences_for_agent(agent: AIAgent) -> Dict[str, Any]:
     """Build the validated provider-routing object shared by request paths."""
     preferences: Dict[str, Any] = {}
     if agent.providers_allowed:
@@ -579,7 +582,7 @@ def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
     return preferences
 
 
-def _prompt_cache_scope_for_agent(agent) -> "str | None":
+def _prompt_cache_scope_for_agent(agent: AIAgent) -> "str | None":
     """Rotation-stable logical cache scope for *agent*, or None.
 
     Guarded-import wrapper over the never-raising
@@ -597,7 +600,7 @@ def _prompt_cache_scope_for_agent(agent) -> "str | None":
         return None
 
 
-def _merge_nous_portal_messages_extra_body(agent, anthropic_kwargs: dict) -> dict:
+def _merge_nous_portal_messages_extra_body(agent: AIAgent, anthropic_kwargs: dict) -> dict:
     """Merge Portal ``tags`` / ``session_id`` onto an Anthropic Messages kwargs dict.
 
     The Nous provider profile is only consulted by the OpenAI-wire transport;
@@ -712,21 +715,21 @@ def _codex_wait_notice_recovery(
 # Past the give-up threshold, calls abort immediately with an actionable
 # error instead of re-waiting out the stale timeout.
 
-def _stale_streak(agent) -> int:
+def _stale_streak(agent: AIAgent) -> int:
     try:
         return int(getattr(agent, "_consecutive_stale_streams", 0) or 0)
     except Exception:
         return 0
 
 
-def _bump_stale_streak(agent) -> None:
+def _bump_stale_streak(agent: AIAgent) -> None:
     try:
         agent._consecutive_stale_streams = _stale_streak(agent) + 1
     except Exception:
         pass
 
 
-def _reset_stale_streak(agent) -> None:
+def _reset_stale_streak(agent: AIAgent) -> None:
     try:
         agent._consecutive_stale_streams = 0
     except Exception:
@@ -797,7 +800,7 @@ def _report_stale_nonstream_kill(
         logger.debug("stale status buffering failed", exc_info=True)
 
 
-def _touch_stale_kill_activity(agent, elapsed: float) -> None:
+def _touch_stale_kill_activity(agent: AIAgent, elapsed: float) -> None:
     try:
         agent._touch_activity(
             f"stale non-streaming call killed after {int(elapsed)}s"
@@ -806,7 +809,7 @@ def _touch_stale_kill_activity(agent, elapsed: float) -> None:
         logger.debug("stale activity touch failed", exc_info=True)
 
 
-def _check_stale_giveup(agent) -> None:
+def _check_stale_giveup(agent: AIAgent) -> None:
     """Raise immediately when the consecutive-stale streak is past the
     give-up threshold — no network attempt, no stale-timeout wait."""
     _giveup = env_int("HERMES_STREAM_STALE_GIVEUP", 5)
@@ -820,7 +823,7 @@ def _check_stale_giveup(agent) -> None:
         )
 
 
-def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
+def _derive_stream_stale_timeout(agent: AIAgent, api_kwargs: dict) -> float:
     """Stale-stream patience for a provider that is never a local endpoint.
 
     Mirrors the main streaming path's derivation — provider config → env base
@@ -923,7 +926,7 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
     return None
 
 
-def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
+def _dispatch_nonstreaming_api_request(agent: AIAgent, api_kwargs: dict, *, make_client):
     """Run one non-streaming LLM request for the active api_mode and return it.
 
     Shared by the interrupt-worker path (``interruptible_api_call``) and the
@@ -999,7 +1002,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     return request_client.chat.completions.create(**api_kwargs)
 
 
-def should_use_direct_api_call(agent) -> bool:
+def should_use_direct_api_call(agent: AIAgent) -> bool:
     """Whether an OpenAI-wire request should skip the interrupt worker.
 
     Two nested-pool contexts wedge before the socket opens when the request
@@ -1051,7 +1054,7 @@ def should_use_direct_api_call(agent) -> bool:
 _DIRECT_API_ACTIVITY_HEARTBEAT_SECONDS = 15.0
 
 
-def _resolve_direct_stale_timeout(agent, api_kwargs: dict) -> float:
+def _resolve_direct_stale_timeout(agent: AIAgent, api_kwargs: dict) -> float:
     """Stale budget for the inline non-streaming call.
 
     Same derivation the interrupt-worker path uses for its stale-call
@@ -1105,7 +1108,7 @@ def _inline_nonstream_hard_timeout(stale_timeout: float):
         return stale_timeout
 
 
-def direct_api_call(agent, api_kwargs: dict):
+def direct_api_call(agent: AIAgent, api_kwargs: dict):
     """Run a non-streaming LLM call inline on the conversation thread.
 
     Used when ``should_use_direct_api_call`` is True (cron turns and
@@ -1332,7 +1335,7 @@ def direct_api_call(agent, api_kwargs: dict):
             )
 
 
-def interruptible_api_call(agent, api_kwargs: dict):
+def interruptible_api_call(agent: AIAgent, api_kwargs: dict):
     """
     Run the API call in a background thread so the main conversation loop
     can detect interrupts without waiting for the full HTTP round-trip.
@@ -1822,7 +1825,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
 
 
-def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = None) -> dict:
+def build_api_kwargs(agent: AIAgent, api_messages: list, tools_for_api: list | None = None) -> dict:
     """Build the keyword arguments dict for the active API mode."""
     if tools_for_api is None:
         tools_for_api = agent.tools
@@ -2112,7 +2115,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
 
 
 
-def build_assistant_message(agent, assistant_message, finish_reason: str) -> dict:
+def build_assistant_message(agent: AIAgent, assistant_message, finish_reason: str) -> dict:
     """Build a normalized assistant message dict from an API response message.
 
     Handles reasoning extraction, reasoning_details, and optional tool_calls
@@ -2366,7 +2369,7 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
 
 
 
-def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
+def rewrite_prompt_model_identity(agent: AIAgent, model: str, provider: str) -> None:
     """Point the cached system prompt's ``Model:``/``Provider:`` lines at
     the active runtime after a provider switch.
 
@@ -2403,7 +2406,7 @@ def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
     )
 
 
-def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str]:
+def _fallback_entry_unavailable_without_network(agent: AIAgent, fb: dict) -> Optional[str]:
     """Return a skip reason for fallback entries known to be unusable locally."""
     fb_provider = (fb.get("provider") or "").strip().lower()
     if fb_provider != "nous":
@@ -2424,7 +2427,7 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
 
 
 
-def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
+def try_activate_fallback(agent: AIAgent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
 
     Called when the current model is failing after retries.  Swaps the
@@ -2842,7 +2845,7 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 
 
-def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
+def handle_max_iterations(agent: AIAgent, messages: list, api_call_count: int) -> str:
     """Request a summary when max iterations are reached. Returns the final response text."""
     agent._safe_print(
         f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
@@ -3188,7 +3191,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
 
 
-def cleanup_task_resources(agent, task_id: str) -> None:
+def cleanup_task_resources(agent: AIAgent, task_id: str) -> None:
     """Clean up VM and browser resources for a given task.
 
     Skips ``cleanup_vm`` when the active terminal environment is marked
@@ -3268,7 +3271,7 @@ def _build_partial_stream_stub(
     )
 
 
-def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
+def interruptible_streaming_api_call(agent: AIAgent, api_kwargs: dict, *, on_first_delta=None):
     """Streaming variant of _interruptible_api_call for real-time token delivery.
 
     Handles all three api_modes:

@@ -20,7 +20,10 @@ import json
 import logging
 import time
 from types import SimpleNamespace
-from typing import Any, Callable, Dict, List
+from typing import TYPE_CHECKING, Any, Callable, Dict, List
+
+if TYPE_CHECKING:
+    from run_agent import AIAgent
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
@@ -101,7 +104,7 @@ def _coerce_usage_int(value: Any) -> int:
     return 0
 
 
-def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
+def _record_codex_app_server_usage(agent: AIAgent, turn) -> dict[str, Any]:
     """Translate Codex app-server token usage into Hermes accounting.
 
     Codex app-server reports usage via thread/tokenUsage/updated as:
@@ -487,7 +490,7 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
     return "", False
 
 
-def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
+def make_codex_app_server_event_bridge(agent: AIAgent) -> Callable[[dict], None]:
     """Build an ``on_event`` callback that wires codex app-server JSON-RPC
     notifications into Hermes' gateway UI callbacks.
 
@@ -1305,7 +1308,7 @@ def _consume_codex_event_stream(
     return final
 
 
-def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
+def run_codex_stream(agent: AIAgent, api_kwargs: dict, client: Any = None, on_first_delta=None):
     """Execute one streaming Responses API request and return the final response.
 
     Uses ``responses.create(stream=True)`` (low-level raw event iteration)
@@ -1551,7 +1554,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         )
 
 
-def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None):
+def run_codex_create_stream_fallback(agent: AIAgent, api_kwargs: dict, client: Any = None):
     """Backward-compatible alias for the unified event-driven path.
 
     Historically this was the fallback when the SDK's high-level

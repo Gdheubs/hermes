@@ -21,7 +21,10 @@ import random
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from run_agent import AIAgent
 
 from agent.display import (
     KawaiiSpinner,
@@ -76,7 +79,7 @@ def _ensure_file_checkpoint(
     agent._checkpoint_mgr.ensure_checkpoint(work_dir, f"before {function_name}")
 
 
-def _budget_for_agent(agent) -> BudgetConfig:
+def _budget_for_agent(agent: AIAgent) -> BudgetConfig:
     """Resolve a tool-result BudgetConfig scaled to the agent's context window.
 
     Large-context models keep the historical 100K/200K char defaults; small
@@ -256,7 +259,7 @@ def _is_interpreter_shutdown_submit_error(exc: RuntimeError) -> bool:
 
 
 def _emit_terminal_post_tool_call(
-    agent,
+    agent: AIAgent,
     *,
     function_name: str,
     function_args: dict,
@@ -301,7 +304,7 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
 
 
 def _emit_cancelled_terminal_post_tool_call(
-    agent,
+    agent: AIAgent,
     *,
     function_name: str,
     function_args: dict,
@@ -329,7 +332,7 @@ def _emit_cancelled_terminal_post_tool_call(
     return result
 
 
-def _tool_search_scoped_names(agent) -> frozenset:
+def _tool_search_scoped_names(agent: AIAgent) -> frozenset:
     """Return the deferrable tool names the session may invoke via tool_call.
 
     The Tool Search unwrap dispatches the underlying tool directly, bypassing
@@ -1045,7 +1048,7 @@ def _begin_tool_execution(
             pass
 
 
-def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_concurrent(agent: AIAgent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
     Results are collected in the original tool-call order and appended to
@@ -1890,7 +1893,7 @@ def _append_cancelled_tool_results(messages: list, tool_calls, *, reason: str) -
         ))
 
 
-def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def execute_tool_calls_sequential(agent: AIAgent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools.
 
     ``finalize=False`` skips the end-of-batch aggregate budget enforcement
@@ -2695,7 +2698,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
 
 
-def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
+def execute_tool_calls_segmented(agent: AIAgent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
     """Execute a mixed tool-call batch as ordered parallel/sequential segments.
 
     ``segments`` is the ``(kind, calls)`` plan from
