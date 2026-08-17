@@ -1561,6 +1561,13 @@ def _model_flow_named_custom(config, provider_info):
         fetch_kwargs = {"timeout": 8.0}
         if api_mode:
             fetch_kwargs["api_mode"] = api_mode
+        # Gateways fronting named custom providers often REQUIRE the entry's
+        # ``extra_headers`` (e.g. Bifrost's ``x-bf-vk`` virtual key) even on
+        # the /models probe — without them the probe 401s and the picker
+        # collapses to manual entry while chat works fine (#88463).
+        _probe_headers = provider_info.get("extra_headers")
+        if isinstance(_probe_headers, dict) and _probe_headers:
+            fetch_kwargs["headers"] = {str(k): str(v) for k, v in _probe_headers.items()}
         live_models = fetch_api_models(api_key, base_url, **fetch_kwargs)
         # If the probe came back empty but the operator configured an explicit
         # list, fall back to it rather than forcing manual entry.

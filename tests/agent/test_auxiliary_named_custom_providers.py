@@ -110,6 +110,44 @@ class TestResolveProviderClientNamedCustom:
         assert "beans.local" in str(client.base_url)
 
 
+    def test_named_custom_extra_headers_reach_the_client(self, tmp_path):
+        """#88463 — the entry's extra_headers are part of the endpoint contract.
+
+        Gateways like Bifrost require their virtual-key header on every
+        request; without it the main chat loop works (it threads the entry)
+        while every auxiliary call 401s.
+        """
+        _write_config(tmp_path, {
+            "model": {"default": "test-model"},
+            "custom_providers": [
+                {
+                    "name": "bifrost",
+                    "base_url": "http://bifrost.local/v1",
+                    "api_key": "k",
+                    "extra_headers": {"x-bf-vk": "vk-secret", "x-tenant": "acme"},
+                },
+            ],
+        })
+        from agent.auxiliary_client import resolve_provider_client
+        client, _model = resolve_provider_client("bifrost", "my-model")
+        assert client is not None
+        headers = getattr(client, "default_headers", {}) or {}
+        assert headers.get("x-bf-vk") == "vk-secret"
+        assert headers.get("x-tenant") == "acme"
+
+    def test_named_custom_without_extra_headers_unchanged(self, tmp_path):
+        """No extra_headers on the entry → client built exactly as before."""
+        _write_config(tmp_path, {
+            "model": {"default": "test-model"},
+            "custom_providers": [
+                {"name": "plain", "base_url": "http://plain.local/v1", "api_key": "k"},
+            ],
+        })
+        from agent.auxiliary_client import resolve_provider_client
+        client, _model = resolve_provider_client("plain", "my-model")
+        assert client is not None
+        assert "plain.local" in str(client.base_url)
+
     def test_named_custom_no_api_key_uses_fallback(self, tmp_path):
         _write_config(tmp_path, {
             "model": {"default": "test"},
