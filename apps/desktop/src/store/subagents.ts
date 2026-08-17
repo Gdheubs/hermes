@@ -18,6 +18,8 @@ export interface SubagentProgress {
   goal: string
   /** The child's own stored session id — lets UIs open its session window. */
   sessionId?: string
+  /** Operator-owned delegation route alias, when the child was spawned on one. */
+  route?: string
   model?: string
   status: SubagentStatus
   taskCount: number
@@ -189,6 +191,7 @@ function toProgress(payload: SubagentPayload, prev: SubagentProgress | undefined
     parentId: str(payload.parent_id) || prev?.parentId || null,
     goal: str(payload.goal) || prev?.goal || 'Subagent',
     sessionId: str(payload.child_session_id) || prev?.sessionId,
+    route: str(payload.route) || prev?.route,
     model: str(payload.model) || prev?.model,
     status,
     taskCount: num(payload.task_count) ?? prev?.taskCount ?? 1,
@@ -285,6 +288,22 @@ export function upsertSubagent(sid: string, payload: SubagentPayload, createIfMi
   const nextList = idx >= 0 ? list.map(item => (item.id === id ? next : item)) : [...list, next]
 
   $subagentsBySession.set({ ...map, [sid]: nextList })
+}
+
+/** Rebuild live children that were already running before this renderer
+ * attached or reconnected. Prefer the durable stored parent id so sidebar
+ * rows (keyed on stored session ids) light up even when the commissioning
+ * UI sid has rotated. */
+export function hydrateActiveSubagents(snapshots: readonly SubagentPayload[]) {
+  for (const snapshot of snapshots) {
+    const parentSessionId = str(snapshot.parent_session_id) || str(snapshot.owner_session_id)
+
+    if (!parentSessionId) {
+      continue
+    }
+
+    upsertSubagent(parentSessionId, snapshot, true, 'subagent.start')
+  }
 }
 
 export function buildSubagentTree(items: readonly SubagentProgress[]): SubagentNode[] {

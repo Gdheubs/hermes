@@ -5994,6 +5994,8 @@ def _on_tool_progress(
             payload["depth"] = int(_kwargs["depth"])
         if _kwargs.get("model"):
             payload["model"] = str(_kwargs["model"])
+        if _kwargs.get("route"):
+            payload["route"] = str(_kwargs["route"])
         if _kwargs.get("tool_count") is not None:
             payload["tool_count"] = int(_kwargs["tool_count"])
         if _kwargs.get("toolsets"):

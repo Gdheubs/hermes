@@ -300,28 +300,61 @@ def _capture_gateway_steer_authority(
         return None, None
 
 
-def list_active_subagents() -> List[Dict[str, Any]]:
+def list_active_subagents(
+    *,
+    owner_transport: Any = None,
+    include_owner_session: bool = False,
+) -> List[Dict[str, Any]]:
     """Snapshot of the currently running subagent tree.
 
     Each record: {subagent_id, parent_id, depth, goal, model, started_at,
-    tool_count, status}.  Safe to call from any thread — returns a copy.
+    tool_count, status}.  Passing ``owner_transport`` scopes the snapshot to
+    the caller's UI transport.  Only that scoped form may include the parent
+    runtime session id needed to rehydrate a reconnecting UI.
+
+    Safe to call from any thread — returns copies.
     """
     with _active_subagents_lock:
-        return [
-            {
-                k: v
-                for k, v in r.items()
-                if k
-                not in {
-                    "agent",
-                    "owner_session_id",
-                    "owner_transport",
-                    "owner_session_record",
-                    "accepting_steer",
-                }
+        records = list(_active_subagents.values())
+
+    snapshots: List[Dict[str, Any]] = []
+    for record in records:
+        if owner_transport is not None and record.get("owner_transport") is not owner_transport:
+            continue
+
+        snapshot = {
+            k: v
+            for k, v in record.items()
+            if k
+            not in {
+                "agent",
+                "owner_session_id",
+                "owner_transport",
+                "owner_session_record",
+                "accepting_steer",
             }
-            for r in _active_subagents.values()
-        ]
+        }
+
+        if include_owner_session and owner_transport is not None:
+            owner_session_id = record.get("owner_session_id")
+            if isinstance(owner_session_id, str) and owner_session_id:
+                snapshot["owner_session_id"] = owner_session_id
+
+            child_session_id = getattr(record.get("agent"), "session_id", None)
+            if isinstance(child_session_id, str) and child_session_id:
+                snapshot["child_session_id"] = child_session_id
+
+            parent_session_id = record.get("parent_session_id")
+            if isinstance(parent_session_id, str) and parent_session_id:
+                snapshot["parent_session_id"] = parent_session_id
+
+            route = record.get("route")
+            if isinstance(route, str) and route:
+                snapshot["route"] = route
+
+        snapshots.append(snapshot)
+
+    return snapshots
 
 
 def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) -> bool:
@@ -1235,6 +1268,7 @@ def _build_child_progress_callback(
     model: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
     session_ref: Optional[Dict[str, Any]] = None,
+    route: Optional[str] = None,
 ) -> Optional[callable]:
     """Build a callback that relays child agent tool calls to the parent display.
 
@@ -1280,6 +1314,8 @@ def _build_child_progress_callback(
             kw["depth"] = depth
         if model is not None:
             kw["model"] = model
+        if route:
+            kw["route"] = str(route)
         if toolsets is not None:
             kw["toolsets"] = list(toolsets)
         # The child's own session id — filled into the shared ref once the
@@ -1486,6 +1522,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    route: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1619,6 +1656,7 @@ def _build_child_agent(
         model=effective_model_for_cb,
         toolsets=child_toolsets,
         session_ref=child_session_ref,
+        route=route,
     )
 
     # Each subagent gets its own iteration budget capped at max_iterations
@@ -2320,6 +2358,7 @@ def _run_single_child(
     owner_session_id: Optional[str] = None,
     owner_transport: Any = None,
     owner_session_record: Any = None,
+    route: Optional[str] = None,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
@@ -2481,6 +2520,7 @@ def _run_single_child(
                     if isinstance(getattr(child, "model", None), str)
                     else None
                 ),
+                "task_index": task_index,
                 "started_at": time.time(),
                 "status": "running",
                 "tool_count": 0,
@@ -2490,6 +2530,8 @@ def _run_single_child(
                 "owner_session_id": owner_session_id,
                 "owner_transport": owner_transport,
                 "owner_session_record": owner_session_record,
+                "parent_session_id": getattr(parent_agent, "session_id", None),
+                "route": route,
             }
         )
 

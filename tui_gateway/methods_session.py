@@ -3182,10 +3182,19 @@ def _(rid, params: dict) -> dict:
         _get_max_spawn_depth,
     )
 
+    # A reconnecting desktop has no replay buffer for relayed ``subagent.*``
+    # events. Return only children owned by THIS transport, including their
+    # parent runtime ids, so it can rebuild its in-memory status projection
+    # without exposing another client's session topology.
+    transport = current_transport() or _stdio_transport
+
     return _ok(
         rid,
         {
-            "active": list_active_subagents(),
+            "active": list_active_subagents(
+                owner_transport=transport,
+                include_owner_session=True,
+            ),
             "paused": is_spawn_paused(),
             "max_spawn_depth": _get_max_spawn_depth(),
             "max_concurrent_children": _get_max_concurrent_children(),

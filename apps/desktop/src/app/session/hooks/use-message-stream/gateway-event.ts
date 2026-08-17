@@ -78,7 +78,12 @@ import {
   setYoloActive
 } from '@/store/session'
 import { dropSessionState, unbindTileRuntime } from '@/store/session-states'
-import { pruneDelegateFallbackSubagents, pruneFinishedSessionSubagents, upsertSubagent } from '@/store/subagents'
+import {
+  hydrateActiveSubagents,
+  pruneDelegateFallbackSubagents,
+  pruneFinishedSessionSubagents,
+  upsertSubagent
+} from '@/store/subagents'
 import { reportMcpToolResult } from '@/store/suggestion-providers/repair'
 import { invalidateSkillSuggestionIndex } from '@/store/suggestion-providers/skill'
 import { requestScrollToBottom } from '@/store/thread-scroll'
@@ -425,6 +430,26 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       }
 
       if (event.type === 'gateway.ready') {
+        // Relayed subagent events are transient. A renderer that connects after
+        // a delegation started (or reconnects during one) otherwise starts with
+        // an empty subagent store, making the parent look idle and hiding the
+        // parked-work notice above its composer until the next child event.
+        const gateway = $gateway.get()
+
+        void gateway
+          ?.request<{ active?: unknown }>('delegation.status')
+          .then(result => {
+            // A connection edit may replace the global gateway while the old
+            // request is in flight; never hydrate stale topology into the new
+            // backend's renderer state.
+            if ($gateway.get() !== gateway || !Array.isArray(result?.active)) {
+              return
+            }
+
+            hydrateActiveSubagents(result.active.filter(item => item && typeof item === 'object'))
+          })
+          .catch(() => undefined)
+
         // Seed the active skin into the desktop theme registry without applying,
         // so a fresh connect never overrides the user's persisted desktop theme.
         ingestBackendSkin((payload as { skin?: HermesSkin } | undefined)?.skin, { apply: false })

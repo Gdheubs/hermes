@@ -48,7 +48,43 @@ import {
   setSessions
 } from './session'
 import { ackStoredSessionId, markSessionUnreadFinished } from './session-unread'
+import { $subagentsBySession, activeSubagentCount } from './subagents'
 import { isSecondaryWindow } from './windows'
+
+const CHILD_STATUS_SOURCES = new Set(['subagent', 'tool'])
+
+function isDelegatedChildSession(storedId: string | null | undefined): boolean {
+  if (!storedId) {
+    return false
+  }
+
+  return $sessions.get().some(
+    session => sessionMatchesStoredId(session, storedId) && CHILD_STATUS_SOURCES.has(session.source ?? '')
+  )
+}
+
+function hasLiveDelegatedChildren(storedId: string | null | undefined): boolean {
+  if (!storedId) {
+    return false
+  }
+
+  const sessions = $sessions.get()
+  const states = $sessionStates.get()
+
+  for (const [runtimeId, items] of Object.entries($subagentsBySession.get())) {
+    if (activeSubagentCount(items) === 0) {
+      continue
+    }
+
+    const ownerId = states[runtimeId]?.storedSessionId ?? runtimeId
+
+    if (lineageAliases(ownerId, sessions).includes(storedId)) {
+      return true
+    }
+  }
+
+  return false
+}
 
 // ---------------------------------------------------------------------------
 // Reactive per-runtime session state (view mirror of the wiring cache).
@@ -231,9 +267,14 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
   } else if (!next.busy && wasWorking) {
     markSettled(storedId)
 
-    // FOCUSED, not selected: a session finishing in the tile the user is
-    // watching is already seen, and a tile is never the primary selection.
-    if (storedId !== $focusedStoredSessionId.get()) {
+    // Child/subagent heartbeats must not mint sidebar unread on the parent
+    // conversation. Their own rows are excluded from recents; treating a
+    // child settle as unread is what made parent dots ping-pong.
+    if (
+      !isDelegatedChildSession(storedId) &&
+      !hasLiveDelegatedChildren(storedId) &&
+      storedId !== $focusedStoredSessionId.get()
+    ) {
       // Re-light only genuinely new completions: if the user already viewed
       // this session (or its family) at or after this settle moment, a
       // re-assert of the same completion must not re-arm the dot. `-1` for
@@ -400,7 +441,7 @@ const storedIds = (
   const ids = new Set<string>()
 
   for (const [runtimeId, state] of Object.entries(states)) {
-    if (!pred(state)) {
+    if (!pred(state) || isDelegatedChildSession(state.storedSessionId ?? runtimeId)) {
       continue
     }
 

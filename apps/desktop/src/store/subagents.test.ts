@@ -7,6 +7,7 @@ import {
   buildSubagentTree,
   clearSessionSubagents,
   failedSubagentCount,
+  hydrateActiveSubagents,
   pruneDelegateFallbackSubagents,
   pruneFinishedSessionSubagents,
   upsertSubagent
@@ -131,6 +132,72 @@ describe('subagent store', () => {
 
     expect($subagentsBySession.get().s1).toBeUndefined()
     expect($subagentsBySession.get().s2).toHaveLength(1)
+  })
+
+  it('hydrates running children into their parent sessions after a gateway reconnect', () => {
+    hydrateActiveSubagents([
+      {
+        child_session_id: 'child-1',
+        goal: 'inspect the live status flow',
+        owner_session_id: 'parent-runtime-1',
+        status: 'running',
+        subagent_id: 'sa-reconnected',
+        task_index: 0
+      }
+    ])
+
+    const item = listFor('parent-runtime-1')[0]
+    expect(item).toMatchObject({
+      goal: 'inspect the live status flow',
+      id: 'sa-reconnected',
+      sessionId: 'child-1',
+      status: 'running'
+    })
+    expect(activeSubagentCount(listFor('parent-runtime-1'))).toBe(1)
+  })
+
+  it('preserves the delegation route alias on a hydrated child', () => {
+    hydrateActiveSubagents([
+      {
+        child_session_id: 'child-route-1',
+        goal: 'inspect the live status flow',
+        owner_session_id: 'parent-runtime-1',
+        parent_session_id: 'stored-parent-1',
+        route: 'implement',
+        status: 'running',
+        subagent_id: 'sa-routed',
+        task_index: 0
+      }
+    ])
+
+    expect(listFor('stored-parent-1')[0]).toMatchObject({
+      id: 'sa-routed',
+      route: 'implement',
+      status: 'running'
+    })
+  })
+
+  it('hydrates a child under its stored parent id so sidebar rows light up', () => {
+    hydrateActiveSubagents([
+      {
+        child_session_id: '20260816_081051_6efbd7',
+        goal: 'resume the interrupted Phase 7 repair',
+        owner_session_id: '10b21015',
+        parent_session_id: '20260812_130336_16394e',
+        status: 'running',
+        subagent_id: 'sa-live-child',
+        task_index: 0
+      }
+    ])
+
+    expect(listFor('10b21015')).toHaveLength(0)
+    expect(listFor('20260812_130336_16394e')[0]).toMatchObject({
+      goal: 'resume the interrupted Phase 7 repair',
+      id: 'sa-live-child',
+      sessionId: '20260816_081051_6efbd7',
+      status: 'running'
+    })
+    expect(activeSubagentCount(listFor('20260812_130336_16394e'))).toBe(1)
   })
 
   // Regression test for #64015: still-RUNNING background subagents must survive

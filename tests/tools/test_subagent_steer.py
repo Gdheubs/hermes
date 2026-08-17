@@ -38,6 +38,8 @@ def _with_registered(
     owner_session_id: str | None = None,
     owner_transport=None,
     owner_session_record=None,
+    parent_session_id: str | None = None,
+    route: str | None = None,
 ) -> None:
     _register_subagent(
         {
@@ -50,6 +52,8 @@ def _with_registered(
             "owner_session_id": owner_session_id,
             "owner_transport": owner_transport,
             "owner_session_record": owner_session_record,
+            "parent_session_id": parent_session_id,
+            "route": route,
         }
     )
 
@@ -154,6 +158,37 @@ def test_status_snapshot_never_leaks_owner_or_lifecycle_metadata():
         assert all(value is not owner_session_record for value in snapshot.values())
     finally:
         _unregister_subagent("sid-private-metadata", agent=agent)
+
+
+def test_owner_scoped_status_snapshot_maps_child_to_its_parent_runtime():
+    from tools.delegate_tool import list_active_subagents
+
+    agent = _StubAgent()
+    agent.session_id = "child-session-1"
+    owner_transport = object()
+    _with_registered(
+        "sid-reconnect-hydration",
+        agent,
+        owner_session_id="parent-runtime-1",
+        owner_transport=owner_transport,
+        parent_session_id="20260812_130336_16394e",
+        route="implement",
+    )
+    try:
+        snapshot = next(
+            item
+            for item in list_active_subagents(
+                owner_transport=owner_transport,
+                include_owner_session=True,
+            )
+            if item["subagent_id"] == "sid-reconnect-hydration"
+        )
+        assert snapshot["owner_session_id"] == "parent-runtime-1"
+        assert snapshot["child_session_id"] == "child-session-1"
+        assert snapshot["parent_session_id"] == "20260812_130336_16394e"
+        assert snapshot["route"] == "implement"
+    finally:
+        _unregister_subagent("sid-reconnect-hydration", agent=agent)
 
 
 class TestMissedSteerRetention:

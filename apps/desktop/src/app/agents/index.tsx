@@ -347,6 +347,14 @@ function SubagentRow({ node, depth = 0, nowMs }: { node: SubagentNode; depth?: n
           ) : null}
         </span>
         {running ? <ActivityTimerText className="mt-1 shrink-0 text-[0.6rem]" seconds={durationSeconds} /> : null}
+        {node.route ? (
+          <span
+            className="mt-1 shrink-0 font-mono text-[0.6rem] text-muted-foreground/70"
+            data-testid="subagent-route"
+          >
+            {node.route}
+          </span>
+        ) : null}
       </button>
 
       {visibleRows.length > 0 ? (

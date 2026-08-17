@@ -7,7 +7,9 @@ import { isTargetSessionBusy } from '@/app/session/hooks/use-prompt-actions/util
 import type { ClientSessionState } from '@/app/types'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
+import { $gateway } from '@/store/gateway'
 import { setCurrentModel, setCurrentProvider } from '@/store/session'
+import { $subagentsBySession } from '@/store/subagents'
 import type { RpcEvent } from '@/types/hermes'
 
 import { PRE_TURN_LIVE_SETTLE_GRACE_MS } from './utils'
@@ -75,12 +77,16 @@ beforeEach(() => {
   queryClient = new QueryClient()
   setCurrentModel('')
   setCurrentProvider('')
+  $gateway.set(null)
+  $subagentsBySession.set({})
 })
 
 afterEach(() => {
   cleanup()
   setCurrentModel('')
   setCurrentProvider('')
+  $gateway.set(null)
+  $subagentsBySession.set({})
   vi.useRealTimers()
   vi.restoreAllMocks()
 })
@@ -116,6 +122,37 @@ describe('session.info config refetch gating', () => {
     })
 
     expect(refreshHermesConfig).not.toHaveBeenCalled()
+  })
+})
+
+describe('gateway.ready delegation hydration', () => {
+  it('rehydrates active children into their parent runtime session', async () => {
+    const request = vi.fn().mockResolvedValue({
+      active: [
+        {
+          child_session_id: 'child-session-1',
+          goal: 'inspect live state',
+          owner_session_id: 'parent-runtime-1',
+          parent_session_id: 'stored-parent-1',
+          status: 'running',
+          subagent_id: 'sa-reconnected',
+          task_index: 0
+        }
+      ]
+    })
+    $gateway.set({ request } as never)
+    await mountStream()
+
+    act(() => handleEvent!({ type: 'gateway.ready' }))
+
+    await waitFor(() => expect(request).toHaveBeenCalledWith('delegation.status'))
+    await waitFor(() =>
+      expect($subagentsBySession.get()['stored-parent-1']?.[0]).toMatchObject({
+        id: 'sa-reconnected',
+        sessionId: 'child-session-1',
+        status: 'running'
+      })
+    )
   })
 })
 

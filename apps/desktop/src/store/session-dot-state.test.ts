@@ -9,6 +9,9 @@ import { clearAllSessionStates, publishSessionState } from './session-states'
 import { $unreadWriteGuard } from './session-unread-remote'
 import { $subagentsBySession, type SubagentProgress } from './subagents'
 
+const storedRow = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo =>
+  ({ id, message_count: 1, source: 'cli', started_at: 0, title: id, ...extra }) as SessionInfo
+
 describe('showsRunningArc', () => {
   it('keeps the arc when an authoritative turn goes quiet', () => {
     expect(showsRunningArc('working')).toBe(true)
@@ -84,10 +87,49 @@ describe('$delegatingSessionIds', () => {
 
     expect($delegatingSessionIds.get()).toContain('runtime-fresh')
   })
-})
 
-const storedRow = (id: string, extra: Partial<SessionInfo> = {}): SessionInfo =>
-  ({ id, message_count: 1, source: 'cli', started_at: 0, title: id, ...extra }) as SessionInfo
+  it('claims a stored parent id when hydration keyed the child there', () => {
+    $subagentsBySession.set({ '20260812_130336_16394e': [subagent('running')] })
+
+    expect($delegatingSessionIds.get()).toContain('20260812_130336_16394e')
+    expect($sessionDotStateById.get()['20260812_130336_16394e']).toBe('working')
+  })
+
+  it('does not let a child heartbeat flip the parent row between working and unread', () => {
+    setSessions([
+      storedRow('20260812_130336_16394e', { source: 'desktop' }),
+      storedRow('20260816_081051_6efbd7', {
+        parent_session_id: '20260812_130336_16394e',
+        source: 'subagent'
+      })
+    ])
+    $subagentsBySession.set({ '20260812_130336_16394e': [subagent('running')] })
+
+    publishSessionState('child-runtime', {
+      ...createClientSessionState('20260816_081051_6efbd7'),
+      busy: true
+    })
+    expect($sessionDotStateById.get()['20260812_130336_16394e']).toBe('working')
+
+    publishSessionState('child-runtime', {
+      ...createClientSessionState('20260816_081051_6efbd7'),
+      busy: false
+    })
+    expect($sessionDotStateById.get()['20260812_130336_16394e']).toBe('working')
+    expect($sessionDotStateById.get()['20260816_081051_6efbd7'] ?? 'idle').not.toBe('working')
+    expect($sessionDotStateById.get()['20260816_081051_6efbd7'] ?? 'idle').not.toBe('unread')
+  })
+
+  it('does not mint unread when the parent turn ends while children are still running', () => {
+    publishSessionState('runtime-1', { ...createClientSessionState('stored-1'), busy: true })
+    $subagentsBySession.set({ 'runtime-1': [subagent('running')] })
+
+    publishSessionState('runtime-1', { ...createClientSessionState('stored-1'), busy: false })
+
+    expect($sessionDotStateById.get()['stored-1']).toBe('working')
+    expect($unreadFinishedSessionIds.get()).not.toContain('stored-1')
+  })
+})
 
 describe('persisted unread (backend watermark)', () => {
   beforeEach(() => {
