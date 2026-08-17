@@ -2386,6 +2386,94 @@ class TestAuxiliaryTaskExtraBody:
             "thinking": {"type": "disabled"}, "metadata": {"user_id": "u1"},
         }
 
+    def test_anthropic_aux_strips_response_format(self):
+        """#85624: response_format must never reach the Messages API.
+
+        It is an OpenAI chat.completions-only field. Bedrock rejects unknown
+        body keys with 'response_format: Extra inputs are not permitted',
+        which made every title_generation call fail on Bedrock/Anthropic.
+        """
+        api_kwargs = self._run_anthropic_adapter(
+            call_extra_body={
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"name": "session_title", "strict": True},
+                },
+            },
+        )
+        # Nothing survived, so no extra_body should be attached at all.
+        assert "response_format" not in (api_kwargs.get("extra_body") or {})
+        assert "extra_body" not in api_kwargs
+
+    def test_anthropic_aux_strips_response_format_keeps_siblings(self):
+        """Stripping response_format must not drop legitimate vendor fields."""
+        api_kwargs = self._run_anthropic_adapter(
+            call_extra_body={
+                "response_format": {"type": "json_object"},
+                "metadata": {"user_id": "u1"},
+            },
+        )
+        assert api_kwargs["extra_body"] == {"metadata": {"user_id": "u1"}}
+
+    def test_anthropic_aux_response_format_top_level_kwarg_not_forwarded(self):
+        """#85626 review: response_format can't leak as a top-level kwarg either.
+
+        The adapter reads a fixed allow-list of OpenAI kwargs (model, messages,
+        tools, tool_choice, max_tokens, temperature, extra_body) and builds the
+        Messages body from scratch, so an unrecognized top-level kwarg is
+        dropped on the floor rather than forwarded. This pins that behaviour so
+        a future refactor to **kwargs-splat forwarding can't silently reopen
+        the leak on a second path.
+        """
+        from agent.auxiliary_client import _AnthropicCompletionsAdapter
+
+        adapter = _AnthropicCompletionsAdapter(
+            MagicMock(), "claude-sonnet-4-6", is_oauth=False,
+        )
+        bak_result = {
+            "model": "claude-sonnet-4-6", "messages": [], "max_tokens": 64,
+        }
+        with patch("agent.anthropic_adapter.build_anthropic_kwargs",
+                   return_value=dict(bak_result)) as mock_bak, \
+             patch("agent.anthropic_adapter.create_anthropic_message") as mock_create, \
+             patch("agent.transports.get_transport") as mock_gt:
+            mock_gt.return_value.normalize_response.return_value = MagicMock(
+                content="ok", tool_calls=None, reasoning=None,
+                finish_reason="stop", usage=None, provider_data=None,
+            )
+            adapter.create(
+                model="claude-sonnet-4-6",
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=64,
+                # top-level, NOT nested under extra_body
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": "session_title", "strict": True},
+                },
+            )
+
+        # Never reaches the body builder...
+        assert "response_format" not in mock_bak.call_args.kwargs
+        api_kwargs = mock_create.call_args.args[1]
+        # ...nor the SDK, top-level or smuggled into extra_body.
+        assert "response_format" not in api_kwargs
+        assert "response_format" not in (api_kwargs.get("extra_body") or {})
+
+    def test_anthropic_aux_logs_dropped_response_format(self, caplog):
+        """#85626 review: the degradation is observable, not silent."""
+        with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):
+            self._run_anthropic_adapter(
+                call_extra_body={
+                    "response_format": {"type": "json_object"},
+                    "metadata": {"user_id": "u1"},
+                },
+            )
+        assert any(
+            "dropped unsupported extra_body keys" in r.message
+            and "response_format" in r.getMessage()
+            for r in caplog.records
+        ), caplog.text
+
 
 
 
