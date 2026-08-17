@@ -26946,7 +26946,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _buffer_only = False
         if source.platform == Platform.MATRIX:
             _effective_cursor = ""
-            _buffer_only = True
         # Fresh-final applies to Telegram only — other
         # platforms either edit in place cheaply (Discord,
         # Slack) or don't have the timestamp-on-edit /
