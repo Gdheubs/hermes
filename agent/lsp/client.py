@@ -56,7 +56,11 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 from urllib.parse import quote, unquote
 
-from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli._subprocess_compat import (
+    kill_process_tree,
+    windows_batch_proxy_command,
+    windows_hide_flags,
+)
 
 from agent.lsp.protocol import (
     ERROR_CONTENT_MODIFIED,
@@ -71,7 +75,6 @@ from agent.lsp.protocol import (
     make_response,
     read_message,
 )
-
 logger = logging.getLogger("agent.lsp.client")
 
 # Timeouts (seconds) — mirror OpenCode's constants, scaled to seconds.
@@ -281,12 +284,9 @@ class LSPClient:
             raise
 
     @staticmethod
-    def _win_wrap_cmd(cmd: List[str]) -> List[str]:
-        """On Windows, wrap .cmd/.bat shims so CreateProcess can run them."""
-        exe = cmd[0]
-        if exe.lower().endswith((".cmd", ".bat")):
-            return ["cmd.exe", "/c", *cmd]
-        return cmd
+    def _win_batch_proxy_command(cmd: List[str]) -> List[str]:
+        """Build native argv for the explicit, AutoRun-disabled batch relay."""
+        return windows_batch_proxy_command(cmd)
 
     async def _spawn(self) -> None:
         env = dict(os.environ)
@@ -294,8 +294,9 @@ class LSPClient:
             env.update(self._env)
 
         cmd = self._command
-        if sys.platform == "win32":
-            cmd = self._win_wrap_cmd(cmd)
+        use_windows_shell = sys.platform == "win32" and cmd[0].lower().endswith(
+            (".cmd", ".bat")
+        )
         # Suppress the cmd.exe console window that would otherwise flash
         # every time we launch a ``.cmd``-wrapped language server
         # (e.g. pyright-langserver.CMD) from a console-less host such as
@@ -311,17 +312,24 @@ class LSPClient:
             # gateway's child set, it captures the LSP PID, records the
             # inherited pgid, and killpg() then kills the TUI parent itself.
             # See tui_gateway_crash.log "killpg → SIGTERM received" stacks.
-            self._proc = await asyncio.create_subprocess_exec(
-                cmd[0],
-                *cmd[1:],
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                cwd=self._cwd,
-                start_new_session=True,
-                creationflags=creationflags,
-            )
+            spawn_kwargs = {
+                "stdin": asyncio.subprocess.PIPE,
+                "stdout": asyncio.subprocess.PIPE,
+                "stderr": asyncio.subprocess.PIPE,
+                "env": env,
+                "cwd": self._cwd,
+                "start_new_session": True,
+                "creationflags": creationflags,
+            }
+            if use_windows_shell:
+                proxy_command = self._win_batch_proxy_command(cmd)
+                self._proc = await asyncio.create_subprocess_exec(
+                    proxy_command[0], *proxy_command[1:], **spawn_kwargs
+                )
+            else:
+                self._proc = await asyncio.create_subprocess_exec(
+                    cmd[0], *cmd[1:], **spawn_kwargs
+                )
         except FileNotFoundError as e:
             raise LSPProtocolError(
                 f"LSP server binary not found: {cmd[0]} ({e})"
@@ -492,7 +500,19 @@ class LSPClient:
             return
         if proc.returncode is None:
             try:
-                proc.terminate()
+                # Give a server that received shutdown+exit one brief chance to
+                # leave cleanly. On Windows, forced cleanup must kill the full
+                # Python-proxy -> cmd.exe -> language-server tree; terminating
+                # only the tracked proxy leaks Node indefinitely.
+                await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
+            except asyncio.TimeoutError:
+                if sys.platform == "win32":
+                    await asyncio.to_thread(kill_process_tree, proc)
+                else:
+                    try:
+                        proc.terminate()
+                    except ProcessLookupError:
+                        pass
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
                 except asyncio.TimeoutError:
@@ -501,7 +521,16 @@ class LSPClient:
                         await proc.wait()
                     except ProcessLookupError:
                         pass
-            except ProcessLookupError:
+        # asyncio's proactor subprocess transport keeps its pipe handles and a
+        # pending-connection callback alive even after the process exits. Close
+        # it while the loop is still running so GC never calls __del__ against
+        # a closed loop (ResourceWarning + "Event loop is closed" noise) and
+        # the pipes are released promptly on Windows.
+        transport = getattr(proc, "_transport", None)
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:  # noqa: BLE001
                 pass
 
     # ------------------------------------------------------------------
