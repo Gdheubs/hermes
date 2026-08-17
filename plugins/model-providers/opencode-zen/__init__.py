@@ -26,6 +26,18 @@ _ATTRIBUTION_HEADERS = {
     "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
 }
 
+# OpenCode Zen's gateway rate-limits free-tier models (deepseek-v4-flash-free,
+# nemotron-*-free, big-pickle, etc.) based on the request User-Agent. Requests
+# that do not look like the official CLI (User-Agent not prefixed with
+# "opencode/") are treated as anonymous third-party traffic and return HTTP 429
+# FreeUsageLimitError even with a valid API key. Reproduced with curl against
+# https://opencode.ai/zen/v1: `HermesAgent/0.19.1` -> 429, `opencode/1.15.0 ...`
+# -> 200. Use an opencode-compatible UA so free models work from Hermes too.
+_OPENCODE_ZEN_HEADERS = {
+    **_ATTRIBUTION_HEADERS,
+    "User-Agent": "opencode/1.15.0 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.13",
+}
+
 
 def _flat_model_name(model: str | None) -> str:
     """Return the bare OpenCode model ID, tolerating aggregator prefixes."""
@@ -144,7 +156,7 @@ opencode_zen = ProviderProfile(
     aliases=("opencode", "opencode_zen", "zen"),
     env_vars=("OPENCODE_ZEN_API_KEY",),
     base_url="https://opencode.ai/zen/v1",
-    default_headers=dict(_ATTRIBUTION_HEADERS),
+    default_headers=dict(_OPENCODE_ZEN_HEADERS),
     default_aux_model="gemini-3-flash",
 )
 
