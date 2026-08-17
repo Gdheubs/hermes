@@ -100,11 +100,11 @@ function renderRuntime() {
     Button: 'Button',
     BotFace: 'BotFace',
     Codicon: 'Codicon',
-    ContextMenu: 'ContextMenu',
-    ContextMenuContent: 'ContextMenuContent',
-    ContextMenuItem: 'ContextMenuItem',
-    ContextMenuSeparator: 'ContextMenuSeparator',
-    ContextMenuTrigger: 'ContextMenuTrigger',
+    Dialog: 'Dialog',
+    DialogContent: 'DialogContent',
+    DialogDescription: 'DialogDescription',
+    DialogHeader: 'DialogHeader',
+    DialogTitle: 'DialogTitle',
     haptic: () => undefined,
     host: {
       state: {

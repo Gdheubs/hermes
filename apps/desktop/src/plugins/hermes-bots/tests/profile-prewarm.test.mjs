@@ -18,6 +18,7 @@ function sourceBetween(start, end) {
 function renderBotRow(name = 'alpha') {
   const botRowSource = sourceBetween('function BotRow(', '// ── model picker')
   const warmed = []
+  const actionStates = []
   const atom = value => ({
     get: () => value,
     set: next => {
@@ -27,11 +28,13 @@ function renderBotRow(name = 'alpha') {
   const node = (type, props = {}) => ({ type, props })
   const context = {
     BotFace: 'BotFace',
-    ContextMenu: 'ContextMenu',
-    ContextMenuContent: 'ContextMenuContent',
-    ContextMenuItem: 'ContextMenuItem',
-    ContextMenuSeparator: 'ContextMenuSeparator',
-    ContextMenuTrigger: 'ContextMenuTrigger',
+    Button: 'Button',
+    Codicon: 'Codicon',
+    Dialog: 'Dialog',
+    DialogContent: 'DialogContent',
+    DialogDescription: 'DialogDescription',
+    DialogHeader: 'DialogHeader',
+    DialogTitle: 'DialogTitle',
     ROSTER_KEY: ['hermes-bots', 'roster'],
     $botMeta: atom({}),
     $botUnread: atom({}),
@@ -50,7 +53,7 @@ function renderBotRow(name = 'alpha') {
     ACTIVE_WINDOW_S: 90,
     A2A_PREFIX_RE: /^$/,
     useEffect: () => undefined,
-    useState: initial => [typeof initial === 'function' ? initial() : initial, () => undefined],
+    useState: initial => [typeof initial === 'function' ? initial() : initial, value => actionStates.push(value)],
     host: {
       state: { gateway: atom('open'), profile: atom('default') },
       warmProfile: profile => warmed.push(profile),
@@ -71,9 +74,9 @@ function renderBotRow(name = 'alpha') {
   vm.runInNewContext(`${botRowSource}\nglobalThis.BotRow = BotRow`, context)
 
   const tree = context.BotRow({ bot: { name }, onEdit: context.onEdit })
-  const row = tree.props.children[0].props.children
+  const row = tree.props.children[0]
 
-  return { row, warmed }
+  return { actionStates, row, tree, warmed }
 }
 
 test('regression: rendering BotsPane does not prewarm the entire roster', () => {
@@ -89,4 +92,39 @@ test('behavior: pointer entry prewarms only the hovered bot', () => {
   assert.equal(typeof row.props.onPointerEnter, 'function')
   row.props.onPointerEnter()
   assert.deepEqual(warmed, ['alpha'])
+})
+
+test('behavior: right-click opens bot actions', () => {
+  const { actionStates, tree } = renderBotRow('alpha')
+  let prevented = false
+  let stopped = false
+
+  tree.props.onContextMenu({
+    preventDefault: () => {
+      prevented = true
+    },
+    stopPropagation: () => {
+      stopped = true
+    }
+  })
+
+  assert.equal(prevented, true)
+  assert.equal(stopped, true)
+  assert.deepEqual(actionStates, [true])
+})
+
+test('behavior: the visible actions button opens bot actions without opening the chat', () => {
+  const { actionStates, tree } = renderBotRow('alpha')
+  const actionsButton = tree.props.children[1]
+  let stopped = false
+
+  actionsButton.props.onClick({
+    stopPropagation: () => {
+      stopped = true
+    }
+  })
+
+  assert.equal(actionsButton.props['aria-label'], 'Actions for alpha')
+  assert.equal(stopped, true)
+  assert.deepEqual(actionStates, [true])
 })

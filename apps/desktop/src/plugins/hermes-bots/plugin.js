@@ -23,11 +23,6 @@ import {
   cn,
   Codicon,
   COMPOSER_AREAS,
-  ContextMenu,
-  ContextMenuContent,
-  ContextMenuItem,
-  ContextMenuSeparator,
-  ContextMenuTrigger,
   ConfirmDialog,
   Dialog,
   DialogContent,
@@ -3024,9 +3019,15 @@ function activeBots(roster, activeProfile, gatewayState, now = Date.now()) {
   })
 }
 
+function botRosterKey(bot) {
+  const source = bot.remoteSource ? bot.connectionId || bot.connectionLabel || bot.handle || 'remote' : 'local'
+  return `${source}:${bot.name}`
+}
+
 // ── bot row ──────────────────────────────────────────────────────────────────
 
 function BotRow({ bot, onDelete, onEdit, onGroup }) {
+  const [actionsOpen, setActionsOpen] = useState(false)
   const activeProfile = useValue(host.state.profile)
   const meta = useValue($botMeta)[bot.name]
   const last = bot.last_session
@@ -3128,7 +3129,7 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
     onPointerEnter: warm,
     onClick: open,
     className: cn(
-      'flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-2 py-2 text-left transition-colors',
+      'flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md py-2 pr-9 pl-2 text-left transition-colors',
       'hover:bg-(--chrome-action-hover)',
       isActive && 'bg-(--chrome-action-hover)'
     ),
@@ -3217,64 +3218,118 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
     ]
   })
 
-  return jsxs(ContextMenu, {
+  return jsxs('div', {
+    className: 'group relative w-full min-w-0 max-w-full',
+    onContextMenu: event => {
+      event.preventDefault()
+      event.stopPropagation()
+      setActionsOpen(true)
+    },
     children: [
-      jsx(ContextMenuTrigger, { asChild: true, children: row }),
-      jsxs(ContextMenuContent, {
-        children: [
-          jsx(ContextMenuItem, {
-            onSelect: () => {
-              const pinned = Boolean($botMeta.get()[bot.name]?.pinned)
-              saveBotMeta(bot.name, { pinned: !pinned })
-              host.notify({
-                kind: 'info',
-                message: `${displayName(bot, meta)} ${pinned ? 'unpinned' : 'pinned to top'}`
-              })
-            },
-            children: meta?.pinned ? 'Unpin' : 'Pin to top'
-          }),
-          jsx(ContextMenuSeparator, {}),
-          jsx(ContextMenuItem, {
-            onSelect: () => openBotSessionsWorkspace(bot),
-            children: 'Sessions'
-          }),
-          jsx(ContextMenuItem, { onSelect: () => onEdit(bot), children: 'Edit Profile' }),
-          jsx(ContextMenuItem, {
-            onSelect: () => onGroup(bot),
-            children: meta?.group ? `Group: ${meta.group}…` : 'Move to group…'
-          }),
-          jsx(ContextMenuItem, {
-            onSelect: () => {
-              host.notify({ kind: 'info', message: `Duplicating ${displayName(bot, meta)}…` })
-              duplicateBot(bot, $lastRoster.get())
-                .then(name => {
-                  queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
-                  host.notify({ kind: 'success', message: `Created ${name} — full copy of ${bot.name}` })
-                })
-                .catch(err => host.notifyError(err, 'Duplicate failed'))
-            },
-            children: 'Duplicate'
-          }),
-          jsx(ContextMenuSeparator, {}),
-          jsx(ContextMenuItem, {
-            onSelect: () => {
-              $selectedBot.set(bot.name)
+      row,
+      jsx('button', {
+        type: 'button',
+        'aria-label': `Actions for ${displayName(bot, meta)}`,
+        className:
+          'absolute top-1/2 right-1 flex size-7 -translate-y-1/2 items-center justify-center rounded-md text-(--ui-text-quaternary) opacity-70 transition hover:bg-(--chrome-action-hover) hover:text-foreground hover:opacity-100 focus-visible:opacity-100',
+        onClick: event => {
+          event.stopPropagation()
+          setActionsOpen(true)
+        },
+        children: jsx(Codicon, { name: 'ellipsis' })
+      }),
+      jsx(Dialog, {
+        open: actionsOpen,
+        onOpenChange: setActionsOpen,
+        children: jsxs(DialogContent, {
+          className: 'max-w-xs',
+          children: [
+            jsxs(DialogHeader, {
+              children: [
+                jsx(DialogTitle, { children: 'Bot actions' }),
+                jsx(DialogDescription, { children: displayName(bot, meta) })
+              ]
+            }),
+            jsxs('div', {
+              className: 'grid gap-1.5',
+              children: [
+                jsx(Button, {
+                  variant: 'secondary',
+                  onClick: () => {
+                    setActionsOpen(false)
+                    const pinned = Boolean($botMeta.get()[bot.name]?.pinned)
+                    saveBotMeta(bot.name, { pinned: !pinned })
+                    host.notify({
+                      kind: 'info',
+                      message: `${displayName(bot, meta)} ${pinned ? 'unpinned' : 'pinned to top'}`
+                    })
+                  },
+                  children: meta?.pinned ? 'Unpin' : 'Pin to top'
+                }),
+                jsx(Button, {
+                  variant: 'secondary',
+                  onClick: () => {
+                    setActionsOpen(false)
+                    openBotSessionsWorkspace(bot)
+                  },
+                  children: 'Sessions'
+                }),
+                jsx(Button, {
+                  variant: 'secondary',
+                  onClick: () => {
+                    setActionsOpen(false)
+                    onEdit(bot)
+                  },
+                  children: 'Edit Profile'
+                }),
+                jsx(Button, {
+                  variant: 'secondary',
+                  onClick: () => {
+                    setActionsOpen(false)
+                    onGroup(bot)
+                  },
+                  children: meta?.group ? `Group: ${meta.group}…` : 'Move to group…'
+                }),
+                jsx(Button, {
+                  variant: 'secondary',
+                  onClick: () => {
+                    setActionsOpen(false)
+                    host.notify({ kind: 'info', message: `Duplicating ${displayName(bot, meta)}…` })
+                    duplicateBot(bot, $lastRoster.get())
+                      .then(name => {
+                        queryClient.invalidateQueries({ queryKey: ROSTER_KEY })
+                        host.notify({ kind: 'success', message: `Created ${name} — full copy of ${bot.name}` })
+                      })
+                      .catch(err => host.notifyError(err, 'Duplicate failed'))
+                  },
+                  children: 'Duplicate'
+                }),
+                jsx(Button, {
+                  variant: 'secondary',
+                  onClick: () => {
+                    setActionsOpen(false)
+                    $selectedBot.set(bot.name)
 
-              if (typeof host.newChat === 'function') {
-                host.newChat(bot.name)
-              }
-            },
-            children: 'New chat with this agent'
-          }),
-          bot.is_default ? null : jsx(ContextMenuSeparator, {}),
-          bot.is_default
-            ? null
-            : jsx(ContextMenuItem, {
-                onSelect: () => onDelete(bot),
-                variant: 'destructive',
-                children: 'Delete'
-              })
-        ]
+                    if (typeof host.newChat === 'function') {
+                      host.newChat(bot.name)
+                    }
+                  },
+                  children: 'New chat with this agent'
+                }),
+                bot.is_default
+                  ? null
+                  : jsx(Button, {
+                      onClick: () => {
+                        setActionsOpen(false)
+                        onDelete(bot)
+                      },
+                      variant: 'destructive',
+                      children: 'Delete'
+                    })
+              ]
+            })
+          ]
+        })
       })
     ]
   })
@@ -5929,7 +5984,7 @@ function ActiveNowStrip({ roster, activeProfile, gatewayState, metaByName, onOpe
               children: label
             })
           ]
-        }, bot.name)
+        }, botRosterKey(bot))
       })
     ]
   })
@@ -6388,7 +6443,7 @@ function BotsPane() {
                           }, `group:${section.group}`)
                         : null,
                       ...section.bots.map(bot =>
-                        jsx(BotRow, { bot, onDelete: setDeleting, onEdit: setEditing, onGroup: setGrouping }, bot.name)
+                        jsx(BotRow, { bot, onDelete: setDeleting, onEdit: setEditing, onGroup: setGrouping }, botRosterKey(bot))
                       )
                     ])
                   })

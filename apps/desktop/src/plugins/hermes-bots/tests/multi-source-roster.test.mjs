@@ -26,7 +26,7 @@ function runtime() {
     .replace(/^import .* from 'react\/jsx-runtime'\r?\n/m, '')
     .replace('export default {', 'globalThis.plugin = {')
     .concat(
-      '\nglobalThis.__mergeMultiSourceRoster = mergeMultiSourceRoster;\nglobalThis.__botHandle = botHandle;\nglobalThis.__filterBots = filterBots;'
+      '\nglobalThis.__mergeMultiSourceRoster = mergeMultiSourceRoster;\nglobalThis.__botHandle = botHandle;\nglobalThis.__botRosterKey = botRosterKey;\nglobalThis.__filterBots = filterBots;'
     )
   vm.runInNewContext(code, context)
   return context
@@ -82,6 +82,13 @@ test('merge: local rows are annotated, remote rows appended with source tags', (
   const coder = out.profiles.find(p => p.name === 'coder')
   assert.equal(coder.remoteSource, true)
   assert.equal(coder.handle, 'coder')
+})
+
+test('botRosterKey keeps same-named local and remote rows distinct', () => {
+  const { __botRosterKey: key } = runtime()
+
+  assert.equal(key({ name: 'research' }), 'local:research')
+  assert.equal(key({ name: 'research', remoteSource: true, connectionId: 'homelab' }), 'homelab:research')
 })
 
 test('merge: union-only local profiles are NOT invented as thin rows', () => {
