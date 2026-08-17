@@ -89,3 +89,45 @@ def test_randomized_typed_boundary_never_leaks_or_emits_non_json_payloads():
         except EmbedValidationError:
             continue
         json.dumps(embed.to_payload())
+
+
+# ── Additional adversarial closure (F1-F6) ─────────────────────────────────
+@pytest.mark.parametrize("url",[
+    "https://example.com/x%0ay","https://example.com/x%0d%0ay","https://example.com/x%09y",
+    "https://example.com/x%00y","https://example.com/x%20y","https://example.com/x%5cy",
+    "https://evil%0a.com",
+])
+def test_percent_encoded_forbidden_chars_rejected(url):
+    with pytest.raises(EmbedValidationError): Embed(url=url)
+
+@pytest.mark.parametrize("url",[
+    "https://user:pass@evil.com/","https://evil.com@good.com/","https://***@evil.com",
+    "https://@evil.com","https://user@evil.com",
+])
+def test_userinfo_credentials_rejected(url):
+    with pytest.raises(EmbedValidationError): Embed(url=url)
+
+def test_bidi_format_chars_rejected():
+    with pytest.raises(EmbedValidationError): Embed(url="https://‮example.com")
+    with pytest.raises(EmbedValidationError): Embed(url="https://example.com/​")
+
+def test_garbage_after_ipv6_literal_rejected():
+    with pytest.raises(EmbedValidationError): Embed(url="http://[::1]x")
+
+def test_valid_ipv6_authority_accepted():
+    Embed(url="https://[::1]/")
+    Embed(url="https://[::1]:8443/")
+
+@pytest.mark.parametrize("url",["attachment://..","attachment://a%2fb","attachment://a/b"])
+def test_attachment_nonfilename_rejected(url):
+    with pytest.raises(EmbedValidationError): Embed(image_url=url)
+
+def test_attachment_valid_filenames_accepted():
+    Embed(image_url="attachment://x.png")
+    Embed(image_url="attachment://a_b-1")
+
+def test_timestamp_out_of_range_offset_rejected():
+    with pytest.raises(EmbedValidationError): Embed(timestamp="2026-08-14T10:00:00+12:60")
+
+def test_timestamp_valid_offset_accepted():
+    Embed(timestamp="2026-08-14T10:00:00+05:30")

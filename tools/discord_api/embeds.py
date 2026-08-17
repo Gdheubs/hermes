@@ -43,6 +43,7 @@ _ISO_TS_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:?\d{2})$"
 )
 _BAD_PERCENT_RE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_PERCENT_HEX_RE = re.compile(r"%([0-9A-Fa-f]{2})")
 
 
 class EmbedValidationError(ValueError):
@@ -62,7 +63,23 @@ def _check_len(value: Optional[str], limit: int, what: str) -> Optional[str]:
 
 
 def _has_forbidden_url_chars(value: str) -> bool:
-    return any(ch.isspace() or unicodedata.category(ch) == "Cc" for ch in value) or "\\" in value
+    # Literal control chars (Cc), bidi/format (Cf: RLO, ZWSP, ZWJ), and
+    # backslash are forbidden. Unicode whitespace (Zs, via isspace) too.
+    return any(
+        ch.isspace() or unicodedata.category(ch) in ("Cc", "Cf") for ch in value
+    ) or "\\" in value
+
+
+def _has_forbidden_percent_encoded(value: str) -> bool:
+    """Reject percent-encoded control/whitespace/backslash (e.g. %0a, %0d%0a,
+    %09, %00, %20, %5c) even though the literal chars are absent. Well-formed
+    escapes otherwise pass, matching how Discord's clients treat them."""
+    for m in _PERCENT_HEX_RE.finditer(value):
+        code = int(m.group(1), 16)
+        ch = chr(code)
+        if ch.isspace() or unicodedata.category(ch) in ("Cc", "Cf") or ch == "\\":
+            return True
+    return False
 
 
 def _check_url(
@@ -89,6 +106,11 @@ def _check_url(
         raise EmbedValidationError(
             f"embed {what} contains malformed percent encoding, got {value!r}"
         )
+    if _has_forbidden_percent_encoded(value):
+        raise EmbedValidationError(
+            f"embed {what} contains percent-encoded whitespace/control/backslash "
+            f"characters, got {value!r}"
+        )
 
     try:
         parsed = urlparse(value)
@@ -101,16 +123,41 @@ def _check_url(
             f"embed {what} is not a structurally valid URL, got {value!r}"
         ) from exc
 
+    # Reject any userinfo (username/password) — credentials in a URL are never
+    # legitimate here and open host-confusion/phishing (e.g. evil.com@good.com).
+    if parsed.username is not None or "@" in (parsed.netloc or ""):
+        raise EmbedValidationError(
+            f"embed {what} must not contain userinfo/credentials, got {value!r}"
+        )
+
     if scheme in ("http", "https"):
         if not hostname:
             raise EmbedValidationError(
                 f"embed {what} must have a non-empty hostname, got {value!r}"
             )
+        # Reject trailing garbage after a bracketed IPv6 literal (e.g. "[::1]x"):
+        # urlparse silently strips it, hiding a malformed authority.
+        if "[" in parsed.netloc:
+            bracket_end = parsed.netloc.find("]")
+            if bracket_end == -1:
+                raise EmbedValidationError(
+                    f"embed {what} has an unclosed IPv6 literal, got {value!r}"
+                )
+            after = parsed.netloc[bracket_end + 1:]
+            if after and not after.startswith(":"):
+                raise EmbedValidationError(
+                    f"embed {what} has garbage after the IPv6 literal, got {value!r}"
+                )
         return value
 
     if allow_attachment and scheme == "attachment":
+        filename = parsed.netloc
         if (
-            not parsed.netloc
+            not filename
+            or filename in (".", "..")
+            or "/" in filename
+            or "\\" in filename
+            or not re.fullmatch(r"[A-Za-z0-9._-]+", filename)
             or parsed.path
             or parsed.params
             or parsed.query
@@ -247,6 +294,16 @@ class Embed:
             normalized = self.timestamp
             if normalized.endswith("Z"):
                 normalized = normalized[:-1] + "+00:00"
+            # Reject out-of-range UTC-offset fields before fromisoformat
+            # normalizes them (e.g. "+12:60" silently becomes "+13:00").
+            _tz = re.search(r"([+-])(\d{2}):(\d{2})$", normalized)
+            if _tz:
+                _oh, _om = int(_tz.group(2)), int(_tz.group(3))
+                if _oh > 23 or _om > 59:
+                    raise EmbedValidationError(
+                        f"embed timestamp has an out-of-range UTC offset, "
+                        f"got {self.timestamp!r}"
+                    )
             try:
                 datetime.fromisoformat(normalized)
             except ValueError as exc:
