@@ -140,7 +140,7 @@ class TestStaleBridgeHandshake:
         mock_proc.poll.return_value = 1
         mock_proc.returncode = 1
 
-        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+        with patch("plugins.platforms.whatsapp.adapter._resolve_node_command", return_value=("node", {})), \
              patch("aiohttp.ClientSession", mock_client), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
@@ -165,7 +165,7 @@ class TestDepRefreshStamp:
         mock_proc.poll.return_value = 1
         mock_proc.returncode = 1
 
-        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+        with patch("plugins.platforms.whatsapp.adapter._resolve_node_command", return_value=("node", {})), \
              patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
@@ -192,7 +192,7 @@ class TestCacheDirEnvPassthrough:
         mock_proc.poll.return_value = 1
         mock_proc.returncode = 1
 
-        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+        with patch("plugins.platforms.whatsapp.adapter._resolve_node_command", return_value=("node", {})) as mock_resolve, \
              patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
@@ -211,3 +211,4 @@ class TestCacheDirEnvPassthrough:
         assert env["HERMES_AUDIO_CACHE_DIR"] == str(get_audio_cache_dir())
         assert env["HERMES_DOCUMENT_CACHE_DIR"] == str(get_document_cache_dir())
         assert env["WHATSAPP_SEND_READ_RECEIPTS"] == "true"
+        mock_resolve.assert_called_once_with()

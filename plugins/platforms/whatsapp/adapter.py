@@ -355,27 +355,54 @@ def _file_content_hash(path: Path) -> str:
         return ""
 
 
+def _resolve_node_command() -> Optional[tuple[str, dict[str, str]]]:
+    """Resolve a usable Node.js command for the WhatsApp bridge.
+
+    Prefer the Hermes-managed / PATH lookup. On macOS, fall back to the VS
+    Code bundled runtime when present so the WhatsApp bridge can still start
+    on systems without a separate Node install (#2975 / #2976).
+    """
+    candidates: list[tuple[str, dict[str, str]]] = []
+
+    node_path = find_node_executable("node")
+    if node_path:
+        candidates.append((node_path, {}))
+
+    if platform.system() == "Darwin":
+        vscode_node = (
+            "/Applications/Visual Studio Code.app/Contents/Frameworks/"
+            "Code Helper (Plugin).app/Contents/MacOS/Code Helper (Plugin)"
+        )
+        if Path(vscode_node).exists():
+            candidates.append((vscode_node, {"ELECTRON_RUN_AS_NODE": "1"}))
+
+    for argv, extra_env in candidates:
+        env = os.environ.copy()
+        env.update(extra_env)
+        try:
+            result = subprocess.run(
+                [argv, "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                env=env,
+            )
+        except Exception:
+            continue
+
+        if result.returncode == 0:
+            return argv, extra_env
+
+    return None
+
+
 def check_whatsapp_requirements() -> bool:
     """
     Check if WhatsApp dependencies are available.
     
     WhatsApp requires a Node.js bridge for most implementations.
     """
-    # Prefer Hermes-managed Node/npm so Windows installs are not broken by a
-    # bad or elevation-triggering system Node on PATH.
-    _node = find_node_executable("node")
-    if not _node:
-        return False
-    try:
-        result = subprocess.run(
-            [_node, "--version"],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            timeout=5
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
+    return _resolve_node_command() is not None
 
 
 class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
@@ -512,7 +539,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         
         This launches the Node.js bridge process and waits for it to be ready.
         """
-        if not check_whatsapp_requirements():
+        # Resolve and validate Node once per connection attempt. Re-running
+        # the probe immediately before spawning can select a different
+        # runtime or fail after an earlier successful probe.
+        node_command = _resolve_node_command()
+        if not node_command:
             logger.warning("[%s] Node.js not found. WhatsApp requires Node.js.", self.name)
             self._set_fatal_error(
                 "whatsapp_node_missing",
@@ -520,6 +551,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 retryable=False,
             )
             return False
+        node_argv, node_env = node_command
         
         bridge_path = Path(self._bridge_script)
         if not bridge_path.exists():
@@ -732,9 +764,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             bridge_env["HERMES_AUDIO_CACHE_DIR"] = str(_get_audio_dir())
             bridge_env["HERMES_DOCUMENT_CACHE_DIR"] = str(_get_doc_dir())
 
+            bridge_env.update(node_env)
+
             self._bridge_process = subprocess.Popen(
                 [
-                    find_node_executable("node") or "node",
+                    node_argv,
                     str(bridge_path),
                     "--port", str(self._bridge_port),
                     "--session", str(self._session_path),
