@@ -2100,6 +2100,21 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
 
+            # F9: canonical mutation-layer enforcement. Every update surface —
+            # model tool, CLI, API PATCH (/api/jobs/{id}), dashboard, migration,
+            # direct internal callers — funnels through update_job, so the
+            # deliver-ownership gate belongs HERE (the model-tool wrapper alone
+            # left the HTTP PATCH surface able to retarget a job's delivery to
+            # an arbitrary chat). Same invariant function as create.
+            if "deliver" in updates:
+                from cron.scheduler import _validate_deliver_targets_owned
+
+                _deliver_error = _validate_deliver_targets_owned(
+                    updates["deliver"], job.get("origin")
+                )
+                if _deliver_error:
+                    raise ValueError(_deliver_error)
+
             # Normalize monitor fields the same way create_job does (empty
             # string clears the field).
             for _mon_field in ("monitor_script", "monitor_url"):

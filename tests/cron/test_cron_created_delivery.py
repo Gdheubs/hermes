@@ -258,6 +258,123 @@ class TestCronContextUpdatePath:
         assert get_job(created["job_id"]).get("deliver") == "origin"
 
 
+class TestNativeDeliverTargetResolution:
+    """F9: colon-form delivery targets must be validated against the RESOLVED
+    native identity — the identity the delivery path actually uses — not a
+    naive second-colon truncation. Matrix rooms, Yuanbao direct/group ids and
+    Signal group ids legitimately contain colons of their own."""
+
+    @pytest.mark.parametrize(
+        ("deliver", "origin_chat"),
+        [
+            ("matrix:!roomid:server.org", "!roomid:server.org"),
+            ("matrix:@alice:server.org", "@alice:server.org"),
+            ("yuanbao:direct:acct_123", "direct:acct_123"),
+            ("yuanbao:group:code_456", "group:code_456"),
+            ("signal:group:zzz", "group:zzz"),
+        ],
+    )
+    def test_native_owned_target_accepted(self, deliver, origin_chat):
+        """A target the operator owns (the creating session's own chat) must
+        pass. The pre-fix validator truncated these to ``!roomid`` / ``direct``
+        / ``group`` and rejected them as unowned (false positive)."""
+        from cron.scheduler import _validate_deliver_targets_owned
+
+        platform = deliver.split(":", 1)[0]
+        origin = {"platform": platform, "chat_id": origin_chat}
+        assert _validate_deliver_targets_owned(deliver, origin) is None, (
+            f"owned native target {deliver} was rejected"
+        )
+
+    def test_telegram_thread_target_accepted(self):
+        """A telegram ``chat:thread`` target keeps the full chat identity —
+        the thread segment must not change which chat is authorized."""
+        from cron.scheduler import _validate_deliver_targets_owned
+
+        origin = {"platform": "telegram", "chat_id": "-100123456"}
+        assert (
+            _validate_deliver_targets_owned("telegram:-100123456:17", origin)
+            is None
+        )
+
+    @pytest.mark.parametrize(
+        ("deliver", "origin"),
+        [
+            # Same room name on a DIFFERENT homeserver — the truncated
+            # ``!roomid`` must not make this look owned.
+            (
+                "matrix:!roomid:evil.org",
+                {"platform": "matrix", "chat_id": "!roomid:server.org"},
+            ),
+            (
+                "matrix:@alice:evil.org",
+                {"platform": "matrix", "chat_id": "@alice:server.org"},
+            ),
+            (
+                "yuanbao:group:other",
+                {"platform": "yuanbao", "chat_id": "group:mine"},
+            ),
+            (
+                "yuanbao:direct:other",
+                {"platform": "yuanbao", "chat_id": "direct:mine"},
+            ),
+            (
+                "signal:group:other",
+                {"platform": "signal", "chat_id": "group:mine"},
+            ),
+            (
+                "telegram:-999999999:17",
+                {"platform": "telegram", "chat_id": "-100123456"},
+            ),
+        ],
+    )
+    def test_unowned_native_target_rejected(self, deliver, origin):
+        """A target the operator does NOT own must be rejected — the checked
+        identity is the full resolved one, never a prefix."""
+        from cron.scheduler import _validate_deliver_targets_owned
+
+        error = _validate_deliver_targets_owned(deliver, origin)
+        assert error is not None, f"unowned target {deliver} was accepted"
+        assert "not a chat you own" in error
+
+
+class TestUpdateJobDeliverGate:
+    """F9: the canonical update layer enforces the same deliver-ownership
+    invariant as create. Every update surface (model tool, CLI, API PATCH,
+    dashboard, migration) funnels through update_job, so a PATCHed deliver
+    target can no longer bypass the gate the model-tool wrapper alone left
+    open on the HTTP surface."""
+
+    def test_update_deliver_unowned_chat_rejected(self, temp_cron_home):
+        from cron.jobs import create_job, update_job, get_job
+
+        job = create_job(
+            prompt="check",
+            schedule="every 5m",
+            name="gate-job",
+            deliver="local",
+            origin={"platform": "telegram", "chat_id": "-100123456"},
+        )
+        with pytest.raises(ValueError, match="not a chat you own"):
+            update_job(job["id"], {"deliver": "telegram:-999999999"})
+        # The stored deliver must be untouched (fail closed).
+        assert get_job(job["id"])["deliver"] == "local"
+
+    def test_update_deliver_owned_chat_accepted(self, temp_cron_home):
+        from cron.jobs import create_job, update_job, get_job
+
+        job = create_job(
+            prompt="check",
+            schedule="every 5m",
+            name="gate-job",
+            deliver="local",
+            origin={"platform": "telegram", "chat_id": "-100123456"},
+        )
+        updated = update_job(job["id"], {"deliver": "telegram:-100123456"})
+        assert updated["deliver"] == "telegram:-100123456"
+        assert get_job(job["id"])["deliver"] == "telegram:-100123456"
+
+
 class TestNonCronContextUnchanged:
     def test_chat_session_create_keeps_literal_origin(self, temp_cron_home):
         # No cron_session var — ordinary chat/CLI create. Existing semantics:

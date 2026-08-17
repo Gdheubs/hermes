@@ -2440,9 +2440,25 @@ def _validate_deliver_targets_owned(deliver_value: Optional[str], origin: Option
 
     ``local`` / ``origin`` / ``all`` / bare platform names need no concrete
     chat validation (they resolve to the operator's own home channel or the
-    creating session at fire time). Only ``platform:chat_id`` colon forms are
-    checked. Callers should run this at CREATE/UPDATE time so an unknown
-    target is rejected before the job is stored.
+    creating session at fire time). Only ``platform:...`` colon forms are
+    checked.
+
+    The identity checked is the identity the delivery path will actually use:
+    each colon-form element is resolved through the canonical platform-aware
+    target parser (``resolve_send_target``) and ownership is verified on the
+    RESOLVED chat_id. Native identifiers legitimately contain colons of their
+    own — ``matrix:!roomid:server.org``, ``matrix:@user:server.org``,
+    ``yuanbao:direct:<account>``, ``yuanbao:group:<code>``, Signal
+    ``group:<id>`` — so naively splitting at the second colon (the old
+    ``rest.split(\":\", 1)[0]``) authorized a TRUNCATED identity (``!roomid``,
+    ``direct``, ``group``) while delivery consumed the full one: it rejected
+    legitimate owned targets and separated the authorized identity from the
+    delivered identity.
+
+    Callers should run this at CREATE/UPDATE time so an unknown target is
+    rejected before the job is stored. This is the single invariant function;
+    every mutation surface (model tool, CLI, API PATCH, dashboard, migration)
+    passes through the canonical create/update layer which invokes it.
     """
     if not deliver_value:
         return None
@@ -2453,18 +2469,44 @@ def _validate_deliver_targets_owned(deliver_value: Optional[str], origin: Option
         if ":" not in part:
             continue  # bare platform name → home channel at fire time
         platform_name, rest = part.split(":", 1)
-        platform_name = platform_name.strip()
-        chat_id = rest.split(":", 1)[0].strip()  # strip optional :thread
-        if not platform_name or not chat_id:
+        platform_key = platform_name.strip().lower()
+        rest = rest.strip()
+        if not platform_key or not rest:
             continue
-        if _delivery_chat_is_operator_owned(platform_name, chat_id, origin):
+        # Resolve through the same parser the fire-time delivery path uses
+        # (_resolve_single_delivery_target → resolve_send_target), so the
+        # chat id ownership is checked against is the chat id delivered.
+        try:
+            from tools.send_message_tool import (
+                prepare_send_message_platforms,
+                resolve_send_target,
+            )
+
+            prepare_send_message_platforms()
+            chat_id, _thread_id, resolution_error = resolve_send_target(
+                platform_key, rest, pass_unresolved_references=True
+            )
+        except Exception as exc:
+            logger.debug(
+                "cron deliver validation: target resolution failed for %s: %s",
+                part, exc,
+            )
+            chat_id, resolution_error = None, str(exc)
+        if chat_id is None:
+            return (
+                f"deliver target '{part}' could not be resolved to a chat on "
+                f"{platform_key} ({resolution_error or 'unresolvable target'}). "
+                f"Colon-form delivery targets must resolve through the "
+                f"platform's own target grammar."
+            )
+        if _delivery_chat_is_operator_owned(platform_key, str(chat_id), origin):
             continue
         return (
             f"deliver target '{part}' is not a chat you own or have allowlisted "
-            f"for {platform_name}. Colon-form delivery targets must be the "
+            f"for {platform_key}. Colon-form delivery targets must be the "
             f"platform's home channel, a channel-directory entry, a chat in the "
             f"platform's allowlist (allow_from / group_allow_from / "
-            f"group_allowed_chats / {platform_name.upper()}_ALLOWED_USERS), or "
+            f"group_allowed_chats / {platform_key.upper()}_ALLOWED_USERS), or "
             f"the chat this job was created from."
         )
     return None
