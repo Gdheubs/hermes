@@ -622,6 +622,7 @@ class AgentImporter:
                 atomic_write_text(
                     destination,
                     ENTRY_DELIMITER.join(merged) + ("\n" if merged else ""),
+                    newline="\n",
                 )
             except OSError as exc:
                 self.record(kind, source, destination, "error",

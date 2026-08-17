@@ -1322,7 +1322,11 @@ class Migrator:
                 return
             backup_path = self.maybe_backup(destination)
             ensure_parent(destination)
-            destination.write_text(ENTRY_DELIMITER.join(merged) + ("\n" if merged else ""), encoding="utf-8")
+            destination.write_text(
+                ENTRY_DELIMITER.join(merged) + ("\n" if merged else ""),
+                encoding="utf-8",
+                newline="\n",
+            )
             self.record(
                 kind,
                 source,
@@ -2080,7 +2084,11 @@ class Migrator:
                 return
             backup_path = self.maybe_backup(destination)
             ensure_parent(destination)
-            destination.write_text(ENTRY_DELIMITER.join(merged) + ("\n" if merged else ""), encoding="utf-8")
+            destination.write_text(
+                ENTRY_DELIMITER.join(merged) + ("\n" if merged else ""),
+                encoding="utf-8",
+                newline="\n",
+            )
             self.record(
                 "daily-memory",
                 source_dir,

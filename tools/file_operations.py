@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
 from pathlib import Path
 from tools.binary_extensions import BINARY_EXTENSIONS
+from utils import normalize_newlines
 
 from agent.file_safety import (
     build_write_denied_paths,
@@ -104,19 +105,10 @@ def _detect_line_ending(sample: str) -> Optional[str]:
 def _normalize_line_endings(text: str, target: str) -> str:
     """Convert all line endings in ``text`` to ``target`` (``\\n`` or ``\\r\\n``).
 
-    Idempotent: ``_normalize_line_endings(_normalize_line_endings(x, "\\r\\n"), "\\r\\n") == _normalize_line_endings(x, "\\r\\n")``.
-    Strips lone ``\\r`` characters as well, so mixed-ending content is
-    homogenized in a single pass.
+    Thin alias for :func:`utils.normalize_newlines`, kept for the existing
+    call sites in this module.
     """
-    # First collapse to LF (handle CRLF and lone CR), then expand if target
-    # is CRLF.  Order matters: doing the replacements separately would
-    # double-convert a CRLF -> LFLF.
-    lf_normalized = text.replace("\r\n", "\n").replace("\r", "\n")
-    if target == "\n":
-        return lf_normalized
-    if target == "\r\n":
-        return lf_normalized.replace("\n", "\r\n")
-    return text
+    return normalize_newlines(text, target)
 
 
 # UTF-8 byte order mark. Some Windows editors (Notepad, older Visual Studio,

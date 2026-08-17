@@ -447,6 +447,7 @@ class TestExistingMemoryStorePreserved:
             self, claude_tree, seeded_home):
         path = seeded_home / "memories" / "MEMORY.md"
         run_import("claude-code", claude_tree, seeded_home, execute=True)
+        assert b"\r\n" not in path.read_bytes()
         entries = path.read_text(encoding="utf-8").split(ENTRY_DELIMITER)
         # The pre-existing store survives byte-intact as a SINGLE entry ...
         assert entries[0] == EXISTING_MEMORY.strip()

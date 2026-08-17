@@ -5,6 +5,7 @@ import pytest
 from pathlib import Path
 
 from tools.memory_tool import (
+    ENTRY_DELIMITER,
     MemoryStore,
     memory_tool,
     _scan_memory_content,
@@ -245,6 +246,47 @@ class TestMemoryConsolidationGracefulDegrade:
 
 
 class TestMemoryStorePersistence:
+    @pytest.mark.parametrize(
+        "delimiter",
+        [
+            pytest.param(ENTRY_DELIMITER, id="lf"),
+            pytest.param(
+                "\r\n§\r\n", id="crlf"
+            ),
+            pytest.param("\n§\r\n", id="mixed"),
+        ],
+    )
+    @pytest.mark.parametrize("action", ["replace", "remove"])
+    def test_line_endings_survive_parse_mutation_roundtrip(
+        self, tmp_path, monkeypatch, delimiter, action
+    ):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+        path = tmp_path / "MEMORY.md"
+        raw = f"first entry{delimiter}second entry"
+        path.write_bytes(raw.encode("utf-8"))
+        store = MemoryStore()
+
+        # Parsing must be robust at the serialization boundary, even when the
+        # caller supplies raw decoded bytes rather than universal-newline text.
+        assert MemoryStore._parse_entries(raw) == ["first entry", "second entry"]
+        assert store._detect_external_drift("memory", raw) is None
+
+        store.load_from_disk()
+        assert store.memory_entries == ["first entry", "second entry"]
+
+        if action == "replace":
+            result = store.replace("memory", "first", "updated first entry")
+            expected = ["updated first entry", "second entry"]
+        else:
+            result = store.remove("memory", "first")
+            expected = ["second entry"]
+
+        assert result["success"] is True
+        persisted = path.read_bytes()
+        assert b"\r\n" not in persisted
+        assert persisted.decode("utf-8") == ENTRY_DELIMITER.join(expected)
+        assert MemoryStore._parse_entries(persisted.decode("utf-8")) == expected
+
     def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
 

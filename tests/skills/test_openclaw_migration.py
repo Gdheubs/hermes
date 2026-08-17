@@ -523,6 +523,7 @@ def test_daily_memory_merged(tmp_path: Path):
     report = migrator.migrate()
     mem_path = target / "memories" / "MEMORY.md"
     assert mem_path.exists()
+    assert b"\r\n" not in mem_path.read_bytes()
     content = mem_path.read_text(encoding="utf-8")
     assert "dark mode" in content
     assert "migration project" in content

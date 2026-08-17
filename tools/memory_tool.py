@@ -31,7 +31,7 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional, Tuple
 
-from utils import atomic_write_text
+from utils import atomic_write_text, normalize_newlines
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 msvcrt = None
@@ -783,9 +783,15 @@ class MemoryStore:
         """Split raw memory-file text into stripped, non-empty entries."""
         if not raw.strip():
             return []
-        # Use ENTRY_DELIMITER for consistency with _write_file. Splitting by "§"
-        # alone would incorrectly split entries that contain "§" in their content.
-        entries = [e.strip() for e in raw.split(ENTRY_DELIMITER)]
+        # Defensive normalization: production reads decode via Path.read_text
+        # (universal newlines), so `raw` never contains \r on that path — but
+        # callers handing over raw decoded bytes (tests, future byte-level
+        # readers) still split on the canonical LF delimiter. Splitting by "§"
+        # alone would incorrectly split entries that contain it as content.
+        entries = [
+            e.strip()
+            for e in normalize_newlines(raw).split(ENTRY_DELIMITER)
+        ]
         return [e for e in entries if e]
 
     @staticmethod
@@ -825,9 +831,9 @@ class MemoryStore:
         The memory file is supposed to be a list of small entries the tool
         wrote, joined by §. Detect drift via two signals:
 
-        1. Round-trip mismatch — re-parsing and re-serializing the file
-           doesn't produce identical bytes (rare; would catch oddly-encoded
-           delimiters).
+        1. Semantic round-trip mismatch — after normalizing line endings,
+           re-parsing and re-serializing the file changes its content. LF and
+           CRLF delimiters are both valid input and are not treated as drift.
         2. Entry-size overflow — any single parsed entry exceeds the
            store's whole-file char limit. The tool budgets the ENTIRE store
            against that limit; no single tool-written entry can exceed it.
@@ -847,13 +853,17 @@ class MemoryStore:
         if not raw.strip():
             return None
 
-        parsed = [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
+        # Normalize once and derive both the parse and the drift comparison
+        # from the same normalized snapshot (parse re-normalizing is an
+        # idempotent no-op).
+        normalized_raw = normalize_newlines(raw).strip()
+        parsed = self._parse_entries(normalized_raw)
         roundtrip = ENTRY_DELIMITER.join(parsed)
 
         char_limit = self._char_limit(target)
         max_entry_len = max((len(e) for e in parsed), default=0)
 
-        drift_detected = (raw.strip() != roundtrip) or (max_entry_len > char_limit)
+        drift_detected = (normalized_raw != roundtrip) or (max_entry_len > char_limit)
         if not drift_detected:
             return None
 
@@ -862,8 +872,11 @@ class MemoryStore:
         # the caller can refuse the mutation.
         ts = int(time.time())
         bak_path = path.with_suffix(path.suffix + f".bak.{ts}")
+        # Keep the snapshot on the same canonical-LF policy as the store
+        # itself so a restored .bak is byte-identical to what the parser
+        # round-trips (raw is already universal-newline decoded).
         try:
-            bak_path.write_text(raw, encoding="utf-8")
+            bak_path.write_text(raw, encoding="utf-8", newline="\n")
         except (OSError, IOError):
             return str(bak_path) + " (BACKUP FAILED — file unchanged on disk)"
         return str(bak_path)
@@ -875,11 +888,15 @@ class MemoryStore:
         Previous implementation used open("w") + flock, but "w" truncates the
         file *before* the lock is acquired, creating a race window where
         concurrent readers see an empty file. Atomic rename avoids this:
-        readers always see either the old complete file or the new one.
+        readers always see either the old complete file or the new one. Memory
+        files use canonical LF delimiters on every platform (newline="\\n"
+        disables the text-mode translation that previously produced CRLF
+        bytes on Windows); reads normalize defensively, so a pre-existing
+        CRLF file is rewritten canonical on its next successful mutation.
         """
         content = ENTRY_DELIMITER.join(entries) if entries else ""
         try:
-            atomic_write_text(path, content, tmp_prefix=".mem_")
+            atomic_write_text(path, content, tmp_prefix=".mem_", newline="\n")
         except (OSError, IOError) as e:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 
