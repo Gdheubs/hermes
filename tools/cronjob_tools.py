@@ -1190,6 +1190,7 @@ def cronjob(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     reason: Optional[str] = None,
     script: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
@@ -1292,6 +1293,7 @@ def cronjob(
                     model=_normalize_optional_job_value(model),
                     provider=_normalize_optional_job_value(provider),
                     base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
+                    reasoning_effort=_normalize_optional_job_value(reasoning_effort),
                     script=_normalize_optional_job_value(script),
                     context_from=context_from,
                     enabled_toolsets=enabled_toolsets or None,
@@ -1482,6 +1484,12 @@ def cronjob(
                 updates["provider"] = _normalize_optional_job_value(provider)
             if base_url is not None:
                 updates["base_url"] = _normalize_optional_job_value(base_url, strip_trailing_slash=True)
+            if reasoning_effort is not None:
+                # An empty operator CLI value clears the override. Validation
+                # and canonicalization stay centralized in update_job().
+                updates["reasoning_effort"] = (
+                    _normalize_optional_job_value(reasoning_effort) or None
+                )
             # Re-validate the EFFECTIVE provider/base_url on EVERY update, not
             # only when this update supplies provider/base_url. A job persisted
             # before this guard (or written directly to the jobs store) may
@@ -1782,7 +1790,7 @@ registry.register(
         include_disabled=args.get("include_disabled", True),
         skill=args.get("skill"),
         skills=args.get("skills"),
-        # model / provider / base_url are intentionally NOT read from the
+        # model / provider / base_url / reasoning_effort are intentionally NOT read from the
         # agent's arguments: per-job inference pins are user-owned (dashboard,
         # `hermes cron create/edit --model`, or hand-edited jobs). The agent
         # must not be able to point unattended spend at a different model.

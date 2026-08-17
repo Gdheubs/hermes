@@ -128,6 +128,51 @@ class TestCronCommandLifecycle:
         assert jobs[0]["skills"] == ["blogwatcher", "maps"]
         assert jobs[0]["name"] == "Skill combo"
 
+    def test_operator_can_set_disable_and_clear_reasoning_effort(
+        self, tmp_cron_dir, capsys
+    ):
+        cron_command(
+            Namespace(
+                cron_command="create",
+                schedule="every 1h",
+                prompt="Reason about the report",
+                name="Reasoned job",
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                script=None,
+                workdir=None,
+                no_agent=False,
+                reasoning_effort="high",
+            )
+        )
+        job = list_jobs()[0]
+        assert job["reasoning_effort"] == "high"
+
+        common_edit = dict(
+            cron_command="edit",
+            job_id=job["id"],
+            schedule=None,
+            prompt=None,
+            name=None,
+            deliver=None,
+            repeat=None,
+            skill=None,
+            skills=None,
+            clear_skills=False,
+            add_skills=None,
+            remove_skills=None,
+            script=None,
+            workdir=None,
+            no_agent=None,
+        )
+        cron_command(Namespace(**common_edit, reasoning_effort="none"))
+        assert get_job(job["id"])["reasoning_effort"] == "none"
+
+        cron_command(Namespace(**common_edit, reasoning_effort=""))
+        assert "reasoning_effort" not in get_job(job["id"])
+
 
 
 class TestGatewayNotRunningWarning:

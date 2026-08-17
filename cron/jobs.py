@@ -1692,6 +1692,22 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
     return text or None
 
 
+def _normalize_job_reasoning_effort(value: Any) -> Optional[str]:
+    """Validate and canonicalize an explicit per-job reasoning override."""
+    if value is None:
+        return None
+    if value is True:
+        raise ValueError("Invalid reasoning_effort: true is not an explicit effort")
+    from hermes_constants import parse_reasoning_effort
+
+    parsed = parse_reasoning_effort(value)
+    if parsed is None:
+        raise ValueError(f"Invalid reasoning_effort: {value!r}")
+    if parsed.get("enabled") is False:
+        return "none"
+    return str(parsed["effort"])
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -1789,6 +1805,7 @@ def create_job(
     model: Optional[str] = None,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
+    reasoning_effort: Any = None,
     script: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
@@ -1814,6 +1831,7 @@ def create_job(
         model: Optional per-job model override
         provider: Optional per-job provider override
         base_url: Optional per-job base URL override
+        reasoning_effort: Optional per-job reasoning effort override
         script: Optional path to a script whose stdout feeds the job. With
                 ``no_agent=True`` the script IS the job — its stdout is
                 delivered verbatim. Without ``no_agent``, its stdout is
@@ -1879,6 +1897,7 @@ def create_job(
     normalized_model = _normalize_job_optional_text(model)
     normalized_provider = _normalize_job_optional_text(provider)
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
+    normalized_reasoning_effort = _normalize_job_reasoning_effort(reasoning_effort)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
     normalized_toolsets = [str(t).strip() for t in enabled_toolsets if str(t).strip()] if enabled_toolsets else None
@@ -1990,6 +2009,8 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    if normalized_reasoning_effort is not None:
+        job["reasoning_effort"] = normalized_reasoning_effort
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -2078,6 +2099,14 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             f"Cron job field(s) cannot be updated: {', '.join(sorted(bad_fields))}"
         )
 
+    clear_reasoning_effort = (
+        "reasoning_effort" in updates and updates["reasoning_effort"] is None
+    )
+    if "reasoning_effort" in updates and not clear_reasoning_effort:
+        updates["reasoning_effort"] = _normalize_job_reasoning_effort(
+            updates["reasoning_effort"]
+        )
+
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
@@ -2103,6 +2132,8 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            if clear_reasoning_effort:
+                updated.pop("reasoning_effort", None)
 
             # Re-check execution-mode invariants on the MERGED record when
             # any participating field changes, so create-time invariants

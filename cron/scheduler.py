@@ -391,6 +391,21 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     return disabled
 
 
+def _resolve_job_reasoning_config(job: dict, cfg: dict, model: str):
+    """Resolve model/config reasoning, then apply a validated job override."""
+    from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
+
+    resolved = resolve_reasoning_config(cfg, model)
+    if "reasoning_effort" not in job:
+        return resolved
+    override = parse_reasoning_effort(job.get("reasoning_effort"))
+    if override is None:
+        raise ValueError(
+            f"Invalid reasoning_effort on cron job {job.get('id', '<unknown>')!r}"
+        )
+    return override
+
+
 def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]:
     """Layer enabled MCP servers onto a per-job ``enabled_toolsets`` allowlist.
 
@@ -5076,8 +5091,6 @@ def run_job(
 
         # Reasoning config is resolved after provider authentication so an auth
         # fallback can first replace the primary model with its configured model.
-        from hermes_constants import resolve_reasoning_config
-
         # Prefill messages from env or config.yaml. The top-level
         # prefill_messages_file key is canonical; agent.prefill_messages_file is
         # retained as a legacy fallback for older CLI/godmode configs.
@@ -5288,8 +5301,8 @@ def run_job(
             if runtime is None:
                 raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 
-        reasoning_config = resolve_reasoning_config(
-            _cfg if isinstance(_cfg, dict) else {}, str(model)
+        reasoning_config = _resolve_job_reasoning_config(
+            job, _cfg if isinstance(_cfg, dict) else {}, str(model)
         )
 
         # Provider/model-drift fail-closed guard (#44585).

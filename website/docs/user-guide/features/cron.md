@@ -31,6 +31,13 @@ All of this is available to Hermes itself through the `cronjob` tool, so you can
 `hermes setup --portal` is the lowest-friction option for unattended runs since OAuth refresh is automatic. See [Nous Portal](/integrations/nous-portal).
 :::
 
+:::tip
+**How much does a cron job think?** Reasoning resolution at fire time is: per-job `reasoning_effort` override → per-model entry in `agent.reasoning_overrides` → global `agent.reasoning_effort`.
+
+- **Per-job override** — set by *you* via `hermes cron create/edit --reasoning-effort <level>` (or by editing `~/.hermes/cron/jobs.json`). Valid levels are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; `none` disables reasoning for that job. Pass an empty string to `hermes cron edit --reasoning-effort ""` to clear the override and follow the config default again. Like per-job model pins, this override is user-owned — the agent's `cronjob` tool cannot set or change it.
+- **Config default** — jobs without an override resolve reasoning exactly like an interactive session: per-model override first, then the global `agent.reasoning_effort`.
+:::
+
 :::warning
 Cron-run sessions cannot recursively create more cron jobs. Hermes disables cron management tools inside cron executions to prevent runaway scheduling loops.
 :::

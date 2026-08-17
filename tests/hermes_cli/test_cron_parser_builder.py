@@ -41,6 +41,19 @@ def test_cron_edit_no_agent_tristate():
     assert parser.parse_args(["cron", "edit", "j"]).no_agent is None
 
 
+def test_cron_reasoning_effort_is_operator_configurable():
+    parser = _build()
+    created = parser.parse_args(
+        ["cron", "create", "30m", "--reasoning-effort", "high"]
+    )
+    edited = parser.parse_args(
+        ["cron", "edit", "j", "--reasoning-effort", "none"]
+    )
+
+    assert created.reasoning_effort == "high"
+    assert edited.reasoning_effort == "none"
+
+
 def test_cron_accept_hooks_flag_on_run_and_tick():
     parser = _build()
     # --accept-hooks is suppressed-default; present only when passed.

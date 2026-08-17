@@ -118,6 +118,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
             "monitors, incremental digests). First run is unchanged."
         ),
     )
+    cron_create.add_argument(
+        "--reasoning-effort",
+        help=(
+            "Pin this job's reasoning effort (none, minimal, low, medium, high, "
+            "xhigh, max, or ultra). User-owned; the agent's cronjob tool cannot "
+            "set it. Omit to follow the model/config default."
+        ),
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -230,6 +238,13 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--provider",
         dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.",
+    )
+    cron_edit.add_argument(
+        "--reasoning-effort",
+        help=(
+            "Set this job's reasoning effort; use none to disable reasoning or "
+            "pass an empty string to clear the override."
+        ),
     )
 
     # lifecycle actions

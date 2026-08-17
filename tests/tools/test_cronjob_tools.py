@@ -406,6 +406,7 @@ class TestAgentCannotSetModelPin:
         assert "model" not in props
         assert "provider" not in props
         assert "base_url" not in props
+        assert "reasoning_effort" not in props
 
 
     def test_handler_update_leaves_user_pin_untouched(self):
