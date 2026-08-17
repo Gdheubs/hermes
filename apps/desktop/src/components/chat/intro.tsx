@@ -1,5 +1,6 @@
 import { type CSSProperties, useState } from 'react'
 
+import { useI18n } from '@/i18n'
 import { capitalize, normalize } from '@/lib/text'
 
 import introCopyJsonl from './intro-copy.jsonl?raw'
@@ -157,8 +158,13 @@ function resolveCopy(personality?: string, seed?: number): IntroCopy {
 }
 
 export function Intro({ personality, seed }: IntroProps) {
+  const { locale, t } = useI18n()
   const [mountSeed] = useState(() => Math.floor(Math.random() * 100000))
-  const copy = resolveCopy(personality, mountSeed + (seed ?? 0))
+
+  const copy =
+    locale === 'en'
+      ? resolveCopy(personality, mountSeed + (seed ?? 0))
+      : { body: t.composer.introBody, headline: WORDMARK }
 
   return (
     <div

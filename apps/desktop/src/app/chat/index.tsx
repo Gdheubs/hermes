@@ -500,7 +500,7 @@ export const ChatView = memo(function ChatView({
       },
       tools: {
         enabled: true,
-        label: 'Add context',
+        label: t.composer.addContext,
         suggestions: contextSuggestions
       },
       voice: {
@@ -508,7 +508,15 @@ export const ChatView = memo(function ChatView({
         active: false
       }
     }),
-    [contextSuggestions, currentModel, currentProvider, gatewayOpen, modelMenuContent, quickModels]
+    [
+      contextSuggestions,
+      currentModel,
+      currentProvider,
+      gatewayOpen,
+      modelMenuContent,
+      quickModels,
+      t.composer.addContext
+    ]
   )
 
   // Drop files anywhere in the conversation area, not just on the composer
