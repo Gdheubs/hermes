@@ -31,9 +31,12 @@ else:
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import os
+import stat
 import sys
+import threading
 from pathlib import Path
 from hermes_constants import get_hermes_home
 
@@ -217,6 +220,165 @@ def _run_setup_browser(assume_yes: bool = False) -> int:
         return 1
 
 
+def _fd_mode(stream) -> int | None:
+    """Return ``os.fstat(stream).st_mode`` or None when it can't be determined."""
+    try:
+        return os.fstat(stream.fileno()).st_mode
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _is_pipe_like(stream) -> bool:
+    """True when ``stream`` can back an asyncio pipe transport.
+
+    The acp SDK's POSIX ``stdio_streams()`` calls ``loop.connect_read_pipe`` /
+    ``loop.connect_write_pipe`` on the real stdio, which raises
+    ``ValueError: Pipe transport is only for pipes, sockets and character devices``
+    for anything that is not a pipe, socket, or character device (a redirected
+    regular file, an in-memory wrapper, etc.).  This mirrors the mode check
+    Python itself applies before building those transports.
+    """
+    mode = _fd_mode(stream)
+    if mode is None:
+        return False
+    return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode) or stat.S_ISCHR(mode)
+
+
+def _needs_stdio_fallback(platform: str | None = None) -> bool:
+    """True when the ACP stdio transport needs Hermes-side stream pumps.
+
+    The acp SDK only touches the real stdio with ``connect_read_pipe`` /
+    ``connect_write_pipe`` on POSIX; on Windows it already uses a background
+    stdin feeder plus a custom stdout transport that tolerates any stdout
+    (``acp.stdio._windows_stdio_streams``).  So the fallback is only required
+    on POSIX when either stdin or stdout is not pipe-like — e.g.
+    ``hermes acp > out.txt`` or a host app that wraps stdout without a pipe.
+    """
+    if (sys.platform if platform is None else platform) == "win32":
+        return False
+    return not (_is_pipe_like(sys.stdin) and _is_pipe_like(sys.stdout))
+
+
+class _StdoutWriteTransport(asyncio.BaseTransport):
+    """Minimal write transport that forwards bytes to the real stdout.
+
+    Used only when stdout is not pipe-like (redirected to a file, wrapped by
+    a host app), where the SDK's ``connect_write_pipe`` would raise.  Mirrors
+    ``acp.stdio._StdoutTransport``.
+    """
+
+    def __init__(self) -> None:
+        self._is_closing = False
+
+    def write(self, data: bytes) -> None:  # type: ignore[override]
+        if self._is_closing:
+            return
+        try:
+            target = getattr(sys.stdout, "buffer", sys.stdout)
+            target.write(data)
+            target.flush()
+        except Exception:
+            logging.exception("Error writing to stdout")
+
+    def can_write_eof(self) -> bool:  # type: ignore[override]
+        return False
+
+    def is_closing(self) -> bool:  # type: ignore[override]
+        return self._is_closing
+
+    def close(self) -> None:  # type: ignore[override]
+        self._is_closing = True
+        with contextlib.suppress(Exception):
+            sys.stdout.flush()
+
+    def abort(self) -> None:  # type: ignore[override]
+        self.close()
+
+    def get_extra_info(self, name: str, default=None):  # type: ignore[override]
+        return default
+
+
+class _DrainHelperProtocol(asyncio.BaseProtocol):
+    """Protocol shim so ``StreamWriter.drain()`` works over the fallback
+    transport (it awaits ``protocol._drain_helper()``)."""
+
+    def __init__(self) -> None:
+        self._paused = False
+        self._drain_waiter: asyncio.Future[None] | None = None
+
+    def pause_writing(self) -> None:  # type: ignore[override]
+        self._paused = True
+        if self._drain_waiter is None:
+            self._drain_waiter = asyncio.get_running_loop().create_future()
+
+    def resume_writing(self) -> None:  # type: ignore[override]
+        self._paused = False
+        if self._drain_waiter is not None and not self._drain_waiter.done():
+            self._drain_waiter.set_result(None)
+        self._drain_waiter = None
+
+    async def _drain_helper(self) -> None:
+        if self._paused and self._drain_waiter is not None:
+            await self._drain_waiter
+
+
+def _build_fallback_stdio_streams(
+    loop: asyncio.AbstractEventLoop,
+    limit: int | None = None,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Build ``(reader, writer)`` that pump the real stdin/stdout without
+    requiring pipe/socket/char-device backing.
+
+    This is the same strategy the acp SDK already uses on Windows: a daemon
+    thread feeds ``sys.stdin`` into an ``asyncio.StreamReader`` and a custom
+    transport forwards ``StreamWriter.write()`` to ``sys.stdout.buffer``.  It
+    lets ``hermes acp`` keep speaking JSON-RPC over stdio even when a host
+    app redirects or wraps stdout (#84515).
+    """
+    reader = (
+        asyncio.StreamReader(limit=limit)
+        if limit is not None
+        else asyncio.StreamReader()
+    )
+
+    def _feed_stdin() -> None:
+        try:
+            src = getattr(sys.stdin, "buffer", sys.stdin)
+            while True:
+                data = src.readline()
+                if not data:
+                    break
+                loop.call_soon_threadsafe(reader.feed_data, data)
+        finally:
+            loop.call_soon_threadsafe(reader.feed_eof)
+
+    threading.Thread(target=_feed_stdin, daemon=True).start()
+
+    write_protocol = _DrainHelperProtocol()
+    transport = _StdoutWriteTransport()
+    writer = asyncio.StreamWriter(transport, write_protocol, None, loop)
+    return reader, writer
+
+
+async def _run_acp_with_stdio_fallback(agent) -> None:
+    """Run ``acp.run_agent`` over Hermes-built stdio pump streams.
+
+    Used when the process stdio isn't pipe-backed (e.g. stdout redirected to
+    a file), where the SDK's default stdio transport would raise
+    ``ValueError: Pipe transport is only for pipes, sockets and character devices``.
+    """
+    import acp
+
+    loop = asyncio.get_running_loop()
+    reader, writer = _build_fallback_stdio_streams(loop)
+    await acp.run_agent(
+        agent,
+        input_stream=writer,
+        output_stream=reader,
+        use_unstable_protocol=True,
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     """Entry point: load env, configure logging, run the ACP agent."""
     args = _parse_args(argv)
@@ -270,7 +432,20 @@ def main(argv: list[str] | None = None) -> None:
 
     agent = HermesACPAgent()
     try:
-        asyncio.run(acp.run_agent(agent, use_unstable_protocol=True))
+        if _needs_stdio_fallback():
+            stdin_mode = _fd_mode(sys.stdin)
+            stdout_mode = _fd_mode(sys.stdout)
+            logger.warning(
+                "stdio is not pipe-backed (stdin mode %s, stdout mode %s); "
+                "wrapping stdio in a Hermes-side pump so the ACP transport "
+                "can start. Host applications should spawn `hermes acp` with "
+                "stdio pipes.",
+                oct(stdin_mode) if stdin_mode is not None else "n/a",
+                oct(stdout_mode) if stdout_mode is not None else "n/a",
+            )
+            asyncio.run(_run_acp_with_stdio_fallback(agent))
+        else:
+            asyncio.run(acp.run_agent(agent, use_unstable_protocol=True))
     except KeyboardInterrupt:
         logger.info("Shutting down (KeyboardInterrupt)")
     except Exception:
