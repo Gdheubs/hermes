@@ -238,7 +238,8 @@ def _max_workers_for_tool_batch(runnable_calls) -> int:
         return 0
     max_workers = _MAX_TOOL_WORKERS
     if any(
-        (call[2] if len(call) >= 3 else None) == "image_generate"
+        (call.get("function_name") if isinstance(call, dict) else
+         (call[2] if len(call) >= 3 else None)) == "image_generate"
         for call in runnable_calls
     ):
         max_workers = min(max_workers, _image_generate_parallel_limit())
@@ -2693,6 +2694,79 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
 
 
+
+
+async def _wait_with_interrupt(agent, futures, timeout_s):
+    """Poll the futures on small slices: a mid-batch interrupt drains the
+    batch immediately; the deadline bounds the wedged calls."""
+    import asyncio
+
+    loop = asyncio.get_running_loop()
+    if timeout_s is None:
+        timeout_s = 3600.0
+    deadline = loop.time() + timeout_s
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return await asyncio.wait(futures, timeout=0)
+        done, pending = await asyncio.wait(futures, timeout=min(remaining, 0.05))
+        if getattr(agent, "_interrupt_requested", False):
+            return done, pending
+        if not pending:
+            return done, pending
+
+
+async def _execute_tool_batch_async(agent, runnable_calls, timeout_s):
+    """Async batch dispatch with the full sync worker contract: real daemon
+    threads, tid tracking, per-tid interrupt reset, loop-time gate timeout,
+    mid-batch interrupt drain, dynamic worker cap."""
+    import asyncio
+    from tools.daemon_pool import DaemonThreadPoolExecutor
+
+    executor = DaemonThreadPoolExecutor(
+        max_workers=_max_workers_for_tool_batch(runnable_calls)
+    )
+    worker_tids: list[int] = []
+
+    def _run(call):
+        tid = threading.current_thread().ident
+        worker_tids.append(tid)
+        with agent._tool_worker_threads_lock:
+            agent._tool_worker_threads.add(tid)
+        try:
+            if getattr(agent, "_interrupt_requested", False):
+                return ("interrupted", None)
+            try:
+                return ("ok", _run_agent_tool_execution_middleware(agent, **call))
+            except Exception as exc:  # per-call error contract (matches the sync path)
+                return ("error", repr(exc))
+        finally:
+            with agent._tool_worker_threads_lock:
+                agent._tool_worker_threads.discard(tid)
+            try:
+                _ra()._set_interrupt(False, tid)
+            except Exception:
+                pass
+
+    loop = asyncio.get_running_loop()
+    try:
+        futures = [loop.run_in_executor(executor, _run, c) for c in runnable_calls]
+        done, pending = await _wait_with_interrupt(agent, futures, timeout_s)
+        for f in pending:
+            f.cancel()
+        outcomes = {}
+        for f in done:
+            if not f.cancelled():
+                outcomes[id(f)] = f.result()
+        ordered = []
+        for fut, call in zip(futures, runnable_calls):
+            if id(fut) in outcomes:
+                ordered.append((call, *outcomes[id(fut)]))
+            else:
+                ordered.append((call, "timed_out", None))
+        return ordered
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
