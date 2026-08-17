@@ -1276,6 +1276,10 @@ export interface MoaConfigResponse {
       reference_max_tokens?: number | null
       /** Fan-out cadence (user_turn default | per_iteration | every_n:N) — round-tripped. */
       fanout?: string
+      /** Advisor transcript view — round-tripped, not edited here. */
+      reference_input_scope?: 'conversation' | 'current_turn'
+      /** Pre-provider advisor input filtering — round-tripped, not edited here. */
+      reference_input_filter?: 'none' | 'redact'
       reference_timeout: number | null
     }
   >
@@ -1286,6 +1290,8 @@ export interface MoaConfigResponse {
   max_tokens: number
   reference_models: MoaModelSlot[]
   reference_temperature: number
+  reference_input_scope?: 'conversation' | 'current_turn'
+  reference_input_filter?: 'none' | 'redact'
   reference_timeout: number | null
 }
 
