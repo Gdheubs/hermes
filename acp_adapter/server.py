@@ -72,7 +72,12 @@ from acp_adapter.events import (
 )
 from acp_adapter.permissions import make_approval_callback
 from acp_adapter.provenance import session_provenance_meta
-from acp_adapter.session import SessionManager, SessionState, _expand_acp_enabled_toolsets
+from acp_adapter.session import (
+    SessionManager,
+    SessionState,
+    _expand_acp_enabled_toolsets,
+    _normalize_acp_toolsets,
+)
 from acp_adapter.tools import build_tool_complete, build_tool_start
 from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY,
@@ -221,6 +226,15 @@ _TEXT_RESOURCE_MIME_TYPES = {
     "application/toml",
     "application/sql",
 }
+
+_PATROCLO_SESSION_TOOLSETS_META = "dev.patroclo/session-toolsets"
+
+
+def _session_toolsets_from_kwargs(kwargs: dict[str, Any]) -> list[str] | None:
+    """Read Patroclo's namespaced ACP metadata after the SDK merges it into kwargs."""
+    if _PATROCLO_SESSION_TOOLSETS_META not in kwargs:
+        return None
+    return _normalize_acp_toolsets(kwargs[_PATROCLO_SESSION_TOOLSETS_META])
 
 
 def _resource_display_name(uri: str, name: str | None = None, title: str | None = None) -> str:
@@ -1009,7 +1023,7 @@ class HermesACPAgent(acp.Agent):
             from agent.memory_manager import inject_memory_provider_tools
 
             enabled_toolsets = _expand_acp_enabled_toolsets(
-                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"],
+                getattr(state.agent, "enabled_toolsets", None),
                 mcp_server_names=[server.name for server in mcp_servers],
             )
             state.agent.enabled_toolsets = enabled_toolsets
@@ -1438,7 +1452,8 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> NewSessionResponse:
-        state = self.session_manager.create_session(cwd=cwd)
+        toolsets = _session_toolsets_from_kwargs(kwargs)
+        state = self.session_manager.create_session(cwd=cwd, enabled_toolsets=toolsets)
         await self._register_session_mcp_servers(state, mcp_servers)
         self._schedule_mcp_late_refresh(state)
         logger.info("New session %s (cwd=%s)", state.session_id, cwd)
@@ -1460,7 +1475,10 @@ class HermesACPAgent(acp.Agent):
         mcp_servers: list | None = None,
         **kwargs: Any,
     ) -> LoadSessionResponse | None:
-        state = self.session_manager.update_cwd(session_id, cwd)
+        toolsets = _session_toolsets_from_kwargs(kwargs)
+        state = self.session_manager.update_cwd(
+            session_id, cwd, enabled_toolsets=toolsets
+        )
         if state is None:
             logger.warning("load_session: session %s not found", session_id)
             return None
@@ -2181,6 +2199,7 @@ class HermesACPAgent(acp.Agent):
             cwd=state.cwd,
             model=new_model,
             requested_provider=target_provider,
+            enabled_toolsets=state.enabled_toolsets,
         )
         self.session_manager.save_session(state.session_id)
         provider_label = getattr(state.agent, "provider", None) or target_provider or current_provider
@@ -2194,7 +2213,7 @@ class HermesACPAgent(acp.Agent):
             from agent.memory_manager import inject_memory_provider_tools
 
             toolsets = _expand_acp_enabled_toolsets(
-                getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
+                getattr(state.agent, "enabled_toolsets", None)
             )
             tools = get_tool_definitions(enabled_toolsets=toolsets, quiet_mode=True)
             tool_view = SimpleNamespace(
@@ -2433,6 +2452,7 @@ class HermesACPAgent(acp.Agent):
                 requested_provider=requested_provider,
                 base_url=current_base_url,
                 api_mode=current_api_mode,
+                enabled_toolsets=state.enabled_toolsets,
             )
             self.session_manager.save_session(session_id)
             logger.info(

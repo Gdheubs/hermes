@@ -137,13 +137,36 @@ def _register_task_cwd(task_id: str, cwd: str) -> None:
         logger.debug("Failed to register ACP task cwd override", exc_info=True)
 
 
+def _normalize_acp_toolsets(toolsets: Any) -> List[str] | None:
+    """Validate an explicit per-session toolset policy; None means configured defaults."""
+    if toolsets is None:
+        return None
+    if not isinstance(toolsets, list) or len(toolsets) > 32:
+        raise ValueError("ACP toolsets must be a list of at most 32 names")
+    normalized: List[str] = []
+    for name in toolsets:
+        if not isinstance(name, str) or re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name) is None:
+            raise ValueError("invalid ACP toolset name")
+        if name not in normalized:
+            normalized.append(name)
+    return normalized
+
+
 def _expand_acp_enabled_toolsets(
     toolsets: List[str] | None = None,
     mcp_server_names: List[str] | None = None,
 ) -> List[str]:
     """Return ACP toolsets plus explicit MCP server toolsets for this session."""
     expanded: List[str] = []
-    for name in list(toolsets or ["hermes-acp"]):
+    # Internal call sites may hand us whatever lives on the agent object
+    # (including non-list sentinels from mocked agents in tests); only an
+    # actual list is a real per-session policy — anything else falls back
+    # to the configured default.
+    if isinstance(toolsets, list):
+        source = _normalize_acp_toolsets(toolsets)
+    else:
+        source = ["hermes-acp"]
+    for name in source:
         if name and name not in expanded:
             expanded.append(name)
 
@@ -181,6 +204,7 @@ class SessionState:
     runtime_lock: Any = field(default_factory=Lock)
     current_prompt_text: str = ""
     interrupted_prompt_text: str = ""
+    enabled_toolsets: List[str] | None = None
 
 
 class SessionManager:
@@ -207,19 +231,27 @@ class SessionManager:
 
     # ---- public API ---------------------------------------------------------
 
-    def create_session(self, cwd: str = ".") -> SessionState:
+    def create_session(
+        self,
+        cwd: str = ".",
+        enabled_toolsets: List[str] | None = None,
+    ) -> SessionState:
         """Create a new session with a unique ID and a fresh AIAgent."""
         import threading
 
         cwd = _translate_acp_cwd(cwd)
+        enabled_toolsets = _normalize_acp_toolsets(enabled_toolsets)
         session_id = str(uuid.uuid4())
-        agent = self._make_agent(session_id=session_id, cwd=cwd)
+        agent = self._make_agent(
+            session_id=session_id, cwd=cwd, enabled_toolsets=enabled_toolsets
+        )
         state = SessionState(
             session_id=session_id,
             agent=agent,
             cwd=cwd,
             model=getattr(agent, "model", "") or "",
             cancel_event=threading.Event(),
+            enabled_toolsets=enabled_toolsets,
         )
         with self._lock:
             self._sessions[session_id] = state
@@ -228,7 +260,9 @@ class SessionManager:
         logger.info("Created ACP session %s (cwd=%s)", session_id, cwd)
         return state
 
-    def get_session(self, session_id: str) -> Optional[SessionState]:
+    def get_session(
+        self, session_id: str, enabled_toolsets: List[str] | None = None
+    ) -> Optional[SessionState]:
         """Return the session for *session_id*, or ``None``.
 
         If the session is not in memory but exists in the database (e.g. after
@@ -237,9 +271,9 @@ class SessionManager:
         with self._lock:
             state = self._sessions.get(session_id)
         if state is not None:
-            return state
+            return self._apply_toolset_policy(state, enabled_toolsets)
         # Attempt to restore from database.
-        return self._restore(session_id)
+        return self._restore(session_id, enabled_toolsets=enabled_toolsets)
 
     def remove_session(self, session_id: str) -> bool:
         """Remove a session from memory and database. Returns True if it existed."""
@@ -264,6 +298,7 @@ class SessionManager:
             session_id=new_id,
             cwd=cwd,
             model=original.model or None,
+            enabled_toolsets=original.enabled_toolsets,
         )
         state = SessionState(
             session_id=new_id,
@@ -272,6 +307,7 @@ class SessionManager:
             model=getattr(agent, "model", original.model) or original.model,
             history=copy.deepcopy(original.history),
             cancel_event=threading.Event(),
+            enabled_toolsets=copy.deepcopy(original.enabled_toolsets),
         )
         with self._lock:
             self._sessions[new_id] = state
@@ -354,10 +390,13 @@ class SessionManager:
         results.sort(key=lambda item: _updated_at_sort_key(item.get("updated_at")), reverse=True)
         return results
 
-    def update_cwd(self, session_id: str, cwd: str) -> Optional[SessionState]:
+    def update_cwd(
+        self, session_id: str, cwd: str,
+        enabled_toolsets: List[str] | None = None,
+    ) -> Optional[SessionState]:
         """Update the working directory for a session and its tool overrides."""
         cwd = _translate_acp_cwd(cwd)
-        state = self.get_session(session_id)  # checks DB too
+        state = self.get_session(session_id, enabled_toolsets=enabled_toolsets)
         if state is None:
             return None
         state.cwd = cwd
@@ -433,6 +472,8 @@ class SessionManager:
         # Ensure model is a plain string (not a MagicMock or other proxy).
         model_str = str(state.model) if state.model else None
         session_meta = {"cwd": state.cwd}
+        if state.enabled_toolsets is not None:
+            session_meta["enabled_toolsets"] = list(state.enabled_toolsets)
         provider = getattr(state.agent, "provider", None)
         base_url = getattr(state.agent, "base_url", None)
         api_mode = getattr(state.agent, "api_mode", None)
@@ -452,7 +493,7 @@ class SessionManager:
                     session_id=state.session_id,
                     source="acp",
                     model=model_str,
-                    model_config={"cwd": state.cwd},
+                    model_config=session_meta,
                 )
             else:
                 # Update model_config (contains cwd) if changed.
@@ -506,7 +547,10 @@ class SessionManager:
         except Exception:
             logger.warning("Failed to persist ACP session %s", state.session_id, exc_info=True)
 
-    def _restore(self, session_id: str) -> Optional[SessionState]:
+    def _restore(
+        self, session_id: str,
+        enabled_toolsets: List[str] | None = None,
+    ) -> Optional[SessionState]:
         """Load a session from the database into memory, recreating the AIAgent."""
         import threading
 
@@ -532,6 +576,7 @@ class SessionManager:
         requested_provider = row.get("billing_provider")
         restored_base_url = row.get("billing_base_url")
         restored_api_mode = None
+        persisted_toolsets = None
         mc = row.get("model_config")
         if mc:
             try:
@@ -541,8 +586,12 @@ class SessionManager:
                     requested_provider = meta.get("provider") or requested_provider
                     restored_base_url = meta.get("base_url") or restored_base_url
                     restored_api_mode = meta.get("api_mode") or restored_api_mode
+                    persisted_toolsets = _normalize_acp_toolsets(meta.get("enabled_toolsets"))
             except (json.JSONDecodeError, TypeError):
                 pass
+            except ValueError:
+                logger.warning("Ignoring invalid persisted ACP toolset policy for %s", session_id)
+        effective_toolsets = _normalize_acp_toolsets(enabled_toolsets) if enabled_toolsets is not None else persisted_toolsets
 
         model = row.get("model") or None
 
@@ -567,6 +616,7 @@ class SessionManager:
                 requested_provider=requested_provider,
                 base_url=restored_base_url,
                 api_mode=restored_api_mode,
+                enabled_toolsets=effective_toolsets,
             )
         except Exception:
             logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
@@ -579,6 +629,7 @@ class SessionManager:
             model=model or getattr(agent, "model", "") or "",
             history=history,
             cancel_event=threading.Event(),
+            enabled_toolsets=effective_toolsets,
         )
         with self._lock:
             self._sessions[session_id] = state
@@ -599,6 +650,37 @@ class SessionManager:
 
     # ---- internal -----------------------------------------------------------
 
+    def _apply_toolset_policy(
+        self, state: SessionState, enabled_toolsets: List[str] | None
+    ) -> SessionState:
+        """Apply an explicit policy without letting an omitted field elevate a restricted session."""
+        if enabled_toolsets is None:
+            return state
+        normalized = _normalize_acp_toolsets(enabled_toolsets)
+        if state.enabled_toolsets == normalized:
+            return state
+        previous = state.agent
+        provider = getattr(previous, "provider", None)
+        base_url = getattr(previous, "base_url", None)
+        api_mode = getattr(previous, "api_mode", None)
+        state.agent = self._make_agent(
+            session_id=state.session_id,
+            cwd=state.cwd,
+            model=state.model or None,
+            requested_provider=provider if isinstance(provider, str) else None,
+            base_url=base_url if isinstance(base_url, str) else None,
+            api_mode=api_mode if isinstance(api_mode, str) else None,
+            enabled_toolsets=normalized,
+        )
+        state.enabled_toolsets = normalized
+        self._persist(state)
+        logger.info(
+            "Session %s: applied explicit ACP toolset policy (%d toolsets)",
+            state.session_id,
+            len(normalized),
+        )
+        return state
+
     def _make_agent(
         self,
         *,
@@ -608,6 +690,7 @@ class SessionManager:
         requested_provider: str | None = None,
         base_url: str | None = None,
         api_mode: str | None = None,
+        enabled_toolsets: List[str] | None = None,
     ):
         if self._agent_factory is not None:
             return self._agent_factory()
@@ -632,11 +715,12 @@ class SessionManager:
             if not isinstance(cfg, dict) or cfg.get("enabled", True) is not False
         ]
 
+        normalized_toolsets = _normalize_acp_toolsets(enabled_toolsets)
         kwargs = {
             "platform": "acp",
             "enabled_toolsets": _expand_acp_enabled_toolsets(
-                ["hermes-acp"],
-                mcp_server_names=configured_mcp_servers,
+                normalized_toolsets,
+                mcp_server_names=configured_mcp_servers if normalized_toolsets is None else [],
             ),
             "quiet_mode": True,
             "session_id": session_id,

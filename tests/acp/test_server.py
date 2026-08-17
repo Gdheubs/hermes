@@ -58,6 +58,38 @@ def agent(mock_manager):
 
 
 @pytest.mark.asyncio
+async def test_new_session_honors_explicit_empty_patroclo_toolsets(agent):
+    resp = await agent.new_session(
+        cwd="/tmp",
+        **{"dev.patroclo/session-toolsets": []},
+    )
+    state = agent.session_manager.get_session(resp.session_id)
+    assert state.enabled_toolsets == []
+
+
+@pytest.mark.asyncio
+async def test_load_session_applies_and_persists_restricted_toolsets(agent):
+    resp = await agent.new_session(cwd="/tmp")
+    await agent.load_session(
+        cwd="/tmp",
+        session_id=resp.session_id,
+        **{"dev.patroclo/session-toolsets": []},
+    )
+    state = agent.session_manager.get_session(resp.session_id)
+    assert state.enabled_toolsets == []
+    # Omitting the extension later must not silently elevate the room session.
+    await agent.load_session(cwd="/tmp", session_id=resp.session_id)
+    assert agent.session_manager.get_session(resp.session_id).enabled_toolsets == []
+
+
+def test_explicit_empty_toolsets_do_not_expand_to_hermes_defaults():
+    from acp_adapter.session import _expand_acp_enabled_toolsets
+
+    assert _expand_acp_enabled_toolsets([]) == []
+    assert _expand_acp_enabled_toolsets(None) == ["hermes-acp"]
+
+
+@pytest.mark.asyncio
 async def test_new_session_exposes_edit_approvals_as_modes_not_config_options(agent):
     resp = await agent.new_session(cwd="/tmp")
 
