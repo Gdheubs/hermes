@@ -68,9 +68,12 @@ Voice messages from messaging platforms are auto-transcribed.
 stt:
   enabled: true
   provider: local   # local (faster-whisper, free) | groq | openai | mistral | elevenlabs | deepinfra
+  hotwords: []      # words/phrases to bias recognition toward (e.g. ["Hermes", "Nous"])
   local:
     model: base     # tiny, base, small, medium, large-v3
 ```
+
+Add domain terms (app names, project jargon) to `stt.hotwords` so STT recognizes them correctly. Supported by local (faster-whisper), OpenAI, and Groq providers.
 
 Auto-detect priority: local faster-whisper (`pip install faster-whisper`) → Groq (`GROQ_API_KEY`, free tier) → OpenAI (`VOICE_TOOLS_OPENAI_KEY`) → Mistral Voxtral (`MISTRAL_API_KEY`).
 
