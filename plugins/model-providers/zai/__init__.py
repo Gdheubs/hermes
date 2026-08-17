@@ -19,9 +19,10 @@ untouched.
 
 GLM-5.2 additionally exposes a native ``reasoning_effort`` knob with exactly
 two enabled levels — ``high`` and ``max`` — on the OpenAI-compatible endpoint
-(per Z.AI / BigModel docs).  Hermes' richer effort scale is collapsed onto
-those two so the user's effort preference actually reaches the model instead
-of being silently dropped.
+(per Z.AI / BigModel docs).  GLM-5.3 exposes ``low``, ``high``, and ``max``;
+thinking cannot be disabled on GLM-5.3.  Hermes' richer effort scale is
+collapsed onto the levels each model accepts so the user's effort preference
+actually reaches the model instead of being silently dropped or rejected.
 """
 
 from __future__ import annotations
@@ -59,6 +60,14 @@ def _is_glm_5_2(model: str | None) -> bool:
     return any(token in m for token in ("glm-5.2", "glm-5-2", "glm-5p2"))
 
 
+def _is_glm_5_3(model: str | None) -> bool:
+    """Detect GLM-5.3 across the alias spellings providers use."""
+    m = (model or "").strip().lower()
+    if not m:
+        return False
+    return any(token in m for token in ("glm-5.3", "glm-5-3", "glm-5p3"))
+
+
 def _glm_5_2_reasoning_effort(reasoning_config: dict | None) -> str | None:
     """Map Hermes reasoning effort onto GLM-5.2's native ``high``/``max``.
 
@@ -82,8 +91,30 @@ def _glm_5_2_reasoning_effort(reasoning_config: dict | None) -> str | None:
     return "high"
 
 
+def _glm_5_3_reasoning_effort(reasoning_config: dict | None) -> str | None:
+    """Map Hermes reasoning effort onto GLM-5.3's ``low``/``high``/``max``.
+
+    GLM-5.3 rejects ``thinking.type=disabled``. An explicit Hermes disable is
+    therefore kept working at the model's lowest supported effort by the
+    caller below, rather than sending a request the API will reject.
+    """
+    if not isinstance(reasoning_config, dict):
+        return None
+    if reasoning_config.get("enabled") is False:
+        return "low"
+
+    effort = (reasoning_config.get("effort") or "").strip().lower()
+    if not effort or effort == "none":
+        return "low"
+    if effort in {"xhigh", "max", "ultra"}:
+        return "max"
+    if effort in {"medium", "high"}:
+        return "high"
+    return "low"
+
+
 class ZaiProfile(ProviderProfile):
-    """Z.AI / GLM — extra_body.thinking on/off + GLM-5.2 reasoning_effort."""
+    """Z.AI / GLM — thinking markers + native GLM-5.2/5.3 effort."""
 
     def build_api_kwargs_extras(
         self, *, reasoning_config: dict | None = None, model: str | None = None, **context
@@ -91,16 +122,27 @@ class ZaiProfile(ProviderProfile):
         extra_body: dict[str, Any] = {}
         top_level: dict[str, Any] = {}
 
-        if not _model_supports_thinking(model) and not _is_glm_5_2(model):
+        is_glm_5_2 = _is_glm_5_2(model)
+        is_glm_5_3 = _is_glm_5_3(model)
+        if not _model_supports_thinking(model) and not is_glm_5_2 and not is_glm_5_3:
             return extra_body, top_level
 
         # Only emit when the user expressed a preference; omitting the field
         # keeps the server default (enabled) exactly as before.
         if isinstance(reasoning_config, dict):
             enabled = reasoning_config.get("enabled") is not False
-            extra_body["thinking"] = {"type": "enabled" if enabled else "disabled"}
+            # GLM-5.3 no longer accepts ``disabled``. Keep the request valid
+            # and use its lowest supported effort when Hermes asks for none.
+            if is_glm_5_3:
+                extra_body["thinking"] = {"type": "enabled"}
+            else:
+                extra_body["thinking"] = {"type": "enabled" if enabled else "disabled"}
 
-        if _is_glm_5_2(model):
+        if is_glm_5_3:
+            effort = _glm_5_3_reasoning_effort(reasoning_config)
+            if effort is not None:
+                top_level["reasoning_effort"] = effort
+        elif is_glm_5_2:
             effort = _glm_5_2_reasoning_effort(reasoning_config)
             if effort is not None:
                 top_level["reasoning_effort"] = effort
@@ -116,6 +158,7 @@ zai = ZaiProfile(
     description="Z.AI / GLM — Zhipu AI models",
     signup_url="https://z.ai/",
     fallback_models=(
+        "glm-5.3",
         "glm-5.2",
         "glm-5",
         "glm-4-9b",

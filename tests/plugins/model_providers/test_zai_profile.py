@@ -7,8 +7,9 @@ Z.AI route — users who turned thinking off kept burning thinking tokens on
 every turn (the desktop "thinking reverts to medium" report).
 
 GLM-5.2 additionally exposes a native ``reasoning_effort`` knob with two
-enabled levels (high / max) on the OpenAI-compatible ``/api/paas/v4``
-endpoint; the Hermes effort scale is collapsed onto those.
+enabled levels (high / max), while GLM-5.3 exposes low / high / max and
+rejects disabled thinking.  The Hermes effort scale is collapsed onto the
+levels each model accepts.
 
 These tests pin the profile's wire-shape contract so Z.AI requests stay
 correctly shaped without going live.
@@ -136,6 +137,53 @@ class TestZaiGLM52ReasoningEffort:
         assert top_level == {}
 
 
+class TestZaiGLM53ReasoningEffort:
+    """GLM-5.3's native ``reasoning_effort`` knob (low / high / max)."""
+
+    @pytest.mark.parametrize(
+        ("effort", "expected"),
+        [
+            ("minimal", "low"),
+            ("low", "low"),
+            ("medium", "high"),
+            ("high", "high"),
+            ("xhigh", "max"),
+            ("max", "max"),
+            ("ultra", "max"),
+        ],
+    )
+    def test_efforts_map_to_supported_levels(self, zai_profile, effort, expected):
+        extra_body, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": effort},
+            model="glm-5.3",
+        )
+        assert extra_body == {"thinking": {"type": "enabled"}}
+        assert top_level == {"reasoning_effort": expected}
+
+    def test_disabled_is_migrated_to_low_enabled(self, zai_profile):
+        """GLM-5.3 rejects disabled thinking; keep the request API-valid."""
+        extra_body, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False, "effort": "none"},
+            model="glm-5.3",
+        )
+        assert extra_body == {"thinking": {"type": "enabled"}}
+        assert top_level == {"reasoning_effort": "low"}
+
+    @pytest.mark.parametrize(
+        "model",
+        ["z-ai/glm-5.3", "glm-5-3", "glm-5p3", "zai-org-glm-5-3"],
+    )
+    def test_alias_spellings_recognized(self, zai_profile, model):
+        _, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": "max"},
+            model=model,
+        )
+        assert top_level == {"reasoning_effort": "max"}
+
+    def test_curated_catalog_includes_glm_5_3(self, zai_profile):
+        assert "glm-5.3" in zai_profile.fallback_models
+
+
 class TestZaiModelGating:
     """GLM 4.5+ get thinking; earlier GLM models are left untouched."""
 
@@ -157,6 +205,13 @@ class TestZaiModelGating:
         )
         assert extra_body == {"thinking": {"type": "disabled"}}
 
+    def test_glm_5_3_never_emits_disabled_thinking(self, zai_profile):
+        extra_body, top_level = zai_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": False}, model="glm-5.3"
+        )
+        assert extra_body == {"thinking": {"type": "enabled"}}
+        assert top_level == {"reasoning_effort": "low"}
+
 
 class TestZaiFullKwargsIntegration:
     """End-to-end: the transport's full kwargs carry the reasoning wiring."""
@@ -172,6 +227,21 @@ class TestZaiFullKwargsIntegration:
             provider_profile=zai_profile,
             reasoning_config={"enabled": True, "effort": "max"},
             base_url="https://api.z.ai/api/paas/v4",
+            provider_name="zai",
+        )
+        assert kwargs["reasoning_effort"] == "max"
+        assert kwargs["extra_body"]["thinking"] == {"type": "enabled"}
+
+    def test_glm_5_3_effort_reaches_top_level(self, zai_profile):
+        from agent.transports.chat_completions import ChatCompletionsTransport
+
+        kwargs = ChatCompletionsTransport().build_kwargs(
+            model="glm-5.3",
+            messages=[{"role": "user", "content": "ping"}],
+            tools=None,
+            provider_profile=zai_profile,
+            reasoning_config={"enabled": True, "effort": "max"},
+            base_url="https://api.z.ai/api/coding/paas/v4",
             provider_name="zai",
         )
         assert kwargs["reasoning_effort"] == "max"
