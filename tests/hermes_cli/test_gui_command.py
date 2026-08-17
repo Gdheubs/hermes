@@ -97,6 +97,32 @@ def _make_packaged_executable(root: Path, monkeypatch) -> Path:
     return exe
 
 
+def test_gui_routes_termux_before_electron_packaging(tmp_path, monkeypatch):
+    root = _make_desktop_tree(tmp_path)
+    desktop_dir = root / "apps" / "desktop"
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    monkeypatch.setattr(cli_main, "_is_termux_startup_environment", lambda: True)
+
+    routed = []
+
+    def termux_gui(args, resolved_desktop_dir):
+        routed.append((args, resolved_desktop_dir))
+
+    monkeypatch.setattr(cli_main, "_cmd_termux_gui", termux_gui)
+    monkeypatch.setattr(
+        cli_main,
+        "_desktop_packaged_executable",
+        lambda _desktop_dir: (_ for _ in ()).throw(
+            AssertionError("Termux must route before resolving an Electron executable")
+        ),
+    )
+
+    args = _ns()
+    cli_main.cmd_gui(args)
+
+    assert routed == [(args, desktop_dir)]
+
+
 def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
     root = _make_desktop_tree(tmp_path)
     desktop_dir = root / "apps" / "desktop"
