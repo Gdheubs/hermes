@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: lin-hermes-management
+    runtime: python
+    plan: starter
+    buildCommand: uv sync --extra dev
+    startCommand: sh lin_runtime/start_management.sh
+    healthCheckPath: /health
+    envVars:
+      - key: HERMES_HOME
+        value: /var/data/hermes
+      - key: HERMES_DASHBOARD_BASIC_AUTH
+        sync: false
+      - key: HERMES_DASHBOARD_INTERNAL_TOKEN
+        sync: false
+    disk:
+      name: hermes-management-data
+      mountPath: /var/data
+      sizeGB: 10

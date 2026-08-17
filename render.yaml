@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: lin-hermes-runtime
+    runtime: python
+    plan: starter
+    buildCommand: uv sync --extra dev
+    startCommand: uv run uvicorn lin_runtime.render_main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: LIN_HERMES_RUNTIME_TOKEN
+        sync: false
+      - key: HERMES_HOME
+        value: /var/data/hermes
+    disk:
+      name: hermes-runtime-data
+      mountPath: /var/data
+      sizeGB: 10
