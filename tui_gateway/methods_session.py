@@ -33,6 +33,8 @@ def _(rid, params: dict) -> dict:
         explicit_cwd = False
     resolved_cwd = _completion_cwd(params)
     source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+    pty_user_id = str(params.get("pty_user_id") or "").strip() or None
+    pty_provider = str(params.get("pty_provider") or "").strip() or None
     _enable_gateway_prompts()
 
     # ``profile`` (app-global remote mode): a new chat started under a non-launch
@@ -100,6 +102,8 @@ def _(rid, params: dict) -> dict:
             "pending_title": title or None,
             "pending_hidden": is_truthy_value(params.get("hidden", False)),
             "profile_home": str(profile_home) if profile_home is not None else None,
+            "pty_user_id": pty_user_id,
+            "pty_provider": pty_provider,
             "running": False,
             "session_key": key,
             "show_reasoning": _load_show_reasoning(),
@@ -482,6 +486,8 @@ def _(rid, params: dict) -> dict:
                 close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
                 profile_home=profile_home,
                 lazy=True,
+                pty_user_id=params.get("pty_user_id"),
+                pty_provider=params.get("pty_provider"),
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _ok(rid, _reuse_live_payload(*live))
@@ -646,6 +652,8 @@ def _(rid, params: dict) -> dict:
                 profile_home=profile_home,
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
+                pty_user_id=params.get("pty_user_id"),
+                pty_provider=params.get("pty_provider"),
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _ok(rid, _reuse_live_payload(*live))
@@ -731,6 +739,7 @@ def _(rid, params: dict) -> dict:
                     session_id=target,
                     session_db=db,
                     platform_override=source,
+                    pty_user_id=params.get("pty_user_id"),
                     **stored_runtime_overrides,
                 )
             finally:
@@ -788,9 +797,11 @@ def _(rid, params: dict) -> dict:
                         history,
                         cols=cols,
                         cwd=profile_resume_cwd,
-                        session_db=db,
-                        source=source,
-                    )
+                    session_db=db,
+                    source=source,
+                    pty_user_id=params.get("pty_user_id"),
+                    pty_provider=params.get("pty_provider"),
+                )
                     # Ownership TRANSFER — the registered session's agent now
                     # holds this handle for its whole life, and _init_session
                     # never closes a caller-supplied session_db (its
@@ -3048,6 +3059,7 @@ def _(rid, params: dict) -> dict:
                     session_id=new_key,
                     session_db=branch_db,
                     platform_override=source,
+                    pty_user_id=session.get("pty_user_id"),
                 )
             finally:
                 _clear_session_context(tokens)
@@ -3061,6 +3073,8 @@ def _(rid, params: dict) -> dict:
                 session_db=branch_db,
                 source=source,
                 profile_home=parent_home,
+                pty_user_id=session.get("pty_user_id"),
+                pty_provider=session.get("pty_provider"),
             )
             # Ownership TRANSFER — the branched session's agent holds this
             # handle for its whole life and closes it on teardown. Drop is
