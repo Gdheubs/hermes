@@ -6075,6 +6075,7 @@ function installPreviewShortcut(window) {
 import {
   applyZoomLevel,
   DEFAULT_ZOOM_LEVEL,
+  installZoomDriftReassert,
   installZoomReassertOnWindowEvents,
   percentToZoomLevel,
   ZOOM_STEP,
@@ -10528,6 +10529,9 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
     // recovery and any in-place reload/navigation (#46429).
     installZoomReassertOnWindowEvents(win, () => restorePersistedZoomLevel(win))
     win.webContents.on('did-finish-load', () => restorePersistedZoomLevel(win))
+    // Catches resets with no window/screen event at all, e.g. another
+    // Electron app's launch/quit silently re-normalizing our zoom (#82713).
+    installZoomDriftReassert(win, () => readZoomState(), () => restorePersistedZoomLevel(win))
   }
 
   installContextMenu(win)

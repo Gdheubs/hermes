@@ -100,6 +100,43 @@ export function installZoomReassertOnWindowEvents(win, reassert, platform = proc
   }
 }
 
+// Some zoom resets never touch a BrowserWindow or screen event at all — e.g.
+// macOS silently re-normalizing every Electron app's rendering layer when a
+// second Electron app (observed with Antigravity) launches or quits produces
+// no window bounds change and no display-metrics-changed, so neither
+// installZoomReassertOnWindowEvents nor a screen listener ever fires (#82713).
+// A low-frequency drift check is the only thing that catches resets with zero
+// observable trigger: compare the live zoom level against the persisted one
+// and reassert on mismatch.
+export const ZOOM_DRIFT_POLL_INTERVAL_MS = 4000
+const ZOOM_DRIFT_EPSILON = 0.01
+
+export function installZoomDriftReassert(win, getPersistedLevel, reassert) {
+  if (!win?.on) {
+    return undefined
+  }
+
+  const timer = setInterval(() => {
+    if (win.isDestroyed?.() || win.webContents?.isDestroyed?.()) {
+      return
+    }
+
+    const persisted = getPersistedLevel()
+
+    if (persisted == null) {
+      return
+    }
+
+    if (Math.abs(win.webContents.getZoomLevel() - clampZoomLevel(persisted)) > ZOOM_DRIFT_EPSILON) {
+      reassert()
+    }
+  }, ZOOM_DRIFT_POLL_INTERVAL_MS)
+
+  win.on('closed', () => clearInterval(timer))
+
+  return timer
+}
+
 /**
  * Zoom-wiring decision per window kind. Chat windows (main + session + the HUD)
  * keep global UI zoom; the pet overlay and the Quick Entry composer opt out

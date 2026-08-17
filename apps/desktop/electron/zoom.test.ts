@@ -12,8 +12,10 @@ import {
   applyZoomLevel,
   clampZoomLevel,
   DEFAULT_ZOOM_LEVEL,
+  installZoomDriftReassert,
   installZoomReassertOnWindowEvents,
   percentToZoomLevel,
+  ZOOM_DRIFT_POLL_INTERVAL_MS,
   ZOOM_RESIZE_REASSERT_DELAY_MS,
   ZOOM_STEP,
   ZOOM_STORAGE_KEY,
@@ -185,6 +187,115 @@ test('installZoomReassertOnWindowEvents skips destroyed windows', () => {
   destroyed = true
   handlers.get('show')()
   assert.equal(calls, 0)
+})
+
+test('installZoomDriftReassert reasserts when the live zoom level drifts from the persisted one', () => {
+  vi.useFakeTimers()
+
+  try {
+    const handlers = new Map()
+    let zoomLevel = 0.5
+
+    const win = {
+      isDestroyed: () => false,
+      webContents: {
+        isDestroyed: () => false,
+        getZoomLevel: () => zoomLevel
+      },
+      on(event, listener) {
+        handlers.set(event, listener)
+      }
+    }
+
+    let calls = 0
+    installZoomDriftReassert(
+      win,
+      () => 0.5,
+      () => {
+        calls += 1
+      }
+    )
+
+    vi.advanceTimersByTime(ZOOM_DRIFT_POLL_INTERVAL_MS)
+    assert.equal(calls, 0, 'in-sync zoom must not trigger a reassert')
+
+    // Simulates the invisible reset (#82713): the runtime zoom moved but no
+    // window/screen event fired, so nothing else would ever notice.
+    zoomLevel = 0
+    vi.advanceTimersByTime(ZOOM_DRIFT_POLL_INTERVAL_MS)
+    assert.equal(calls, 1)
+  } finally {
+    vi.useRealTimers()
+  }
+})
+
+test('installZoomDriftReassert skips when there is no persisted level yet or the window is destroyed', () => {
+  vi.useFakeTimers()
+
+  try {
+    let destroyed = false
+
+    const win = {
+      isDestroyed: () => destroyed,
+      webContents: {
+        isDestroyed: () => false,
+        getZoomLevel: () => 0
+      },
+      on() {}
+    }
+
+    let calls = 0
+    installZoomDriftReassert(
+      win,
+      () => null,
+      () => {
+        calls += 1
+      }
+    )
+
+    vi.advanceTimersByTime(ZOOM_DRIFT_POLL_INTERVAL_MS)
+    assert.equal(calls, 0)
+
+    destroyed = true
+    vi.advanceTimersByTime(ZOOM_DRIFT_POLL_INTERVAL_MS)
+    assert.equal(calls, 0)
+  } finally {
+    vi.useRealTimers()
+  }
+})
+
+test('installZoomDriftReassert clears its timer on window close', () => {
+  vi.useFakeTimers()
+
+  try {
+    const handlers = new Map()
+
+    const win = {
+      isDestroyed: () => false,
+      webContents: {
+        isDestroyed: () => false,
+        getZoomLevel: () => 9
+      },
+      on(event, listener) {
+        handlers.set(event, listener)
+      }
+    }
+
+    let calls = 0
+    installZoomDriftReassert(
+      win,
+      () => 0,
+      () => {
+        calls += 1
+      }
+    )
+
+    handlers.get('closed')()
+    vi.advanceTimersByTime(ZOOM_DRIFT_POLL_INTERVAL_MS * 3)
+    assert.equal(calls, 0)
+  } finally {
+    vi.useRealTimers()
+  }
 })
 
 // Zoom-wiring contract: chat windows keep global UI zoom while fixed-size
