@@ -52,7 +52,7 @@ import threading
 import time
 import uuid
 from pathlib import PureWindowsPath
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from hermes_cli._subprocess_compat import windows_hide_flags
 from tools.computer_use.backend import (
@@ -876,6 +876,56 @@ def _mcp_args_with_overlay_flag(
     if _cua_no_overlay() and _cua_driver_supports_no_overlay(driver_cmd):
         return [*args, "--no-overlay"]
     return list(args)
+
+
+# Binaries whose user-configured MCP launch should receive the same overlay
+# policy the embedded cua_backend applies to its own spawn. Any rename of the
+# upstream binary stays in sync with what ``resolve_cua_driver_cmd`` accepts.
+_CUA_DRIVER_MCP_BINARIES: Tuple[str, ...] = (
+    _CUA_DRIVER_DEFAULT_CMD,
+    "cua-driver-rs",
+    "cua_driver",
+)
+
+
+def looks_like_cua_driver_command(command: Optional[str]) -> bool:
+    """True when *command* matches a known cua-driver binary.
+
+    Used by ``tools/mcp_tool.py`` to apply the same ``--no-overlay``
+    policy to *user-configured* ``mcp_servers.<name>`` entries that wrap
+    cua-driver (``args: [mcp]`` / ``cua-driver mcp``), which would
+    otherwise bypass the embedded-backend normalization at
+    ``_resolve_mcp_invocation`` and silently leave the overlay mapped
+    even when ``computer_use.no_overlay`` is set (#81220).
+    """
+    if not command:
+        return False
+    base = os.path.basename(command.strip().replace("\\", "/")).lower()
+    if not base:
+        return False
+    # Drop a trailing ``.exe`` so ``cua-driver.exe`` still matches.
+    if base.endswith(".exe"):
+        base = base[:-4]
+    return base in _CUA_DRIVER_MCP_BINARIES
+
+
+def normalize_user_cua_driver_args(
+    command: Optional[str],
+    args: Sequence[str],
+) -> List[str]:
+    """Apply the cua-driver overlay policy to a user-configured MCP launch.
+
+    Returns *args* unchanged when *command* is not a known cua-driver
+    binary, or when ``--no-overlay`` is not needed / not supported.
+    Otherwise appends ``--no-overlay`` so the overlay never reaches the
+    multi-monitor X11 desktop class (#81220). Safe to call from any MCP
+    stdio spawn path; never mutates the input list.
+    """
+    if not looks_like_cua_driver_command(command):
+        return list(args)
+    return _mcp_args_with_overlay_flag(
+        list(args), driver_cmd=(command or _CUA_DRIVER_DEFAULT_CMD),
+    )
 
 
 @functools.lru_cache(maxsize=1)
