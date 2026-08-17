@@ -18831,6 +18831,13 @@ def start_server(
         ws_ping_interval=None if _is_loopback else 20.0,
         ws_ping_timeout=None if _is_loopback else 20.0,
         ws_max_size=_DESKTOP_ATTACHMENT_WS_MAX_BYTES,
+        # Bound graceful shutdown. On SIGINT (e.g. a systemd restart) uvicorn's
+        # shutdown() waits for open connections to finish, but a long-lived
+        # dashboard WebSocket never closes on its own, so with the default
+        # timeout_graceful_shutdown=None the wait is unbounded and the process
+        # hangs until the service manager's stop timeout fires SIGKILL. Cap the
+        # wait so uvicorn force-cancels the lingering ws task and exits cleanly.
+        timeout_graceful_shutdown=10,
     )
     server = uvicorn.Server(config)
 
