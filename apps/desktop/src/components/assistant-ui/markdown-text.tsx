@@ -13,7 +13,6 @@ import { type ComponentProps, memo, useEffect, useMemo, useState } from 'react'
 import { ExpandableBlock } from '@/components/chat/expandable-block'
 import { PreviewAttachment } from '@/components/chat/preview-attachment'
 import { chunkByLines, SyntaxHighlighter } from '@/components/chat/shiki-highlighter'
-import { ZoomableImage } from '@/components/chat/zoomable-image'
 import { ErrorBoundary } from '@/components/error-boundary'
 import { detectArtifact } from '@/lib/artifact-detect'
 import { normalizeExternalUrl, openExternalLink, PrettyLink } from '@/lib/external-link'
@@ -38,6 +37,7 @@ import { cn } from '@/lib/utils'
 import { ArtifactCard } from './artifact-card'
 import { SessionRefLink } from './directive-text'
 import { detectEmbed, extractAlert, MarkdownAlert, RichCodeBlock, UrlEmbed } from './embeds'
+import { SmartMedia } from './smart-media'
 
 // Math rendering plugin (KaTeX). Configured once at module scope — the
 // plugin is stateless beyond its internal cache so re-creating per-render
@@ -189,6 +189,9 @@ function MediaAttachment({ path }: { path: string }) {
   }, [kind, path])
 
   if (kind === 'image' && src) {
+    // Source already resolved by resolveMediaPlaybackSrc / resolveMediaDisplaySrc.
+    // Hand the display URL to MarkdownImageContent via an inline src so we do
+    // not re-enter MediaAttachment (which would loop on #media: image paths).
     return (
       <span className="block">
         <MarkdownImage alt={name} src={src} />
@@ -208,16 +211,13 @@ function MediaAttachment({ path }: { path: string }) {
 
   if (kind === 'video' && src) {
     return (
-      <span className="my-3 block max-w-2xl rounded-xl border border-(--ui-stroke-tertiary) bg-muted/35 p-3">
-        <span className="mb-2 block truncate text-xs font-medium text-muted-foreground">{name}</span>
-        <video
-          className="block max-h-112 w-full rounded-lg bg-black"
-          controls
-          onError={() => setFailed(true)}
-          src={src}
-        />
-        {failed && <OpenMediaButton kind="video" path={path} />}
-      </span>
+      <SmartMedia
+        kind="video"
+        name={name}
+        onOpenExternal={open}
+        openFailedNote={openFailed ? <OpenMediaFailedNote name={name} /> : undefined}
+        src={src}
+      />
     )
   }
 
@@ -387,13 +387,17 @@ function MarkdownImageContent({ className, src, alt, ...props }: ComponentProps<
   // width, so the box overshoots the rendered image and strands the download
   // button — which anchors to the container — out in the margin.
   return (
-    <ZoomableImage
+    <SmartMedia
       alt={alt}
       className={cn(
         'm-0 block h-auto w-auto max-h-(--image-preview-height) max-w-full rounded-lg object-contain shadow-[0_0.0625rem_0.125rem_color-mix(in_srgb,#000_4%,transparent),0_0.625rem_1.5rem_color-mix(in_srgb,#000_5%,transparent)]',
         className
       )}
       containerClassName="my-2 block w-fit max-w-[min(100%,var(--image-preview-max-width))]"
+      kind="image"
+      name={name}
+      onOpenExternal={open}
+      openFailedNote={openFailed ? <OpenMediaFailedNote name={name} /> : undefined}
       slot="aui_markdown-image"
       src={resolvedSrc}
       {...props}
