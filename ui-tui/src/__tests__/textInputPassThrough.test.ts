@@ -50,4 +50,10 @@ describe('shouldPassThroughToGlobalHandler', () => {
     expect(shouldPassThroughToGlobalHandler('', key({ pageUp: true }))).toBe(true)
     expect(shouldPassThroughToGlobalHandler('', key({ pageDown: true }))).toBe(true)
   })
+
+  it('passes through the Ctrl+L redraw key so the composer never inserts a stray "l"', () => {
+    expect(shouldPassThroughToGlobalHandler('l', key({ ctrl: true }))).toBe(true)
+    // A plain (unmodified) "l" must still reach the composer as typing.
+    expect(shouldPassThroughToGlobalHandler('l', key())).toBe(false)
+  })
 })

@@ -7,6 +7,7 @@ import { readClipboardText, writeClipboardText } from '../lib/clipboard.js'
 import { cursorLayout, offsetFromPosition } from '../lib/inputMetrics.js'
 import {
   DEFAULT_VOICE_RECORD_KEY,
+  isAction,
   isActionMod,
   isMac,
   isMacActionFallback,
@@ -1728,6 +1729,7 @@ export const shouldPassThroughToGlobalHandler = (
   (key.ctrl && input === 'c') ||
   (key.ctrl && input === 'x') ||
   (key.ctrl && input === 'o') ||
+  isAction(key, input, 'l') ||
   key.tab ||
   (key.shift && key.tab) ||
   key.pageUp ||
