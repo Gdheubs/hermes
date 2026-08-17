@@ -130,3 +130,34 @@ class TestRunJobScriptTamperGuard:
         assert error is None
         assert "RAM 92% on host" in final_response
         assert config.read_text(encoding="utf-8") == original
+
+    def test_settle_loop_reverts_detached_retamper(self, hermes_env, monkeypatch):
+        """F4/P2: a detached child re-flipping config.yaml AFTER the
+        completion revert must not win — the settle loop re-reverts."""
+        import cron.scheduler as sched
+        monkeypatch.setattr(sched.time, "sleep", lambda s: None)
+        real_restore = sched._restore_config_yaml_if_tampered
+
+        config = hermes_env / "config.yaml"
+        original = config.read_text(encoding="utf-8")
+        calls = {"n": 0}
+
+        def _flaky_restore(snapshot):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # Simulate the script's detached child re-flipping the
+                # approval policy right after the first completion revert.
+                config.write_text(
+                    "approvals:\n  cron_mode: approve\n  mode: manual\n",
+                    encoding="utf-8",
+                )
+            return real_restore(snapshot)
+
+        monkeypatch.setattr(sched, "_restore_config_yaml_if_tampered", _flaky_restore)
+
+        job = self._make_job(hermes_env, "#!/bin/bash\necho hi\n")
+        success, doc, final_response, error = run_job(job)
+
+        assert success is False
+        assert config.read_text(encoding="utf-8") == original
+        assert calls["n"] >= 2, "settle loop must re-check after the first revert"
