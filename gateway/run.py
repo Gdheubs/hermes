@@ -11590,10 +11590,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         try:
             from gateway.delivery_ledger import (
-                RECOVERED_MARKER,
                 ledger_enabled,
-                mark_delivered,
-                mark_failed,
                 sweep_recoverable,
             )
 
@@ -11611,8 +11608,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("delivery ledger sweep failed", exc_info=True)
             return 0
+        return await self._redeliver_claimed_rows(claimed)
+
+    async def _redeliver_claimed_rows(
+        self, claimed: List[Dict[str, Any]]
+    ) -> int:
+        """Send claimed ledger rows and update their state.
+
+        Shared by the startup sweep (``_redeliver_pending_obligations``) and
+        the runtime reconnect path
+        (``_redeliver_failed_obligations_for_platform``): each row is
+        already claimed (owner re-stamped, attempts spent), so this only
+        performs the send and records delivered/failed. Returns the number
+        of successful redeliveries.
+        """
         if not claimed:
             return 0
+        from gateway.delivery_ledger import (
+            RECOVERED_MARKER,
+            mark_delivered,
+            mark_failed,
+        )
 
         redelivered = 0
         for row in claimed:
@@ -11626,8 +11642,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 continue
             adapter = self.adapters.get(platform)
             if adapter is None:
-                # Platform not connected this boot — leave the row claimed;
-                # attempts cap + stale cutoff bound the retries on later boots.
+                # Platform not connected — leave the row claimed; attempts
+                # cap + stale cutoff bound the retries on later sweeps/boots.
                 continue
             content = row["content"]
             if row.get("needs_marker"):
@@ -11678,6 +11694,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=True,
                     )
         return redelivered
+
+    async def _redeliver_failed_obligations_for_platform(self, platform) -> int:
+        """Retry final responses that were definitively rejected for a
+        platform which just reconnected — the runtime counterpart of the
+        startup sweep.
+
+        The startup sweep only redelivers rows owned by a DEAD process, so a
+        rejection that happened while this gateway stayed alive (e.g. the
+        network outage that also dropped the adapter) would otherwise sit in
+        the ledger until the next restart. Firing after a successful
+        reconnect closes that gap: the platform is known-good again, so the
+        failed send is worth one more attempt. Returns the number of
+        redeliveries attempted.
+        """
+        try:
+            from gateway.delivery_ledger import (
+                ledger_enabled,
+                sweep_failed_for_runtime,
+            )
+
+            if not await asyncio.to_thread(ledger_enabled):
+                return 0
+            claimed = await asyncio.to_thread(
+                sweep_failed_for_runtime,
+                getattr(platform, "value", str(platform)),
+            )
+        except Exception:
+            logger.debug(
+                "delivery ledger runtime sweep failed", exc_info=True
+            )
+            return 0
+        return await self._redeliver_claimed_rows(claimed)
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
@@ -13917,6 +13965,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         except Exception:
                             logger.debug(
                                 "resume-pending reschedule after %s reconnect failed",
+                                platform.value,
+                                exc_info=True,
+                            )
+                        # Final responses that were definitively rejected
+                        # while this platform was down are now retryable. The
+                        # delivery ledger only redelivers on restart, so
+                        # without this a rejection during a live gateway's
+                        # outage (the same outage that dropped the adapter)
+                        # would sit undelivered until the next boot.
+                        try:
+                            await self._redeliver_failed_obligations_for_platform(
+                                platform
+                            )
+                        except Exception:
+                            logger.debug(
+                                "failed-obligation redelivery after %s "
+                                "reconnect failed",
                                 platform.value,
                                 exc_info=True,
                             )

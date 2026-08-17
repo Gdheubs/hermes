@@ -11,6 +11,19 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.run import GatewayRunner
 
 
+@pytest.fixture(autouse=True)
+def _fresh_ledger_db(tmp_path, monkeypatch):
+    """Isolated state.db for ledger-backed reconnect tests (the conftest
+    HERMES_HOME redirect already isolates get_hermes_home; make the redirect
+    explicit and per-test, matching tests/gateway/test_delivery_ledger.py)."""
+    from gateway import delivery_ledger as dl
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(dl, "_db_path", lambda: home / "state.db")
+    yield
+
+
 class StubAdapter(BasePlatformAdapter):
     """Adapter whose connect() result can be controlled."""
 
@@ -262,6 +275,79 @@ class TestPlatformReconnectWatcher:
             platform=Platform.TELEGRAM
         )
 
+    @pytest.mark.asyncio
+    async def test_reconnect_redelivers_failed_obligations_for_platform(self):
+        """A successful reconnect retries final responses that were rejected
+        while the platform was down.
+
+        Regression: the delivery ledger only redelivered rows owned by a DEAD
+        process at startup, so a definitive rejection during a live gateway's
+        network outage (the very outage that also dropped the adapter) sat
+        undelivered until the next restart. The watcher now sweeps the
+        platform's failed obligations right after it reconnects.
+        """
+        from gateway import delivery_ledger as dl
+
+        dl.record_obligation(
+            obligation_id="ob-tg-1",
+            session_key="agent:main:telegram:group:1",
+            platform="telegram",
+            chat_id="123",
+            thread_id=None,
+            content="final answer",
+        )
+        dl.mark_failed("ob-tg-1", "send_path_degraded")
+
+        runner = _make_runner()
+        runner._sync_voice_mode_state_to_adapter = MagicMock()
+        runner._schedule_resume_pending_sessions = MagicMock(return_value=1)
+        _store = MagicMock()
+        _store.clear_resume_pending = AsyncMock()
+        runner._async_session_store = _store
+
+        platform_config = PlatformConfig(enabled=True, token="test")
+        runner._failed_platforms[Platform.TELEGRAM] = {
+            "config": platform_config,
+            "attempts": 1,
+            "next_retry": time.monotonic() - 1,
+        }
+
+        succeed_adapter = StubAdapter(succeed=True)
+        succeed_adapter.send = AsyncMock(
+            return_value=SendResult(success=True, message_id="redelivered")
+        )
+        real_sleep = asyncio.sleep
+
+        with patch.object(runner, "_create_adapter", return_value=succeed_adapter):
+            with patch("gateway.run.build_channel_directory", create=True):
+                async def run_one_iteration():
+                    runner._running = True
+                    call_count = 0
+
+                    async def fake_sleep(n):
+                        nonlocal call_count
+                        call_count += 1
+                        if call_count > 1:
+                            runner._running = False
+                        await real_sleep(0)
+
+                    with patch("asyncio.sleep", side_effect=fake_sleep):
+                        await runner._platform_reconnect_watcher()
+
+                await run_one_iteration()
+
+        assert Platform.TELEGRAM in runner.adapters
+        succeed_adapter.send.assert_awaited_once()
+        sent = succeed_adapter.send.call_args.kwargs
+        assert sent["chat_id"] == "123"
+        assert sent["content"].startswith(dl.RECOVERED_MARKER)
+        assert sent["content"].endswith("final answer")
+        with dl._connect() as conn:
+            state = conn.execute(
+                "SELECT state FROM delivery_obligations WHERE obligation_id=?",
+                ("ob-tg-1",),
+            ).fetchone()[0]
+        assert state == "delivered"
 
     @pytest.mark.asyncio
     async def test_reconnect_never_auto_pauses_retryable_failures(self):

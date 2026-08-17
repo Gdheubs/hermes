@@ -9,6 +9,7 @@ id stability, and the startup redelivery sweep's contract:
 - poison rows abandon at the attempts cap / stale cutoff
 """
 
+import os
 import time
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -220,6 +221,171 @@ class TestGatewayRedeliverySweep:
             )
 
         assert blocked_event_loop == []
+
+
+class TestRuntimeFailedSweep:
+    """``sweep_failed_for_runtime``: the runtime redelivery path that fires
+    after a platform reconnects, without waiting for a restart.
+
+    The startup sweep only claims rows owned by a DEAD process, so a final
+    response definitively rejected while this gateway stayed alive (e.g. the
+    network outage that also dropped the adapter) would otherwise sit in the
+    ledger until the next boot. This sweep claims exactly those rows for a
+    platform that just reconnected. The attempts cap and stale cutoff still
+    bound poison rows, and a different live process's rows are never stolen.
+    """
+
+    def _failed(self, oid="ob-1", **kw):
+        _record(oid=oid, **kw)
+        dl.mark_failed(oid, "send_path_degraded")
+
+    def test_failed_row_claimed_for_platform_with_marker(self):
+        self._failed()
+
+        claimed = dl.sweep_failed_for_runtime("slack")
+
+        assert len(claimed) == 1
+        assert claimed[0]["obligation_id"] == "ob-1"
+        # A previous rejection means a resend MIGHT duplicate — the marker
+        # keeps the at-least-once contract honest (same as the startup path).
+        assert claimed[0]["needs_marker"] is True
+        assert claimed[0]["attempts"] == 1
+        row = _row("ob-1")
+        assert row["state"] == "attempting"  # claimed → about to send
+        # Claim re-stamps ownership: a second sweep must not double-claim.
+        assert dl.sweep_failed_for_runtime("slack") == []
+
+    def test_other_platform_failed_rows_not_claimed(self):
+        self._failed(oid="ob-slack", platform="slack")
+        self._failed(
+            oid="ob-tg", platform="telegram",
+            session_key="agent:main:telegram:group:1",
+        )
+
+        claimed = dl.sweep_failed_for_runtime("slack")
+
+        assert [c["obligation_id"] for c in claimed] == ["ob-slack"]
+        assert _row("ob-tg")["state"] == "failed"
+
+    def test_other_live_process_rows_not_stolen(self):
+        """A failed row owned by a DIFFERENT live process is left alone —
+        that process owns the retry budget and will redeliver (or abandon)
+        it. Only rows owned by ourselves or by a dead process are claimed."""
+        self._failed()
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET owner_pid=?, owner_started_at=NULL "
+                "WHERE obligation_id=?",
+                (os.getppid(), "ob-1"),  # our parent is alive for this test
+            )
+
+        assert dl.sweep_failed_for_runtime("slack") == []
+        assert _row("ob-1")["state"] == "failed"
+
+    def test_rows_over_attempts_cap_abandoned_not_claimed(self):
+        self._failed()
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET attempts=? WHERE obligation_id=?",
+                (dl.MAX_ATTEMPTS, "ob-1"),
+            )
+
+        assert dl.sweep_failed_for_runtime("slack") == []
+        assert _row("ob-1")["state"] == "abandoned"
+
+    def test_stale_failed_row_abandoned_not_claimed(self):
+        self._failed()
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET created_at=? WHERE obligation_id=?",
+                (time.time() - dl.STALE_AFTER_SECONDS - 60, "ob-1"),
+            )
+
+        assert dl.sweep_failed_for_runtime("slack") == []
+        assert _row("ob-1")["state"] == "abandoned"
+
+
+class TestRuntimeFailedRedelivery:
+    """Drive GatewayRunner._redeliver_failed_obligations_for_platform — the
+    runtime counterpart of the startup sweep, fired when a platform
+    reconnects after an outage. Uses the same real ledger + real adapter
+    harness as TestGatewayRedeliverySweep."""
+
+    @staticmethod
+    def _runner(adapter=None):
+        from gateway.config import Platform
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner.adapters = {Platform.SLACK: adapter} if adapter else {}
+        _store = MagicMock()
+        _store.clear_resume_pending = AsyncMock()
+        _store._store = None
+        runner.session_store = None
+        runner._async_session_store = _store
+        return runner
+
+    @staticmethod
+    def _adapter(success=True):
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=MagicMock(success=success, error="" if success else "nope")
+        )
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_failed_row_redelivered_with_marker(self):
+        from gateway.config import Platform
+
+        _record()  # slack, pending
+        dl.mark_failed("ob-1", "send_path_degraded")
+        adapter = self._adapter()
+        runner = self._runner(adapter)
+
+        n = await runner._redeliver_failed_obligations_for_platform(Platform.SLACK)
+
+        assert n == 1
+        sent = adapter.send.call_args.kwargs
+        assert sent["content"].startswith(dl.RECOVERED_MARKER)
+        assert sent["content"].endswith("the final answer")
+        assert _row("ob-1")["state"] == "delivered"
+        runner._async_session_store.clear_resume_pending.assert_awaited_once_with(
+            "agent:main:slack:channel:C1"
+        )
+
+    @pytest.mark.asyncio
+    async def test_failed_send_marks_failed_again_without_crash(self):
+        from gateway.config import Platform
+
+        _record()
+        dl.mark_failed("ob-1", "send_path_degraded")
+        adapter = self._adapter(success=False)
+        runner = self._runner(adapter)
+
+        n = await runner._redeliver_failed_obligations_for_platform(Platform.SLACK)
+
+        assert n == 0
+        assert _row("ob-1")["state"] == "failed"
+
+    @pytest.mark.asyncio
+    async def test_other_platform_failed_rows_not_redelivered(self):
+        from gateway.config import Platform
+
+        _record(oid="ob-slack", platform="slack")
+        _record(
+            oid="ob-tg", platform="telegram",
+            session_key="agent:main:telegram:group:1",
+        )
+        dl.mark_failed("ob-slack", "x")
+        dl.mark_failed("ob-tg", "x")
+        adapter = self._adapter()
+        runner = self._runner(adapter)  # only the slack adapter is connected
+
+        n = await runner._redeliver_failed_obligations_for_platform(Platform.SLACK)
+
+        assert n == 1
+        assert _row("ob-slack")["state"] == "delivered"
+        assert _row("ob-tg")["state"] == "failed"
 
 
 class TestAttemptsOnlySpentOnRealSends:

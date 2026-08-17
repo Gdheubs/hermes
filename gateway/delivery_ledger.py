@@ -17,8 +17,12 @@ bounded retention). The gateway writes three checkpoints around the send:
     mark_failed()         state='failed'      on a definitive rejection
 
 On startup, ``sweep_recoverable()`` claims rows whose owning process is
-dead and hands them to the gateway for redelivery. Crash semantics are
-explicit about ambiguity (the contract review of the earlier
+dead and hands them to the gateway for redelivery. At runtime,
+``sweep_failed_for_runtime()`` claims a platform's ``failed`` rows when
+that platform reconnects after an outage, so a rejection that happened
+while the gateway stayed alive (typically during the same network trouble
+that dropped the adapter) is retried without waiting for a restart. Crash
+semantics are explicit about ambiguity (the contract review of the earlier
 delivery-outbox attempt, #61790, closed it for silently resending
 ambiguous sends):
 
@@ -317,6 +321,75 @@ def sweep_recoverable(
                     # pending = send never started, redeliver plainly;
                     # attempting/failed = ambiguous or rejected, carry marker.
                     "needs_marker": state != "pending",
+                    "attempts": attempts + 1,
+                })
+    return claimed
+
+
+def sweep_failed_for_runtime(
+    platform: str,
+    now: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Claim 'failed' rows for a platform so a just-reconnected gateway can
+    retry them without waiting for a restart.
+
+    The startup sweep (``sweep_recoverable``) only claims rows owned by a
+    DEAD process, so a final response definitively rejected while this
+    gateway stayed alive — typically during the network outage that also
+    dropped the adapter — would otherwise sit undelivered until the next
+    boot. Firing after a successful reconnect closes that gap: the platform
+    is known-good again, so a rejected send is worth one more attempt.
+
+    Claiming atomically re-stamps the owner to THIS process, sets
+    ``state='attempting'`` and increments ``attempts`` (the redelivery
+    budget), so a concurrent sweep cannot double-claim. Rows over the
+    attempts cap or older than the stale cutoff transition to 'abandoned'
+    instead of being returned, and rows owned by a DIFFERENT live process
+    are left untouched (that process owns their retry budget).
+    """
+    now = now if now is not None else time.time()
+    pid, started = _owner_stamp()
+    claimed: List[Dict[str, Any]] = []
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT obligation_id, session_key, platform, chat_id, thread_id,
+                      content, state, attempts, created_at,
+                      owner_pid, owner_started_at
+               FROM delivery_obligations
+               WHERE state='failed' AND platform=?""",
+            (platform,),
+        ).fetchall()
+        for (oid, session_key, row_platform, chat_id, thread_id, content, state,
+             attempts, created_at, owner_pid, owner_started_at) in rows:
+            if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
+                conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='abandoned', updated_at=? WHERE obligation_id=?""",
+                    (now, oid),
+                )
+                continue
+            if _owner_alive(owner_pid, owner_started_at) and owner_pid != pid:
+                # Another live gateway still owns this row — it owns the
+                # retry budget and will redeliver (or abandon) it.
+                continue
+            cursor = conn.execute(
+                """UPDATE delivery_obligations
+                   SET owner_pid=?, owner_started_at=?, state='attempting',
+                       attempts=attempts+1, updated_at=?
+                   WHERE obligation_id=? AND (owner_pid IS ? OR owner_pid=?)""",
+                (pid, started, now, oid, owner_pid, owner_pid),
+            )
+            if cursor.rowcount:
+                claimed.append({
+                    "obligation_id": oid,
+                    "session_key": session_key,
+                    "platform": row_platform,
+                    "chat_id": chat_id,
+                    "thread_id": thread_id,
+                    "content": content,
+                    # failed = definitively rejected once; a resend may
+                    # duplicate, so the marker labels the at-least-once retry.
+                    "needs_marker": True,
                     "attempts": attempts + 1,
                 })
     return claimed
