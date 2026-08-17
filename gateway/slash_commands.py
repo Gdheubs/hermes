@@ -239,6 +239,7 @@ class GatewaySlashCommandsMixin:
             pass
 
         # Reset the session
+        await self._cancel_deferred_clarify_session(session_key, reason="session_reset")
         new_entry = await self.async_session_store.reset_session(session_key)
 
         # (Conversation-scoped overrides + security state were already
@@ -4853,6 +4854,7 @@ class GatewaySlashCommandsMixin:
         self._release_running_agent_state(session_key)
 
         # Switch the session entry to point at the old session
+        await self._cancel_deferred_clarify_session(session_key, reason="session_resume")
         new_entry = await self.async_session_store.switch_session(session_key, target_id)
         if not new_entry:
             return t("gateway.resume.switch_failed")
@@ -5101,7 +5103,11 @@ class GatewaySlashCommandsMixin:
             pass
 
         # Switch the session store entry to the new session
-        new_entry = await self.async_session_store.switch_session(session_key, new_session_id)
+        await self._cancel_deferred_clarify_session(session_key, reason="session_branch")
+        new_entry = await self.async_session_store.switch_session(
+            session_key,
+            new_session_id,
+        )
         if not new_entry:
             return t("gateway.branch.switch_failed")
         self._clear_session_boundary_security_state(session_key)
