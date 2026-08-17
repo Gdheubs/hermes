@@ -244,7 +244,7 @@ def _normalize_unauthorized_dm_behavior(value: Any, default: str = "pair") -> st
     """Normalize unauthorized DM behavior to a supported value."""
     if isinstance(value, str):
         normalized = value.strip().lower()
-        if normalized in {"pair", "ignore"}:
+        if normalized in {"pair", "ignore", "decline"}:
             return normalized
     return default
 
@@ -986,7 +986,10 @@ class GatewayConfig:
     loop_watchdog: bool = True
 
     # Unauthorized DM policy
-    unauthorized_dm_behavior: str = "pair"  # "pair" or "ignore"
+    unauthorized_dm_behavior: str = "pair"  # "pair", "ignore", or "decline"
+    # Custom text for the one-time polite decline sent when
+    # unauthorized_dm_behavior is "decline".  Empty → built-in default.
+    unauthorized_dm_decline_message: str = ""
 
     # Streaming configuration
     streaming: StreamingConfig = field(default_factory=StreamingConfig)
@@ -1125,6 +1128,7 @@ class GatewayConfig:
             "systemd_watchdog_seconds": self.systemd_watchdog_seconds,
             "loop_watchdog": self.loop_watchdog,
             "unauthorized_dm_behavior": self.unauthorized_dm_behavior,
+            "unauthorized_dm_decline_message": self.unauthorized_dm_decline_message,
             "streaming": self.streaming.to_dict(),
             "session_store_max_age_days": self.session_store_max_age_days,
             "profile_routes": [
@@ -1237,6 +1241,9 @@ class GatewayConfig:
             data.get("unauthorized_dm_behavior"),
             "pair",
         )
+        unauthorized_dm_decline_message = str(
+            data.get("unauthorized_dm_decline_message") or ""
+        ).strip()
 
         try:
             session_store_max_age_days = int(data.get("session_store_max_age_days", 90))
@@ -1271,6 +1278,7 @@ class GatewayConfig:
             loop_watchdog=loop_watchdog,
             max_concurrent_sessions=max_concurrent_sessions,
             unauthorized_dm_behavior=unauthorized_dm_behavior,
+            unauthorized_dm_decline_message=unauthorized_dm_decline_message,
             streaming=StreamingConfig.from_dict(data.get("streaming", {})),
             session_store_max_age_days=session_store_max_age_days,
             profile_routes=profile_routes,

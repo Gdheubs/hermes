@@ -396,3 +396,137 @@ def test_qqbot_with_allowlist_ignores_unauthorized_dm(monkeypatch):
 
     behavior = runner._get_unauthorized_dm_behavior(Platform.QQBOT)
     assert behavior == "ignore"
+
+
+# ---------------------------------------------------------------------------
+# "decline" behavior: one-time polite decline instead of a pairing code
+# (ported from qwibitai/nanoclaw#3260)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_unauthorized_dm_decline_sends_polite_message_once(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    config = GatewayConfig(
+        platforms={
+            Platform.WHATSAPP: PlatformConfig(
+                enabled=True,
+                extra={"unauthorized_dm_behavior": "decline"},
+            ),
+        },
+    )
+    runner, adapter = _make_runner(Platform.WHATSAPP, config)
+    runner.pairing_store.has_recent_decline.return_value = False
+
+    result = await runner._handle_message(
+        _make_event(
+            Platform.WHATSAPP,
+            "15551234567@s.whatsapp.net",
+            "15551234567@s.whatsapp.net",
+        )
+    )
+
+    assert result is None
+    # No pairing code was offered.
+    runner.pairing_store.generate_code.assert_not_called()
+    # The decline stamp was persisted BEFORE delivery.
+    runner.pairing_store.record_decline.assert_called_once_with(
+        "whatsapp", "15551234567@s.whatsapp.net"
+    )
+    adapter.send.assert_awaited_once()
+    sent_text = adapter.send.await_args.args[1]
+    assert "owner" in sent_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_dm_decline_deduped_within_window(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    config = GatewayConfig(
+        platforms={
+            Platform.WHATSAPP: PlatformConfig(
+                enabled=True,
+                extra={"unauthorized_dm_behavior": "decline"},
+            ),
+        },
+    )
+    runner, adapter = _make_runner(Platform.WHATSAPP, config)
+    runner.pairing_store.has_recent_decline.return_value = True
+
+    result = await runner._handle_message(
+        _make_event(
+            Platform.WHATSAPP,
+            "15551234567@s.whatsapp.net",
+            "15551234567@s.whatsapp.net",
+        )
+    )
+
+    assert result is None
+    runner.pairing_store.record_decline.assert_not_called()
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_dm_decline_honors_custom_message(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                extra={"unauthorized_dm_behavior": "decline"},
+            ),
+        },
+    )
+    config.unauthorized_dm_decline_message = "Sorry, this assistant is private."
+    runner, adapter = _make_runner(Platform.TELEGRAM, config)
+    runner.pairing_store.has_recent_decline.return_value = False
+
+    result = await runner._handle_message(
+        _make_event(Platform.TELEGRAM, "999999", "999999")
+    )
+
+    assert result is None
+    adapter.send.assert_awaited_once()
+    assert adapter.send.await_args.args[1] == "Sorry, this assistant is private."
+
+
+def test_config_normalizes_decline_behavior():
+    config = GatewayConfig.from_dict({"unauthorized_dm_behavior": "decline"})
+    assert config.unauthorized_dm_behavior == "decline"
+    # Round-trips through to_dict, including the custom message.
+    config2 = GatewayConfig.from_dict(
+        {
+            "unauthorized_dm_behavior": "DECLINE",
+            "unauthorized_dm_decline_message": "  custom text  ",
+        }
+    )
+    assert config2.unauthorized_dm_behavior == "decline"
+    assert config2.unauthorized_dm_decline_message == "custom text"
+    assert config2.to_dict()["unauthorized_dm_behavior"] == "decline"
+
+
+def test_pairing_store_decline_stamp_roundtrip(monkeypatch, tmp_path):
+    """Real PairingStore: record_decline persists a stamp; has_recent_decline
+    honors it inside the window and expires it afterwards."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import importlib
+
+    import gateway.pairing as pairing_mod
+
+    importlib.reload(pairing_mod)
+    store = pairing_mod.PairingStore()
+
+    assert store.has_recent_decline("telegram", "12345") is False
+    store.record_decline("telegram", "12345")
+    assert store.has_recent_decline("telegram", "12345") is True
+    # A different sender is unaffected.
+    assert store.has_recent_decline("telegram", "67890") is False
+
+    # Expire the stamp by rewinding it past the dedupe window.
+    stamps_path = store._decline_stamp_path()
+    import json as _json
+    import time as _time
+
+    stamps = _json.loads(stamps_path.read_text())
+    for key in stamps:
+        stamps[key] = _time.time() - pairing_mod.DECLINE_DEDUPE_SECONDS - 1
+    stamps_path.write_text(_json.dumps(stamps))
+    assert store.has_recent_decline("telegram", "12345") is False

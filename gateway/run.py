@@ -16153,15 +16153,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
-            # In DMs: offer pairing code. In groups: silently ignore.
-            if (
-                source.chat_type == "dm"
-                and self._get_unauthorized_dm_behavior(
+            # In DMs: offer pairing code, send a one-time polite decline, or
+            # silently ignore (per unauthorized_dm_behavior). In groups:
+            # always silently ignore.
+            _dm_behavior = (
+                self._get_unauthorized_dm_behavior(
                     source.platform,
                     profile=source.profile,
                 )
-                == "pair"
-            ):
+                if source.chat_type == "dm"
+                else "ignore"
+            )
+            if _dm_behavior == "decline":
+                platform_name = source.platform.value if source.platform else "unknown"
+                pairing_store = self._pairing_store_for(source)
+                # Dedupe: at most one decline per (platform, sender) per
+                # 24h window so a persistent unknown sender is not spammed.
+                # Without a pairing store there is no dedupe state, so stay
+                # silent rather than risk a decline storm.
+                if pairing_store is None or pairing_store.has_recent_decline(
+                    platform_name, source.user_id
+                ):
+                    return None
+                # Stamp BEFORE sending so a delivery failure cannot turn
+                # into a decline storm on the sender's next message.
+                pairing_store.record_decline(platform_name, source.user_id)
+                adapter = self._adapter_for_source(source)
+                if adapter:
+                    decline_text = ""
+                    _cfg = getattr(self, "config", None)
+                    if _cfg is not None:
+                        decline_text = str(
+                            getattr(_cfg, "unauthorized_dm_decline_message", "") or ""
+                        ).strip()
+                    if not decline_text:
+                        decline_text = (
+                            "Hi! I'm a personal assistant and can only chat with "
+                            "my owner, so I can't help you directly. Sorry!"
+                        )
+                    try:
+                        await adapter.send(source.chat_id, decline_text)
+                    except Exception:
+                        logger.warning(
+                            "Failed to deliver unauthorized-DM decline on %s",
+                            platform_name,
+                            exc_info=True,
+                        )
+                return None
+            if _dm_behavior == "pair":
                 platform_name = source.platform.value if source.platform else "unknown"
                 pairing_store = self._pairing_store_for(source)
                 if pairing_store is None:
