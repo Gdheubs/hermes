@@ -4652,7 +4652,11 @@ class GatewaySlashCommandsMixin:
             with open(temp_path, "w", encoding="utf-8") as f:
                 f.write(content)
 
-            adapter = self.get_adapter(source.platform)
+            # Sibling handlers all resolve through the runner's adapter
+            # dict — get_adapter() does not exist on GatewayRunner and the
+            # AttributeError surfaced as "Error exporting session" on
+            # every /save (#88713).
+            adapter = self.adapters.get(source.platform) if source else None
             if adapter:
                 await adapter.send_document(
                     chat_id=source.chat_id,
