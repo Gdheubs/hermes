@@ -48,6 +48,7 @@ class TestBackgroundTaskProfileScope:
                     parent_session_key="telegram:chat",
                     reply_to_text=complete_reply,
                     reply_to_is_own_message=True,
+                    origin={"execution_kind": "user_explicit_background"},
                 )
             )
 
@@ -59,5 +60,8 @@ class TestBackgroundTaskProfileScope:
         assert forwarded["reply_to_text"] == complete_reply
         assert decision_after_old_limit in forwarded["reply_to_text"]
         assert forwarded["reply_to_is_own_message"] is True
+        assert forwarded["origin"] == {
+            "execution_kind": "user_explicit_background"
+        }
 
 

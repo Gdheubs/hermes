@@ -3472,6 +3472,14 @@ class GatewaySlashCommandsMixin:
         parent_session_id = str(getattr(parent_entry, "session_id", "") or "")
         parent_session_key = self._session_key_for_source(source)
         reply_to_text = str(getattr(event, "reply_to_text", "") or "")
+        origin = source.to_dict()
+        origin.update(
+            {
+                "execution_kind": "user_explicit_background",
+                "user_initiated": True,
+                "command": "/background",
+            }
+        )
 
         event_message_id = self._reply_anchor_for_event(event)
 
@@ -3494,6 +3502,7 @@ class GatewaySlashCommandsMixin:
                 reply_to_is_own_message=bool(
                     getattr(event, "reply_to_is_own_message", False)
                 ),
+                origin=origin,
             )
         )
         self._background_tasks.add(_task)

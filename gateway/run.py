@@ -21897,6 +21897,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         parent_session_key: Optional[str] = None,
         reply_to_text: Optional[str] = None,
         reply_to_is_own_message: bool = False,
+        origin: Optional[dict] = None,
     ) -> None:
         """Profile-scoping wrapper around the background agent task.
 
@@ -21917,6 +21918,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 parent_session_key=parent_session_key,
                 reply_to_text=reply_to_text,
                 reply_to_is_own_message=reply_to_is_own_message,
+                origin=origin,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -21932,6 +21934,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 parent_session_key=parent_session_key,
                 reply_to_text=reply_to_text,
                 reply_to_is_own_message=reply_to_is_own_message,
+                origin=origin,
             )
 
     def _resolve_enabled_toolsets_for_source(
@@ -21981,6 +21984,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         parent_session_key: Optional[str] = None,
         reply_to_text: Optional[str] = None,
         reply_to_is_own_message: bool = False,
+        origin: Optional[dict] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
@@ -22057,6 +22061,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
             def run_sync():
+                if bool(parent_session_id) != bool(parent_session_key):
+                    raise RuntimeError(
+                        "Background parent session metadata is incomplete"
+                    )
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
@@ -22090,34 +22098,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
-                if parent_session_id and parent_session_key:
-                    agent._ensure_db_session()
-                    session_db = getattr(agent, "_session_db", None)
-                    recorder = getattr(session_db, "record_gateway_session_peer", None)
-                    if callable(recorder):
-                        try:
-                            origin = source.to_dict()
-                        except Exception:
-                            origin = {}
-                        origin.update(
-                            {
-                                "execution_kind": "user_explicit_background",
-                                "user_initiated": True,
-                                "command": "/background",
-                            }
-                        )
-                        recorder(
-                            task_id,
-                            source=platform_key,
-                            user_id=source.user_id,
-                            session_key=parent_session_key,
-                            chat_id=source.chat_id,
-                            chat_type=source.chat_type,
-                            thread_id=source.thread_id,
-                            display_name=source.chat_name,
-                            origin_json=json.dumps(origin),
-                        )
                 try:
+                    if parent_session_id and parent_session_key:
+                        agent.record_gateway_session_peer(origin=origin)
                     return agent.run_conversation(
                         user_message=enriched_prompt,
                         task_id=task_id,
