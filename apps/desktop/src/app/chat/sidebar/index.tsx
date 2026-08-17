@@ -125,7 +125,12 @@ import {
   setCurrentCwd
 } from '@/store/session'
 import { $sessionDotStateById, sessionStatusBucket } from '@/store/session-dot-state'
-import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/store/session-states'
+import {
+  $focusedSessionIsTile,
+  $focusedStoredSessionId,
+  $workingSessionIds,
+  type SplitDir
+} from '@/store/session-states'
 import { ackAllSessionsRead } from '@/store/session-unread'
 import { markSessionUnread } from '@/store/session-unread-remote'
 import { $archivedSessions, loadArchivedSessions } from '@/store/sidebar-archive'
@@ -145,6 +150,7 @@ import type { SidebarNavItem } from '../../types'
 import { SidebarCronJobsSection } from './cron-jobs-section'
 import { SidebarFilterMenu } from './filter-menu'
 import { SidebarLoadMoreRow } from './load-more-row'
+import { sidebarNavItemIsActive, sidebarVisibleView } from './nav-state'
 import { orderByIds, reconcileOrderIds, resolveManualSessionOrderIds, sameIds } from './order'
 import { filterSessionsByProfileScope } from './profile-scope'
 import { ProfileRail } from './profile-switcher'
@@ -364,7 +370,9 @@ export function ChatSidebar({
   const cronOpen = useStore($sidebarCronOpen)
   // The sidebar highlight tracks the FOCUSED session — the interacted tile's
   // tab, else the main selection — so it stays 1:1 with whatever tab is active.
-  const selectedSessionId = useStore($focusedStoredSessionId)
+  const focusedSessionId = useStore($focusedStoredSessionId)
+  const focusedSessionIsTile = useStore($focusedSessionIsTile)
+  const visibleView = sidebarVisibleView(currentView, focusedSessionIsTile)
   const sessions = useStore($sessions)
   const cronSessions = useStore($cronSessions)
   const cronJobs = useStore($cronJobs)
@@ -456,7 +464,7 @@ export function ChatSidebar({
     }
   }, [])
 
-  const activeSidebarSessionId = currentView === 'chat' ? selectedSessionId : null
+  const activeSidebarSessionId = currentView === 'chat' ? focusedSessionId : null
 
   const dndSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
@@ -1454,18 +1462,18 @@ export function ChatSidebar({
               {[...SIDEBAR_NAV, ...contributedNav].map(item => {
                 const isInteractive = Boolean(item.action) || Boolean(item.route)
 
-                const active =
-                  (item.id === 'skills' && currentView === 'skills') ||
-                  (item.id === 'messaging' && currentView === 'messaging') ||
-                  (item.id === 'artifacts' && currentView === 'artifacts') ||
-                  (item.id === 'cron' && currentView === 'cron') ||
-                  // Contributed rows light up at their own route.
-                  (Boolean(item.route) && pathname === item.route)
+                const active = sidebarNavItemIsActive({
+                  contributed: contributedNav.includes(item),
+                  currentView: visibleView,
+                  item,
+                  pathname
+                })
 
                 const isNewSession = item.id === 'new-session'
 
                 const button = (
                   <SidebarMenuButton
+                    aria-current={active ? 'page' : undefined}
                     aria-disabled={!isInteractive}
                     className={cn(
                       // no-drag: these rows sit directly under the titlebar's
@@ -1481,6 +1489,7 @@ export function ChatSidebar({
                       !isInteractive &&
                         'cursor-default hover:border-transparent hover:bg-transparent hover:text-inherit'
                     )}
+                    isActive={active}
                     onClick={() => {
                       // A plain new session lands in whatever profile the live
                       // gateway is on (= the active switcher context). null →
