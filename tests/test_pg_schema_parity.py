@@ -775,3 +775,47 @@ def test_planner_without_applied_set_preserves_legacy_behaviour():
         "the no-applied-set call should return strictly the versions above the "
         f"high-water mark, got {planned}"
     )
+
+
+def test_search_sql_uses_no_trigram_operators():
+    """Search must not depend on pg_trgm being installed.
+
+    pg_trgm supplies the GIN indexes that make ILIKE fast; it does not supply
+    the search semantics. If a search path ever adopts a trigram operator
+    (``%``, ``<->``) or function (``similarity()``, ``word_similarity()``),
+    the extension stops being optional and a managed database that forbids it
+    can no longer search at all -- so v17 would have to become required again,
+    which is the startup failure this guard exists to prevent.
+
+    Checked against the SQL-building functions' own source rather than a live
+    server so the guard runs without Docker, and asserts on the query text
+    those functions emit rather than on formatting.
+    """
+    import inspect
+
+    import hermes_state_postgres as hsp
+
+    trigram_tokens = (
+        "similarity(",
+        "word_similarity(",
+        "<->",
+        "show_trgm(",
+        "gin_trgm_ops",
+    )
+
+    offenders = []
+    for name in ("_search_messages_ilike", "_search_messages_fts", "_build_where"):
+        fn = getattr(hsp, name, None)
+        if fn is None:
+            continue
+        src = inspect.getsource(fn)
+        for token in trigram_tokens:
+            if token in src:
+                offenders.append(f"{name} uses {token!r}")
+
+    assert not offenders, (
+        "search path depends on pg_trgm-provided SQL: "
+        + "; ".join(offenders)
+        + ". The extension must stay an optimization, not a requirement — "
+        "managed PostgreSQL can refuse to install it."
+    )
