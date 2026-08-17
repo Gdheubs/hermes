@@ -1777,6 +1777,37 @@ def _validate_job_mode_invariants(
         )
 
 
+def _validate_delivery_target(deliver: Any, origin: Optional[Dict[str, Any]]) -> None:
+    """Reject cron targets that can never receive an asynchronous delivery.
+
+    The API server is an HTTP request/response surface, not a persistent chat
+    transport. Its adapter therefore cannot push a later cron result back to
+    the request session. Reject both an API-server ``origin`` and an explicit
+    ``api_server:*`` target before the job is persisted; ``local`` and real
+    gateway targets remain valid for jobs created from API requests.
+    """
+    if isinstance(deliver, (list, tuple)):
+        raw_parts = [str(part).strip() for part in deliver]
+    else:
+        raw_parts = str(deliver or "").split(",")
+    targets = [part.lower() for part in raw_parts if part.strip()]
+
+    explicit_api_target = any(
+        target == "api_server" or target.startswith("api_server:")
+        for target in targets
+    )
+    origin_is_api = (
+        isinstance(origin, dict)
+        and str(origin.get("platform") or "").strip().lower() == "api_server"
+    )
+    if explicit_api_target or (origin_is_api and "origin" in targets):
+        raise ValueError(
+            "API-server sessions use HTTP request/response and cannot receive "
+            "scheduled push delivery. Set deliver='local' to save output only, "
+            "or choose a gateway-connected platform."
+        )
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1871,6 +1902,7 @@ def create_job(
     # Default delivery to origin if available, otherwise local
     if deliver is None:
         deliver = "origin" if origin else "local"
+    _validate_delivery_target(deliver, origin)
 
     job_id = uuid.uuid4().hex[:12]
     now = _hermes_now().isoformat()
@@ -2103,6 +2135,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+
+            if {"deliver", "origin"}.intersection(updates):
+                _validate_delivery_target(updated.get("deliver"), updated.get("origin"))
 
             # Re-check execution-mode invariants on the MERGED record when
             # any participating field changes, so create-time invariants

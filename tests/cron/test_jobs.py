@@ -260,6 +260,32 @@ class TestJobCRUD:
         )
         assert job["deliver"] == "origin"
 
+    @pytest.mark.parametrize("deliver", [None, "origin", "origin,all", "api_server:session-1"])
+    def test_rejects_api_server_push_delivery(self, tmp_cron_dir, deliver):
+        kwargs = {
+            "prompt": "Follow up later",
+            "schedule": "30m",
+            "origin": {"platform": "api_server", "chat_id": "session-1"},
+        }
+        if deliver is not None:
+            kwargs["deliver"] = deliver
+
+        with pytest.raises(ValueError, match="cannot receive scheduled push delivery"):
+            create_job(**kwargs)
+
+        assert load_jobs() == []
+
+    @pytest.mark.parametrize("deliver", ["local", "telegram:123"])
+    def test_api_server_origin_allows_non_api_delivery(self, tmp_cron_dir, deliver):
+        job = create_job(
+            prompt="Follow up later",
+            schedule="30m",
+            deliver=deliver,
+            origin={"platform": "api_server", "chat_id": "session-1"},
+        )
+
+        assert job["deliver"] == deliver
+
 
 class TestUpdateJob:
     def test_update_name(self, tmp_cron_dir):
@@ -276,6 +302,19 @@ class TestUpdateJob:
         # Verify persisted to disk
         fetched = get_job(job["id"])
         assert fetched["name"] == "New Name"
+
+    def test_update_rejects_api_server_origin_delivery(self, tmp_cron_dir):
+        job = create_job(
+            prompt="Follow up later",
+            schedule="every 1h",
+            deliver="local",
+            origin={"platform": "api_server", "chat_id": "session-1"},
+        )
+
+        with pytest.raises(ValueError, match="cannot receive scheduled push delivery"):
+            update_job(job["id"], {"deliver": "origin"})
+
+        assert get_job(job["id"])["deliver"] == "local"
 
 
 class TestPauseResumeJob:
