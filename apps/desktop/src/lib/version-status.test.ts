@@ -30,6 +30,15 @@ describe('resolveVersionStatus', () => {
     expect(status.tooltip).toContain('12 commits behind main')
   })
 
+  it('treats backend UPDATE_DIVERGED (-2) as update without a tip count', () => {
+    const status = backend({ behind: -2, version: '0.4.2' })
+
+    expect(status.hasUpdate).toBe(true)
+    expect(status.label).toContain('diverged')
+    expect(status.label).not.toContain('+-2')
+    expect(status.tooltip).toMatch(/diverged/i)
+  })
+
   // FAIL-BEFORE (#84591 class): a shallow install reports behind:null +
   // updateAvailable. The client target ignored updateAvailable entirely, so
   // the statusbar showed no update at all — and further back, the fabricated

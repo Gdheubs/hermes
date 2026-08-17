@@ -65,7 +65,8 @@ export function AboutSettings() {
   const behind = status?.behind ?? 0
   // behind is null when the exact count is unknowable (shallow clone): the
   // backend flags that case via updateAvailable instead of a number.
-  const updateAvailable = behind > 0 || Boolean(status?.updateAvailable)
+  // behind === -2 is UPDATE_DIVERGED — not a fast-forward count.
+  const updateAvailable = behind > 0 || behind === -2 || Boolean(status?.updateAvailable)
   const supported = status?.supported !== false
   const applying = apply.applying || apply.stage === 'restart'
 

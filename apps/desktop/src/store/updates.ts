@@ -213,7 +213,8 @@ export function maybeNotifyUpdateAvailable(status: DesktopUpdateStatus | null) {
 
   // behind === null means "update available, exact count unknown" (shallow
   // clone). That still deserves the toast — just with count-free copy.
-  if ((behind ?? 0) <= 0 && !status.updateAvailable) {
+  // behind === -2 is UPDATE_DIVERGED — still an update signal, not a count.
+  if ((behind ?? 0) <= 0 && behind !== -2 && !status.updateAvailable) {
     return
   }
 
@@ -274,7 +275,7 @@ export function requestActiveUpdate(): void {
   const target: UpdateTarget = isRemoteMode() ? 'backend' : 'client'
   const status = target === 'backend' ? $backendUpdateStatus.get() : $updateStatus.get()
 
-  if ((status?.behind ?? 0) > 0 || status?.updateAvailable) {
+  if ((status?.behind ?? 0) > 0 || status?.behind === -2 || status?.updateAvailable) {
     startActiveUpdate()
 
     return
@@ -322,7 +323,7 @@ function mapBackendCheck(res: BackendUpdateCheckResponse): DesktopUpdateStatus {
     supported: res.can_apply,
     message: res.message ?? undefined,
     updateAvailable: res.update_available,
-    behind: behind > 0 ? behind : 0,
+    behind: behind > 0 || behind === -2 ? behind : 0,
     currentVersion: res.current_version,
     targetSha: res.update_available ? `backend:${res.current_version}` : undefined,
     commits: res.commits,
