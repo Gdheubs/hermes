@@ -67,6 +67,7 @@ const cssEscape = (value: string): string => {
 }
 
 interface SubmitDetail {
+  surfaceId: string
   target: ComposerTarget
   text: string
 }
@@ -150,6 +151,30 @@ const dispatch = <T>(name: string, detail: T) => {
   }
 
   window.setTimeout(() => window.dispatchEvent(new CustomEvent<T>(name, { detail })), 0)
+}
+
+/** Submit is the one bus mutation that must preserve the chat visible at click
+ * time. Deferring it lets a parent click handler/tab reveal switch the active
+ * keep-alive pane before subscribers run, so the task is dropped or claimed by
+ * another `'main'` composer. Other bus events intentionally defer for focus
+ * restoration; submit has no such requirement. */
+const dispatchNow = <T>(name: string, detail: T) => {
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent<T>(name, { detail }))
+  }
+}
+
+/** Unique mounted-composer identity stamped on the visible chat surface.
+ * Unlike a session key it is present for fresh chats and remains unique if the
+ * same session is rendered in two panes. */
+const visibleComposerSurfaceId = (target: ComposerTarget): string | null => {
+  if (typeof document === 'undefined') {
+    return null
+  }
+
+  const surface = queryVisible<HTMLElement>(`[data-composer-target="${cssEscape(target)}"]`)
+
+  return surface?.dataset.composerSurfaceId || null
 }
 
 const subscribe = <T>(name: string, handler: (detail: T) => void) => {
@@ -266,7 +291,20 @@ export const requestComposerSubmit = (
   const trimmed = text.trim()
 
   if (trimmed) {
-    dispatch<SubmitDetail>(SUBMIT_EVENT, { target: resolve(target), text: trimmed })
+    const resolvedTarget = resolve(target)
+    const surfaceId = visibleComposerSurfaceId(resolvedTarget)
+
+    // Fail closed: without an exact mounted surface identity, broadcasting a
+    // submit could make more than one keep-alive/new-chat composer claim it.
+    if (!surfaceId) {
+      return
+    }
+
+    dispatchNow<SubmitDetail>(SUBMIT_EVENT, {
+      surfaceId,
+      target: resolvedTarget,
+      text: trimmed
+    })
   }
 }
 
