@@ -19,6 +19,7 @@ preserved.
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import re
@@ -429,16 +430,60 @@ def _custom_provider_model_matches(agent_model: str, entry: Dict[str, Any]) -> b
 def _custom_provider_extra_body_for_agent(
     *,
     provider: str,
+    requested_provider: str = "",
     model: str,
     base_url: str,
     custom_providers: List[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    provider_norm = (provider or "").strip().lower()
-    if provider_norm == "custom":
-        provider_key_filter = ""
-    elif provider_norm.startswith("custom:"):
-        provider_key_filter = provider_norm.split(":", 1)[1].strip()
-    else:
+    try:
+        from hermes_cli.models import CANONICAL_PROVIDERS
+
+        native_provider_ids = {
+            str(entry.slug or "").strip().lower()
+            for entry in CANONICAL_PROVIDERS
+            if str(entry.slug or "").strip().lower() != "custom"
+        }
+        native_catalog_available = True
+    except Exception:
+        # Without the native catalog, bare provider IDs are ambiguous.  Fail
+        # closed and require the explicit ``custom:`` identity instead of
+        # risking a custom-name collision with a native route.
+        native_provider_ids = set()
+        native_catalog_available = False
+    native_provider_ids.update({"openai", "github", "github-copilot"})
+
+    configured_keys = {
+        value
+        for entry in custom_providers or []
+        if isinstance(entry, dict)
+        for value in (
+            str(entry.get("provider_key", "") or "").strip().lower(),
+            str(entry.get("name", "") or "").strip().lower(),
+        )
+        if value
+    }
+    provider_key_filter = ""
+    is_custom_route = False
+    for raw_identity in (requested_provider, provider):
+        identity = str(raw_identity or "").strip().lower()
+        if identity == "custom":
+            is_custom_route = True
+            continue
+        if identity.startswith("custom:"):
+            is_custom_route = True
+            provider_key_filter = identity.split(":", 1)[1].strip()
+            break
+        # Live model switches may carry the configured provider key as the
+        # provider identity rather than the canonical ``custom`` label.
+        if (
+            native_catalog_available
+            and identity in configured_keys
+            and identity not in native_provider_ids
+        ):
+            is_custom_route = True
+            provider_key_filter = identity
+            break
+    if not is_custom_route:
         return None
 
     target_url = _normalized_custom_base_url(base_url)
@@ -471,23 +516,84 @@ def _custom_provider_extra_body_for_agent(
     return fallback
 
 
+def _remove_provider_owned_values(
+    current: Dict[str, Any], owned: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Remove unchanged provider-owned leaves from a nested mapping."""
+    result = copy.deepcopy(current)
+    for key, owned_value in owned.items():
+        if key not in result:
+            continue
+        current_value = result[key]
+        if current_value == owned_value:
+            result.pop(key)
+        elif isinstance(current_value, dict) and isinstance(owned_value, dict):
+            nested = _remove_provider_owned_values(current_value, owned_value)
+            if nested:
+                result[key] = nested
+            else:
+                result.pop(key)
+    return result
+
+
+def _merge_provider_defaults_with_caller(
+    defaults: Dict[str, Any], caller: Dict[str, Any]
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Deep-merge mappings and return effective values plus owned leaves."""
+    merged = copy.deepcopy(defaults)
+    owned = copy.deepcopy(defaults)
+    for key, caller_value in caller.items():
+        default_value = defaults.get(key)
+        if isinstance(default_value, dict) and isinstance(caller_value, dict):
+            merged_value, owned_value = _merge_provider_defaults_with_caller(
+                default_value, caller_value
+            )
+            merged[key] = merged_value
+            if owned_value:
+                owned[key] = owned_value
+            else:
+                owned.pop(key, None)
+        else:
+            merged[key] = copy.deepcopy(caller_value)
+            owned.pop(key, None)
+    return merged, owned
+
+
 def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, Any]]) -> None:
-    extra_body = _custom_provider_extra_body_for_agent(
+    destination_defaults = _custom_provider_extra_body_for_agent(
         provider=agent.provider,
+        requested_provider=getattr(agent, "requested_provider", ""),
         model=agent.model,
         base_url=agent.base_url,
         custom_providers=custom_providers,
-    )
-    if not extra_body:
-        return
+    ) or {}
 
-    overrides = dict(getattr(agent, "request_overrides", {}) or {})
-    merged_extra_body = dict(extra_body)
+    overrides = copy.deepcopy(getattr(agent, "request_overrides", {}) or {})
     existing_extra_body = overrides.get("extra_body")
-    if isinstance(existing_extra_body, dict):
-        merged_extra_body.update(existing_extra_body)
-    overrides["extra_body"] = merged_extra_body
+    caller_extra_body = (
+        copy.deepcopy(existing_extra_body)
+        if isinstance(existing_extra_body, dict)
+        else {}
+    )
+
+    # Remove only unchanged values that Hermes previously injected.  A value
+    # changed after injection is treated as caller/runtime-owned and preserved.
+    previous_owned = copy.deepcopy(
+        getattr(agent, "_custom_provider_extra_body", {}) or {}
+    )
+    caller_extra_body = _remove_provider_owned_values(
+        caller_extra_body, previous_owned
+    )
+
+    merged_extra_body, destination_owned = _merge_provider_defaults_with_caller(
+        destination_defaults, caller_extra_body
+    )
+    if merged_extra_body:
+        overrides["extra_body"] = merged_extra_body
+    else:
+        overrides.pop("extra_body", None)
     agent.request_overrides = overrides
+    agent._custom_provider_extra_body = destination_owned
 
 
 def init_agent(
@@ -2558,7 +2664,6 @@ def init_agent(
                 # connections, clients); in that case fall back to the built-in
                 # compressor with an ACCURATE message rather than silently
                 # mislabelling it "not found".
-                import copy
                 try:
                     _selected_engine = copy.deepcopy(_candidate)
                 except Exception as _copy_err:
@@ -2928,6 +3033,12 @@ def init_agent(
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
+        "request_overrides": copy.deepcopy(
+            getattr(agent, "request_overrides", {}) or {}
+        ),
+        "custom_provider_extra_body": copy.deepcopy(
+            getattr(agent, "_custom_provider_extra_body", {}) or {}
+        ),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         # Context engine state that _try_activate_fallback() overwrites.

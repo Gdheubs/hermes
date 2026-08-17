@@ -2656,6 +2656,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             agent._transport_cache.clear()
         agent._fallback_activated = True
 
+        # Provider-scoped custom extra_body defaults belong to the route that
+        # produced them. Remove only unchanged source-owned values and apply
+        # the fallback destination's defaults before building its request.
+        from agent.agent_init import _merge_custom_provider_extra_body
+
+        _merge_custom_provider_extra_body(
+            agent, getattr(agent, "_custom_providers", None) or []
+        )
+
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream
         # recovery (rate_limit / billing / auth) mutate the wrong credential

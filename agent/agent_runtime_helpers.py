@@ -1349,6 +1349,17 @@ def try_recover_primary_transport(
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
+        if "request_overrides" in rt:
+            agent.request_overrides = copy.deepcopy(rt["request_overrides"])
+            agent._custom_provider_extra_body = copy.deepcopy(
+                rt.get("custom_provider_extra_body", {})
+            )
+        else:
+            from agent.agent_init import _merge_custom_provider_extra_body
+
+            _merge_custom_provider_extra_body(
+                agent, getattr(agent, "_custom_providers", None) or []
+            )
 
         if agent.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client
@@ -1580,6 +1591,19 @@ def restore_primary_runtime(agent) -> bool:
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
         agent._client_kwargs = dict(rt["client_kwargs"])
+        if "request_overrides" in rt:
+            agent.request_overrides = copy.deepcopy(rt["request_overrides"])
+            agent._custom_provider_extra_body = copy.deepcopy(
+                rt.get("custom_provider_extra_body", {})
+            )
+        else:
+            # Compatibility for bare/older runtime snapshots: reconcile the
+            # live state against the restored route rather than crashing.
+            from agent.agent_init import _merge_custom_provider_extra_body
+
+            _merge_custom_provider_extra_body(
+                agent, getattr(agent, "_custom_providers", None) or []
+            )
         agent._use_prompt_caching = rt["use_prompt_caching"]
         # Default to native layout when the restored snapshot predates the
         # native-vs-proxy split (older sessions saved before this PR).
@@ -2657,6 +2681,21 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # _client_kwargs is a dict — snapshot a shallow copy so mutating the
     # live dict doesn't poison the rollback target.
     _snapshot["_client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
+    _snapshot["request_overrides"] = (
+        copy.deepcopy(agent.request_overrides)
+        if hasattr(agent, "request_overrides")
+        else _MISSING
+    )
+    _snapshot["_custom_provider_extra_body"] = (
+        copy.deepcopy(agent._custom_provider_extra_body)
+        if hasattr(agent, "_custom_provider_extra_body")
+        else _MISSING
+    )
+    _snapshot["_custom_providers"] = (
+        copy.deepcopy(agent._custom_providers)
+        if hasattr(agent, "_custom_providers")
+        else _MISSING
+    )
     # Snapshot the credential pool reference so a failed client rebuild can
     # restore the original pool (issue #52727: pool reload is part of this
     # switch and must be reversible on rollback).
@@ -2668,10 +2707,26 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     def _restore_snapshot() -> None:
         for _name, _value in _snapshot.items():
             if _value is _MISSING:
-                # Attribute did not exist before the swap — don't fabricate it.
+                # Remove anything the failed transaction created when the
+                # attribute did not exist before the swap.
+                try:
+                    delattr(agent, _name)
+                except AttributeError:
+                    pass
                 continue
             try:
-                setattr(agent, _name, _value)
+                setattr(
+                    agent,
+                    _name,
+                    copy.deepcopy(_value)
+                    if _name in {
+                        "_client_kwargs",
+                        "request_overrides",
+                        "_custom_provider_extra_body",
+                        "_custom_providers",
+                    }
+                    else _value,
+                )
             except Exception:  # noqa: BLE001
                 pass
 
@@ -2715,6 +2770,31 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent._transport_cache.clear()
         if api_key:
             agent.api_key = api_key
+
+        # Provider-scoped extra_body defaults must follow the destination
+        # route. Refresh live config once; if that read fails, the cached
+        # catalog still lets us remove proven source-owned values safely.
+        try:
+            from hermes_cli.config import (
+                get_compatible_custom_providers,
+                load_config_readonly,
+            )
+
+            _sm_custom_providers = get_compatible_custom_providers(
+                load_config_readonly()
+            )
+        except Exception:
+            logger.debug(
+                "custom-provider override catalog refresh skipped on switch_model",
+                exc_info=True,
+            )
+            _sm_custom_providers = copy.deepcopy(
+                getattr(agent, "_custom_providers", None) or []
+            )
+        agent._custom_providers = _sm_custom_providers
+        from agent.agent_init import _merge_custom_provider_extra_body
+
+        _merge_custom_provider_extra_body(agent, _sm_custom_providers)
 
         # ── Reload credential pool for the new provider (issue #52727) ──
         # Without this, ``recover_with_credential_pool`` sees a
@@ -2847,16 +2927,11 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         raise
 
     # ── LM Studio: preload before probing context length ──
-    _sm_custom_providers = None
     try:
         from hermes_cli.config import (
-            get_compatible_custom_providers,
             get_custom_provider_context_length,
-            load_config,
         )
 
-        _sm_cfg = load_config()
-        _sm_custom_providers = get_compatible_custom_providers(_sm_cfg)
         _destination_context_intent = get_custom_provider_context_length(
             model=agent.model,
             base_url=agent.base_url,
@@ -2967,6 +3042,12 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
+        "request_overrides": copy.deepcopy(
+            getattr(agent, "request_overrides", {}) or {}
+        ),
+        "custom_provider_extra_body": copy.deepcopy(
+            getattr(agent, "_custom_provider_extra_body", {}) or {}
+        ),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_config": dict(agent.reasoning_config) if getattr(agent, "reasoning_config", None) else None,

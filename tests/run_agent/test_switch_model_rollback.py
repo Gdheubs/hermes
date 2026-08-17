@@ -34,6 +34,12 @@ def _make_agent_openrouter():
         "api_key": "or-key-original",
         "base_url": "https://openrouter.ai/api/v1",
     }
+    agent.request_overrides = {
+        "service_tier": "priority",
+        "extra_body": {"source_owned": True, "caller_only": 1},
+    }
+    agent._custom_provider_extra_body = {"source_owned": True}
+    agent._custom_providers = []
     agent.context_compressor = None
     agent._anthropic_api_key = ""
     agent._anthropic_base_url = None
@@ -83,6 +89,11 @@ def test_openai_client_rebuild_failure_rolls_back_to_original_state():
 
     original_client = agent.client
     original_kwargs = dict(agent._client_kwargs)
+    original_overrides = {
+        "service_tier": "priority",
+        "extra_body": {"source_owned": True, "caller_only": 1},
+    }
+    original_owned = {"source_owned": True}
 
     # _create_openai_client raises mid-swap (simulates bad key / network error)
     def boom(*_a, **_kw):
@@ -108,6 +119,8 @@ def test_openai_client_rebuild_failure_rolls_back_to_original_state():
     assert agent.api_key == "or-key-original"
     assert agent.client is original_client
     assert agent._client_kwargs == original_kwargs
+    assert agent.request_overrides == original_overrides
+    assert agent._custom_provider_extra_body == original_owned
 
 
 def test_anthropic_client_rebuild_failure_rolls_back_to_original_state():
@@ -202,3 +215,32 @@ def test_successful_switch_still_works_after_rollback_refactor():
     assert agent.provider == "openrouter"
     assert agent.api_key == "or-key-new"
     assert agent.client is new_client
+
+
+def test_failure_does_not_fabricate_missing_override_metadata():
+    """Bare/legacy agents return to the exact missing-attribute shape."""
+    agent = _make_agent_openrouter()
+    for name in (
+        "request_overrides",
+        "_custom_provider_extra_body",
+        "_custom_providers",
+    ):
+        delattr(agent, name)
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("client build failed")
+
+    agent._create_openai_client = boom
+    with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
+        with pytest.raises(RuntimeError, match="client build failed"):
+            agent.switch_model(
+                new_model="gpt-5.5",
+                new_provider="openai-codex",
+                api_key="new-key",
+                base_url="https://chatgpt.com/backend-api/codex",
+                api_mode="codex_responses",
+            )
+
+    assert not hasattr(agent, "request_overrides")
+    assert not hasattr(agent, "_custom_provider_extra_body")
+    assert not hasattr(agent, "_custom_providers")
