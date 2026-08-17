@@ -1222,3 +1222,46 @@ class TestReadEventsClosedWsGuard:
         with pytest.raises(RuntimeError):
             asyncio.run(adapter._read_events())
 
+class TestGatewayUrlFetch:
+    def _make_adapter(self, **extra):
+        from gateway.platforms.qqbot import QQAdapter
+        return QQAdapter(_make_config(**extra))
+
+    def test_get_gateway_url_retries_then_succeeds(self):
+        adapter = self._make_adapter(app_id="a", client_secret="b")
+        adapter._ensure_token = mock.AsyncMock(return_value="tok")
+
+        resp_fail = mock.Mock()
+        resp_fail.raise_for_status.side_effect = RuntimeError("temporary error")
+        resp_ok = mock.Mock()
+        resp_ok.raise_for_status.return_value = None
+        resp_ok.json.return_value = {"url": "wss://qq-gateway.example/ws"}
+
+        adapter._http_client = mock.Mock()
+        adapter._http_client.get = mock.AsyncMock(side_effect=[resp_fail, resp_ok])
+
+        async def _run():
+            with mock.patch("gateway.platforms.qqbot.adapter.asyncio.sleep", new=mock.AsyncMock()):
+                return await adapter._get_gateway_url()
+
+        url = asyncio.run(_run())
+        assert url == "wss://qq-gateway.example/ws"
+        assert adapter._last_gateway_url == "wss://qq-gateway.example/ws"
+        assert adapter._http_client.get.await_count == 2
+
+    def test_get_gateway_url_uses_cached_value_after_retries_fail(self):
+        adapter = self._make_adapter(app_id="a", client_secret="b")
+        adapter._ensure_token = mock.AsyncMock(return_value="tok")
+        adapter._last_gateway_url = "wss://cached.qq/ws"
+
+        resp_fail = mock.Mock()
+        resp_fail.raise_for_status.side_effect = RuntimeError("gateway down")
+        adapter._http_client = mock.Mock()
+        adapter._http_client.get = mock.AsyncMock(return_value=resp_fail)
+
+        async def _run():
+            with mock.patch("gateway.platforms.qqbot.adapter.asyncio.sleep", new=mock.AsyncMock()):
+                return await adapter._get_gateway_url()
+
+        url = asyncio.run(_run())
+        assert url == "wss://cached.qq/ws"
