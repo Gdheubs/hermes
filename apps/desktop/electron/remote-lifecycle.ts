@@ -395,34 +395,67 @@ async function remotePidAlive(ssh, pid) {
 
 // A pid is "provably ours" only if its remote cmdline carries our dashboard
 // args — never kill a pid we can't positively identify as our dashboard.
-async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
-  if (!pid || !/^[0-9a-f]{16}$/.test(String(spawnNonce || '')) || !hermesPath) {
+async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '', ownershipId = '') {
+  const numericPid = Number(pid)
+
+  if (
+    !Number.isInteger(numericPid) ||
+    numericPid <= 0 ||
+    numericPid > 4194304 ||
+    !/^[0-9a-f]{16}$/.test(String(spawnNonce || '')) ||
+    !hermesPath
+  ) {
     return false
+  }
+
+  let tokenFilePath = ''
+
+  if (ownershipId) {
+    try {
+      tokenFilePath = `${ownershipDirectory(ownershipId)}/${validateSpawnNonce(spawnNonce)}.token`
+    } catch {
+      return false
+    }
   }
 
   try {
     const script =
       'import os,shlex,subprocess,sys\n' +
-      `pid=${Number(pid)}\n` +
-      `expected=os.path.expanduser(${shq(hermesPath)})\n` +
-      `nonce=${shq(spawnNonce)}\n` +
+      `pid=${numericPid}\n` +
+      `expected=os.path.expanduser(${JSON.stringify(String(hermesPath))})\n` +
+      `nonce=${JSON.stringify(String(spawnNonce))}\n` +
+      `tokenfile=os.path.expanduser(${JSON.stringify(tokenFilePath)})\n` +
       'try:\n' +
       ' raw=open(f"/proc/{pid}/cmdline","rb").read()\n' +
       ' args=[x.decode("utf-8","surrogateescape") for x in raw.split(b"\\0") if x]\n' +
+      ' argv_exact=True\n' +
       'except OSError:\n' +
+      ' argv_exact=False\n' +
       ' try:\n' +
-      '  line=subprocess.check_output(["ps","-o","command=","-p",str(pid)],text=True).strip()\n' +
-      ' except subprocess.CalledProcessError:\n' +
-      '  # pid already gone — a dead process is FOREIGN, not a transport error\n' +
-      '  print("FOREIGN");sys.exit(0)\n' +
-      ' args=shlex.split(line)\n' +
+      '  line=subprocess.check_output(["ps","-ww","-o","command=","-p",str(pid)],text=True).strip()\n' +
+      '  args=shlex.split(line)\n' +
+      ' except (OSError,subprocess.SubprocessError,ValueError):args=[]\n' +
       'ok=False\n' +
       'try:\n' +
       ' serve=args.index("serve")\n' +
-      ' owner=args.index("--ssh-owner-nonce",serve+1)\n' +
+      ' def option(name):\n' +
+      '  matches=[i for i,arg in enumerate(args[serve+1:],serve+1) if arg==name or (argv_exact and arg.startswith(name+"="))]\n' +
+      '  if len(matches)>1:raise ValueError\n' +
+      '  if not matches:return None\n' +
+      '  i=matches[0]\n' +
+      '  return args[i+1] if args[i]==name else args[i].split("=",1)[1]\n' +
+      ' owner=option("--ssh-owner-nonce")\n' +
+      ' token=option("--ssh-session-token-file")\n' +
+      ' host=option("--host")\n' +
+      ' port=option("--port")\n' +
+      ' if owner is None:raise ValueError\n' +
       ' direct=args[0]==expected\n' +
       ' python_entry=len(args)>1 and args[1]==expected and os.path.basename(args[0]).startswith("python")\n' +
-      ' ok=(direct or python_entry) and "--isolated" in args[serve+1:] and args[owner+1]==nonce\n' +
+      ' executable_match=direct or python_entry\n' +
+      ' wrapper_owned=False\n' +
+      ' if tokenfile and argv_exact:\n' +
+      '  wrapper_owned=(token is not None and os.path.normpath(token)==os.path.normpath(tokenfile) and host=="127.0.0.1" and port=="0")\n' +
+      ' ok=(executable_match or wrapper_owned) and "--isolated" in args[serve+1:] and owner==nonce\n' +
       'except (ValueError,IndexError):pass\n' +
       'print("OWNED" if ok else "FOREIGN")'
 
@@ -439,7 +472,7 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
 
 // Kill the stale dashboard ONLY if provably ours, then drop the lockfile.
 async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
-  if (pidAlive && lock && (await pidIsOurDashboard(ssh, lock.pid, lock.spawnNonce, lock.hermesPath))) {
+  if (pidAlive && lock && (await pidIsOurDashboard(ssh, lock.pid, lock.spawnNonce, lock.hermesPath, ownershipId))) {
     try {
       const result = (
         await ssh.exec(
@@ -741,7 +774,7 @@ async function connect(deps) {
 
   if (lock) {
     const pidAlive = await remotePidAlive(ssh, lock.pid)
-    const owned = pidAlive && (await pidIsOurDashboard(ssh, lock.pid, lock.spawnNonce, lock.hermesPath))
+    const owned = pidAlive && (await pidIsOurDashboard(ssh, lock.pid, lock.spawnNonce, lock.hermesPath, ownershipId))
 
     const reusable =
       pidAlive &&
