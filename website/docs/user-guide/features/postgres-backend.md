@@ -49,11 +49,30 @@ install, needs no server, and is the more thoroughly exercised path.
   manual step. Environments that block outbound PyPI access should install the
   extra ahead of time. The published Docker image ships with it already baked in.
 
-- **The `pg_trgm` extension** is recommended. Hermes creates it automatically on
-  first connect (`CREATE EXTENSION IF NOT EXISTS pg_trgm`); it backs the GIN
-  trigram indexes used for message search. If the connecting role lacks
-  permission to create extensions, ask a superuser to install it once on the
-  target database.
+- **The `pg_trgm` extension** is recommended but not required. Hermes tries to
+  create it on first connect (`CREATE EXTENSION IF NOT EXISTS pg_trgm`); it
+  backs the GIN trigram indexes that accelerate substring search.
+
+  If the connecting role may not create extensions, Hermes logs a warning and
+  continues — search still works, because the `ILIKE` path is plain SQL and the
+  full-text path uses core PostgreSQL `tsvector`. Only the trigram acceleration
+  is lost, which matters on large tables. Hermes retries on every connect, so
+  allow-listing the extension later picks it up automatically with no
+  intervention.
+
+  Managed providers often gate this. On Azure Database for PostgreSQL Flexible
+  Server, for example, extensions must be allow-listed in the
+  `azure.extensions` server parameter (empty by default) before a non-superuser
+  can create them:
+
+  ```bash
+  az postgres flexible-server parameter set \
+    --resource-group <rg> --server-name <server> \
+    --name azure.extensions --value pg_trgm
+  ```
+
+  On self-managed PostgreSQL, a superuser can install it once per database:
+  `CREATE EXTENSION IF NOT EXISTS pg_trgm;`
 
 The database user needs `CREATE` on the target database — Hermes manages its own
 tables, indexes, and migrations.

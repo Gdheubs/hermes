@@ -307,17 +307,37 @@ class PostgresMigration:
 
 
 _PG_ONLY_MIGRATIONS: List[PostgresMigration] = [
-    # v17 — Install pg_trgm extension (required: failure retries next connect).
-    # A no-op where the extension is already installed (common on managed
-    # Postgres). Non-optional so unexpected failure surfaces in logs.
+    # v17 — Install pg_trgm, which accelerates the ILIKE search path via the
+    # GIN indexes in v18. A no-op where the extension is already installed.
+    #
+    # optional=True because pg_trgm is an OPTIMIZATION, not a requirement:
+    # ILIKE is plain SQL and the tsvector FTS path (v19) is core PostgreSQL, so
+    # search is correct without the extension — only slower on large tables.
+    # Making this fatal would be strictly worse than the degradation it
+    # prevents.
+    #
+    # This is not hypothetical. Managed providers restrict which extensions a
+    # non-superuser may create, and some ship with an empty allow-list by
+    # default: creating pg_trgm then fails with a permission or
+    # FeatureNotSupported error that no amount of retrying will clear. With
+    # optional=False that error propagated out of init_postgres_schema and
+    # SessionDB.__init__, so the agent could not start at all against an
+    # otherwise perfectly healthy database. Verified against Azure Database for
+    # PostgreSQL Flexible Server 18.4, whose default azure.extensions parameter
+    # is empty.
+    #
+    # The failure is logged at WARNING and the version is not recorded, so the
+    # migration retries on the next connect and picks the extension up
+    # automatically if an operator later allow-lists it.
     PostgresMigration(
         version=17,
-        optional=False,
+        optional=True,
         sql="CREATE EXTENSION IF NOT EXISTS pg_trgm",
     ),
     # v18 — GIN trigram indexes on the three searched columns. optional=True
-    # because index builds can fail transiently (lock, OOM, disk full); ILIKE
-    # still works without them (just slower). IF NOT EXISTS makes this
+    # because index builds can fail transiently (lock, OOM, disk full) and
+    # because they cannot be built at all when v17 could not install pg_trgm;
+    # ILIKE still works without them (just slower). IF NOT EXISTS makes this
     # idempotent so pre-created indexes on large production tables are skipped.
     PostgresMigration(
         version=18,
@@ -541,14 +561,35 @@ _PG_ONLY_MIGRATIONS: List[PostgresMigration] = [
 ]
 
 
-def plan_postgres_migrations(current_version: int) -> List[PostgresMigration]:
-    """Return pending Postgres-only migrations (version > *current_version*).
+def plan_postgres_migrations(
+    current_version: int,
+    applied: Optional[set] = None,
+) -> List[PostgresMigration]:
+    """Return pending Postgres-only migrations.
 
-    *current_version* is sourced from ``schema_version`` ``MAX(version)`` —
-    NOT from the upstream ``SCHEMA_VERSION`` constant, which governs only the
-    SQLite/shared schema.
+    *current_version* is the high-water mark from ``pg_migration_version``
+    ``MAX(version)`` — NOT the shared ``SCHEMA_VERSION`` constant, which
+    governs only the SQLite/shared schema.
+
+    *applied* is the full set of recorded versions. It matters because an
+    ``optional=True`` migration that fails does NOT record its version, while
+    later migrations still succeed and do. A pure ``> MAX(version)`` rule would
+    then strand the skipped one forever: pg_trgm denied by a managed provider's
+    extension allow-list would never be retried even after an operator
+    allow-lists it, because v19+ already pushed the high-water mark past it.
+
+    Passing *applied* replays any gap below the high-water mark. Every
+    migration is ``IF NOT EXISTS``-guarded, so re-running an already-applied
+    statement is a no-op; the only cost of retrying a still-failing optional
+    migration is one logged warning per connect.
     """
-    return [m for m in _PG_ONLY_MIGRATIONS if m.version > current_version]
+    if applied is None:
+        return [m for m in _PG_ONLY_MIGRATIONS if m.version > current_version]
+    return [
+        m
+        for m in _PG_ONLY_MIGRATIONS
+        if m.version > current_version or m.version not in applied
+    ]
 
 
 def _probe_pg_trgm(conn: Any) -> bool:
@@ -565,6 +606,23 @@ def _probe_pg_trgm(conn: Any) -> bool:
         return row is not None
     except Exception:
         return False
+
+
+def postgres_applied_migrations(conn: Any) -> set:
+    """Return the set of recorded Postgres-only migration versions.
+
+    Distinct from :func:`postgres_migration_version`, which returns only the
+    maximum. The full set is what lets the planner spot a GAP — an optional
+    migration that failed while later ones succeeded — and retry it instead of
+    stranding it below the high-water mark.
+    """
+    try:
+        rows = conn.execute("SELECT version FROM pg_migration_version").fetchall()
+    except Exception:
+        return set()
+    return {
+        int(r["version"]) for r in (rows or []) if r["version"] is not None
+    }
 
 
 def _apply_single_migration(conn: Any, migration: PostgresMigration) -> None:
@@ -607,9 +665,11 @@ def _apply_single_migration(conn: Any, migration: PostgresMigration) -> None:
 def apply_postgres_migrations(conn: Any) -> None:
     """Apply any pending Postgres-only migrations.
 
-    Called by :func:`init_postgres_schema` on every connect. Reads
-    ``MAX(version)`` from ``schema_version`` and applies only migrations with
-    version > current. Idempotent: safe to call repeatedly.
+    Called by :func:`init_postgres_schema` on every connect. Reads the recorded
+    versions from ``pg_migration_version`` and applies anything not yet
+    recorded — including gaps below the high-water mark, so an optional
+    migration that failed earlier is retried rather than stranded. Idempotent:
+    safe to call repeatedly.
 
     Concurrent-connect race: safe. ``CREATE EXTENSION IF NOT EXISTS`` and
     ``CREATE INDEX CONCURRENTLY IF NOT EXISTS`` are idempotent; the version
@@ -620,7 +680,8 @@ def apply_postgres_migrations(conn: Any) -> None:
     migrations propagate the exception.
     """
     current = postgres_migration_version(conn)
-    pending = plan_postgres_migrations(current)
+    applied = postgres_applied_migrations(conn)
+    pending = plan_postgres_migrations(current, applied)
     if not pending:
         return
     for migration in pending:

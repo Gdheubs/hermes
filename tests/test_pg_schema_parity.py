@@ -39,6 +39,7 @@ from hermes_state_postgres import (
     SCHEMA_SQL_POSTGRES,
     _PG_ONLY_MIGRATIONS,
     _pg_column_type,
+    plan_postgres_migrations,
     reconcile_postgres_columns,
 )
 
@@ -672,4 +673,105 @@ def test_every_pg_only_migration_statement_is_idempotent():
         "unguarded statement(s) in the Postgres-only migrations; replaying the "
         "list on a database that already has these objects would fail:\n  "
         + "\n  ".join(unguarded)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Managed-Postgres degradation
+#
+# Hosted PostgreSQL restricts which extensions a non-superuser may create, and
+# some providers ship an empty allow-list by default. Creating pg_trgm then
+# fails with a permission / FeatureNotSupported error that retrying will never
+# clear.
+#
+# pg_trgm only ACCELERATES search: the ILIKE path is plain SQL and the FTS path
+# is core PostgreSQL tsvector. So the correct behaviour when it cannot be
+# installed is to degrade, not to refuse to start. A non-optional v17 made the
+# error propagate out of SessionDB.__init__ and the agent could not start at
+# all against an otherwise healthy database.
+# ---------------------------------------------------------------------------
+
+
+def test_extension_migration_is_optional():
+    """pg_trgm must never be able to block startup.
+
+    Asserts the property (every migration whose SQL creates an EXTENSION is
+    optional) rather than pinning v17 specifically, so a future extension
+    migration inherits the guard.
+    """
+    fatal_extension_migrations = [
+        m.version
+        for m in _PG_ONLY_MIGRATIONS
+        if "CREATE EXTENSION" in m.sql.upper() and not m.optional
+    ]
+    assert not fatal_extension_migrations, (
+        "migration(s) "
+        f"{fatal_extension_migrations} create an extension with optional=False. "
+        "Managed PostgreSQL can deny extension creation to non-superusers; a "
+        "fatal migration there means the agent cannot start at all, even "
+        "though search works without the extension (ILIKE is plain SQL and "
+        "the FTS path is core tsvector)."
+    )
+
+
+def test_index_migrations_that_need_an_extension_are_optional():
+    """Indexes using an extension operator class must also be optional.
+
+    They cannot be built when the extension is absent, so a fatal migration
+    here reintroduces the startup failure one step later.
+    """
+    fatal = [
+        m.version
+        for m in _PG_ONLY_MIGRATIONS
+        if "GIN_TRGM_OPS" in m.sql.upper() and not m.optional
+    ]
+    assert not fatal, (
+        f"migration(s) {fatal} build trigram indexes with optional=False; "
+        "these fail when pg_trgm could not be installed"
+    )
+
+
+def test_planner_retries_a_gap_below_the_high_water_mark():
+    """An optional migration that failed must not be stranded.
+
+    A failing optional migration does not record its version, but later
+    migrations still succeed and do. Planning purely on ``> MAX(version)``
+    would therefore skip the failed one forever — so a provider-denied
+    extension would never be installed even after an operator allow-lists it.
+    """
+    versions = sorted(m.version for m in _PG_ONLY_MIGRATIONS)
+    assert len(versions) >= 3, "need several migrations to model a gap"
+
+    lowest, highest = versions[0], versions[-1]
+    # Everything recorded except the lowest: the shape left behind when an
+    # early optional migration failed and the rest succeeded.
+    applied = set(versions) - {lowest}
+
+    planned = [m.version for m in plan_postgres_migrations(highest, applied)]
+    assert lowest in planned, (
+        f"v{lowest} was skipped despite never being recorded; a gap below the "
+        "high-water mark must be replayed or a failed optional migration is "
+        "stranded permanently"
+    )
+
+    # Nothing already recorded should be replanned.
+    assert not (set(planned) & applied), (
+        f"replanned already-applied migrations: {sorted(set(planned) & applied)}"
+    )
+
+
+def test_planner_is_a_noop_when_everything_is_applied():
+    """The steady state: no gaps, nothing above the mark, nothing to do."""
+    versions = {m.version for m in _PG_ONLY_MIGRATIONS}
+    planned = plan_postgres_migrations(max(versions), versions)
+    assert planned == [], f"unexpected replanning: {[m.version for m in planned]}"
+
+
+def test_planner_without_applied_set_preserves_legacy_behaviour():
+    """Omitting ``applied`` keeps the plain high-water-mark semantics."""
+    versions = sorted(m.version for m in _PG_ONLY_MIGRATIONS)
+    planned = [m.version for m in plan_postgres_migrations(versions[0])]
+    assert planned == versions[1:], (
+        "the no-applied-set call should return strictly the versions above the "
+        f"high-water mark, got {planned}"
     )
