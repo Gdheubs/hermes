@@ -114,6 +114,31 @@ def test_unset_platform_toolsets_still_applies_defaults():
     assert "hermes-cli" in enabled or bool(enabled)
 
 
+def test_scalar_platform_toolsets_string_is_single_name():
+    """F7/P2: a bare SCALAR restriction value is a single-name list, NOT
+    "unset" — it must not fall back to the FULL default toolset (fail open)."""
+    config = {"platform_toolsets": {"cli": "web"}}
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+    assert "web" in enabled
+
+
+def test_empty_string_platform_toolsets_disables_all():
+    """F7/P2: an explicitly saved EMPTY STRING restriction means disable all
+    (fail closed) — not "no restriction" (which fell back to the full
+    default toolset)."""
+    config = {"platform_toolsets": {"cli": ""}}
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+    assert enabled == set()
+
+
+def test_numeric_platform_toolsets_value_never_default():
+    """F7/P2: a numeric restriction value (YAML parses bare numbers as int)
+    is EXPLICIT, not unset — the full default toolset must not reappear."""
+    config = {"platform_toolsets": {"cli": 12306}}
+    enabled = _get_platform_tools(config, "cli", include_default_mcp_servers=False)
+    assert "web" not in enabled
+
+
 def test_quoted_json_disabled_toolsets_recovered_and_empty_means_none_disabled():
     """F7: quoted-JSON ``agent.disabled_toolsets`` strings are recovered to
     lists (so the restriction applies), while an empty list means nothing is

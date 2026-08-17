@@ -2412,19 +2412,26 @@ def _get_platform_tools(
     platform_toolsets = config.get("platform_toolsets") or {}
     toolset_names = platform_toolsets.get(platform)
 
-    # F7: a restriction value that LOOKS like structured data but arrived as
-    # a plain string (quoted-JSON editor save, hand edit, or a `config set`
-    # that warned and stored the raw string) must NOT silently fall back to
-    # the platform's FULL default toolset — that is fail-open. Recover the
-    # intended list when it parses; otherwise raise (fail closed, refuse to
-    # resolve) instead of widening the toolset.
-    if isinstance(toolset_names, str) and toolset_names.strip():
+    # F7: a restriction value that arrived as a string (quoted-JSON editor
+    # save, hand edit, or a `config set` that stored the raw string) must
+    # NOT silently fall back to the platform's FULL default toolset — that
+    # is fail-open. Recover the intended list when it parses; malformed list
+    # literals raise (fail closed, refuse to resolve); a bare scalar is a
+    # single-name list (#13026); an empty/whitespace string is an explicit
+    # disable-all.
+    if isinstance(toolset_names, str):
         _stripped = toolset_names.strip()
-        if _stripped[:1] in ("[", "{"):
+        if not _stripped:
+            # F7/P2: an explicitly saved empty STRING restriction means
+            # "no toolsets" (fail closed) — not "no restriction" (which fell
+            # back to the full default).
+            toolset_names = []
+        else:
             from agent.skill_utils import parse_config_string_list
 
-            # Raises ValueError on a malformed list literal (F7 fail-closed).
-            toolset_names = parse_config_string_list(toolset_names)
+            # Scalars become single-name lists; [/{ literals are parsed
+            # (malformed -> ValueError, F7 fail-closed).
+            toolset_names = parse_config_string_list(_stripped)
 
     # Track whether the user explicitly saved a toolset list for this platform
     # (vs. falling back to the platform default). An explicit composite (e.g.
@@ -2432,7 +2439,7 @@ def _get_platform_tools(
     # toolsets — see _exempt_explicit_platform_native (#35527).
     explicitly_configured = isinstance(toolset_names, list)
 
-    if toolset_names is None or not isinstance(toolset_names, list):
+    if toolset_names is None:
         plat_info = PLATFORMS.get(platform)
         if plat_info:
             default_ts = plat_info["default_toolset"]
@@ -2440,6 +2447,12 @@ def _get_platform_tools(
             # Plugin platform — derive toolset name from platform key
             default_ts = f"hermes-{platform}"
         toolset_names = [default_ts]
+    elif not isinstance(toolset_names, list):
+        # F7/P2: a non-list, non-None value (e.g. YAML parses a bare numeric
+        # key like ``12306:`` as int) is an EXPLICIT restriction, not
+        # "unset" — never fall back to the full default. Coerce to a
+        # single-name list (fail closed).
+        toolset_names = [str(toolset_names)]
 
     # YAML may parse bare numeric names (e.g. ``12306:``) as int.
     # Normalise to str so downstream sorted() never mixes types.
