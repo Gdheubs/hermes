@@ -5912,15 +5912,16 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         try:
             result = _call_once()
-            # Check if the MCP tool itself returned an error
-            try:
-                parsed = json.loads(result)
-                if "error" in parsed:
-                    _bump_server_error(server_name)
-                else:
-                    _reset_server_error(server_name)  # success — reset
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
+            # A returned result means the RPC round-trip completed, so the
+            # transport is healthy — this is the same invariant `_call` already
+            # asserts when it calls `_mark_session_proven()` above, "even if
+            # the tool itself returned isError". The breaker measures server
+            # reachability, so an application-level error (bad arguments,
+            # permission denied, not-found, any isError payload) must not arm
+            # it: only the transport/session failures handled above and in the
+            # except branches below do. Repeated *tool* failures are the
+            # per-turn loop guardrails' job, not the breaker's.
+            _reset_server_error(server_name)
             return result
         except InterruptedError:
             return _interrupted_call_result()
