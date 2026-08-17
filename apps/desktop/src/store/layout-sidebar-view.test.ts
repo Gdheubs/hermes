@@ -4,10 +4,12 @@ import {
   $sidebarGrouping,
   $sidebarOrdering,
   $sidebarRowMeta,
+  $sidebarSessionOrderIdsByProfile,
   $sidebarViewCustomized,
   resetSidebarView,
   setSidebarGrouping,
   setSidebarOrdering,
+  setSidebarSessionOrderIdsForProfile,
   toggleSidebarRowMeta,
   toggleSidebarStatusFilter
 } from './layout'
@@ -74,5 +76,43 @@ describe('the sidebar as it ships', () => {
 
     expect($showAllProfiles.get()).toBe(true)
     expect($sidebarGrouping.get()).toBe('profile')
+  })
+
+  it('moves all-profiles Manual into profile grouping so the selected mode has reorder handles', () => {
+    $showAllProfiles.set(true)
+    setSidebarGrouping('status')
+
+    setSidebarOrdering('manual')
+
+    expect($sidebarOrdering.get()).toBe('manual')
+    expect($sidebarGrouping.get()).toBe('profile')
+  })
+
+  it('moves scoped Project grouping back to the flat recents list when Manual is selected', () => {
+    setSidebarGrouping('project')
+
+    setSidebarOrdering('manual')
+
+    expect($sidebarOrdering.get()).toBe('manual')
+    expect($sidebarGrouping.get()).toBe('date')
+  })
+
+  it('persists colliding session ids independently per normalized profile', () => {
+    setSidebarSessionOrderIdsForProfile(' alpha ', ['shared', 'alpha-2'])
+    setSidebarSessionOrderIdsForProfile('beta', ['beta-2', 'shared'])
+
+    expect($sidebarSessionOrderIdsByProfile.get()).toEqual({
+      alpha: ['shared', 'alpha-2'],
+      beta: ['beta-2', 'shared']
+    })
+  })
+
+  it('clears every per-profile manual order when leaving Manual mode', () => {
+    setSidebarOrdering('manual')
+    setSidebarSessionOrderIdsForProfile('alpha', ['a2', 'a1'])
+
+    setSidebarOrdering('updated')
+
+    expect($sidebarSessionOrderIdsByProfile.get()).toEqual({})
   })
 })
