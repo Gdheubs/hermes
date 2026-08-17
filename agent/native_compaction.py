@@ -1,4 +1,4 @@
-"""Native OpenAI Responses server-side compaction — gpt-5.6 on direct OpenAI routes only.
+"""Native OpenAI Responses server-side compaction — safely gated gpt-5.6 routes.
 
 OpenAI's Responses API supports server-side compaction: include
 ``context_management=[{"type": "compaction", "compact_threshold": N}]`` in a
@@ -17,11 +17,12 @@ Hermes' support is deliberately narrow (live verification, Aug 2026):
   path (90s watchdog x 3 retries = a dead turn). There is no structured
   "unsupported" rejection to downgrade on, so the only safe gate is an
   explicit model-family check.
-* **Direct OpenAI routes only:** api.openai.com (API key) or the ChatGPT
-  Codex backend (subscription OAuth). Every other Responses surface
-  (xAI, GitHub/Copilot, relays, local servers) never sees the field —
-  most would 400 on the unknown parameter, and none can mint or decrypt
-  the compaction blob.
+* **Trusted routes only:** api.openai.com (API key), the ChatGPT Codex
+  backend (subscription OAuth), or an exact normalized HTTP(S) origin listed
+  in ``compression.codex_responses_native_trusted_base_urls``. The explicit
+  list is intended only for proxies whose compaction checkpoint persistence
+  and replay have been verified. xAI and GitHub/Copilot remain hard-excluded
+  even if listed; arbitrary relays and local servers never see the field.
 
 Ownership model: Hermes' local compression stays fully armed as the
 fallback owner. The native threshold is clamped safely below the local
@@ -38,7 +39,7 @@ conversation loop can share the gate without import cycles.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
 # Native compaction fires this many tokens below the local compressor's
@@ -51,25 +52,81 @@ DEFAULT_COMPACT_THRESHOLD = 200_000
 # snapshots (gpt-5.6-2026-07-xx) and variants (gpt-5.6-mini) stay eligible.
 _ELIGIBLE_MODEL_MARKER = "gpt-5.6"
 
+# These Responses surfaces have provider-specific replay semantics and must not
+# become native-compaction eligible through the generic proxy allowlist. The
+# per-request provider flags below remain the primary gate; this hostname guard
+# keeps the exclusion true even for a misclassified custom-provider profile.
+_EXCLUDED_TRUSTED_HOSTS = frozenset(
+    {
+        "api.x.ai",
+        "api.githubcopilot.com",
+        "models.github.ai",
+        "models.inference.ai.azure.com",
+    }
+)
+
+
+def _is_excluded_trusted_hostname(hostname: str) -> bool:
+    return hostname in _EXCLUDED_TRUSTED_HOSTS or hostname.endswith(".x.ai")
+
 
 def is_native_compaction_model(model: Optional[str]) -> bool:
     """True when the model is in the gpt-5.6 family."""
     return _ELIGIBLE_MODEL_MARKER in (model or "").lower()
 
 
+def _normalized_http_origin(url: Any) -> Optional[Tuple[str, str, Optional[int]]]:
+    """Return a canonical HTTP(S) origin tuple, or None for invalid input.
+
+    Paths, queries, fragments, and trailing slashes are intentionally ignored:
+    native compaction checkpoints are sealed to the server origin, not a
+    particular API path. Scheme, hostname, and effective port must all match.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return None
+    try:
+        parsed = urlsplit(url.strip())
+        scheme = parsed.scheme.lower()
+        hostname = (parsed.hostname or "").lower()
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    if scheme not in {"http", "https"} or not hostname:
+        return None
+    if parsed.username is not None or parsed.password is not None:
+        return None
+    if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+        port = None
+    return scheme, hostname, port
+
+
 def is_direct_openai_route(
     base_url: Optional[str],
     *,
     is_codex_backend: bool = False,
+    trusted_base_urls: Any = (),
 ) -> bool:
-    """True for api.openai.com or the ChatGPT Codex backend — nothing else."""
+    """True for a native-compaction-capable, explicitly trusted route.
+
+    Direct OpenAI and the ChatGPT Codex backend remain built-in trusted routes.
+    Other Responses proxies are eligible only when their normalized HTTP(S)
+    origin exactly matches an entry in ``trusted_base_urls``. The list defaults
+    empty, so upgrading never broadens the existing trust boundary.
+    """
     if is_codex_backend:
         return True
-    try:
-        hostname = (urlsplit(base_url or "").hostname or "").lower()
-    except ValueError:
+    origin = _normalized_http_origin(base_url)
+    if origin is None or _is_excluded_trusted_hostname(origin[1]):
         return False
-    return hostname == "api.openai.com"
+    if origin[1] == "api.openai.com":
+        return True
+    if not isinstance(trusted_base_urls, (list, tuple)):
+        return False
+    return any(
+        _normalized_http_origin(candidate) == origin
+        for candidate in trusted_base_urls
+        if isinstance(candidate, str)
+    )
 
 
 def resolve_compact_threshold(
@@ -132,7 +189,11 @@ def native_compaction_context_management(
     if not is_native_compaction_model(getattr(agent, "model", None)):
         return None
     if not is_direct_openai_route(
-        getattr(agent, "base_url", None), is_codex_backend=is_codex_backend
+        getattr(agent, "base_url", None),
+        is_codex_backend=is_codex_backend,
+        trusted_base_urls=getattr(
+            agent, "codex_responses_native_trusted_base_urls", ()
+        ),
     ):
         return None
 

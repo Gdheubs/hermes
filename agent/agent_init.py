@@ -2176,8 +2176,9 @@ def init_agent(
         )
         codex_app_server_auto_compaction = "native"
     # Native OpenAI Responses server-side compaction (opt-in). Only ever
-    # engages for gpt-5.6-family models on api.openai.com or the ChatGPT
-    # Codex backend — the per-request gate lives in agent/native_compaction.py.
+    # engages for gpt-5.6-family models on api.openai.com, the ChatGPT Codex
+    # backend, or an exact normalized origin explicitly trusted in config.
+    # The per-request gate lives in agent/native_compaction.py.
     # Shared truthy coercion: "false"/"off"/"no" strings stay disabled
     # (bool("false") is True — #82777).
     from utils import is_truthy_value as _is_truthy
@@ -2185,6 +2186,27 @@ def init_agent(
     codex_responses_native_compaction = _is_truthy(
         _compression_cfg.get("codex_responses_native", False)
     )
+    _native_trusted_raw = _compression_cfg.get(
+        "codex_responses_native_trusted_base_urls", []
+    )
+    if isinstance(_native_trusted_raw, list):
+        codex_responses_native_trusted_base_urls = tuple(
+            value.strip()
+            for value in _native_trusted_raw
+            if isinstance(value, str) and value.strip()
+        )
+    elif isinstance(_native_trusted_raw, str) and _native_trusted_raw.strip():
+        # ``hermes config set`` accepts scalar values but cannot currently
+        # serialize a list in one call. Accept one trusted origin as a scalar
+        # so profile-safe CLI configuration remains possible.
+        codex_responses_native_trusted_base_urls = (_native_trusted_raw.strip(),)
+    else:
+        _ra().logger.warning(
+            "Invalid compression.codex_responses_native_trusted_base_urls=%r; "
+            "using an empty trust list (expected a URL or list of HTTP(S) base URLs).",
+            _native_trusted_raw,
+        )
+        codex_responses_native_trusted_base_urls = ()
     _native_threshold_raw = _compression_cfg.get(
         "codex_responses_compact_threshold", 200_000
     )
@@ -2662,6 +2684,9 @@ def init_agent(
         )
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
     agent.codex_responses_native_compaction = codex_responses_native_compaction
+    agent.codex_responses_native_trusted_base_urls = (
+        codex_responses_native_trusted_base_urls
+    )
     agent.codex_responses_compact_threshold = codex_responses_compact_threshold
     agent.max_compression_attempts = compression_max_attempts
     agent.compression_idle_compact_after_seconds = (

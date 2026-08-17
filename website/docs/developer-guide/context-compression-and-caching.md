@@ -92,7 +92,8 @@ compression:
   codex_gpt55_autoraise: true  # gpt-5.5 on Codex OAuth: raise trigger to 85% (default: true)
   codex_gpt55_autoraise_notice: true  # Show the one-time autoraise notice (default: true)
   codex_app_server_auto: native  # native|hermes|off for Codex app-server thread compaction
-  codex_responses_native: false  # gpt-5.6 on direct OpenAI/Codex: server-side compaction (opt-in)
+  codex_responses_native: false  # gpt-5.6 on trusted Responses routes: server-side compaction (opt-in)
+  codex_responses_native_trusted_base_urls: []  # Exact normalized origins for verified proxies
   codex_responses_compact_threshold: 200000  # Server-side compaction trigger (input tokens)
   in_place: true             # Compact on the same session id, no rotation (default: true)
 
@@ -119,7 +120,8 @@ auxiliary:
 | `codex_gpt55_autoraise` | `true` | bool | Raise the trigger to 85% for gpt-5.5 on the ChatGPT Codex OAuth route (see below). Set `false` to keep the global `threshold` |
 | `codex_gpt55_autoraise_notice` | `true` | bool | Show the one-time Codex gpt-5.5 autoraise notice. Set `false` to keep the 85% autoraise but suppress the banner |
 | `codex_app_server_auto` | `native` | `native`, `hermes`, `off` | Thread-compaction mode for Codex app-server sessions (see below) |
-| `codex_responses_native` | `false` | bool | Opt in to OpenAI's server-side compaction on the Responses API. Engages only for gpt-5.6-family models on the direct OpenAI API or a ChatGPT Codex subscription (see below) |
+| `codex_responses_native` | `false` | bool | Opt in to OpenAI Responses server-side compaction. Engages only for gpt-5.6-family models on a trusted route (see below) |
+| `codex_responses_native_trusted_base_urls` | `[]` | list of HTTP(S) URLs | Explicitly trust verified Responses proxies by exact normalized origin (scheme + host + effective port; path ignored). xAI and GitHub/Copilot remain excluded |
 | `codex_responses_compact_threshold` | `200000` | ≥1 tokens | Server-side compaction trigger in input tokens. Clamped below the local compression threshold at request time so the server compacts first |
 | `in_place` | `true` | bool | Compact on the same session id instead of rotating to a new one (see below) |
 
@@ -214,7 +216,7 @@ Hermes' local transcript is never rewritten on this runtime — state.db records
 the compaction boundary while the visible transcript stays intact. All other
 routes (including Codex OAuth chat sessions) keep Hermes' summary compressor.
 
-### Native Responses compaction (gpt-5.6 on direct OpenAI / Codex subscription)
+### Native Responses compaction (gpt-5.6 on trusted routes)
 
 OpenAI's Responses API supports server-side compaction: when a request includes
 `context_management: [{type: "compaction", compact_threshold: N}]` and the
@@ -231,9 +233,24 @@ narrow, re-checked on every request:
 - **Models:** the gpt-5.6 family only. Other models fail server-side when the
   field is present (gpt-5.1/5.2 return HTTP 500 or stall the stream — there is
   no structured rejection to downgrade on, verified live Aug 2026).
-- **Routes:** `api.openai.com` (OpenAI API key) or the ChatGPT Codex backend
-  (Codex subscription OAuth) only. xAI, GitHub/Copilot, OpenRouter, relays, and
-  local servers never see the field.
+- **Routes:** `api.openai.com` (OpenAI API key), the ChatGPT Codex backend
+  (Codex subscription OAuth), or a proxy whose HTTP(S) origin is explicitly
+  listed under `compression.codex_responses_native_trusted_base_urls`. Trust
+  entries and the active `model.base_url` are normalized to scheme + lowercase
+  hostname + effective port and matched exactly; paths, queries, and fragments
+  are ignored. The default list is empty. Only list a proxy after verifying that
+  it preserves and replays endpoint-sealed compaction checkpoints. xAI and
+  GitHub/Copilot remain hard-excluded even if listed; other relays/local servers
+  never see the field.
+
+For a verified Agent LB at `http://127.0.0.1:2455/v1`, configure:
+
+```yaml
+compression:
+  codex_responses_native: true
+  codex_responses_native_trusted_base_urls:
+    - http://127.0.0.1:2455/v1
+```
 
 Everything else about compression is unchanged: the local compressor stays
 armed as the fallback owner (the native threshold is clamped ~8K tokens below

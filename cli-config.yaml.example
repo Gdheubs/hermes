@@ -599,12 +599,15 @@ compression:
   codex_app_server_auto: native
 
   # Native OpenAI Responses server-side compaction (default: false). When true,
-  # gpt-5.6-family models on the DIRECT OpenAI API (api.openai.com) or a ChatGPT
-  # Codex subscription compact server-side: OpenAI prunes older context into an
-  # encrypted checkpoint that Hermes replays on later turns. No other provider,
-  # route, or model is affected. Hermes' local compression stays armed as the
-  # fallback and still handles every non-eligible session.
+  # gpt-5.6-family models on the direct OpenAI API, a ChatGPT Codex subscription,
+  # or an explicitly trusted Responses proxy compact server-side. Hermes captures
+  # and replays the endpoint-sealed checkpoint. Local compression stays armed.
   codex_responses_native: false
+
+  # Explicit allowlist for verified Responses proxies. Entries are normalized
+  # to origins and matched exactly by scheme + host + effective port; paths are
+  # ignored. Leave empty unless you have verified checkpoint persistence/replay.
+  codex_responses_native_trusted_base_urls: []
 
   # Server-side compaction trigger in input tokens. Clamped below the local
   # compression threshold at request time so the server compacts first.

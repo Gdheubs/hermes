@@ -27,6 +27,7 @@ def _agent(
     compression_enabled=True,
     threshold=DEFAULT_COMPACT_THRESHOLD,
     compressor=None,
+    trusted_base_urls=None,
 ):
     return SimpleNamespace(
         model=model,
@@ -34,6 +35,7 @@ def _agent(
         codex_responses_native_compaction=enabled,
         compression_enabled=compression_enabled,
         codex_responses_compact_threshold=threshold,
+        codex_responses_native_trusted_base_urls=(trusted_base_urls or []),
         context_compressor=compressor,
     )
 
@@ -72,6 +74,47 @@ class TestRouteGate:
             None,
         ):
             assert not is_direct_openai_route(url), url
+
+    def test_explicit_trusted_origin_is_eligible(self):
+        trusted = ["http://127.0.0.1:2455/v1"]
+        assert is_direct_openai_route(
+            "http://127.0.0.1:2455/v1", trusted_base_urls=trusted
+        )
+        # Origin normalization deliberately ignores API path and a trailing slash.
+        assert is_direct_openai_route(
+            "HTTP://127.0.0.1:2455/other/", trusted_base_urls=trusted
+        )
+
+    def test_trusted_origin_match_is_exact(self):
+        trusted = ["http://127.0.0.1:2455/v1"]
+        for url in (
+            "http://127.0.0.1:2456/v1",
+            "https://127.0.0.1:2455/v1",
+            "http://127.0.0.1.evil.test:2455/v1",
+            "http://localhost:2455/v1",
+        ):
+            assert not is_direct_openai_route(url, trusted_base_urls=trusted), url
+
+    def test_xai_and_github_origins_cannot_be_allowlisted(self):
+        for url in (
+            "https://api.x.ai/v1",
+            "https://api.githubcopilot.com",
+            "https://models.github.ai/inference",
+            "https://models.inference.ai.azure.com",
+        ):
+            assert not is_direct_openai_route(url, trusted_base_urls=[url]), url
+
+    def test_default_ports_are_normalized(self):
+        assert is_direct_openai_route(
+            "https://proxy.test/v1",
+            trusted_base_urls=["https://proxy.test:443/anything"],
+        )
+
+    def test_malformed_trust_entries_do_not_broaden_gate(self):
+        trusted = [None, 123, "", "proxy.test", "ftp://proxy.test/v1"]
+        assert not is_direct_openai_route(
+            "https://proxy.test/v1", trusted_base_urls=trusted
+        )
 
 
 class TestRequestGate:
@@ -113,6 +156,17 @@ class TestRequestGate:
             )
             is None
         )
+        assert (
+            native_compaction_context_management(
+                _agent(
+                    model="gpt-5.1",
+                    base_url="http://127.0.0.1:2455/v1",
+                    trusted_base_urls=["http://127.0.0.1:2455/v1"],
+                ),
+                is_codex_backend=False,
+            )
+            is None
+        )
 
     def test_xai_and_github_surfaces_never_send(self):
         agent = _agent()
@@ -137,6 +191,34 @@ class TestRequestGate:
             )
             is None
         )
+
+    def test_explicit_trusted_proxy_gets_payload(self):
+        agent = _agent(
+            base_url="http://127.0.0.1:2455/v1",
+            trusted_base_urls=["http://127.0.0.1:2455/v1"],
+        )
+        assert native_compaction_context_management(
+            agent, is_codex_backend=False
+        ) is not None
+
+    def test_unlisted_proxy_never_sends(self):
+        agent = _agent(base_url="http://127.0.0.1:2455/v1")
+        assert (
+            native_compaction_context_management(agent, is_codex_backend=False)
+            is None
+        )
+
+    def test_xai_and_github_exclusions_override_trust_list(self):
+        agent = _agent(
+            base_url="http://127.0.0.1:2455/v1",
+            trusted_base_urls=["http://127.0.0.1:2455/v1"],
+        )
+        assert native_compaction_context_management(
+            agent, is_codex_backend=False, is_xai_responses=True
+        ) is None
+        assert native_compaction_context_management(
+            agent, is_codex_backend=False, is_github_responses=True
+        ) is None
 
     def test_threshold_clamped_below_local_compressor(self):
         compressor = SimpleNamespace(threshold_tokens=100_000)
@@ -383,6 +465,7 @@ class TestResponseCapture:
 
 class TestAgentInitConfig:
     def test_defaults_off_and_threshold(self, monkeypatch):
+        from hermes_cli.config import DEFAULT_CONFIG
         from run_agent import AIAgent
 
         agent = AIAgent(
@@ -398,6 +481,40 @@ class TestAgentInitConfig:
         )
         assert agent.codex_responses_native_compaction is False
         assert agent.codex_responses_compact_threshold == 200_000
+        assert agent.codex_responses_native_trusted_base_urls == ()
+        assert DEFAULT_CONFIG["compression"][
+            "codex_responses_native_trusted_base_urls"
+        ] == []
+
+    def test_config_value_reaches_agent(self, tmp_path, monkeypatch):
+        from run_agent import AIAgent
+
+        (tmp_path / "config.yaml").write_text(
+            "compression:\n"
+            "  codex_responses_native: true\n"
+            "  codex_responses_native_trusted_base_urls:\n"
+            "    - http://127.0.0.1:2455/v1\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="http://127.0.0.1:2455/v1",
+            api_mode="codex_responses",
+            model="gpt-5.6",
+            provider="openai-api",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            enabled_toolsets=[],
+        )
+        assert agent.codex_responses_native_trusted_base_urls == (
+            "http://127.0.0.1:2455/v1",
+        )
+        kwargs = agent._build_api_kwargs(
+            [{"role": "user", "content": "hi"}]
+        )
+        assert isinstance(kwargs.get("context_management"), list)
 
     def test_kwargs_have_no_context_management_by_default(self):
         from run_agent import AIAgent

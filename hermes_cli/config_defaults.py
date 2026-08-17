@@ -821,10 +821,15 @@ DEFAULT_CONFIG = {
                                       # (codex may still compact natively).
         "codex_responses_native": False,  # Opt in to OpenAI's server-side compaction
                                       # on the Responses API. Engages ONLY for
-                                      # gpt-5.6-family models on api.openai.com or
-                                      # the ChatGPT Codex backend; every other
-                                      # route/model is unaffected. Hermes' local
-                                      # compression stays armed as the fallback.
+                                      # gpt-5.6-family models on api.openai.com,
+                                      # the ChatGPT Codex backend, or an exact
+                                      # origin explicitly trusted below. Hermes'
+                                      # local compression stays armed as fallback.
+        "codex_responses_native_trusted_base_urls": [],  # Explicit allowlist for
+                                      # verified Responses proxies. Entries are
+                                      # normalized to HTTP(S) origins and matched
+                                      # exactly by scheme + host + effective port;
+                                      # paths are ignored. Empty by default.
         "codex_responses_compact_threshold": 200000,  # Server-side compaction trigger
                                       # (input tokens). Clamped below the local
                                       # compression threshold at request time so

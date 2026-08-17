@@ -877,7 +877,15 @@ compression:
   threshold: 0.50
   target_ratio: 0.20         # fraction of threshold to preserve as recent tail
   protect_last_n: 20         # minimum recent messages to keep uncompressed
+  codex_responses_native: false
+  codex_responses_native_trusted_base_urls: []  # exact origins for verified proxies
 ```
+
+Native Responses compaction remains opt-in and restricted to gpt-5.6. Direct
+OpenAI/Codex routes are built in; a verified proxy can be allowed explicitly by
+adding its base URL to `codex_responses_native_trusted_base_urls`. Hermes
+normalizes each URL to its HTTP(S) origin and requires an exact scheme, host,
+and effective-port match. xAI and GitHub/Copilot stay excluded even when listed.
 
 :::info Legacy migration
 Older configs with `compression.summary_model`, `compression.summary_provider`, and `compression.summary_base_url` are automatically migrated to `auxiliary.compression.*` on first load.
