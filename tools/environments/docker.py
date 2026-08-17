@@ -352,6 +352,12 @@ _BASE_SECURITY_ARGS = [
 
 # Default per-container PID limit. Applied as ``--pids-limit`` only when the
 # cgroup ``pids`` controller is available (see ``_cgroup_limits_available``).
+# The pids cgroup counts threads as well as processes, so legitimate
+# multiprocessing workloads (pytest, PyTorch DataLoader, Chromium, parallel
+# subagents) can exhaust 256 quickly — and once exhausted, not even `pwd`
+# can start. Configurable via ``terminal.docker_pids_limit`` in config.yaml;
+# an empty value (or "0") omits the flag and falls back to Docker's default
+# (unlimited).
 _DEFAULT_PIDS_LIMIT = "256"
 
 # Default /dev/shm size. Docker's built-in default is a tiny 64 MB, which
@@ -887,6 +893,7 @@ class DockerEnvironment(BaseEnvironment):
         extra_args: list = None,
         persist_across_processes: bool = True,
         shm_size: str = _DEFAULT_SHM_SIZE,
+        pids_limit: str = _DEFAULT_PIDS_LIMIT,
     ):
         if cwd == "~":
             cwd = "/root"
@@ -925,8 +932,9 @@ class DockerEnvironment(BaseEnvironment):
             resource_args.extend(["--cpus", str(cpu)])
         if memory > 0 and _cgroup_limits_available(image):
             resource_args.extend(["--memory", f"{memory}m"])
-        if _cgroup_limits_available(image):
-            resource_args.extend(["--pids-limit", _DEFAULT_PIDS_LIMIT])
+        pids = str(pids_limit or "").strip()
+        if pids and pids != "0" and _cgroup_limits_available(image):
+            resource_args.extend(["--pids-limit", pids])
         # /dev/shm size (not cgroup-gated: --shm-size is a tmpfs mount option,
         # no controller delegation required). Skip when the user already sets
         # it via docker_extra_args, or opted out with an empty/"0" value.

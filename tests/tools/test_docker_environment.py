@@ -55,6 +55,7 @@ def _make_dummy_env(**kwargs):
         extra_args=kwargs.get("extra_args", []),
         persist_across_processes=kwargs.get("persist_across_processes", True),
         shm_size=kwargs.get("shm_size", docker_env._DEFAULT_SHM_SIZE),
+        pids_limit=kwargs.get("pids_limit", docker_env._DEFAULT_PIDS_LIMIT),
     )
 
 
@@ -1488,3 +1489,43 @@ def test_extra_args_set_shm_size_helper():
     assert docker_env._extra_args_set_shm_size(None) is False
     # non-string entries must not crash (config.yaml can be malformed)
     assert docker_env._extra_args_set_shm_size([42, None, "--shm-size=1g"]) is True
+
+
+
+# ── pids limit tests (#84968) ────────────────────────────────────────────────
+
+
+def test_pids_limit_default_applied(monkeypatch):
+    """The shared persistent container defaults to a bounded pids ceiling."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env()
+
+    run_args = _shm_run_args(calls)
+    assert "--pids-limit" in run_args
+    assert run_args[run_args.index("--pids-limit") + 1] == docker_env._DEFAULT_PIDS_LIMIT
+
+
+def test_pids_limit_custom_value(monkeypatch):
+    """Profiles with legitimate parallel workloads can raise the ceiling."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(pids_limit="1024")
+
+    run_args = _shm_run_args(calls)
+    assert run_args[run_args.index("--pids-limit") + 1] == "1024"
+
+
+@pytest.mark.parametrize("opt_out", ["", "0", "  ", None])
+def test_pids_limit_opt_out_omits_flag(monkeypatch, opt_out):
+    """Empty / '0' / None omit the flag and fall back to Docker's default."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(pids_limit=opt_out)
+
+    run_args = _shm_run_args(calls)
+    assert "--pids-limit" not in run_args
+    assert not any(isinstance(a, str) and a.startswith("--pids-limit=") for a in run_args)

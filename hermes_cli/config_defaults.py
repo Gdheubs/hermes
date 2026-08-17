@@ -415,6 +415,12 @@ DEFAULT_CONFIG = {
         # lazily allocated so the higher ceiling costs nothing until used.
         # Set to "" (or "0") to omit the flag and use Docker's default.
         "docker_shm_size": "1g",
+        # Per-container pids cgroup ceiling (counts threads, not just
+        # processes). 256 fits the sandboxed default but is too low for
+        # legitimate multiprocessing workloads (pytest, PyTorch DataLoader,
+        # Chromium, parallel subagents); once exhausted not even `pwd` can
+        # start. Set to "" (or "0") to omit the flag and use Docker's default.
+        "docker_pids_limit": "256",
         # Explicit opt-in: run the Docker container as the host user's uid:gid
         # (via `--user`).  When enabled, files written into bind-mounted dirs
         # (docker_volumes, the persistent workspace, or the auto-mounted cwd)
