@@ -28,6 +28,7 @@ import { computed } from 'nanostores'
 import { stableArray, stableRecord } from '@/lib/stable-array'
 
 import { $backgroundRunningSessionIds } from './composer-status'
+import { normalizeProfileKey } from './profile'
 import { $sessions, $unreadFinishedSessionIds, lineageAliases } from './session'
 import {
   $attentionSessionIds,
@@ -141,8 +142,12 @@ export const $sessionDotStateById = computed(
 
     for (const s of sessions) {
       const entry = unreadWriteGuard.get(s.id)
+      // Same-id rows across profiles are a real, documented possibility
+      // (session-unread.ts) — a guard entry only fences the ROW it was
+      // written for, never a same-id row from another profile.
+      const entryMatchesRow = entry && entry.profile === normalizeProfileKey(s.profile)
 
-      if (entry && Date.now() - entry.at < UNREAD_WRITE_GUARD_MS) {
+      if (entryMatchesRow && Date.now() - entry.at < UNREAD_WRITE_GUARD_MS) {
         if (entry.value) {
           persistedUnread.push(s.id)
         }

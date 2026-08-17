@@ -127,8 +127,8 @@ describe('persisted unread (backend watermark)', () => {
   })
 
   it('fences a stale page with the write guard', () => {
-    const guard = new Map<string, { at: number; value: boolean }>()
-    guard.set('s1', { at: Date.now(), value: true })
+    const guard = new Map<string, { at: number; profile: string; value: boolean }>()
+    guard.set('s1', { at: Date.now(), profile: 'default', value: true })
     $unreadWriteGuard.set(guard)
 
     // A page issued before our PATCH still says read — keep OUR value.
@@ -136,9 +136,23 @@ describe('persisted unread (backend watermark)', () => {
     expect($sessionDotStateById.get()['s1']).toBe('unread')
 
     // The guard expires: the page wins and the dot drops.
-    const expired = new Map<string, { at: number; value: boolean }>()
-    expired.set('s1', { at: Date.now() - 60_000, value: true })
+    const expired = new Map<string, { at: number; profile: string; value: boolean }>()
+    expired.set('s1', { at: Date.now() - 60_000, profile: 'default', value: true })
     $unreadWriteGuard.set(expired)
+    expect($sessionDotStateById.get()['s1']).not.toBe('unread')
+  })
+
+  it('does not let a write guard for one profile fence a same-id row in another', () => {
+    // Session ids are caller-supplied and each profile's backend is its own
+    // namespace, so two profiles can hold the same id (a real, documented
+    // scenario elsewhere in this store family) — a guard entry written for
+    // 'work' must never paint or protect 'personal''s identically-id'd row.
+    const guard = new Map<string, { at: number; profile: string; value: boolean }>()
+    guard.set('s1', { at: Date.now(), profile: 'work', value: true })
+    $unreadWriteGuard.set(guard)
+
+    setSessions([storedRow('s1', { profile: 'personal', unread: false })])
+
     expect($sessionDotStateById.get()['s1']).not.toBe('unread')
   })
 

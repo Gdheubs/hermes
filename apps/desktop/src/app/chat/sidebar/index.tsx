@@ -127,7 +127,7 @@ import {
 import { $sessionDotStateById, sessionStatusBucket } from '@/store/session-dot-state'
 import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/store/session-states'
 import { ackAllSessionsRead } from '@/store/session-unread'
-import { markSessionUnread } from '@/store/session-unread-remote'
+import { markSessionUnread, rowFor as unreadRowFor } from '@/store/session-unread-remote'
 import { $archivedSessions, loadArchivedSessions } from '@/store/sidebar-archive'
 import { $sidebarSessionRankIds } from '@/store/sidebar-sort'
 
@@ -381,8 +381,12 @@ export function ChatSidebar({
   // Toggle the persisted read-state watermark from a row menu. The row's own
   // `unread` prop mirrors what the dot paints; flip it and let the backend
   // become the truth (optimistic update + rollback in markSessionUnread).
+  // Resolved via the same profile-aware lookup markSessionUnread uses
+  // internally: a bare `$sessions.get().find(...)` here would toggle
+  // whichever profile's same-id row happens to sort first when ALL_PROFILES
+  // mode mixes lists, computing the flip direction off the wrong row.
   const toggleUnread = (storedId: string) => {
-    const row = $sessions.get().find(r => r.id === storedId)
+    const row = unreadRowFor(storedId)
 
     if (!row) {
       return
