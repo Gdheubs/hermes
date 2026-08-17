@@ -2542,6 +2542,7 @@ from gateway.platforms.base import (
     _reply_anchor_for_event,
     build_auto_tts_output_path,
     merge_pending_message_event,
+    safe_url_for_log,
     utf16_len,
 )
 from gateway.shutdown_watchdog import (
@@ -27266,7 +27267,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         error_text = await resp.text()
                         logger.warning(
                             "Proxy error (%d) from %s: %s",
-                            resp.status, proxy_url, error_text[:500],
+                            resp.status, safe_url_for_log(proxy_url), error_text[:500],
                         )
                         return {
                             "final_response": f"⚠️ Proxy error ({resp.status}): {error_text[:300]}",
@@ -27326,7 +27327,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.error("Proxy connection error to %s: %s", proxy_url, e)
+            logger.error("Proxy connection error to %s: %s", safe_url_for_log(proxy_url), e)
             if not full_response:
                 return {
                     "final_response": f"⚠️ Proxy connection error: {e}",
@@ -27363,7 +27364,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }
         logger.info(
             "proxy response: url=%s session=%s time=%.1fs response=%d chars",
-            proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
+            safe_url_for_log(proxy_url), (session_id or "")[:20], _elapsed, len(full_response),
         )
 
         return {
