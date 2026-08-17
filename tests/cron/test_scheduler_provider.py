@@ -640,3 +640,68 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+
+
+def test_multiplex_ticker_overlays_owning_profile_adapters(tmp_path):
+    """Delivery half of #83182: each profile's tick receives the default
+    adapter map overlaid with that profile's OWN adapters, so cron delivery
+    resolves to the owning profile's platform identity (its own bot) instead
+    of the default profile's. Profiles with no adapters of their own keep
+    the default map unchanged, and the shared default map is never mutated."""
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    p1 = tmp_path / "default"
+    p2 = tmp_path / "worker"
+    for d in (p1, p2):
+        (d / "cron").mkdir(parents=True)
+    profile_homes = [("default", p1), ("worker", p2)]
+
+    default_discord = object()
+    default_a2a = object()
+    worker_discord = object()
+    default_map = {"discord": default_discord, "a2a": default_a2a}
+    profile_adapters = {"worker": {"discord": worker_discord}}
+
+    calls: list = []
+
+    def _tracking_tick(*args, **kwargs):
+        calls.append(kwargs.get("adapters"))
+        return 0
+
+    stop = threading.Event()
+    prov = InProcessCronScheduler()
+
+    with patch("cron.scheduler.tick", side_effect=_tracking_tick), \
+         patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None):
+        t = threading.Thread(
+            target=prov.start,
+            args=(stop,),
+            kwargs={
+                "interval": 0,
+                "profile_homes": profile_homes,
+                "adapters": default_map,
+                "profile_adapters": profile_adapters,
+            },
+            daemon=True,
+        )
+        t.start()
+        deadline = time.monotonic() + 10
+        while len(calls) < len(profile_homes) and time.monotonic() < deadline:
+            time.sleep(0.005)
+        stop.set()
+        t.join(timeout=5)
+
+    assert not t.is_alive()
+    assert len(calls) >= 2, f"expected a full cycle, got {len(calls)} tick call(s)"
+    default_tick_adapters, worker_tick_adapters = calls[0], calls[1]
+
+    # Default profile has no entry in profile_adapters: the map passes through.
+    assert default_tick_adapters is default_map
+
+    # Owning profile's adapter shadows the default for the same platform...
+    assert worker_tick_adapters["discord"] is worker_discord
+    # ...while platforms the profile does not run fall back to the default map.
+    assert worker_tick_adapters["a2a"] is default_a2a
+
+    # The shared default map itself is never mutated by the overlay.
+    assert default_map["discord"] is default_discord
