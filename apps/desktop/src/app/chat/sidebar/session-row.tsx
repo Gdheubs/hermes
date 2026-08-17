@@ -349,8 +349,8 @@ function SidebarSessionRowImpl({
           card && SIDEBAR_ROW_CARD_MIN_H,
           // Density-aware minimum heights for the inline (non-card) row: the
           // metadata / preview lines below need the extra rows (#68119).
-          !card && density !== 'compact' && 'min-h-[2.75rem]',
-          !card && density === 'detailed' && 'min-h-[3.875rem]',
+          !card && density === 'comfortable' && 'min-h-[3rem]',
+          !card && density === 'detailed' && 'min-h-[4rem]',
           isSelected && 'bg-(--ui-row-active-background)',
           liveTurn && 'text-foreground',
           // Opaque surface while lifted so the dragged row erases what's under
