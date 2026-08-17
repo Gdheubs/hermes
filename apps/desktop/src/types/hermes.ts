@@ -694,6 +694,8 @@ export interface SessionRuntimeInfo {
 }
 
 export interface UsageStats {
+  cache_read_tokens?: number
+  cache_write_tokens?: number
   calls: number
   context_max?: number
   context_percent?: number
