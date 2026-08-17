@@ -1117,6 +1117,26 @@ def _float_env(name: str, default: float) -> float:
         return float(default)
 
 
+def _always_prefix_speaker() -> bool:
+    """True when every stored message should carry a ``[Name]`` speaker prefix.
+
+    By default the prefix is applied only in shared multi-user sessions,
+    where it disambiguates participants.  In a 1:1 there is only one human,
+    so it is omitted — but that makes DM and group transcripts structurally
+    different, and a DM transcript carries no durable record of who was
+    speaking.  Opt-in via ``HERMES_ALWAYS_NAME_PREFIX`` (bridged from
+    ``gateway.always_name_prefix`` in ``config.yaml``); unset keeps the
+    default behavior.  Read live so tests and config reloads take effect
+    without re-importing the module.
+    """
+    return os.environ.get("HERMES_ALWAYS_NAME_PREFIX", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _stamp_hygiene_compression_provenance(
     agent: Any,
     desc: str,
@@ -2405,6 +2425,13 @@ if _config_path.exists():
             _trust_recent_seconds = _gateway_cfg.get("trust_recent_files_seconds")
             if _trust_recent_seconds is not None:
                 os.environ["HERMES_MEDIA_TRUST_RECENT_SECONDS"] = str(_trust_recent_seconds)
+            # Config-authoritative like trust_recent_files above: when the key
+            # is present in config.yaml it wins over any stale .env value.
+            _always_prefix = _gateway_cfg.get("always_name_prefix")
+            if _always_prefix is not None:
+                os.environ["HERMES_ALWAYS_NAME_PREFIX"] = (
+                    "1" if _always_prefix else "0"
+                )
             # Bridge gateway.platform_connect_timeout → the internal env var the
             # connect path + Discord adapter ready-wait both read (#19776).
             # Unlike the agent.*/display.* bridges above (config-authoritative),
@@ -17664,7 +17691,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             group_sessions_per_user=_group_sessions_per_user,
             thread_sessions_per_user=_thread_sessions_per_user,
         )
-        if _is_shared_multi_user and source.user_name:
+        if (_is_shared_multi_user or _always_prefix_speaker()) and source.user_name:
             # source.user_name is the platform display name — attacker-
             # influenceable on any platform that lets participants set their
             # own name. Neutralize embedded newlines/control chars before

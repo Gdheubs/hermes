@@ -49,6 +49,7 @@ def _run_gateway_import(hermes_home: Path, initial_env: dict[str, str]) -> dict[
             "HERMES_GATEWAY_BUSY_INPUT_MODE",
             "HERMES_GATEWAY_BUSY_TEXT_MODE",
             "HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT",
+            "HERMES_ALWAYS_NAME_PREFIX",
             "HERMES_TIMEZONE",
         ):
             v = os.environ.get(k)
@@ -214,3 +215,26 @@ def test_env_platform_connect_timeout_wins_over_config(hermes_home: Path) -> Non
     )
 
     assert env.get("HERMES_GATEWAY_PLATFORM_CONNECT_TIMEOUT") == "120"
+
+
+def test_config_always_name_prefix_wins_over_stale_env(hermes_home: Path) -> None:
+    """gateway.always_name_prefix is config-authoritative (same convention as
+    gateway.trust_recent_files): when present in config.yaml it overwrites any
+    stale .env value, normalized to "1"/"0"."""
+    _write_config(hermes_home, gateway_cfg={"always_name_prefix": True})
+    _write_env(hermes_home, {"HERMES_ALWAYS_NAME_PREFIX": "0"})
+
+    env = _run_gateway_import(hermes_home, initial_env={})
+
+    assert env.get("HERMES_ALWAYS_NAME_PREFIX") == "1"
+
+
+def test_config_always_name_prefix_false_bridges_to_zero(hermes_home: Path) -> None:
+    """An explicit `always_name_prefix: false` bridges to "0" (still overriding
+    a stale truthy .env value); an omitted key leaves the env untouched."""
+    _write_config(hermes_home, gateway_cfg={"always_name_prefix": False})
+    _write_env(hermes_home, {"HERMES_ALWAYS_NAME_PREFIX": "1"})
+
+    env = _run_gateway_import(hermes_home, initial_env={})
+
+    assert env.get("HERMES_ALWAYS_NAME_PREFIX") == "0"
