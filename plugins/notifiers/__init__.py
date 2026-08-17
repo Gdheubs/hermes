@@ -2,7 +2,7 @@
 
 Scans two directories for notifier provider plugins:
 
-1. Bundled providers: ``plugins/memory/<name>/`` (shipped with hermes-agent)
+1. Bundled providers: ``plugins/notifiers/<name>/`` (shipped with hermes-agent)
 2. User-installed providers: ``$HERMES_HOME/plugins/<name>/``
 
 Each subdirectory must contain ``__init__.py`` with a class implementing
@@ -71,7 +71,7 @@ def _get_user_plugins_dir() -> Optional[Path]:
         return None
 
 
-def _is_memory_provider_dir(path: Path) -> bool:
+def _is_notifier_provider_dir(path: Path) -> bool:
     """Heuristic: does *path* look like a notifier provider plugin?
 
     Checks for ``register_notifier_provider`` or ``NotifierProvider`` in the
@@ -96,7 +96,7 @@ def _iter_provider_dirs() -> List[Tuple[str, Path]]:
     seen: set = set()
     dirs: List[Tuple[str, Path]] = []
 
-    # 1. Bundled providers (plugins/memory/<name>/)
+    # 1. Bundled providers (plugins/notifiers/<name>/)
     if _NOTIFIER_PLUGINS_DIR.is_dir():
         for child in sorted(_NOTIFIER_PLUGINS_DIR.iterdir()):
             if not child.is_dir() or child.name.startswith(("_", ".")):
@@ -114,8 +114,8 @@ def _iter_provider_dirs() -> List[Tuple[str, Path]]:
                 continue
             if child.name in seen:
                 continue  # bundled takes precedence
-            if not _is_memory_provider_dir(child):
-                continue  # skip non-memory plugins
+            if not _is_notifier_provider_dir(child):
+                continue  # skip non-notifier plugins
             dirs.append((child.name, child))
 
     return dirs
@@ -134,7 +134,7 @@ def find_provider_dir(name: str) -> Optional[Path]:
     user_dir = _get_user_plugins_dir()
     if user_dir:
         user = user_dir / name
-        if user.is_dir() and _is_memory_provider_dir(user):
+        if user.is_dir() and _is_notifier_provider_dir(user):
             return user
     return None
 
@@ -175,16 +175,11 @@ def discover_notifier_providers() -> List[Tuple[str, str, bool]]:
             except Exception:
                 pass
 
-        # Quick availability check — try loading and calling is_available()
+        # Quick availability check
+        # To avoid heavy initialization at config-schema build time,
+        # we do not instantiate the provider. We assume it's available
+        # if the directory looks like a notifier provider.
         available = True
-        try:
-            provider = _load_provider_from_dir(child)
-            if provider:
-                available = provider.is_available()
-            else:
-                available = False
-        except Exception:
-            available = False
 
         results.append((name, desc, available))
 
@@ -194,7 +189,7 @@ def discover_notifier_providers() -> List[Tuple[str, str, bool]]:
 def load_notifier_provider(name: str) -> Optional["NotifierProvider"]:
     """Load and return a NotifierProvider instance by name.
 
-    Checks both bundled (``plugins/memory/<name>/``) and user-installed
+    Checks both bundled (``plugins/notifiers/<name>/``) and user-installed
     (``$HERMES_HOME/plugins/<name>/``) directories.  Bundled takes
     precedence on name collisions.
 
