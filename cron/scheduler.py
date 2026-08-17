@@ -5103,7 +5103,19 @@ def run_job(
                     prefill_messages = None
 
         # Max iterations
-        max_iterations = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns") or 500
+        _mt_raw = _cfg.get("agent", {}).get("max_turns") or _cfg.get("max_turns")
+        if isinstance(_mt_raw, str) and _mt_raw.lower() in ("none", "null", "unlimited", "infinite", "∞", "", "0", "-1"):
+            max_iterations = 500
+        elif isinstance(_mt_raw, str) and _mt_raw.lstrip("-").isdigit():
+            max_iterations = int(_mt_raw)
+        elif isinstance(_mt_raw, (int, float)) and _mt_raw in (0, -1):
+            max_iterations = 500
+        elif _mt_raw is None:
+            max_iterations = 500
+        elif isinstance(_mt_raw, (int, float)):
+            max_iterations = int(_mt_raw)
+        else:
+            max_iterations = 500
 
         # Provider routing
         pr = _cfg.get("provider_routing") or {}
