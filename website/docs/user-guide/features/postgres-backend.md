@@ -177,16 +177,31 @@ environment-variable form.
 
 ## Migrating existing sessions
 
-`migrate_state_to_postgres.py` performs a one-shot copy of an existing SQLite
-state database into PostgreSQL:
+The `hermes migrate state-to-postgres` subcommand performs a one-shot copy of
+an existing SQLite state database into PostgreSQL:
+
+```bash
+hermes migrate state-to-postgres [--dsn 'postgresql://...'] [--sqlite-path PATH]
+```
+
+Running without `--dsn` resolves the target from the
+`HERMES_STATE_DATABASE_URL` / `HERMES_STATE_POSTGRES_DSN` environment
+variables, or from `sessions.postgres_dsn` in `config.yaml` when
+`sessions.state_backend: postgres` is already set. `--sqlite-path` defaults
+to `state.db` under your Hermes home.
+
+Use `-y` / `--yes` to skip the confirmation prompt in scripts or CI:
+
+```bash
+hermes migrate state-to-postgres --dsn 'postgresql://...' --yes
+```
+
+The equivalent direct invocation (documented for scripting or for users who
+prefer to run the module without the CLI) is:
 
 ```bash
 python -m migrate_state_to_postgres --dsn 'postgresql://...' [--sqlite-path PATH]
 ```
-
-The DSN may also come from `HERMES_STATE_DATABASE_URL` /
-`HERMES_STATE_POSTGRES_DSN`. `--sqlite-path` defaults to `state.db` under your
-Hermes home.
 
 Its properties, by design:
 
