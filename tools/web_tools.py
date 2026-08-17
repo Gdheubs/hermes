@@ -98,6 +98,21 @@ from tools.tool_backend_helpers import (  # noqa: F401
     prefers_gateway,
 )
 from tools.url_safety import async_is_safe_url, normalize_url_for_request, sensitive_query_param_name
+from tools.website_policy import check_website_access
+# Escalation chain helpers live in tools/web_routing.py; the names are
+# re-exported here for tests and backward compatibility.
+from tools.web_routing import (
+    _append_capped_lane_log,
+    _extract_block_signal,
+    _extract_is_technical_failure,
+    _extract_via_browser_use_cloud,
+    _extract_via_home_chrome_cdp,
+    _extract_with_jina_escalation,
+    _HARD_INTERSTITIAL_MIN_CHARS,
+    _is_hard_interstitial,
+    _NEAR_EMPTY_BLOCK_CHARS,
+    _redact_url_for_logs,
+)
 import sys
 
 logger = logging.getLogger(__name__)
@@ -937,17 +952,15 @@ async def web_extract_tool(
                 "Web extract via %s: %d URL(s)", provider.name, len(safe_urls)
             )
 
-            # Async-or-sync dispatch: parallel + firecrawl have async
-            # extract(); exa + tavily are sync.
-            import inspect
-            if inspect.iscoroutinefunction(provider.extract):
-                results = await provider.extract(safe_urls, format=format)
-            else:
-                # Run sync extract() in a thread so we don't block the
-                # event loop on network I/O.
-                results = await asyncio.to_thread(
-                    provider.extract, safe_urls, format=format
-                )
+            # Any configured backend can hit a block or lane failure — not
+            # just Jina. Route every provider through the escalation wrapper
+            # (tools/web_routing.py): it returns primary results untouched
+            # (with routing metadata) when there is no block signal, and
+            # escalates classified 403/429/402 or anti-bot interstitials
+            # through Home Chrome then Browser Use. Transport failures are
+            # returned without escalation. The wrapper handles both async and
+            # sync provider.extract() implementations.
+            results = await _extract_with_jina_escalation(provider, safe_urls, format=format)
 
         # Reconstruct the original input order across invalid, blocked, and
         # provider-processed entries. Providers are expected to preserve the
