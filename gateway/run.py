@@ -3425,17 +3425,8 @@ def _load_gateway_config(config_path: "Path | None" = None) -> dict:
             logger.debug("Could not load gateway config from %s", config_path)
             raw = {}
 
-    # Overlay managed scope. read_raw_config() returns the user's raw YAML
-    # WITHOUT the managed merge (that lives in load_config/_load_config_impl),
-    # so the overlay is required on both paths for the gateway to honor pinned
-    # values. Helper is fail-open and a no-op when no managed scope exists.
-    try:
-        from hermes_cli import managed_scope
-        raw = managed_scope.apply_managed_overlay(raw if isinstance(raw, dict) else {})
-    except Exception:
-        pass
     if not isinstance(raw, dict):
-        return {}
+        raw = {}
     # Canonicalize model-id aliases (model.name / model.model → model.default)
     # and migrate stale root-level provider/base_url into the model section.
     # The gateway bypasses load_config() (it reads raw YAML for speed), so the
@@ -3447,6 +3438,33 @@ def _load_gateway_config(config_path: "Path | None" = None) -> dict:
         raw = _normalize_root_model_keys(raw)
     except Exception:
         pass
+    # Opt-in root primary-model inheritance — applied BEFORE the managed overlay
+    # so an administrator-pinned managed model.default/provider still WINS over
+    # the inherited root value, matching load_config()'s canonical precedence
+    # (managed > inherited root > profile-local). The gateway bypasses
+    # load_config() (raw read for speed), so the shared resolver that
+    # load_config() applies must be replayed here or an opted-in named profile's
+    # gateway model tier would ignore the inherited root model.default/provider.
+    # Keyed on the gateway's OWN config_path so the self-inheritance guard and
+    # $HERMES_HOME isolation hold; reads root fresh each call so root-only edits
+    # are observed without a gateway restart. Fail-open.
+    try:
+        from hermes_cli.config import apply_root_primary_model_inheritance
+        raw = apply_root_primary_model_inheritance(raw, config_path=config_path)
+    except Exception:
+        pass
+    # Overlay managed scope LAST so administrator-pinned values win per-leaf.
+    # read_raw_config() returns the user's raw YAML WITHOUT the managed merge
+    # (that lives in load_config/_load_config_impl), so the overlay is required
+    # on both paths for the gateway to honor pinned values. Helper is fail-open
+    # and a no-op when no managed scope exists.
+    try:
+        from hermes_cli import managed_scope
+        raw = managed_scope.apply_managed_overlay(raw if isinstance(raw, dict) else {})
+    except Exception:
+        pass
+    if not isinstance(raw, dict):
+        return {}
     return raw
 
 

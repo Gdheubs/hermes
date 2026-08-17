@@ -209,6 +209,73 @@ If you want this profile to work in a specific project by default, also set its 
 coder config set terminal.cwd /absolute/path/to/project
 ```
 
+### Inherit the root model (opt-in)
+
+By default every profile is a fully isolated `HERMES_HOME` island: it never
+reads another profile's or the root install's config. If you want one place to
+steer the **primary model** for a named profile, you can opt that profile in to
+inheriting **only** the root install's primary routing from `~/.hermes/config.yaml`:
+
+```bash
+# Opt the coder profile in (default is false):
+coder config set model.inherit_root_primary true
+
+# Now the coder profile's effective model.default and model.provider come from
+# the root ~/.hermes/config.yaml. Change the root once and every opted-in
+# profile follows on its next run — no restart, no per-profile edit:
+hermes config set model.default <your-model>
+hermes config set model.provider <your-provider>
+```
+
+**What is inherited: exactly two fields.** Only `model.default` and
+`model.provider` are read from the root config. **Nothing else crosses the
+profile boundary** — not `providers` / custom provider definitions, credentials
+or API keys, `model.base_url`, `model.api_key`, aliases, delegation
+model/provider, terminal settings, toolsets, memory, skills, sessions, cron,
+logs, or gateway state. Those continue to resolve from Hermes' built-in
+defaults plus the profile's own `config.yaml`, exactly as before.
+
+:::warning Credentials and providers are NOT shared
+Inheriting the root model does **not** give the profile the root's API keys or
+provider definitions. The inherited `model.provider` must still resolve to a
+provider the profile can authenticate on its own (its own `.env` / credentials
+and, for custom providers, its own `providers` entry). If the profile can't
+reach that provider, set the model locally instead.
+:::
+
+**Where the flag lives.** `model.inherit_root_primary` is set in the **named
+profile's own** `config.yaml` (via `-p <profile>` / the profile alias), never in
+the root config. The default/root profile ignores the flag — it can never
+inherit from itself.
+
+**Migration-safe with a legacy local model.** If the profile still has its own
+`model.default` / `model.provider` from before opting in, the root value wins
+for each field the root actually sets; a field the root omits falls back to the
+profile's own value. You can clean up the now-redundant local fields with the
+CLI (never hand-edit `config.yaml`):
+
+```bash
+coder config unset model.default
+coder config unset model.provider
+```
+
+**Cache / reload.** Long-lived processes (gateways, the desktop/TUI backend,
+Kanban workers) pick up a root-config create, change, or delete on the next
+resolution automatically — the root file's modification time is part of the
+config cache key, so a root-only edit is observed without a restart.
+
+**Rollback.** Turn inheritance off again at any time:
+
+```bash
+coder config set model.inherit_root_primary false
+# or remove the flag entirely:
+coder config unset model.inherit_root_primary
+```
+
+If the root config is missing or malformed while a profile is opted in, Hermes
+fails safe: it logs one actionable diagnostic, keeps the profile's own values,
+and never broadens what is inherited.
+
 ### From the dashboard
 
 The [web dashboard](features/web-dashboard.md#managing-multiple-profiles)

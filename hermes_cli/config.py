@@ -242,11 +242,17 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # produces a fresh inode, so stat() sees a new mtime_ns and the next
 # load repopulates automatically — no explicit invalidation hook.
 # Cached tuple is (user_mtime_ns, user_size, managed_mtime_ns, managed_size,
-# merged_value, env_ref_snapshot) — the managed-file signature is folded in so
-# editing the managed-scope config.yaml invalidates the cache (see
-# managed_scope), and the env snapshot invalidates it when a referenced ${VAR}
-# changes value (late .env load, in-process rotation — #58514).
-_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
+# root_mtime_ns, root_size, merged_value, env_ref_snapshot) — the managed-file
+# signature is folded in so editing the managed-scope config.yaml invalidates
+# the cache (see managed_scope); the root-config signature is folded in so that
+# a named profile which opts into primary-model inheritance
+# (``model.inherit_root_primary``) sees root-config create/change/delete WITHOUT
+# a restart (parent-aware invalidation — the gap flagged in issue #43713); and
+# the env snapshot invalidates it when a referenced ${VAR} changes value (late
+# .env load, in-process rotation — #58514). The root part is (0, 0) for the
+# default/root profile and for named profiles that do not opt in, keeping their
+# behavior byte-for-byte unchanged.
+_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
 # (path, mtime_ns, size) -> cached raw yaml dict. Same pattern as
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
@@ -3207,6 +3213,297 @@ def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+# ── Opt-in primary-model inheritance (root → named profile) ─────────────────
+#
+# A NAMED profile may inherit EXACTLY the two primary-routing scalars
+# ``model.default`` and ``model.provider`` from the default root config, and
+# ONLY when its own config sets ``model.inherit_root_primary: true``. Nothing
+# else is shared: providers dicts, credentials, aliases, delegation
+# model/provider, base_url, api_key, terminal, toolsets, memory, sessions,
+# cron, logs and gateway state all continue to resolve from built-in defaults
+# plus the named profile alone. The default/root profile never inherits from
+# itself. This is the scoped, explicit design maintainers asked for in issue
+# #43713 after the broad automatic merges in PR #43765/#43816 were rejected for
+# violating profile isolation.
+INHERIT_ROOT_PRIMARY_KEY = "inherit_root_primary"
+_INHERITED_PRIMARY_FIELDS = ("default", "provider")
+# Dedup set for the fail-safe diagnostic, keyed on (root_path, reason, sig) so a
+# long-lived process warns once per broken/missing root file but re-warns after
+# the file changes. Mirrors _CONFIG_PARSE_WARNED.
+_ROOT_INHERIT_WARNED: set = set()
+
+
+def _profile_opts_into_root_primary(cfg: Dict[str, Any]) -> bool:
+    """Whether ``cfg`` (a profile config) opts into root primary inheritance."""
+    if not isinstance(cfg, dict):
+        return False
+    model_cfg = cfg.get("model")
+    if not isinstance(model_cfg, dict):
+        return False
+    return bool(model_cfg.get(INHERIT_ROOT_PRIMARY_KEY))
+
+
+def _root_config_path_for_inheritance(current_config_path) -> Optional[Path]:
+    """Return the default root ``config.yaml`` path, or ``None`` when the active
+    home IS the root (default profile) so a profile can never inherit from
+    itself. Resolution is HERMES_HOME-relative (see
+    ``hermes_constants.get_default_hermes_root``); it never mutates HERMES_HOME,
+    preserving ``$HERMES_HOME`` isolation."""
+    try:
+        from hermes_constants import get_default_hermes_root
+        root_home = get_default_hermes_root()
+    except Exception:
+        return None
+    root_path = root_home / "config.yaml"
+    current = Path(current_config_path)
+    # Cheap normalized-string comparison — no filesystem syscall. This runs on
+    # every load_config()/load_config_readonly() (the hot readonly path), so
+    # avoid .resolve(). For the default/root profile the two paths are
+    # string-identical (both derive from the same home resolver), so this
+    # short-circuits before any stat.
+    if os.path.normcase(os.path.normpath(str(root_path))) == os.path.normcase(
+        os.path.normpath(str(current))
+    ):
+        return None
+    return root_path
+
+
+def _root_primary_stat_sig(root_path: Optional[Path]) -> Tuple[int, int]:
+    """``(mtime_ns, size)`` of the root config, or ``(0, 0)`` when inheritance
+    is inactive or the file is absent. Folded into the load-config cache
+    signature so root create/change/delete invalidates a cached profile
+    result."""
+    if root_path is None:
+        return (0, 0)
+    try:
+        st = root_path.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (0, 0)
+
+
+def _profile_opts_into_root_primary_on_disk(config_path) -> bool:
+    """Whether the profile config at ``config_path`` sets
+    ``model.inherit_root_primary: true``, read straight from disk.
+
+    Used at cache-signature time (before the full parse), so a NON-opted named
+    profile's load-cache key never folds in the root config's stat — keeping it
+    isolated from root create/change/delete/stat churn (issue #43713). Only ever
+    called for a named profile whose root path differs from its own, so the
+    default/root profile pays nothing. Fail-safe: any read/parse error → False
+    (treat as not opted in → root not folded in → the profile stays isolated).
+    Toggling the flag changes the profile file's own (mtime, size), which is
+    already part of the cache signature, so this is re-derived on the next load."""
+    try:
+        raw = read_user_config_raw(Path(config_path))
+    except Exception:
+        return False
+    return _profile_opts_into_root_primary(raw)
+
+
+# (path) -> (user_mtime_ns, user_size, opt_in). Memoizes the opt-in flag on the
+# profile file's stat signature so the load-config hot path never re-parses the
+# profile YAML merely to discover the flag — most importantly on a cache HIT,
+# where the whole point of the cache is to avoid a parse. The flag is a pure
+# function of the profile file's content, which is fully captured by the SAME
+# (mtime_ns, size) signature _LOAD_CONFIG_CACHE already trusts, so any profile
+# edit (including toggling the flag) re-derives it. Read/written ONLY under
+# _CONFIG_LOCK (from _load_config_impl), so there is no stale-opt-in race.
+_PROFILE_OPT_IN_CACHE: Dict[str, Tuple[int, int, bool]] = {}
+
+
+def _profile_opts_into_root_primary_cached(
+    config_path, path_key: str, user_sig: Optional[Tuple[int, int]]
+) -> bool:
+    """Stat-memoized form of :func:`_profile_opts_into_root_primary_on_disk`,
+    keyed on the profile file's ``(mtime_ns, size)``.
+
+    Returns ``False`` without any parse when the user config is absent
+    (``user_sig is None`` → no file → no opt-in flag → default-false). On a
+    signature match returns the memoized flag with NO disk read (the cache-hit
+    fast path the finding requires). On a miss (cold load, or the profile file
+    changed) it re-derives from disk — so malformed fail-safe (a parse error →
+    ``False``) is preserved and the flag is never stale relative to disk."""
+    if user_sig is None:
+        return False
+    cached = _PROFILE_OPT_IN_CACHE.get(path_key)
+    if cached is not None and cached[0] == user_sig[0] and cached[1] == user_sig[1]:
+        return cached[2]
+    opt_in = _profile_opts_into_root_primary_on_disk(config_path)
+    _PROFILE_OPT_IN_CACHE[path_key] = (user_sig[0], user_sig[1], opt_in)
+    return opt_in
+
+
+def _warn_root_inheritance_failure(root_path: Path, reason: str) -> None:
+    """One-shot actionable diagnostic when an opted-in profile cannot read the
+    root config. Fail-safe: the caller keeps the profile's own values and never
+    broadens inheritance. Re-warns after the root file changes."""
+    try:
+        st = root_path.stat()
+        sig = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        sig = (0, 0)
+    key = (str(root_path), reason, sig)
+    if key in _ROOT_INHERIT_WARNED:
+        return
+    _ROOT_INHERIT_WARNED.add(key)
+    msg = (
+        f"Profile opted into model.inherit_root_primary but the root config "
+        f"{root_path} {reason}. Keeping this profile's own model.default / "
+        f"model.provider (no inheritance applied). Fix the root config with "
+        f"`hermes config set model.default <id>` / `model.provider <name>`, "
+        f"or disable with `hermes -p <profile> config set "
+        f"model.inherit_root_primary false`."
+    )
+    logger.warning(msg)
+    try:
+        sys.stderr.write(f"⚠️  hermes config: {msg}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def _resolve_root_primary_overlay(root_path: Path) -> Dict[str, Any]:
+    """Read EXACTLY ``model.default`` + ``model.provider`` from the root config.
+
+    Returns a dict with 0-2 of those keys. Empty dict when the root config is
+    missing (nothing configured to inherit — the profile keeps its own/default)
+    or malformed (fail-safe: a diagnostic is emitted and inheritance is NOT
+    broadened). Reuses ``_normalize_root_model_keys`` so a dict-valued
+    ``model.default`` or a bare ``model:`` string flattens the same way it does
+    for the local config."""
+    if not root_path.exists():
+        _warn_root_inheritance_failure(root_path, "does not exist")
+        return {}
+    try:
+        raw = read_user_config_raw(root_path)
+    except Exception as e:  # malformed YAML / IO error
+        _warn_root_inheritance_failure(root_path, f"could not be parsed ({e})")
+        return {}
+    if not raw:
+        return {}
+    try:
+        normalized = _normalize_root_model_keys(copy.deepcopy(raw))
+    except Exception as e:
+        _warn_root_inheritance_failure(root_path, f"could not be normalized ({e})")
+        return {}
+    model_cfg = normalized.get("model")
+    if not isinstance(model_cfg, dict):
+        return {}
+    overlay: Dict[str, Any] = {}
+    for field in _INHERITED_PRIMARY_FIELDS:
+        val = model_cfg.get(field)
+        if isinstance(val, str) and val.strip():
+            overlay[field] = val
+    return overlay
+
+
+def apply_root_primary_model_inheritance(
+    cfg: Dict[str, Any],
+    *,
+    config_path=None,
+    env_snapshot: Optional[Dict[str, Optional[str]]] = None,
+) -> Dict[str, Any]:
+    """Overlay ``model.default`` + ``model.provider`` from the default root
+    config onto ``cfg`` in place, and return ``cfg``.
+
+    No-op unless ALL hold: ``cfg`` sets ``model.inherit_root_primary: true``;
+    the active home is a NAMED profile distinct from the root; and the root
+    config supplies the field(s). Root values override any legacy local
+    ``model.default`` / ``model.provider`` still present in the profile
+    (migration-safe: a field the root omits falls back to the profile's own).
+
+    Inherited values are ``${VAR}`` / ``${env:VAR}``-expanded HERE, with the
+    exact ``_expand_env_vars`` semantics (and missing-ref-kept-verbatim
+    behavior) the profile's own values already use. Expanding at this single
+    shared entry point means every consumer resolves an IDENTICAL effective
+    model whether it expands before this overlay (``build_cron_effective_config``
+    re-expands: idempotent), after it (``_load_config_impl`` / the CLI bridge),
+    or not at all (doctor / profile-list). ONLY the two primary scalars are ever
+    read or expanded — no other root field is touched, so a ``${VAR}`` in any
+    non-primary root field is never resolved or merged.
+
+    ``env_snapshot``: when given, each inherited value's raw ``${VAR}`` refs are
+    recorded into it (before expansion) so a caller that CACHES its result can
+    invalidate on an in-process rotation of an inherited ref — parity with the
+    profile's own refs (#58514). Consumers that do not cache omit it.
+
+    This is the single shared entry point every real primary-model resolver
+    routes through so CLI / gateway / profile-list / kanban / bridge all agree
+    (see ``website/docs/user-guide/profiles.md``)."""
+    if not _profile_opts_into_root_primary(cfg):
+        return cfg
+    if config_path is None:
+        config_path = get_config_path()
+    root_path = _root_config_path_for_inheritance(config_path)
+    if root_path is None:
+        return cfg  # default/root profile — never inherit from self
+    overlay = _resolve_root_primary_overlay(root_path)
+    if not overlay:
+        return cfg
+    model_cfg = cfg.get("model")
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+        cfg["model"] = model_cfg
+    for field in _INHERITED_PRIMARY_FIELDS:
+        if field in overlay:
+            raw_val = overlay[field]
+            # Record the raw template's env refs (for cache invalidation) BEFORE
+            # expanding, then store the expanded value — same semantics as the
+            # profile's own values so the effective model is consistent.
+            if env_snapshot is not None:
+                _env_ref_snapshot(raw_val, env_snapshot)
+            model_cfg[field] = _expand_env_vars(raw_val)
+    return cfg
+
+
+def build_cron_effective_config(config_path: Optional[Path] = None) -> Dict[str, Any]:
+    """Effective config the cron ticker resolves its GLOBAL model/provider from.
+
+    Raw user config → opt-in root-primary inheritance → managed overlay → env
+    expansion, in the SAME precedence ``_load_config_impl`` uses (managed wins
+    over an inherited root value, which wins over the profile's own legacy
+    value). This is the single shared helper both cron primary-model paths route
+    through so an opted-in *unpinned* worker snapshots and fires on the same
+    inherited root primary:
+
+      * ``cron/scheduler.py`` ``run_job`` (fire-time global model), and
+      * ``cron/jobs.py`` ``_resolve_default_model_snapshot`` (create-time snapshot).
+
+    Deliberately does NOT merge ``DEFAULT_CONFIG`` — the cron callers treat a
+    missing key as "unset" and apply their own defaults (a defaults merge would
+    make every key "present"), so this mirrors the raw-bypass loaders those
+    callers already used, adding ONLY the previously-missing inheritance step.
+    Explicit cron overrides — a per-job model pin and the ``cron.model`` fleet
+    default — are applied by the callers and are unaffected by this helper.
+
+    Fail modes mirror :func:`read_user_config_raw`: a missing file yields ``{}``;
+    an unparseable/other IO error propagates (the cron callers already wrap this
+    in try/except with their own last-known-good / warn semantics)."""
+    if config_path is None:
+        config_path = get_config_path()
+    config_path = Path(config_path)
+    cfg = read_user_config_raw(config_path)
+    if not isinstance(cfg, dict) or not cfg:
+        return cfg if isinstance(cfg, dict) else {}
+    # 1) Opt-in root→named-profile inheritance of model.default/provider only.
+    #    No-op for the default/root profile and for a profile that did not opt
+    #    in. Keyed on this config's own path so the self-inheritance guard and
+    #    $HERMES_HOME isolation hold; reads root fresh so root-only edits are
+    #    observed with no restart.
+    cfg = apply_root_primary_model_inheritance(cfg, config_path=config_path)
+    # 2) Managed overlay WINS at the leaf (canonical precedence). Fail-open and
+    #    a no-op when no managed scope is present.
+    try:
+        from hermes_cli import managed_scope
+        cfg = managed_scope.apply_managed_overlay(cfg)
+    except Exception:
+        pass
+    # 3) Expand ${VAR} refs, matching the raw-bypass loaders.
+    expanded = _expand_env_vars(cfg)
+    return expanded if isinstance(expanded, dict) else cfg
+
+
 def read_raw_config_readonly() -> Dict[str, Any]:
     """Fast-path variant of ``read_raw_config()`` for callers that ONLY READ.
 
@@ -3519,30 +3816,51 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         except OSError:
             managed_sig = (0, 0)
 
-        # Combined cache signature: user file + managed file. None only when the
-        # user config is absent AND no managed file exists (nothing to cache on).
+        # Root-config signature for opt-in primary-model inheritance. Folded in
+        # ONLY for a named profile that actually opts in (path distinct from the
+        # root config AND model.inherit_root_primary: true), so a root-only
+        # create/change/delete invalidates THAT profile's cached effective
+        # result WITHOUT a restart — closing the parent-aware invalidation gap of
+        # PR #43765 (issue #43713). (0, 0) for the default/root profile AND for a
+        # non-opted named profile, so those cache signatures are unchanged and
+        # stay isolated from root churn (a non-opted profile's effective config
+        # never depends on root). Opt-in is itself part of user_sig, so toggling
+        # the flag re-derives this on the next load.
+        root_cfg_path = _root_config_path_for_inheritance(config_path)
+        if root_cfg_path is not None and _profile_opts_into_root_primary_cached(
+            config_path, path_key, user_sig
+        ):
+            root_sig = _root_primary_stat_sig(root_cfg_path)
+        else:
+            root_sig = (0, 0)
+
+        # Combined cache signature: user file + managed file + root file. None
+        # only when the user config is absent AND no managed file exists
+        # (nothing to cache on; no user config means no opt-in flag either).
         if user_sig is not None:
-            cache_sig: Optional[Tuple[int, int, int, int]] = (
+            cache_sig: Optional[Tuple[int, int, int, int, int, int]] = (
                 user_sig[0],
                 user_sig[1],
                 managed_sig[0],
                 managed_sig[1],
+                root_sig[0],
+                root_sig[1],
             )
         elif managed_sig != (0, 0):
-            cache_sig = (0, 0, managed_sig[0], managed_sig[1])
+            cache_sig = (0, 0, managed_sig[0], managed_sig[1], root_sig[0], root_sig[1])
         else:
             cache_sig = None
 
         cached = _LOAD_CONFIG_CACHE.get(path_key)
-        if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
+        if cached is not None and cache_sig is not None and cached[:6] == cache_sig:
             # File signatures match, but the cached expansion is only valid if
             # every ${VAR} it was expanded against still has the same value.
             # Without this, a load_config() that ran before load_hermes_dotenv()
             # pins unexpanded literals (e.g. auxiliary.<task>.api_key) for the
             # life of the process (#58514).
-            env_snapshot = cached[5] if len(cached) > 5 else {}
+            env_snapshot = cached[7] if len(cached) > 7 else {}
             if all(os.environ.get(k) == v for k, v in env_snapshot.items()):
-                return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
+                return copy.deepcopy(cached[6]) if want_deepcopy else cached[6]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
 
@@ -3593,15 +3911,25 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                         # re-parse the broken file; fixing the file changes the
                         # signature and triggers a normal reload.
                         _empty_env: Dict[str, Optional[str]] = {}
-                        _LOAD_CONFIG_CACHE[path_key] = (
-                            cache_sig[0], cache_sig[1],
-                            cache_sig[2], cache_sig[3],
-                            lkg_copy, _empty_env,
-                        )
+                        _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, lkg_copy, _empty_env)
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
         normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
         expanded = _expand_env_vars(normalized)
+        # Opt-in primary-model inheritance (root → named profile). Applied after
+        # the profile's own values are resolved (so an opted-in profile's root
+        # values override any legacy local model.default/provider) but BEFORE the
+        # managed overlay (so administrator-pinned managed values still win).
+        # No-op unless the profile set model.inherit_root_primary and is a named
+        # profile distinct from root; scoped to exactly model.default +
+        # model.provider — see apply_root_primary_model_inheritance. Inherited
+        # values are ${VAR}-expanded by the resolver (parity with the profile's
+        # own values). Capture their raw env refs so an in-process rotation of an
+        # inherited ref invalidates this cached result too (#58514 parity).
+        _root_env_refs: Dict[str, Optional[str]] = {}
+        apply_root_primary_model_inheritance(
+            expanded, config_path=config_path, env_snapshot=_root_env_refs
+        )
         # Managed scope wins at the leaf. Applied AFTER user expansion so a user
         # ${VAR} cannot shadow a managed literal: managed values are expanded only
         # against the process environment, never against user-config-defined refs.
@@ -3634,6 +3962,10 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             # drift (late .env load, in-process rotation) — see cache hit above.
             cached_copy = copy.deepcopy(expanded)
             env_snapshot = _env_ref_snapshot(normalized)
+            # Fold in the inherited-root value's ${VAR} refs so a later rotation
+            # of an inherited ref is detected on the cache-hit path above —
+            # parity with the profile's own refs (#58514).
+            env_snapshot.update(_root_env_refs)
             if managed_config:
                 _env_ref_snapshot(managed_config, env_snapshot)
             _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, cached_copy, env_snapshot)

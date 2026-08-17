@@ -1182,9 +1182,22 @@ def run_doctor(args):
 
         # Validate model.provider and model.default values
         try:
-            # Raw-file diagnostic: inspects what the user actually wrote.
-            from hermes_cli.config import read_user_config_raw
+            # Diagnose the EFFECTIVE primary model (after opt-in root-primary
+            # inheritance), not just the raw local values. An opted-in profile
+            # mid-migration may keep a stale local model.default/provider that the
+            # root config supersedes at runtime (migration-safe: root wins), so
+            # validating the raw local values would falsely warn about a
+            # provider/model the runtime never actually uses. The shared resolver
+            # is a strict no-op for a non-opted profile and for the default/root
+            # profile, and is scoped to exactly model.default + model.provider —
+            # it never broadens what is inherited. read_user_config_raw returns a
+            # fresh (uncached) dict, so the in-place overlay is safe.
+            from hermes_cli.config import (
+                apply_root_primary_model_inheritance,
+                read_user_config_raw,
+            )
             cfg = read_user_config_raw(config_path)
+            cfg = apply_root_primary_model_inheritance(cfg, config_path=config_path)
             model_section = cfg.get("model") or {}
             provider_raw = (model_section.get("provider") or "").strip()
             provider = provider_raw.lower()

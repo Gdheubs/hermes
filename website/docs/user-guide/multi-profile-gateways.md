@@ -444,6 +444,27 @@ coder gateway restart
 hermes-gateways restart
 ```
 
+### Steer one model for opted-in profiles
+
+A named profile can opt in to inheriting **only** the root install's primary
+model — `model.default` and `model.provider` from `~/.hermes/config.yaml` — so a
+fleet of gateways can follow a single model choice:
+
+```bash
+coder config set model.inherit_root_primary true    # per profile, default false
+hermes config set model.default <your-model>         # change once at the root
+hermes config set model.provider <your-provider>
+```
+
+The running gateway (and the multiplexing gateway's per-profile routing) picks
+up a root-config change on the next resolution — **no restart needed**, because
+the root file's mtime is part of the config cache key. Only those two fields are
+inherited; credentials, `providers` definitions, `base_url`, `api_key`, and all
+other gateway/profile state stay isolated per profile — so the inherited
+`model.provider` must still be one the profile can authenticate on its own. See
+[Inherit the root model](profiles.md#inherit-the-root-model-opt-in) for the full
+boundary, migration, and rollback steps.
+
 ## Keeping the host awake
 
 The gateway process can run all day, but the operating system will still try

@@ -617,6 +617,16 @@ def load_cli_config() -> Dict[str, Any]:
     from hermes_cli.config import _expand_env_vars
     defaults = _expand_env_vars(defaults)
 
+    # Opt-in primary-model inheritance (root → named profile). Mirrors
+    # _load_config_impl: applied after the profile's own values resolve (root
+    # overrides legacy local model.default/provider) but BEFORE the managed
+    # overlay (managed still wins). No-op unless this profile set
+    # model.inherit_root_primary and is a named profile distinct from root, so
+    # the interactive CLI and every kanban worker child (which resolve their
+    # runtime model here) agree with `hermes config get`.
+    from hermes_cli.config import apply_root_primary_model_inheritance
+    apply_root_primary_model_inheritance(defaults, config_path=config_path)
+
     # Managed scope: overlay administrator-pinned values LAST so they win over
     # the user's config here too. cli.py builds its config independently of
     # hermes_cli.config._load_config_impl (which has its own managed merge), so

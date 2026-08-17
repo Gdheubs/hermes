@@ -5013,20 +5013,20 @@ def run_job(
         _cfg = {}
         _model_cfg = {}
         try:
-            from hermes_cli.config import read_user_config_raw
+            from hermes_cli.config import build_cron_effective_config
             _cfg_path = str(_get_hermes_home() / "config.yaml")
             if os.path.exists(_cfg_path):
-                _cfg = read_user_config_raw(Path(_cfg_path))
-                # Managed scope: a scheduled job must honor administrator-pinned
-                # model / reasoning / toolsets / provider_routing too. This loader
-                # builds its own dict, so overlay managed values via the shared
-                # helper (fail-open, no-op when no managed scope).
-                try:
-                    from hermes_cli import managed_scope
-                    _cfg = managed_scope.apply_managed_overlay(_cfg)
-                except Exception:
-                    pass
-                _cfg = _expand_env_vars(_cfg)
+                # Canonical cron effective config: raw user config + opt-in
+                # root-primary inheritance + managed overlay + env expansion.
+                # Routing through the shared helper (rather than a raw read plus
+                # an inline managed overlay) means an opted-in *unpinned* worker
+                # resolves the inherited root primary model here — the SAME value
+                # _resolve_default_model_snapshot captured at create time — while
+                # administrator-pinned managed model / reasoning / toolsets /
+                # provider_routing still win and a non-opted profile keeps its
+                # own value. The explicit cron overrides below (per-job model,
+                # cron.model fleet default) are unchanged.
+                _cfg = build_cron_effective_config(Path(_cfg_path))
                 # Coerce null/missing to {} so a falsy default never
                 # clobbers an already-resolved env value with ``None``.
                 _model_cfg = _cfg.get("model") or {}

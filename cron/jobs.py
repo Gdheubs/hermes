@@ -1652,18 +1652,16 @@ def _resolve_default_model_snapshot() -> Optional[str]:
     or resolution fails (fail-open — caller treats ``None`` as "no snapshot").
     """
     try:
-        from hermes_cli.config import _expand_env_vars, read_user_config_raw
+        from hermes_cli.config import build_cron_effective_config
 
         cfg_path = get_hermes_home() / "config.yaml"
         if not cfg_path.exists():
             return None
-        cfg = read_user_config_raw(cfg_path)
-        try:
-            from hermes_cli import managed_scope
-            cfg = managed_scope.apply_managed_overlay(cfg)
-        except Exception:
-            pass
-        cfg = _expand_env_vars(cfg)
+        # Canonical cron effective config: raw user config + opt-in root-primary
+        # inheritance + managed overlay + env expansion (the SAME helper run_job
+        # resolves the fire-time global model through), so an opted-in unpinned
+        # job snapshots the inherited root model it will actually fire on.
+        cfg = build_cron_effective_config(cfg_path)
         # Mirror run_job's precedence: the explicit cron-fleet default
         # (cron.model) beats the global chat model for unpinned cron jobs.
         cron_cfg = cfg.get("cron") or {}

@@ -3331,7 +3331,31 @@ def _load_cfg() -> dict:
     round-trips or expanded/overlaid values get persisted into the user's
     file.
     """
-    cfg = _apply_managed(_load_cfg_raw())
+    cfg = _load_cfg_raw()
+    # Opt-in root primary-model inheritance — applied to the RAW user config
+    # BEFORE the managed overlay so an administrator-pinned managed
+    # model.default/provider still WINS over the inherited root value (canonical
+    # load_config precedence: managed > inherited root > profile-local). Read-side
+    # only; NEVER applied in _load_cfg_raw, which _save_cfg writes back —
+    # inheriting there would persist root's model into the profile file. Keyed on
+    # the active profile's OWN config path so the self-inheritance guard and
+    # $HERMES_HOME isolation hold; reads root fresh so root-only edits are
+    # observed without restart. Mirrors the gateway and canonical load_config()
+    # resolvers.
+    try:
+        from hermes_cli.config import apply_root_primary_model_inheritance
+
+        override = get_hermes_home_override()
+        home = override if isinstance(override, str) and override else _hermes_home
+        cfg = apply_root_primary_model_inheritance(
+            cfg, config_path=Path(home) / "config.yaml"
+        )
+    except Exception:
+        pass
+    # Managed overlay WINS (applied AFTER inheritance), then ${VAR} expansion —
+    # the same read-side pipeline as load_config_readonly, minus the
+    # DEFAULT_CONFIG merge (callers here treat a missing key as "unset").
+    cfg = _apply_managed(cfg)
     try:
         from hermes_cli.config import _expand_env_vars
 

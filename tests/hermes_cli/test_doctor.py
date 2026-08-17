@@ -363,6 +363,76 @@ def test_run_doctor_accepts_named_provider_from_providers_section(monkeypatch, t
     assert "model.provider 'volcengine-plan' is not a recognised provider" not in out
 
 
+def test_run_doctor_opted_in_unpinned_profile_validates_effective_not_stale_local(
+    monkeypatch, tmp_path
+):
+    """A valid opted-in profile mid-migration may keep a stale local
+    model.provider that the root config supersedes at runtime (migration-safe:
+    root wins). Doctor must diagnose the EFFECTIVE post-inheritance provider —
+    root's — and NOT falsely warn about the superseded local value the runtime
+    never uses. Scoped strictly to model.default/provider; nothing else about
+    inheritance is broadened (a non-opted profile is unaffected)."""
+    import yaml
+
+    root = tmp_path / "root"
+    profile = root / "profiles" / "coder"
+    profile.mkdir(parents=True, exist_ok=True)
+
+    # Root supplies a clean primary provider. "auto" is a recognised provider
+    # that also skips the credential/vendor-slug checks, isolating this test to
+    # the raw-vs-effective boundary.
+    (root / "config.yaml").write_text(
+        yaml.dump({"model": {"provider": "auto", "default": "root-default-model"}})
+    )
+    # Opted-in profile keeps a stale local provider that reads as unrecognised on
+    # the raw file, but root overrides it at runtime.
+    (profile / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "model": {
+                    "inherit_root_primary": True,
+                    "provider": "totally-bogus-xyz",
+                    "default": "legacy-local-model",
+                }
+            }
+        )
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(profile))  # so root resolves to <root>
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", profile)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path / "project")
+    monkeypatch.setattr(doctor_mod, "_DHH", str(profile))
+    (tmp_path / "project").mkdir(exist_ok=True)
+
+    from hermes_cli import config as cfgmod
+    cfgmod._LOAD_CONFIG_CACHE.clear()
+    cfgmod._RAW_CONFIG_CACHE.clear()
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    try:
+        from hermes_cli import auth as _auth_mod
+        monkeypatch.setattr(_auth_mod, "get_nous_auth_status_local", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_codex_auth_status", lambda: {})
+        monkeypatch.setattr(_auth_mod, "get_xai_oauth_auth_status", lambda: {})
+    except Exception:
+        pass
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+
+    out = buf.getvalue()
+    # The superseded local provider must never be validated/warned: doctor now
+    # diagnoses the effective (inherited) "auto".
+    assert "totally-bogus-xyz" not in out
+    assert "is not a recognised provider" not in out
+
+
 def test_run_doctor_accepts_stable_key_when_provider_name_differs(
     monkeypatch, tmp_path
 ):

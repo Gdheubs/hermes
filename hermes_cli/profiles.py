@@ -692,8 +692,16 @@ def _read_config_model(profile_dir: Path) -> tuple:
     try:
         # Multi-profile display read: load_config() targets the ACTIVE
         # profile's home, so read THIS profile's file via the raw primitive.
-        from hermes_cli.config import read_user_config_raw
+        from hermes_cli.config import (
+            read_user_config_raw,
+            apply_root_primary_model_inheritance,
+        )
         cfg = read_user_config_raw(config_path)
+        # Reflect opt-in primary-model inheritance so the listing shows the
+        # profile's EFFECTIVE model/provider (no-op unless this profile set
+        # model.inherit_root_primary and is a named profile). Routes the former
+        # raw bypass through the single shared resolver.
+        cfg = apply_root_primary_model_inheritance(cfg, config_path=config_path)
         model_cfg = cfg.get("model", {})
         if isinstance(model_cfg, str):
             return model_cfg, None
