@@ -984,11 +984,35 @@ def _startup_env_secret(name: str) -> str:
     secret scope verdict (scoped miss ⇒ empty, no borrowing the process
     env); only an UNSCOPED read under multiplex (default-profile startup
     loop) falls back to ``os.environ``, which is that profile's own value.
+
+    External secret sources add one more single-profile edge case: startup can
+    report that a Bitwarden profile alias was applied, while a later Matrix
+    credential read still sees an empty ``os.environ`` value during adapter
+    construction.  In non-multiplex gateways, use the per-HERMES_HOME external
+    secret snapshot as a safe fallback before declaring the credential absent.
+    Multiplex gateways remain fail-closed: a scoped miss must not borrow from a
+    process/global snapshot that might belong to another profile.
     """
     try:
-        return (get_secret(name) or "").strip()
+        val = (get_secret(name) or "").strip()
     except UnscopedSecretError:
         return os.getenv(name, "").strip()
+    if val:
+        return val
+
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        if not is_multiplex_active():
+            from hermes_cli.config import get_hermes_home
+            from hermes_cli.env_loader import get_secret_source_values
+
+            val = (get_secret_source_values(get_hermes_home()).get(name) or "").strip()
+            if val:
+                return val
+    except Exception:
+        pass
+    return ""
 
 
 def matrix_deps_present() -> bool:
