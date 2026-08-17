@@ -264,8 +264,11 @@ class TestBridgeDispatch:
             "name": "unknown_xxx",
             "arguments": {"foo": "bar"},
         })
-        # Will fail classification because unknown_xxx isn't deferrable.
-        assert err is not None
+        # resolve no longer classifies the name — the session-scoped gate at
+        # the dispatch sites rejects unknown/out-of-scope tools instead.
+        assert err is None
+        assert name == "unknown_xxx"
+        assert args == {"foo": "bar"}
 
 
     def test_resolve_underlying_call_rejects_recursion(self):
@@ -379,16 +382,21 @@ class TestRegression_OpenClawCron84141:
         # deferrable tools to put behind them.
         assert "terminal" in names
 
-    def test_unwrap_rejects_core_tool_attempt(self):
-        """Even if the model tries to invoke a core tool through tool_call,
-        we reject the call and tell the model to use it directly."""
+    def test_unwrap_passes_core_tool_through(self):
+        """A core tool routed through tool_call resolves cleanly. The old
+        behavior (hard error "not a deferrable tool") sent bridge-happy
+        models into unrecoverable retry loops — observed live with grok-4.5
+        failing 27 consecutive tool_call attempts without ever emitting a
+        direct call. The scope gate at the dispatch sites still bounds the
+        callable set to the session's own toolsets."""
         from tools.tool_search import resolve_underlying_call
-        _, _, err = resolve_underlying_call({
+        name, args, err = resolve_underlying_call({
             "name": "terminal",
             "arguments": {"command": "echo hi"},
         })
-        assert err is not None
-        assert "not a deferrable" in err
+        assert err is None
+        assert name == "terminal"
+        assert args == {"command": "echo hi"}
 
 
 class TestRegression_ToolsetScoping:
@@ -459,6 +467,87 @@ class TestRegression_ToolsetScoping:
         assert "mcp_helper_op" in names
         # core tools are never deferrable
         assert "terminal" not in names
+
+
+class TestToolCallVisibleFallthrough:
+    """tool_call on a *visible* (core) tool dispatches instead of erroring.
+
+    Bridge-happy models route visible tools through tool_call even though the
+    schema is already in the model-facing array. The bridge now falls through
+    to direct dispatch for any tool inside the session's own toolset scope;
+    out-of-scope names still hard-fail.
+    """
+
+    @staticmethod
+    def _register(name, toolset):
+        from tools.registry import registry
+
+        def _handler(args, task_id=None, **kw):
+            return json.dumps({"ok": True, "tool": name, "args": args})
+
+        registry.register(
+            name=name,
+            handler=_handler,
+            schema=_td(name, f"desc for {name}", {"repo": {"type": "string"}}),
+            toolset=toolset,
+        )
+
+    def test_tool_call_dispatches_visible_tool(self, monkeypatch):
+        import model_tools
+        import toolsets
+
+        self._register("fallthrough_core_probe", "fallthroughcore")
+        # Promote the registered tool to core so it classifies as visible.
+        monkeypatch.setattr(
+            toolsets,
+            "_HERMES_CORE_TOOLS",
+            frozenset(toolsets._HERMES_CORE_TOOLS) | {"fallthrough_core_probe"},
+        )
+
+        result = model_tools.handle_function_call(
+            function_name="tool_call",
+            function_args={
+                "name": "fallthrough_core_probe",
+                "arguments": {"repo": "hermes"},
+            },
+            enabled_toolsets=["fallthroughcore"],
+        )
+        parsed = json.loads(result)
+        assert parsed.get("ok") is True, f"expected dispatch, got: {result}"
+        assert parsed["tool"] == "fallthrough_core_probe"
+
+    def test_tool_call_still_rejects_out_of_scope(self, monkeypatch):
+        import model_tools
+        import toolsets
+
+        self._register("fallthrough_oos_probe", "fallthroughoos")
+        monkeypatch.setattr(
+            toolsets,
+            "_HERMES_CORE_TOOLS",
+            frozenset(toolsets._HERMES_CORE_TOOLS) | {"fallthrough_oos_probe"},
+        )
+
+        # Session scoped to an unrelated toolset must not reach the tool.
+        result = model_tools.handle_function_call(
+            function_name="tool_call",
+            function_args={
+                "name": "fallthrough_oos_probe",
+                "arguments": {"repo": "hermes"},
+            },
+            enabled_toolsets=["some-other-toolset"],
+        )
+        parsed = json.loads(result)
+        assert "error" in parsed
+        assert "not available in this session" in parsed["error"]
+
+    def test_tool_describe_serves_visible_tool_with_note(self):
+        from tools.tool_search import dispatch_tool_describe
+
+        defs = [_td("terminal", "run shell commands", {"command": {"type": "string"}})]
+        result = json.loads(dispatch_tool_describe({"name": "terminal"}, current_tool_defs=defs))
+        assert result["name"] == "terminal"
+        assert result["parameters"]["properties"]["command"]["type"] == "string"
+        assert "call it directly" in result.get("note", "")
 
 
 # ---------------------------------------------------------------------------

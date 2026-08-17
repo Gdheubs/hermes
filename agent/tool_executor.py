@@ -330,15 +330,17 @@ def _emit_cancelled_terminal_post_tool_call(
 
 
 def _tool_search_scoped_names(agent) -> frozenset:
-    """Return the deferrable tool names the session may invoke via tool_call.
+    """Return every tool name the session may invoke via tool_call.
 
     The Tool Search unwrap dispatches the underlying tool directly, bypassing
     the bridge branch (and its scope check) in
     ``model_tools.handle_function_call``. To keep a restricted-toolset session
     (subagent, kanban worker, curated gateway session) from reaching tools it
     was never granted, the unwrap validates the underlying name against this
-    set: the deferrable subset of the session's own enabled/disabled toolset
-    scope.
+    set: all tools (deferrable + visible) of the session's own
+    enabled/disabled toolset scope. Visible tools are included so a model
+    that wrongly routes a core tool through tool_call gets a successful
+    dispatch instead of an error loop.
 
     Result is cached on the agent and refreshed when the tool registry's
     generation changes (e.g. an MCP server reconnects), so the common case is
@@ -369,7 +371,7 @@ def _tool_search_scoped_names(agent) -> frozenset:
             quiet_mode=True,
             skip_tool_search_assembly=True,
         ) or []
-        names = _ts.scoped_deferrable_names(scoped_defs)
+        names = _ts.scoped_callable_names(scoped_defs)
     except Exception:
         names = frozenset()
     try:

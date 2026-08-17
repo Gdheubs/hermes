@@ -924,20 +924,20 @@ def dispatch_tool_describe(args: Dict[str, Any],
     name = str(args.get("name") or "").strip()
     if not name:
         return tool_error("name is required")
-    if not is_deferrable_tool_name(name):
-        return tool_error(
-            f"'{name}' is not a deferrable tool. If you see it in the tools list "
-            "already, call it directly; otherwise check the spelling against tool_search."
-        )
-    _, deferrable = classify_tools(current_tool_defs)
-    for td in deferrable:
+    for td in current_tool_defs:
         fn = td.get("function") or {}
         if fn.get("name") == name:
-            return json.dumps({
+            payload = {
                 "name": name,
                 "description": fn.get("description", ""),
                 "parameters": fn.get("parameters", {}),
-            }, ensure_ascii=False)
+            }
+            if not is_deferrable_tool_name(name):
+                payload["note"] = (
+                    "This tool is already in the model-facing tools list — "
+                    "you can call it directly."
+                )
+            return json.dumps(payload, ensure_ascii=False)
     return tool_error(
         f"'{name}' is not currently available. Re-run tool_search to refresh."
     )
@@ -959,6 +959,30 @@ def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
     for td in tool_defs:
         name = (td.get("function") or {}).get("name", "")
         if name and is_deferrable_tool_name(name):
+            names.add(name)
+    return frozenset(names)
+
+
+def scoped_callable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
+    """Return every tool name in ``tool_defs`` (visible AND deferrable).
+
+    Same input contract as :func:`scoped_deferrable_names` — the
+    *pre-assembly* tool list for the current session's toolset scope. This is
+    the universe of tools the session may reach through ``tool_call``: the
+    deferred catalog PLUS the visible (core) tools whose schemas are already
+    in the model-facing array.
+
+    Rationale: models — cheaper ones especially — routinely route visible
+    tools through ``tool_call`` anyway. Refusing those calls sends the model
+    into a retry loop it often cannot escape. Dispatching them instead is
+    always safe: the set is still bounded by the session's own
+    enabled/disabled toolsets, so the bridge grants nothing the session could
+    not already call directly.
+    """
+    names: set[str] = set()
+    for td in tool_defs:
+        name = (td.get("function") or {}).get("name", "")
+        if name and name not in BRIDGE_TOOL_NAMES:
             names.add(name)
     return frozenset(names)
 
@@ -1041,11 +1065,12 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
             return None, {}, f"tool_call 'arguments' is not valid JSON: {e}"
     if not isinstance(raw_args, dict):
         return None, {}, "tool_call 'arguments' must be an object"
-    if not is_deferrable_tool_name(name):
-        return None, {}, (
-            f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
-            "list already, call it directly instead of via tool_call."
-        )
+    # No deferrable-only gate here: visible (core) tools resolve too, and the
+    # dispatch sites decide via the session-scoped callable set. Refusing a
+    # visible tool at parse time ("not a deferrable tool") turned one wrong
+    # routing choice into an unrecoverable retry loop for models that keep
+    # routing through the bridge (observed live: grok-4.5 failing 27
+    # consecutive tool_call attempts without ever emitting a direct call).
     return name, raw_args, None
 
 
@@ -1074,5 +1099,6 @@ __all__ = [
     "dispatch_tool_describe",
     "resolve_underlying_call",
     "scoped_deferrable_names",
+    "scoped_callable_names",
     "validate_deferred_call_args",
 ]

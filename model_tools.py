@@ -1307,13 +1307,13 @@ def handle_function_call(
                     tool_error(err or "tool_call could not be resolved")
                 )
             # Defense in depth: the underlying tool MUST be in the session's
-            # scoped deferrable catalog. resolve_underlying_call() only checks
-            # that the name is deferrable in the global registry; this gate
-            # additionally rejects any tool the session was not granted, so a
-            # restricted session can never invoke an out-of-scope tool through
-            # the bridge even if the catalog scoping above regressed.
-            _scoped_deferrable = _ts_mod.scoped_deferrable_names(current_defs)
-            if underlying_name not in _scoped_deferrable:
+            # scoped callable set (deferred catalog + visible core tools).
+            # resolve_underlying_call() no longer classifies the name, so this
+            # gate is the only barrier: it rejects any tool the session was
+            # not granted, while letting visible tools fall through to direct
+            # dispatch instead of erroring (see scoped_callable_names).
+            _scoped_callable = _ts_mod.scoped_callable_names(current_defs)
+            if underlying_name not in _scoped_callable:
                 return _return_bridge_result(
                     tool_error(
                         f"'{underlying_name}' is not available in this session. "
