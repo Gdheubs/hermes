@@ -10,6 +10,7 @@ import {
   Archive,
   BarChart3,
   Bell,
+  Cpu,
   Download,
   Globe,
   Info,
@@ -25,6 +26,7 @@ import {
 } from '@/lib/icons'
 import { notifyError } from '@/store/notifications'
 
+import { FederationDevicesOverlay } from '../federation/federation-devices-overlay'
 import { useRouteEnumParam } from '../hooks/use-route-enum-param'
 import { OverlayIconButton } from '../overlays/overlay-chrome'
 import { OverlayMain, OverlayNav, type OverlayNavGroup, OverlaySplitLayout } from '../overlays/overlay-split-layout'
@@ -56,6 +58,7 @@ const SETTINGS_VIEWS: readonly SettingsViewId[] = [
   'notifications',
   'billing',
   'plugins',
+  'federation',
   'sessions',
   'about'
 ]
@@ -254,6 +257,13 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
         onSelect: () => setActiveView('plugins')
       },
       {
+        active: activeView === 'federation',
+        icon: Cpu,
+        id: 'federation',
+        label: 'Federation',
+        onSelect: () => setActiveView('federation')
+      },
+      {
         active: activeView === 'sessions',
         icon: Archive,
         id: 'sessions',
@@ -342,6 +352,8 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
             <BillingSettings />
           ) : activeView === 'plugins' ? (
             <PluginsSettings />
+          ) : activeView === 'federation' ? (
+            <FederationDevicesOverlay />
           ) : (
             <SessionsSettings />
           )}
