@@ -8734,13 +8734,13 @@ def _windows_running_hermes_launcher_locked() -> bool:
 def _default_venv_install_target() -> tuple[list[str], dict[str, str] | None]:
     """Return ``(install_cmd_prefix, env)`` for the project venv when possible."""
     try:
-        from hermes_cli.managed_uv import ensure_uv
+        from hermes_cli.managed_uv import _default_live_venv, ensure_uv
 
         uv_bin = ensure_uv()
     except Exception:
         uv_bin = None
     if uv_bin:
-        env = {**os.environ, "VIRTUAL_ENV": str(PROJECT_ROOT / "venv")}
+        env = {**os.environ, "VIRTUAL_ENV": str(_default_live_venv(PROJECT_ROOT))}
         if _is_termux_env(env):
             env.pop("PYTHONPATH", None)
             env.pop("PYTHONHOME", None)
