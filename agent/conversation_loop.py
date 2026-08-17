@@ -1303,29 +1303,12 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
     return f"Tool '{name}' does not exist. Available tools: {available}"
 
 
-def _content_policy_blocked_result(
-    messages: List[Dict],
-    api_call_count: int,
-    *,
-    final_response: str,
-    error_detail: str,
-) -> Dict[str, Any]:
-    """Build the terminal turn result for a content-policy block.
-
-    A content-policy refusal is deterministic for the unchanged prompt, so the
-    turn ends here (no retry). Both the HTTP-200 refusal handler and the
-    exception-path handler return the identical shape — a failed, non-completed
-    turn carrying the user-facing message and a ``content_policy_blocked:``
-    prefixed error — so they funnel through this one builder.
-    """
-    return {
-        "final_response": final_response,
-        "messages": messages,
-        "api_calls": api_call_count,
-        "completed": False,
-        "failed": True,
-        "error": f"content_policy_blocked: {error_detail}",
-    }
+# R1 slice: ``_content_policy_blocked_result`` extracted byte-verbatim to
+# ``agent/content_policy_blocked_result.py`` (pure dict-builder, typing-only
+# deps). This forwarder is a real module-level binding — object identity with
+# the extracted module — so module-object patch consumers
+# (``agent.conversation_loop._content_policy_blocked_result``) keep working.
+from agent.content_policy_blocked_result import _content_policy_blocked_result
 
 
 def _compression_deferred_result(
