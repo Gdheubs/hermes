@@ -1052,43 +1052,79 @@ async def web_extract_tool(
         return tool_error(error_msg)
 
 
-# Convenience function to check Firecrawl credentials
-def check_web_api_key() -> bool:
-    """Check whether the configured web backend is available.
+# Built-in capability map used only as a fallback when plugin discovery is
+# unavailable. The registered provider remains authoritative in normal runs.
+_LEGACY_SEARCH_BACKENDS = _LEGACY_WEB_BACKENDS
+_LEGACY_EXTRACT_BACKENDS = frozenset({"parallel", "firecrawl", "tavily", "exa"})
 
-    Used as the ``check_fn`` gate for the ``web_search`` and ``web_extract``
-    tool registry entries — so a plugin-registered provider that reports
-    ``is_available()`` must light the tools up even when no built-in backend
-    has credentials (issues #28651, #31873). Resolution funnels through
-    :func:`_is_backend_available`, which delegates non-legacy names to the
-    registry.
+
+def _check_web_capability(capability: str) -> bool:
+    """Return whether the selected backend can service *capability* now.
+
+    Availability and capability are separate facts: DDGS, Brave, SearXNG,
+    and xAI can search but cannot extract arbitrary URLs. A shared boolean
+    gate used to advertise both tools whenever either fact was true, so a
+    DDGS-only install exposed a guaranteed-to-fail ``web_extract`` tool.
     """
-    # ``or ""``: a null ``web.backend`` value yields None from ``.get``, and
-    # ``None.lower()`` would raise. Mirrors ``_get_backend``.
-    configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured and _is_backend_available(configured):
-        return True
-    # Any built-in backend with credentials present. This is a boolean OR, so
-    # unlike _get_backend() the probe order is irrelevant.
-    if any(_is_backend_available(backend) for backend in _LEGACY_WEB_BACKENDS):
-        return True
-    # Any plugin-registered provider the registry considers active for either
-    # capability. Delegating to the registry's own availability-filtered
-    # resolvers keeps a single authority for "is a custom provider usable"
-    # rather than re-implementing the walk here.
-    try:
-        from agent.web_search_registry import (
-            get_active_search_provider,
-            get_active_extract_provider,
-        )
-
-        return (
-            get_active_search_provider() is not None
-            or get_active_extract_provider() is not None
-        )
-    except Exception as exc:  # noqa: BLE001 — registry optional; never fatal
-        logger.debug("web provider registry availability check failed: %s", exc)
+    if capability not in {"search", "extract"}:
         return False
+
+    _ensure_web_plugins_loaded()
+    backend = (
+        _get_search_backend() if capability == "search" else _get_extract_backend()
+    )
+    provider = _registered_web_provider(backend)
+    if provider is not None:
+        try:
+            supports = (
+                provider.supports_search()
+                if capability == "search"
+                else provider.supports_extract()
+            )
+            # Legacy providers share the established config-aware probes in
+            # this module (including test seams and OAuth-aware xAI checks).
+            # Custom providers own their availability contract directly.
+            available = (
+                _is_backend_available(backend)
+                if backend in _LEGACY_WEB_BACKENDS
+                else provider.is_available()
+            )
+            return bool(supports and available)
+        except Exception as exc:  # noqa: BLE001 — a broken provider is unavailable
+            logger.debug(
+                "web provider %r %s capability check failed: %s",
+                backend,
+                capability,
+                exc,
+            )
+            return False
+
+    capable_backends = (
+        _LEGACY_SEARCH_BACKENDS
+        if capability == "search"
+        else _LEGACY_EXTRACT_BACKENDS
+    )
+    return backend in capable_backends and _is_backend_available(backend)
+
+
+def check_web_search_available() -> bool:
+    """Check whether ``web_search`` has an available search provider."""
+    return _check_web_capability("search")
+
+
+def check_web_extract_available() -> bool:
+    """Check whether ``web_extract`` has an available extract provider."""
+    return _check_web_capability("extract")
+
+
+def check_web_api_key() -> bool:
+    """Backward-compatible aggregate web availability check.
+
+    New tool registry entries use the capability-specific checks above.
+    Existing callers that only need to know whether *any* web API is usable
+    retain the historical boolean-OR behavior.
+    """
+    return check_web_search_available() or check_web_extract_available()
 
 
 if __name__ == "__main__":
@@ -1222,7 +1258,7 @@ registry.register(
     toolset="web",
     schema=WEB_SEARCH_SCHEMA,
     handler=lambda args, **kw: web_search_tool(args.get("query", ""), limit=args.get("limit", 5)),
-    check_fn=check_web_api_key,
+    check_fn=check_web_search_available,
     requires_env=_web_requires_env(),
     emoji="🔍",
     max_result_size_chars=100_000,
@@ -1236,7 +1272,7 @@ registry.register(
         "markdown",
         char_limit=args.get("char_limit"),
     ),
-    check_fn=check_web_api_key,
+    check_fn=check_web_extract_available,
     requires_env=_web_requires_env(),
     is_async=True,
     emoji="📄",

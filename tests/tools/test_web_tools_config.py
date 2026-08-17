@@ -550,17 +550,23 @@ class TestNonBuiltinProviderAvailability:
             assert _get_extract_backend() == "fake-plugin-prov"
 
     def test_tool_registry_entries_not_filtered_out(self):
-        """web_search and web_extract tool entries must remain in the
-        registry when only a custom provider is available."""
+        """A custom provider exposes every capability it implements."""
         with patch("tools.web_tools._ddgs_package_importable", return_value=False), \
              patch("tools.web_tools._peek_nous_access_token", return_value=None):
             import tools.web_tools
-            web_search_entry = tools.web_tools.registry.get_entry("web_search")
-            web_extract_entry = tools.web_tools.registry.get_entry("web_extract")
-            assert web_search_entry is not None, \
-                "web_search tool was filtered out despite custom provider being available"
-            assert web_extract_entry is not None, \
-                "web_extract tool was filtered out despite custom provider being available"
+            assert tools.web_tools.check_web_search_available() is True
+            assert tools.web_tools.check_web_extract_available() is True
+
+    def test_custom_search_only_provider_does_not_expose_extract(self):
+        from agent.web_search_registry import _reset_for_tests, register_provider
+        from tools import web_tools
+
+        _reset_for_tests()
+        register_provider(self._create_fake_provider(search=True, extract=False))
+        with patch("tools.web_tools._ddgs_package_importable", return_value=False), \
+             patch("tools.web_tools._peek_nous_access_token", return_value=None):
+            assert web_tools.check_web_search_available() is True
+            assert web_tools.check_web_extract_available() is False
 
 
 class TestFirecrawlEnvResolution:

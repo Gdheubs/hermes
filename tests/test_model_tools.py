@@ -362,6 +362,42 @@ class TestLegacyToolsetMap:
             assert name in _LEGACY_TOOLSET_MAP, f"Missing legacy toolset: {name}"
 
 
+class TestBrowserWebCapabilityDescription:
+    def test_search_only_toolset_removes_web_extract_references(self, monkeypatch):
+        from model_tools import _compute_tool_definitions
+
+        browser_schema = {
+            "type": "function",
+            "function": {
+                "name": "browser_navigate",
+                "description": (
+                    "Navigate. For simple information retrieval, prefer web_search or "
+                    "web_extract (faster, cheaper). For plain text prefer curl via the "
+                    "terminal tool or web_extract."
+                ),
+            },
+        }
+        search_schema = {
+            "type": "function",
+            "function": {"name": "web_search", "description": "Search."},
+        }
+        monkeypatch.setattr(
+            "model_tools.registry.get_definitions",
+            lambda names, quiet=False: [browser_schema, search_schema],
+        )
+
+        definitions = _compute_tool_definitions(
+            enabled_toolsets=["browser_tools", "web_tools"], quiet_mode=True
+        )
+        browser = next(
+            item["function"]
+            for item in definitions
+            if item["function"]["name"] == "browser_navigate"
+        )
+        assert "prefer web_search (faster, cheaper)" in browser["description"]
+        assert "web_extract" not in browser["description"]
+
+
 
 # =========================================================================
 # Backward-compat wrappers

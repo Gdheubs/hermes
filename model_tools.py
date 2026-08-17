@@ -557,20 +557,36 @@ def _compute_tool_definitions(
                         filtered_tools[i] = {"type": "function", "function": dynamic}
                         break
 
-    # Strip web tool cross-references from browser_navigate description when
-    # web_search / web_extract are not available.  The static schema says
-    # "prefer web_search or web_extract" which causes the model to hallucinate
-    # those tools when they're missing.
+    # Keep browser_navigate's web-tool references aligned with the tools that
+    # actually passed their capability checks. Search-only providers such as
+    # DDGS must not leave a tempting but guaranteed-to-fail web_extract hint.
     if "browser_navigate" in available_tool_names:
         web_tools_available = {"web_search", "web_extract"} & available_tool_names
-        if not web_tools_available:
+        if web_tools_available != {"web_search", "web_extract"}:
             for i, td in enumerate(filtered_tools):
                 if td.get("function", {}).get("name") == "browser_navigate":
                     desc = td["function"].get("description", "")
-                    desc = desc.replace(
-                        " For simple information retrieval, prefer web_search or web_extract (faster, cheaper).",
-                        "",
-                    )
+                    if web_tools_available == {"web_search"}:
+                        desc = desc.replace(
+                            "prefer web_search or web_extract (faster, cheaper)",
+                            "prefer web_search (faster, cheaper)",
+                        ).replace(
+                            "curl via the terminal tool or web_extract",
+                            "curl via the terminal tool",
+                        )
+                    elif web_tools_available == {"web_extract"}:
+                        desc = desc.replace(
+                            "prefer web_search or web_extract (faster, cheaper)",
+                            "prefer web_extract (faster, cheaper)",
+                        )
+                    else:
+                        desc = desc.replace(
+                            " For simple information retrieval, prefer web_search or web_extract (faster, cheaper).",
+                            "",
+                        ).replace(
+                            "curl via the terminal tool or web_extract",
+                            "curl via the terminal tool",
+                        )
                     filtered_tools[i] = {
                         "type": "function",
                         "function": {**td["function"], "description": desc},

@@ -255,6 +255,24 @@ class TestDDGSBackendWiring:
         monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: True)
         assert web_tools.check_web_api_key() is True
 
+    def test_ddgs_advertises_search_but_not_extract(self, monkeypatch):
+        from tools import web_tools
+        from tools.registry import invalidate_check_fn_cache
+
+        monkeypatch.setattr(
+            web_tools, "_load_web_config", lambda: {"search_backend": "ddgs"}
+        )
+        monkeypatch.setattr(web_tools, "_ddgs_package_importable", lambda: True)
+        assert web_tools.check_web_search_available() is True
+        assert web_tools.check_web_extract_available() is False
+
+        invalidate_check_fn_cache()
+        definitions = web_tools.registry.get_definitions(
+            {"web_search", "web_extract"}, quiet=True
+        )
+        names = {item["function"]["name"] for item in definitions}
+        assert names == {"web_search"}
+
 
 # ---------------------------------------------------------------------------
 # ddgs is search-only: web_extract returns a clear error
