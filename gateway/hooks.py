@@ -64,9 +64,18 @@ def event_hooks_enabled() -> bool:
     try:
         from hermes_cli.config import cfg_get, load_config_readonly
         config = load_config_readonly()
-        return bool(cfg_get(config, "gateway", "event_hooks_enabled", default=False))
+        raw = cfg_get(config, "gateway", "event_hooks_enabled", default=False)
     except Exception:
         return False
+    # F2/P2 (Purple round 2): strict coercion. ``bool("false")`` is True —
+    # a quoted config value (editor save, hand edit) must NOT open a gate
+    # that guards importlib-exec of arbitrary hook Python. Only an explicit
+    # true value enables discovery; everything else fails closed.
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return False
 
 
 class HookRegistry:

@@ -116,6 +116,36 @@ class TestEventHooksGate:
         monkeypatch.setattr("hermes_cli.config.load_config_readonly", _boom)
         assert hooks.event_hooks_enabled() is False
 
+    def test_event_hooks_enabled_quoted_false_is_closed(self, monkeypatch):
+        """F2/P2: a QUOTED string ``"false"`` must NOT open the gate —
+        ``bool("false")`` is True, which would enable arbitrary hook
+        execution on a mis-saved config value."""
+        from gateway import hooks
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"gateway": {"event_hooks_enabled": "false"}},
+        )
+        assert hooks.event_hooks_enabled() is False
+
+    def test_event_hooks_enabled_quoted_true_opens(self, monkeypatch):
+        """F2/P2 control: a quoted ``"true"`` is parsed as true."""
+        from gateway import hooks
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"gateway": {"event_hooks_enabled": "true"}},
+        )
+        assert hooks.event_hooks_enabled() is True
+
+    def test_event_hooks_enabled_non_bool_value_is_closed(self, monkeypatch):
+        """F2/P2: any non-bool, non-parseable value (int, junk) fails closed."""
+        from gateway import hooks
+        for bad in (1, "maybe", None, ["yes"]):
+            monkeypatch.setattr(
+                "hermes_cli.config.load_config_readonly",
+                lambda b=bad: {"gateway": {"event_hooks_enabled": b}},
+            )
+            assert hooks.event_hooks_enabled() is False, bad
+
 
 class TestEmit:
 
