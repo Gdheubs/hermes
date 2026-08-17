@@ -923,16 +923,51 @@ def _bash_starts(bash: str) -> bool:
         return cached
 
     try:
-        result = subprocess.run(
+        # stdin=DEVNULL mirrors _run_bash: the probe must not inherit the
+        # process's own stdin (under ACP/gateway embedding that's a JSON-RPC
+        # pipe, not a console).
+        proc = subprocess.Popen(
             [bash, "--noprofile", "--norc", "-c", _BASH_EXTERNAL_PROGRAM_PROBE],
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace",
-            timeout=15,
             creationflags=windows_hide_flags() if _IS_WINDOWS else 0,
         )
-        ok = result.returncode == 0
+        try:
+            stdout, stderr = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            # Git-for-Windows ``bin\bash.exe`` is a shim that spawns
+            # ``usr\bin\bash.exe``.  ``proc.kill()`` would kill only the shim;
+            # the orphaned real bash keeps the pipe write ends open, and the
+            # follow-up ``communicate()`` (required on Windows to reap the
+            # reader threads) then blocks forever — wedging environment
+            # creation for the life of the process.  Kill the whole tree so
+            # the pipes hit EOF and the probe fails cleanly instead.
+            if _IS_WINDOWS:
+                subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                    capture_output=True,
+                    timeout=10,
+                    creationflags=windows_hide_flags(),
+                )
+            else:
+                proc.kill()
+            try:
+                proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                # An orphaned MSYS fork child (parent bash died mid-fork) is
+                # not reachable via taskkill /T on the shim's tree and keeps
+                # the pipe write ends open.  Abandon the pipes — the reader
+                # threads are daemons — rather than wedge forever.
+                pass
+            _bash_probe_details_cache[bash] = "external-program probe timed out after 15s"
+            logger.debug("bash probe timed out for %s", bash)
+            _bash_starts_cache[bash] = False
+            return False
+        ok = proc.returncode == 0
         if not ok:
-            combined = f"{result.stdout or ''}{result.stderr or ''}"
+            combined = f"{stdout or ''}{stderr or ''}"
             _bash_probe_details_cache[bash] = combined.strip()[:2000]
             logger.debug("bash probe failed for %s: %s", bash, combined.strip()[:200])
     except Exception as exc:
