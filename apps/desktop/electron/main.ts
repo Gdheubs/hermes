@@ -183,7 +183,7 @@ import {
   writeSecretFileAtomic
 } from './hardening'
 import { cursorPointInWindow } from './hud-cursor'
-import { defaultHudBounds } from './hud-geometry'
+import { applyHudResetBounds, defaultHudBounds } from './hud-geometry'
 import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
@@ -11671,18 +11671,10 @@ ipcMain.handle('hermes:hud:reset-layout', async event => {
   const win = hudWindow
   const display = screen.getDisplayNearestPoint(screen.getCursorScreenPoint())
   const bounds = defaultHudBounds(display?.workArea)
-  const wasResizable = win.isResizable()
 
-  if (!wasResizable) {
-    win.setResizable(true)
-  }
-
-  try {
-    win.setBounds(bounds)
-  } finally {
-    if (!wasResizable && !win.isDestroyed()) {
-      win.setResizable(false)
-    }
+  if (!applyHudResetBounds(win, bounds)) {
+    rememberLog('[hud] reset layout failed while applying window bounds')
+    return { ok: false }
   }
 
   // Write synchronously so closing immediately after Reset cannot restore the

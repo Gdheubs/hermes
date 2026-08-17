@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { defaultHudBounds } from './hud-geometry'
+import { applyHudResetBounds, defaultHudBounds } from './hud-geometry'
 
 test('defaultHudBounds restores the standard centered bottom layout', () => {
   assert.deepEqual(defaultHudBounds({ x: 0, y: 25, width: 1440, height: 875 }), {
@@ -24,4 +24,21 @@ test('defaultHudBounds fits the default layout to a small work area', () => {
 
 test('defaultHudBounds keeps the spawn fallback when no display is available', () => {
   assert.deepEqual(defaultHudBounds(), { x: undefined, y: undefined, width: 620, height: 320 })
+})
+
+test('applyHudResetBounds restores the resize lock and reports native failure', () => {
+  let resizable = false
+  const win = {
+    isDestroyed: () => false,
+    isResizable: () => resizable,
+    setResizable: (value: boolean) => {
+      resizable = value
+    },
+    setBounds: () => {
+      throw new Error('window disappeared')
+    }
+  }
+
+  assert.equal(applyHudResetBounds(win, { x: 0, y: 0, width: 620, height: 320 }), false)
+  assert.equal(resizable, false)
 })

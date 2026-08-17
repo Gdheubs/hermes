@@ -30,3 +30,36 @@ export function defaultHudBounds(area?: HudWorkArea): {
     y: Math.round(Math.max(area.y, area.y + area.height - height - HUD_BOTTOM_MARGIN))
   }
 }
+
+export interface HudBoundsWindow {
+  isDestroyed(): boolean
+  isResizable(): boolean
+  setBounds(bounds: { height: number; width: number; x?: number; y?: number }): void
+  setResizable(resizable: boolean): void
+}
+
+/** Apply recovery bounds and convert native-window failures into a result. */
+export function applyHudResetBounds(
+  win: HudBoundsWindow,
+  bounds: { height: number; width: number; x?: number; y?: number }
+): boolean {
+  try {
+    const wasResizable = win.isResizable()
+
+    if (!wasResizable) {
+      win.setResizable(true)
+    }
+
+    try {
+      win.setBounds(bounds)
+    } finally {
+      if (!wasResizable && !win.isDestroyed()) {
+        win.setResizable(false)
+      }
+    }
+
+    return true
+  } catch {
+    return false
+  }
+}
