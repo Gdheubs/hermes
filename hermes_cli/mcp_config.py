@@ -984,35 +984,143 @@ def cmd_mcp_reauth(args):
 
 # ─── hermes mcp configure ────────────────────────────────────────────────────
 
-def cmd_mcp_configure(args):
-    """Reconfigure which tools are enabled for an existing MCP server."""
+def _clear_mcp_tool_name_filters(server_entry: dict) -> bool:
+    """Enable every server tool while preserving capability settings.
+
+    Removes only the ``include``/``exclude`` name filters from a server
+    entry's ``tools`` dict — or the whole ``tools`` key when it holds
+    nothing else (or is a legacy plain list). Independent capability
+    toggles such as ``tools.prompts`` / ``tools.resources`` are left
+    untouched.
+
+    Returns True when a name filter was actually removed, False when there
+    was no filter to clear.
+    """
+    tools_config = server_entry.get("tools")
+    if not isinstance(tools_config, dict):
+        changed = "tools" in server_entry
+        server_entry.pop("tools", None)
+        return changed
+
+    changed = "include" in tools_config or "exclude" in tools_config
+    tools_config.pop("include", None)
+    tools_config.pop("exclude", None)
+    if not tools_config:
+        server_entry.pop("tools", None)
+    return changed
+
+
+def _configure_fail(message: str, code: int, *, json_mode: bool) -> None:
+    """Report a ``hermes mcp configure`` failure and exit non-zero.
+
+    In ``--json`` mode the error is a machine-readable object on stderr so
+    scripts can parse it; otherwise it matches the plain "Error: ..." style.
+    """
+    import json as _json
     import sys as _sys
-    if not _sys.stdin.isatty():
+
+    if json_mode:
+        print(_json.dumps({"ok": False, "error": message}), file=_sys.stderr)
+    else:
+        print(f"Error: {message}", file=_sys.stderr)
+    _sys.exit(code)
+
+
+def cmd_mcp_configure(args):
+    """Reconfigure which tools are enabled for an existing MCP server.
+
+    Interactive (flagless) use opens the curses checklist and still requires
+    a terminal. ``--tools a,b,c`` and ``--all`` provide a scriptable path:
+    they skip the picker and the TTY gate, fail loudly (nonzero exit) on
+    unknown tools / unreachable servers / empty input instead of silently
+    no-op'ing, and can emit a machine-readable result with ``--json``.
+    """
+    import json as _json
+    import sys as _sys
+
+    requested_tools = getattr(args, "tools", None)
+    select_all = bool(getattr(args, "all", False))
+    json_mode = bool(getattr(args, "json", False))
+    flag_selection = requested_tools is not None or select_all
+
+    if requested_tools is not None and select_all:
+        _configure_fail(
+            "--tools and --all cannot be used together.", 2, json_mode=json_mode
+        )
+    if json_mode and not flag_selection:
+        _configure_fail("--json requires --tools or --all.", 2, json_mode=json_mode)
+
+    requested_names: List[str] = []
+    if requested_tools is not None:
+        requested_names = list(dict.fromkeys(
+            part.strip() for part in requested_tools.split(",") if part.strip()
+        ))
+        if not requested_names:
+            _configure_fail(
+                "--tools requires at least one tool name.", 2, json_mode=json_mode
+            )
+
+    # The TTY gate only guards the curses picker: any explicit selection is
+    # fully deterministic and safe under a pipe.
+    if not flag_selection and not _sys.stdin.isatty():
         print("Error: 'hermes mcp configure' requires an interactive terminal.", file=_sys.stderr)
         _sys.exit(1)
     name = args.name
     servers = _get_mcp_servers()
 
     if name not in servers:
-        _error(f"Server '{name}' not found in config.")
+        message = f"Server '{name}' not found in config."
+        if flag_selection:
+            _configure_fail(message, 1, json_mode=json_mode)
+        _error(message)
         available = list(servers.keys())
         if available:
             _info(f"Available: {', '.join(available)}")
         return
 
+    # `--all` is a pure config operation: clearing the include/exclude name
+    # filters enables every tool without reaching the server, so it works
+    # offline and never blocks on tool discovery.
+    if select_all:
+        config = load_config()
+        server_entry = cfg_get(config, "mcp_servers", name, default={})
+        if not _clear_mcp_tool_name_filters(server_entry):
+            if json_mode:
+                print(_json.dumps({"ok": True, "action": "no_changes", "server": name}))
+            else:
+                _info("No changes made.")
+            return
+
+        config.setdefault("mcp_servers", {})[name] = server_entry
+        save_config(config)
+        if json_mode:
+            print(_json.dumps({"ok": True, "action": "enable_all", "server": name}))
+        else:
+            _success("Updated config: all tools enabled")
+            _info("Start a new session for changes to take effect.")
+        return
+
     cfg = servers[name]
 
     # Discover all available tools
-    print()
-    print(color(f"  Connecting to '{name}' to discover tools...", Colors.CYAN))
+    if not json_mode:
+        print()
+        print(color(f"  Connecting to '{name}' to discover tools...", Colors.CYAN))
 
     try:
         all_tools = _probe_single_server(name, cfg)
     except Exception as exc:
-        _error(f"Failed to connect: {exc}")
+        message = f"Failed to connect: {exc}"
+        if flag_selection:
+            _configure_fail(message, 1, json_mode=json_mode)
+        _error(message)
         return
 
     if not all_tools:
+        if flag_selection:
+            _configure_fail(
+                f"Server '{name}' reports no tools.", 1, json_mode=json_mode
+            )
         _warning("Server reports no tools.")
         return
 
@@ -1052,22 +1160,48 @@ def cmd_mcp_configure(args):
 
     currently = len(pre_selected)
     total = len(all_tools)
-    _info(f"Currently {currently}/{total} tools enabled for '{name}'.")
-    print()
+    if not json_mode:
+        _info(f"Currently {currently}/{total} tools enabled for '{name}'.")
+        print()
 
-    # Interactive checklist
-    from hermes_cli.curses_ui import curses_checklist
+    if requested_tools is not None:
+        available_names = set(tool_names)
+        unknown = [tn for tn in requested_names if tn not in available_names]
+        if unknown:
+            message = f"Unknown tool(s) for '{name}': {', '.join(unknown)}"
+            if json_mode:
+                message += f" (available: {', '.join(tool_names)})"
+            else:
+                print(f"  Available tools: {', '.join(tool_names)}", file=_sys.stderr)
+            _configure_fail(message, 1, json_mode=json_mode)
+        requested_name_set = set(requested_names)
+        chosen = {
+            i for i, tn in enumerate(tool_names) if tn in requested_name_set
+        }
+    else:
+        # Interactive checklist — only reachable through the TTY gate above,
+        # so the curses picker never runs under a pipe.
+        from hermes_cli.curses_ui import curses_checklist
 
-    labels = [f"{t[0]}  —  {t[1]}" for t in all_tools]
-
-    chosen = curses_checklist(
-        f"Select tools for '{name}'",
-        labels,
-        pre_selected,
-    )
+        labels = [f"{t[0]}  —  {t[1]}" for t in all_tools]
+        chosen = curses_checklist(
+            f"Select tools for '{name}'",
+            labels,
+            pre_selected,
+        )
 
     if chosen == pre_selected:
-        _info("No changes made.")
+        if json_mode:
+            print(_json.dumps({
+                "ok": True,
+                "action": "no_changes",
+                "server": name,
+                "tools": [tool_names[i] for i in sorted(chosen)],
+                "enabled": len(chosen),
+                "total": total,
+            }))
+        else:
+            _info("No changes made.")
         return
 
     # Update config
@@ -1075,11 +1209,16 @@ def cmd_mcp_configure(args):
     server_entry = cfg_get(config, "mcp_servers", name, default={})
 
     if len(chosen) == total:
-        # All selected → remove include/exclude (register all)
-        server_entry.pop("tools", None)
+        # All selected → clear the name filters (register all), preserving
+        # independent capability toggles (tools.prompts / tools.resources).
+        _clear_mcp_tool_name_filters(server_entry)
+        chosen_names = list(tool_names)
     else:
         chosen_names = [tool_names[i] for i in sorted(chosen)]
-        server_entry.setdefault("tools", {})
+        # Normalize a legacy plain-list or missing ``tools`` entry into a dict
+        # so the include filter can be written (update-in-place otherwise).
+        if not isinstance(server_entry.get("tools"), dict):
+            server_entry["tools"] = {}
         server_entry["tools"]["include"] = chosen_names
         server_entry["tools"].pop("exclude", None)
 
@@ -1087,8 +1226,18 @@ def cmd_mcp_configure(args):
     save_config(config)
 
     new_count = len(chosen)
-    _success(f"Updated config: {new_count}/{total} tools enabled")
-    _info("Start a new session for changes to take effect.")
+    if json_mode:
+        print(_json.dumps({
+            "ok": True,
+            "action": "set_tools",
+            "server": name,
+            "tools": chosen_names,
+            "enabled": new_count,
+            "total": total,
+        }))
+    else:
+        _success(f"Updated config: {new_count}/{total} tools enabled")
+        _info("Start a new session for changes to take effect.")
 
 
 # ─── Dispatcher ───────────────────────────────────────────────────────────────

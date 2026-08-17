@@ -84,6 +84,25 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
         "configure", aliases=["config"], help="Toggle tool selection"
     )
     mcp_cfg_p.add_argument("name", help="Server name to configure")
+    mcp_cfg_selection = mcp_cfg_p.add_mutually_exclusive_group()
+    mcp_cfg_selection.add_argument(
+        "--tools",
+        metavar="NAME[,NAME...]",
+        help=(
+            "Enable a comma-separated list of tools without opening the "
+            "picker (non-interactive; unknown names are an error)"
+        ),
+    )
+    mcp_cfg_selection.add_argument(
+        "--all",
+        action="store_true",
+        help="Enable every tool without opening the picker (works offline)",
+    )
+    mcp_cfg_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a machine-readable JSON result (requires --tools or --all)",
+    )
 
     mcp_login_p = mcp_sub.add_parser(
         "login",
