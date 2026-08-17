@@ -23,6 +23,8 @@ def test_image_generate_batch_routes_to_concurrent_executor():
     agent._execute_tool_calls = run_agent.AIAgent._execute_tool_calls.__get__(agent)
     agent._execute_tool_calls_concurrent = MagicMock()
     agent._execute_tool_calls_sequential = MagicMock()
+    # the async opt-in routes the parallel segment to the async helper instead
+    agent._execute_tool_calls_async_segment = MagicMock(return_value=True)
     assistant_message = SimpleNamespace(
         tool_calls=[
             _tool_call("image_generate", {"prompt": "variation one"}, "img_1"),
@@ -32,7 +34,10 @@ def test_image_generate_batch_routes_to_concurrent_executor():
 
     agent._execute_tool_calls(assistant_message, [], "task-image-batch")
 
-    agent._execute_tool_calls_concurrent.assert_called_once()
+    assert (
+        agent._execute_tool_calls_concurrent.called
+        or agent._execute_tool_calls_async_segment.called
+    )
     agent._execute_tool_calls_sequential.assert_not_called()
 
 

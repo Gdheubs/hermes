@@ -2708,24 +2708,28 @@ async def _wait_with_interrupt(agent, futures, timeout_s):
     while True:
         remaining = deadline - loop.time()
         if remaining <= 0:
-            return await asyncio.wait(futures, timeout=0)
+            _done, _pending = await asyncio.wait(futures, timeout=0)
+            return _done, _pending, False
         done, pending = await asyncio.wait(futures, timeout=min(remaining, 0.05))
         if getattr(agent, "_interrupt_requested", False):
-            return done, pending
+            return done, pending, True
         if not pending:
-            return done, pending
+            return done, pending, False
 
 
-async def _execute_tool_batch_async(agent, runnable_calls, timeout_s):
+async def _execute_tool_batch_async(agent, runnable_calls, timeout_s, **kwargs):
     """Async batch dispatch with the full sync worker contract: real daemon
     threads, tid tracking, per-tid interrupt reset, loop-time gate timeout,
     mid-batch interrupt drain, dynamic worker cap."""
     import asyncio
     from tools.daemon_pool import DaemonThreadPoolExecutor
 
+    if not runnable_calls:
+        return []
     executor = DaemonThreadPoolExecutor(
         max_workers=_max_workers_for_tool_batch(runnable_calls)
     )
+    messages = kwargs.pop("_messages", None)
     worker_tids: list[int] = []
     # A shared authorization gate for the batch (the sync concurrent path's
     # contract: the gate coordinates the auth-gated calls across the batch).
@@ -2762,7 +2766,7 @@ async def _execute_tool_batch_async(agent, runnable_calls, timeout_s):
             loop.run_in_executor(executor, propagate_context_to_thread(_run), c)
             for c in runnable_calls
         ]
-        done, pending = await _wait_with_interrupt(agent, futures, timeout_s)
+        done, pending, interrupted = await _wait_with_interrupt(agent, futures, timeout_s)
         for f in pending:
             f.cancel()
         outcomes = {}
@@ -2773,9 +2777,59 @@ async def _execute_tool_batch_async(agent, runnable_calls, timeout_s):
         for fut, call in zip(futures, runnable_calls):
             if id(fut) in outcomes:
                 ordered.append((call, *outcomes[id(fut)]))
+            elif interrupted:
+                ordered.append((call, "interrupted", None))
             else:
                 ordered.append((call, "timed_out", None))
+        # The sync executor's result processing: the managed results become
+        # tool messages appended in the MODEL order, flushed to the session DB
+        # per result; interrupted calls get the cancelled markers (the sync's
+        # pre-flight contract).
+        if messages is not None:
+            for _call, _status, _res in ordered:
+                _name = _call.get("function_name")
+                _cid = _call.get("tool_call_id")
+                if _status == "interrupted":
+                    _cancelled = (
+                        f"[Tool execution cancelled — {_name} was skipped "
+                        "due to user interrupt]"
+                    )
+                    messages.append(make_tool_result_message(
+                        _name, _cancelled, _cid, effect_disposition="none",
+                    ))
+                    try:
+                        _emit_terminal_post_tool_call(
+                            agent, function_name=_name, function_args={},
+                            result=_cancelled,
+                            effective_task_id=_call.get("effective_task_id", ""),
+                            tool_call_id=_cid, status="cancelled",
+                        )
+                    except Exception:
+                        pass
+                    continue
+                if _status != "ok" or not isinstance(_res, _ManagedToolResult):
+                    continue
+                if _res.blocked or not _res.dispatched:
+                    continue
+                _tool_content = agent._tool_result_content_for_active_model(
+                    _name, _res.result
+                )
+                messages.append(make_tool_result_message(
+                    _name, _tool_content, _cid, effect_disposition=None,
+                ))
+                if not _flush_session_db_after_tool_progress(
+                    agent, messages, stage=f"tool result {_name}",
+                ):
+                    break
+                _progress = getattr(agent, "tool_progress_callback", None)
+                if _progress is not None:
+                    try:
+                        _progress("tool.completed", _name, None, None,
+                                  duration=0.0, is_error=False, result=_tool_content)
+                    except Exception:
+                        pass
         return ordered
+
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
 

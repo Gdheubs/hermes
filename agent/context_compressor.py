@@ -7525,8 +7525,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         if feasibility_skip:
             summary = None  # No LLM call; Phase 4 inserts the deterministic fallback
         elif (
-            self.checkpoint_mode
-            and self._tool_heavy_score(turns_to_summarize) >= self.checkpoint_tool_ratio
+            getattr(self, "checkpoint_mode", False)
+            and self._tool_heavy_score(turns_to_summarize)
+            >= getattr(self, "checkpoint_tool_ratio", 0.7)
         ):
             # Tool-heavy middle: the deterministic checkpoint (no LLM call).
             summary = self._build_compaction_checkpoint(

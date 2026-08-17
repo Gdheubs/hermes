@@ -8195,6 +8195,10 @@ class AIAgent:
 
             if len(segments) == 1:
                 kind = segments[0][0]
+                if kind == "parallel" and os.environ.get("HERMES_TOOL_EXEC_ASYNC"):
+                    return self._execute_tool_calls_async_segment(
+                        assistant_message, messages, effective_task_id, api_call_count
+                    )
                 if kind == "parallel":
                     return self._execute_tool_calls_concurrent(
                         assistant_message, messages, effective_task_id, api_call_count
@@ -8203,7 +8207,28 @@ class AIAgent:
                     assistant_message, messages, effective_task_id, api_call_count
                 )
 
-            from agent.tool_executor import execute_tool_calls_segmented
+            from agent.tool_executor import (
+                _execute_tool_batch_async,
+                _parse_tool_arguments,
+                execute_tool_calls_segmented,
+            )
+
+            # Async dispatch (opt-in, HERMES_TOOL_EXEC_ASYNC): the parallel
+            # segments run through the async batch — real daemon threads, a
+            # LOOP-TIME gate timeout (cancellable, test-mockable), the shared
+            # authorization gate + thread-context propagation. The sequential
+            # segments keep the sync path; the turn-end work is the segmented
+            # executor's (finalize once per batch). Off by default.
+            if os.environ.get("HERMES_TOOL_EXEC_ASYNC") and all(
+                k == "parallel" for k, _ in segments
+            ):
+                _seg_msg = SimpleNamespace(
+                    tool_calls=[c for _, cs in segments for c in cs]
+                )
+                if self._execute_tool_calls_async_segment(
+                    _seg_msg, messages, effective_task_id, api_call_count
+                ):
+                    return
             return execute_tool_calls_segmented(
                 self, assistant_message, messages, effective_task_id, api_call_count,
                 segments=segments,
@@ -8291,6 +8316,41 @@ class AIAgent:
                 out_lines.extend(wrapped or [raw_line])
         body = ("\n" + indent).join(out_lines)
         return f"{indent}{label}{body}"
+
+    def _execute_tool_calls_async_segment(self, assistant_message, messages, effective_task_id, api_call_count):
+        """Run a parallel segment through the async batch: real daemon threads,
+        a loop-time gate timeout, the shared auth gate + thread context. The
+        middleware appends the results; the turn-end work stays the sync's."""
+        from agent.tool_executor import (
+            _execute_tool_batch_async,
+            _parse_tool_arguments,
+        )
+        import asyncio as _asyncio
+
+        calls = []
+        for tc in assistant_message.tool_calls:
+            fn = tc.function.name
+            args, malformed = _parse_tool_arguments(tc.function.arguments)
+            if malformed is not None:
+                return False
+            def _execute(_next, _name=fn, _tid=effective_task_id,
+                         _cid=getattr(tc, "id", "") or ""):
+                return self._invoke_tool(
+                    _name, _next, _tid,
+                    tool_call_id=_cid, messages=messages,
+                )
+            calls.append({
+                "function_name": fn,
+                "function_args": args,
+                "effective_task_id": effective_task_id,
+                "tool_call_id": getattr(tc, "id", "") or "",
+                "execute": _execute,
+            })
+        if calls:
+            _asyncio.run(_execute_tool_batch_async(
+                self, calls, timeout_s=None, _messages=messages
+            ))
+        return True
 
     def _execute_tool_calls_concurrent(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Forwarder — see ``agent.tool_executor.execute_tool_calls_concurrent``."""

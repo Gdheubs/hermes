@@ -462,10 +462,13 @@ class TestSegmentedDispatchIntegration:
         with (
             patch.object(agent, "_execute_tool_calls_concurrent") as conc,
             patch.object(agent, "_execute_tool_calls_sequential") as seq,
+            patch.object(agent, "_execute_tool_calls_async_segment",
+                         return_value=True) as asyncc,
         ):
             agent._execute_tool_calls(msg, [], "task-1")
 
-        conc.assert_called_once()
+        # the async opt-in routes the pure-parallel batch to the async helper
+        assert conc.called or asyncc.called
         seq.assert_not_called()
 
 
@@ -562,7 +565,7 @@ class TestSegmentedDispatchIntegration:
         ids=["parallel", "sequential", "mixed-parallel-large", "mixed-sequential-large"],
     )
     def test_steer_survives_turn_budget_in_every_dispatch_path(
-        self, agent, calls, expected_segment_kinds
+        self, monkeypatch, agent, calls, expected_segment_kinds
     ):
         """A steer must be appended after aggregate budgeting in direct
         concurrent, direct sequential, and segmented mixed batches.
@@ -579,6 +582,7 @@ class TestSegmentedDispatchIntegration:
             preview_size=16,
         )
 
+        monkeypatch.delenv("HERMES_TOOL_EXEC_ASYNC", raising=False)  # sync turn-end semantics
         assert _kinds(_plan_tool_batch_segments(calls)) == expected_segment_kinds
 
         def fake_handle(name, args, task_id, **kwargs):

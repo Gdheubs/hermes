@@ -6178,7 +6178,7 @@ class TestAnthropicInterruptHandler:
     """_interruptible_api_call must handle Anthropic mode when interrupted."""
 
 
-    def test_interruptible_anthropic_interrupt_never_closes_shared_client(self):
+    def test_interruptible_anthropic_interrupt_never_closes_shared_client(self, monkeypatch):
         """#67142: a non-streaming Anthropic interrupt must abort the
         request-local client from the poll thread, never close/rebuild the
         shared _anthropic_client (which raced a live SSL BIO and corrupted an
@@ -6187,6 +6187,7 @@ class TestAnthropicInterruptHandler:
         Replaces the former source-reading assertion (which asserted the old,
         now-removed rebuild-on-interrupt behavior) with a behavior test.
         """
+        monkeypatch.delenv("HERMES_TOOL_EXEC_ASYNC", raising=False)  # sync interrupt semantics
         import threading
         import time
         from unittest.mock import MagicMock
