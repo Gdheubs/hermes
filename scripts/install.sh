@@ -59,6 +59,28 @@ fi
 PYTHON_VERSION="3.11"
 NODE_VERSION="26"
 
+# Supported Python versions for Termux detection — single source of truth.
+# Listed in PREFERENCE ORDER.  Change ONLY this array to add/remove versions.
+#
+# Why this order:
+#   3.13 — preferred (stable, ABI-compatible with most wheels, has cp313 wheels
+#          for the major C-extension transitive deps Hermes relies on).
+#   3.12 — second choice (still well-supported by the wheel ecosystem).
+#   3.11 — Hermes' declared minimum (matches PYTHON_VERSION above); always safe.
+#
+# 3.14 is INTENTIONALLY EXCLUDED — upstream install_deps explicitly warns
+# that some Rust transitive deps don't ship cp314 wheels yet, causing maturin
+# source builds that fail on Termux's toolchain.  The check_python Termux
+# branch walks this list and prefers already-installed matches, then falls
+# back to:
+#   uv python install <version>     (no root, downloads standalone build)
+#   pkg install tur-repo + pkg install python3.X   (Termux community repo)
+#
+# If the only Python available is the Termux default 3.14.x, the last-resort
+# fallback below accepts it with a warning so the user at least gets to the
+# real failure point (pip install) instead of a Python-not-found error.
+SUPPORTED_PYTHON_VERSIONS=(3.13 3.12 3.11)
+
 # FHS-style root install layout (set by resolve_install_layout when applicable):
 #   code at /usr/local/lib/hermes-agent, command at /usr/local/bin/hermes,
 #   data still at /root/.hermes (HERMES_HOME).  Matches Claude Code / Codex CLI
@@ -76,6 +98,13 @@ BRANCH="main"
 INSTALL_COMMIT=""
 FORCE_COMMIT=false
 ENSURE_DEPS=""
+# Termux-only: choose the pip backend used by `install_deps`.
+#   auto — use `uv pip install` if uv is available, else stdlib pip.
+#   uv   — force uv pip install (10-100x faster than pip on a cold cache).
+#          Errors out if uv is not available.
+#   pip  — force stdlib pip (slower, but matches pre-uv behavior for debugging).
+# Non-Termux installs always use uv (the existing path is unchanged).
+PIP_BACKEND="auto"
 
 MANIFEST_MODE=false
 STAGE_NAME=""
@@ -160,6 +189,18 @@ while [[ $# -gt 0 ]]; do
             ENSURE_DEPS="$2"
             shift 2
             ;;
+        --pip-backend)
+            PIP_BACKEND="$2"
+            case "$PIP_BACKEND" in
+                auto|uv|pip) ;;
+                *)
+                    echo "Invalid --pip-backend value: $PIP_BACKEND"
+                    echo "Valid values: auto | uv | pip"
+                    exit 1
+                    ;;
+            esac
+            shift 2
+            ;;
 
         -h|--help)
             echo "Hermes Agent Installer"
@@ -200,6 +241,9 @@ while [[ $# -gt 0 ]]; do
             echo "  --ensure DEPS  Install only specified deps (comma-separated)"
             echo "                   Supported: node, browser, ripgrep, ffmpeg"
             echo "                   Does NOT clone repo or create venv"
+            echo "  --pip-backend B  Termux only. Choose pip backend:"
+            echo "                   auto (default) | uv | pip"
+            echo "                   uv is 10-100x faster than stdlib pip on a cold cache."
 
             exit 0
             ;;
@@ -554,9 +598,83 @@ detect_os() {
 
 install_uv() {
     if [ "$DISTRO" = "termux" ]; then
-        log_info "Termux detected — using Python's stdlib venv + pip instead of uv"
-        UV_CMD=""
-        return 0
+        # On Termux we use uv for Python resolution, venv creation, AND pip
+        # install (uv pip install is 10-100x faster than stdlib pip on a
+        # cold cache, and reuses a global ~/.cache/uv for re-installs).
+        #
+        # Resolution chain (in order):
+        #   1. uv on PATH (user already installed it)
+        #   2. Hermes-managed uv at $HERMES_HOME/bin/uv (from a previous run)
+        #   3. `pkg install -y uv` (Termux main repo carries uv)
+        #   4. astral.sh installer → $HERMES_HOME/bin/uv (no root needed)
+        #   5. Fail with manual instructions
+
+        # Proactively batch-install the common Termux toolchain in a single
+        # `pkg` invocation.  apt's per-call overhead (dpkg lock acquire +
+        # metadata refresh) is the dominant cost on a phone — batching is
+        # 3-5x faster than calling `pkg install` serially.  Idempotent:
+        # packages already at the latest version are skipped by apt.
+        #
+        # nodejs is included here because check_node's Termux path would
+        # otherwise install it alone later; ripgrep and git are common deps
+        # for the hermes runtime.  We swallow failures — the per-package
+        # resolution chain below will surface any missing piece.
+        log_info "Ensuring required Termux packages (uv git ripgrep nodejs) ..."
+        pkg install -y uv git ripgrep nodejs >/dev/null 2>&1 || true
+
+        if command -v uv >/dev/null 2>&1; then
+            UV_CMD="$(command -v uv)"
+            UV_VERSION=$("$UV_CMD" --version 2>/dev/null) || UV_VERSION="unknown"
+            log_success "uv found on PATH ($UV_VERSION)"
+            return 0
+        fi
+
+        if [ -x "$HERMES_HOME/bin/uv" ]; then
+            UV_CMD="$HERMES_HOME/bin/uv"
+            UV_VERSION=$("$UV_CMD" --version 2>/dev/null) || UV_VERSION="unknown"
+            log_success "Managed uv found ($UV_VERSION)"
+            return 0
+        fi
+
+        # pkg install -y uv above should have placed uv on PATH.  If it didn't
+        # (network failure, full disk, broken apt state), fall back to the
+        # astral.sh installer which works without root.
+        log_info "uv not found via pkg — installing via astral.sh installer ..."
+        mkdir -p "$HERMES_HOME/bin"
+        local _uv_install_log _uv_installer
+        _uv_install_log="$(mktemp 2>/dev/null || echo \"$HERMES_HOME/uv-install.$$.log\")"
+        _uv_installer="$(mktemp 2>/dev/null || echo \"$HERMES_HOME/uv-installer.$$.sh\")"
+        if ! curl -LsSf https://astral.sh/uv/install.sh -o "$_uv_installer" 2>"$_uv_install_log"; then
+            log_error "Failed to download uv installer from https://astral.sh/uv/install.sh"
+            log_info "curl output:"
+            sed 's/^/    /' "$_uv_install_log" >&2
+            log_info "Install manually: pkg install uv  OR  pip install uv"
+            rm -f "$_uv_install_log" "$_uv_installer"
+            exit 1
+        fi
+        if UV_UNMANAGED_INSTALL="$HERMES_HOME/bin" sh "$_uv_installer" >>"$_uv_install_log" 2>&1; then
+            rm -f "$_uv_installer"
+            if [ -x "$HERMES_HOME/bin/uv" ]; then
+                UV_CMD="$HERMES_HOME/bin/uv"
+                UV_VERSION=$("$UV_CMD" --version 2>/dev/null) || UV_VERSION="unknown"
+                log_success "uv installed via astral.sh ($UV_VERSION)"
+                rm -f "$_uv_install_log"
+                return 0
+            fi
+            log_error "uv installer reported success but binary not found at $HERMES_HOME/bin/uv"
+            log_info "Installer output:"
+            sed 's/^/    /' "$_uv_install_log" >&2
+            log_info "Install manually: pkg install uv  OR  pip install uv"
+            rm -f "$_uv_install_log"
+            exit 1
+        else
+            log_error "Failed to install uv via astral.sh"
+            log_info "Installer output:"
+            sed 's/^/    /' "$_uv_install_log" >&2
+            log_info "Install manually: pkg install uv  OR  pip install uv"
+            rm -f "$_uv_install_log" "$_uv_installer"
+            exit 1
+        fi
     fi
 
     # Hermes owns its own uv at $HERMES_HOME/bin/uv.  Always install there —
@@ -617,21 +735,145 @@ install_uv() {
 
 check_python() {
     if [ "$DISTRO" = "termux" ]; then
-        log_info "Checking Termux Python..."
-        if command -v python >/dev/null 2>&1; then
-            PYTHON_PATH="$(command -v python)"
-            if "$PYTHON_PATH" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
-                PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
-                log_success "Python found: $PYTHON_FOUND_VERSION"
-                return 0
+        # Walk SUPPORTED_PYTHON_VERSIONS in preference order.  Try multiple
+        # sources for each version, then fall back to install paths.
+        # See the comment near SUPPORTED_PYTHON_VERSIONS for the rationale.
+        local _supported_csv
+        _supported_csv="$(printf '%s, ' "${SUPPORTED_PYTHON_VERSIONS[@]}" | sed 's/, $//')"
+        log_info "Checking supported Python on Termux ($_supported_csv) ..."
+
+        PYTHON_PATH=""
+        PYTHON_VERSION=""
+
+        # 1) uv-managed Python + pkg-installed Pythons (uv sees both).
+        #    `uv python find X` does NOT download — it only reports an existing
+        #    one, so this is safe to call against every version in the list.
+        if [ -n "$UV_CMD" ]; then
+            for PY_VER in "${SUPPORTED_PYTHON_VERSIONS[@]}"; do
+                local PY_PATH=""
+                if PY_PATH="$("$UV_CMD" python find "$PY_VER" 2>/dev/null)" \
+                   && [ -n "$PY_PATH" ] && [ -x "$PY_PATH" ] \
+                   && "$PY_PATH" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+                    PYTHON_PATH="$PY_PATH"
+                    PYTHON_VERSION="$PY_VER"
+                    break
+                fi
+            done
+        fi
+
+        # 2) python3.X binaries on PATH (covers pkg-installed python3.13 etc).
+        if [ -z "$PYTHON_PATH" ]; then
+            for PY_VER in "${SUPPORTED_PYTHON_VERSIONS[@]}"; do
+                local _bin="python$PY_VER"
+                if command -v "$_bin" >/dev/null 2>&1 \
+                   && "$_bin" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+                    PYTHON_PATH="$(command -v "$_bin")"
+                    PYTHON_VERSION="$PY_VER"
+                    break
+                fi
+            done
+        fi
+
+        # 3) Plain `python` on PATH — covers the Termux default install.
+        #    Note: the default Termux `pkg install python` currently ships 3.14.x,
+        #    which is NOT in SUPPORTED_PYTHON_VERSIONS (Hermes lacks cp314 wheels
+        #    for some Rust transitives).  So this path only succeeds if the user
+        #    manually installed a supported Python (3.13/3.12/3.11) and aliased it
+        #    to `python`.  The 3.14 default is handled by fallback 6 below with
+        #    an explicit warning.
+        if [ -z "$PYTHON_PATH" ] && command -v python >/dev/null 2>&1 \
+           && python -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+            local _py_ver_short
+            _py_ver_short="$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)"
+            # Only accept if the resolved version is in the supported set.
+            case " $_py_ver_short " in
+                *" 3.13 "*|*" 3.12 "*|*" 3.11 "*)
+                    PYTHON_PATH="$(command -v python)"
+                    PYTHON_VERSION="$_py_ver_short"
+                    ;;
+            esac
+        fi
+
+        # 4) Install via uv (standalone Python build, no root needed).
+        #    This is the preferred install path — uv's cpython builds are
+        #    ABI-stable and pre-built for aarch64/arm/x86_64.
+        if [ -z "$PYTHON_PATH" ] && [ -n "$UV_CMD" ]; then
+            local _target_ver="${SUPPORTED_PYTHON_VERSIONS[0]}"  # preference: 3.13
+            log_info "No supported Python found — installing $_target_ver via uv ..."
+            if "$UV_CMD" python install "$_target_ver"; then
+                local _resolved
+                if _resolved="$("$UV_CMD" python find "$_target_ver" 2>/dev/null)" \
+                   && [ -n "$_resolved" ] && [ -x "$_resolved" ]; then
+                    PYTHON_PATH="$_resolved"
+                    PYTHON_VERSION="$_target_ver"
+                fi
+            else
+                log_warn "uv python install $_target_ver failed — falling through to tur-repo"
             fi
         fi
 
-        log_info "Installing Python via pkg..."
-        pkg install -y python >/dev/null
-        PYTHON_PATH="$(command -v python)"
-        PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
-        log_success "Python installed: $PYTHON_FOUND_VERSION"
+        # 5) Termux tur-repo fallback.
+        #    tur-repo is a Termux community repository that ships older Python
+        #    versions not present in the main repo (where only the latest
+        #    stable — currently 3.14.x — is packaged).  It enables
+        #    `pkg install python3.13` / `pkg install python3.11`.
+        if [ -z "$PYTHON_PATH" ]; then
+            log_info "Trying Termux tur-repo fallback (python3.13 / python3.11) ..."
+            if ! command -v pkg >/dev/null 2>&1; then
+                log_error "pkg not found — not a standard Termux environment"
+                exit 1
+            fi
+
+            # Install tur-repo if not already installed.
+            if ! pkg list-installed 2>/dev/null | grep -q '^tur-repo/'; then
+                log_info "Adding tur-repo (provides older Python versions) ..."
+                if ! pkg install -y tur-repo >/dev/null 2>&1; then
+                    log_warn "tur-repo install failed — will try pkg install python3.X directly"
+                fi
+            fi
+
+            for PY_VER in "${SUPPORTED_PYTHON_VERSIONS[@]}"; do
+                local _py_pkg="python$PY_VER"
+                log_info "Trying: pkg install -y $_py_pkg"
+                if pkg install -y "$_py_pkg" >/dev/null 2>&1; then
+                    local _bin="python$PY_VER"
+                    if command -v "$_bin" >/dev/null 2>&1 \
+                       && "$_bin" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+                        PYTHON_PATH="$(command -v "$_bin")"
+                        PYTHON_VERSION="$PY_VER"
+                        break
+                    fi
+                fi
+            done
+        fi
+
+        # 6) Last resort: default Termux Python via `pkg install -y python`.
+        #    Currently ships 3.14.x — which Hermes does NOT officially support.
+        #    We accept it so the rest of the script can run; the user will get a
+        #    clearer error at the actual pip install step if 3.14 turns out
+        #    to break a transitive dep (no cp314 wheel for some C-extension).
+        if [ -z "$PYTHON_PATH" ]; then
+            log_warn "No supported Python found — installing default Python via pkg (may be 3.14, unsupported) ..."
+            pkg install -y python >/dev/null 2>&1 || true
+            if command -v python >/dev/null 2>&1 \
+               && python -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' 2>/dev/null; then
+                PYTHON_PATH="$(command -v python)"
+                PYTHON_VERSION="$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null)"
+            fi
+        fi
+
+        if [ -z "$PYTHON_PATH" ] || [ -z "$PYTHON_VERSION" ]; then
+            log_error "Could not find or install a supported Python on Termux."
+            log_info "Supported versions: $_supported_csv"
+            log_info "Manual install options:"
+            log_info "  1) pkg install tur-repo && pkg install python3.13"
+            log_info "  2) pkg install uv && uv python install 3.13"
+            exit 1
+        fi
+
+        PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>&1)"
+        [ -n "$PYTHON_FOUND_VERSION" ] || { log_error "Python at $PYTHON_PATH is broken"; exit 1; }
+        log_success "Using $PYTHON_FOUND_VERSION at $PYTHON_PATH"
         return 0
     fi
 
@@ -1439,15 +1681,48 @@ setup_venv() {
     fi
 
     if [ "$DISTRO" = "termux" ]; then
-        log_info "Creating virtual environment with Termux Python..."
+        # Use uv for venv creation when available (faster, no --seed needed —
+        # uv bootstraps pip via its own mechanism rather than pulling
+        # setuptools/wheel from PyPI).  Falls back to stdlib venv if uv
+        # somehow ended up unset.
+        if [ -n "$UV_CMD" ]; then
+            log_info "Creating venv with uv ($PYTHON_FOUND_VERSION) ..."
+        else
+            log_info "Creating venv with stdlib (uv not available) ..."
+        fi
 
         if [ -d "venv" ]; then
-            log_info "Virtual environment already exists, recreating..."
+            log_info "Virtual environment already exists, recreating ..."
             rm -rf venv
         fi
 
-        "$PYTHON_PATH" -m venv venv
-        log_success "Virtual environment ready ($(./venv/bin/python --version 2>/dev/null))"
+        if [ -n "$UV_CMD" ]; then
+            # --python points uv at the interpreter we resolved in check_python.
+            # No --seed on Termux: uv-managed and pkg Pythons both ship a working
+            # pip; --seed would download setuptools/wheel from PyPI for nothing.
+            if ! "$UV_CMD" venv venv --python "$PYTHON_PATH"; then
+                log_error "uv venv creation failed"
+                exit 1
+            fi
+        else
+            if ! "$PYTHON_PATH" -m venv venv; then
+                log_error "stdlib venv creation failed"
+                exit 1
+            fi
+        fi
+
+        # Pin UV_PYTHON to the venv interpreter for any later `uv pip install`
+        # call in install_deps.  Exported (not just set) because the bootstrap
+        # may run install stages as separate processes — `install_deps` is a
+        # sibling process that needs to inherit UV_PYTHON.  install_deps below
+        # re-pins the same value for the same reason.
+        if [ -x "$INSTALL_DIR/venv/bin/python" ]; then
+            export UV_PYTHON="$INSTALL_DIR/venv/bin/python"
+        fi
+
+        local _vpy="./venv/bin/python"
+        [ -x "$_vpy" ] || { log_error "venv created but no python binary"; exit 1; }
+        log_success "Virtual environment ready ($("$_vpy" --version 2>&1))"
         return 0
     fi
 
@@ -1484,7 +1759,11 @@ install_deps() {
     # python-deps invocation. Re-deriving it here covers that path. Without it,
     # an inherited UV_PYTHON=3.14 makes the uv sync/pip tiers below recreate the
     # venv at 3.14 and fail the maturin source build (no cp314 wheels yet).
-    if [ "$DISTRO" != "termux" ] && [ -x "$INSTALL_DIR/venv/bin/python" ]; then
+    #
+    # Apply on Termux too: install_deps now uses uv pip install on Termux, and
+    # UV_PYTHON makes uv target the venv interpreter (no --python needed on the
+    # uv pip install call sites below).
+    if [ -x "$INSTALL_DIR/venv/bin/python" ]; then
         export UV_PYTHON="$INSTALL_DIR/venv/bin/python"
     fi
 
@@ -1505,16 +1784,80 @@ install_deps() {
             log_info "Using ANDROID_API_LEVEL=$ANDROID_API_LEVEL for Android wheel builds"
         fi
 
-        "$PIP_PYTHON" -m pip install --upgrade pip setuptools wheel >/dev/null
+        # Pick the pip backend.  Controlled by --pip-backend (default: auto).
+        #   auto — use uv pip install if $UV_CMD is set, else stdlib pip.
+        #   uv   — force uv pip install (uv must be available).
+        #   pip  — force stdlib pip (matches pre-uv behavior; useful for debugging).
+        #
+        # uv pip install is typically 10-100x faster than stdlib pip on a cold
+        # cache because uv: (a) parallelizes downloads, (b) reuses a global
+        # ~/.cache/uv across venvs and re-installs, (c) hardlinks files into
+        # the venv instead of copying, (d) uses a Rust resolver that doesn't
+        # re-fetch already-cached wheels.
+        local PIP_BACKEND_CMD=""
+        case "$PIP_BACKEND" in
+            uv)
+                if [ -z "$UV_CMD" ]; then
+                    log_error "--pip-backend uv requested but uv is not available"
+                    exit 1
+                fi
+                PIP_BACKEND_CMD="uv"
+                log_info "pip backend: uv (uv pip install — fast path)"
+                ;;
+            pip)
+                PIP_BACKEND_CMD="pip"
+                log_info "pip backend: stdlib pip (slow path, --pip-backend pip)"
+                ;;
+            auto|*)
+                if [ -n "$UV_CMD" ]; then
+                    PIP_BACKEND_CMD="uv"
+                    log_info "pip backend: uv (auto-detected from UV_CMD)"
+                else
+                    PIP_BACKEND_CMD="pip"
+                    log_info "pip backend: stdlib pip (uv not available)"
+                fi
+                ;;
+        esac
+
+        # Dispatch helper: route any pip install through the chosen backend.
+        #   uv  : `uv pip install --python $PIP_PYTHON ...` — uv targets the
+        #         venv interpreter explicitly.  UV_NO_CONFIG=1 prevents uv from
+        #         honoring a stray uv.toml/pyproject.toml in $HOME.
+        #   pip : `$PIP_PYTHON -m pip install ...` — stdlib pip.
+        hermes_pip_install() {
+            if [ "$PIP_BACKEND_CMD" = "uv" ]; then
+                env UV_NO_CONFIG=1 "$UV_CMD" pip install --python "$PIP_PYTHON" "$@"
+            else
+                "$PIP_PYTHON" -m pip install "$@"
+            fi
+        }
+
+        # Bootstrap pip/setuptools/wheel only for stdlib pip backend.
+        # uv pip install has its own resolver and doesn't need pip/setuptools
+        # present in the target venv — adding them is wasted download + disk.
+        if [ "$PIP_BACKEND_CMD" = "pip" ]; then
+            "$PIP_PYTHON" -m pip install --upgrade pip setuptools wheel >/dev/null
+        fi
 
         # On Android, psutil's setup.py rejects sys.platform == 'android' before
         # it ever invokes the C build, so the next pip install would fail at
         # "platform android is not supported".  Prebuild psutil from the official
         # sdist with a one-line marker patch (Linux source path is fine on
         # Android).  Stopgap until psutil#2762 ships upstream.
+        #
+        # The prebuild script invokes pip internally; it always uses stdlib pip
+        # regardless of PIP_BACKEND (it accepts `--pip "<cmd>"`).  When uv is
+        # the backend, point the script at `uv pip install --python $PIP_PYTHON`
+        # so the prebuild's pip invocations also benefit from uv.
         if "$PIP_PYTHON" -c 'import sys; raise SystemExit(0 if sys.platform == "android" else 1)' 2>/dev/null; then
-            log_info "Android Python detected: prebuilding psutil compatibility shim..."
-            if ! "$PIP_PYTHON" "$INSTALL_DIR/scripts/install_psutil_android.py" --pip "$PIP_PYTHON -m pip"; then
+            log_info "Android Python detected: prebuilding psutil compatibility shim ..."
+            local _inner_pip_cmd
+            if [ "$PIP_BACKEND_CMD" = "uv" ]; then
+                _inner_pip_cmd="env UV_NO_CONFIG=1 $UV_CMD pip install --python $PIP_PYTHON"
+            else
+                _inner_pip_cmd="$PIP_PYTHON -m pip"
+            fi
+            if ! "$PIP_PYTHON" "$INSTALL_DIR/scripts/install_psutil_android.py" --pip "$_inner_pip_cmd"; then
                 log_warn "psutil Android prebuild failed — package install will likely fail next."
                 log_info "Workaround: manually rerun 'python scripts/install_psutil_android.py' once your toolchain is set up."
             fi
@@ -1522,14 +1865,22 @@ install_deps() {
 
         # Try the broad Termux profile first (best-effort "install all" for Android),
         # then fall back to the conservative Termux baseline, then base package.
-        if ! "$PIP_PYTHON" -m pip install -e '.[termux-all]' -c constraints-termux.txt; then
-            log_warn "Termux broad profile (.[termux-all]) failed, trying baseline Termux profile..."
-            if ! "$PIP_PYTHON" -m pip install -e '.[termux]' -c constraints-termux.txt; then
-                log_warn "Termux baseline profile (.[termux]) failed, trying base install..."
-                if ! "$PIP_PYTHON" -m pip install -e '.' -c constraints-termux.txt; then
+        #
+        # The chosen PIP_BACKEND dispatches via hermes_pip_install.  uv pip
+        # install accepts the same -e / -c / .[extra] syntax as stdlib pip, so
+        # the call sites are identical.
+        if ! hermes_pip_install -e '.[termux-all]' -c constraints-termux.txt; then
+            log_warn "Termux broad profile (.[termux-all]) failed, trying baseline Termux profile ..."
+            if ! hermes_pip_install -e '.[termux]' -c constraints-termux.txt; then
+                log_warn "Termux baseline profile (.[termux]) failed, trying base install ..."
+                if ! hermes_pip_install -e '.' -c constraints-termux.txt; then
                     log_error "Package installation failed on Termux."
                     log_info "Ensure these packages are installed: pkg install clang rust make pkg-config libffi openssl ca-certificates curl"
-                    log_info "Then re-run: cd $INSTALL_DIR && python -m pip install -e '.[termux-all]' -c constraints-termux.txt"
+                    if [ "$PIP_BACKEND_CMD" = "uv" ]; then
+                        log_info "Re-run with: cd $INSTALL_DIR && uv pip install --python $PIP_PYTHON -e '.[termux-all]' -c constraints-termux.txt"
+                    else
+                        log_info "Then re-run: cd $INSTALL_DIR && python -m pip install -e '.[termux-all]' -c constraints-termux.txt"
+                    fi
                     exit 1
                 fi
             fi
