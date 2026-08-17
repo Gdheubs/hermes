@@ -36,6 +36,13 @@ layer reads from it:
   `zai`, `openrouter`, `custom` — those need bespoke token resolution).
 - `hermes_cli/models.py` extends `CANONICAL_PROVIDERS` and calls
   `profile.fetch_models()` inside `provider_model_ids()`.
+  Overrides **must** accept the base signature
+  `fetch_models(*, api_key=None, base_url=None, timeout=8.0)`.
+  Before calling, Hermes inspects the override with `inspect.signature`
+  and passes `base_url` only when the callable accepts that parameter
+  (or `**kwargs`). It makes a single call — an internal `TypeError`
+  from a compliant `fetch_models` is not retried or masked — so lagging
+  plugins that omit `base_url` still populate the model picker.
 - `hermes_cli/doctor.py` adds a `/models` health check for each
   `auth_type="api_key"` profile.
 - `hermes_cli/config.py` injects every `env_var` into
@@ -69,7 +76,7 @@ under `$HERMES_HOME/plugins/model-providers/` for a private plugin).
 | `prepare_messages(msgs)` | Provider-specific message preprocessing (Qwen normalises to list-of-parts, injects `cache_control`). |
 | `build_extra_body(**ctx)` | Provider-specific `extra_body` (OpenRouter provider prefs, Gemini `thinking_config`). |
 | `build_api_kwargs_extras(**ctx)` | `(extra_body_additions, top_level_kwargs)` — Kimi puts reasoning_effort top-level, Qwen splits `enable_thinking`/`thinking_budget`. |
-| `fetch_models(*, api_key)` | Live catalog fetch — default hits `{models_url or base_url}/models` with Bearer auth. Override for no-REST providers (Bedrock), OAuth catalogs (Anthropic), or public catalogs (OpenRouter). |
+| `fetch_models(*, api_key=None, base_url=None, timeout=8.0)` | Live catalog fetch — default hits `{models_url or base_url}/models` with Bearer auth. Override for no-REST providers (Bedrock), OAuth catalogs (Anthropic), or public catalogs (OpenRouter). See wiring notes above for signature inspection of narrower third-party overrides. |
 
 ---
 
