@@ -442,6 +442,14 @@ function timelineDisplayContent(message: SessionMessage, content: string): strin
     return 'personality changed'
   }
 
+  if (message.display_kind === 'goal_resume') {
+    return '/goal resume'
+  }
+
+  if (message.display_kind === 'goal_continue') {
+    return 'continuing standing goal'
+  }
+
   if (message.display_kind === 'async_delegation_complete') {
     const count = timelineTaskCount(message.display_metadata)
 
@@ -1131,7 +1139,8 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       message.display_kind === 'model_switch' ||
       message.display_kind === 'async_delegation_complete' ||
       message.display_kind === 'auto_continue' ||
-      message.display_kind === 'personality_switch'
+      message.display_kind === 'personality_switch' ||
+       message.display_kind === 'goal_continue'
         ? 'system'
         : message.role
 

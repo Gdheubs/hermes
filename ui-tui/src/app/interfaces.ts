@@ -537,7 +537,14 @@ export interface SlashHandlerContext {
   transcript: {
     page: (text: string, title?: string) => void
     panel: (title: string, sections: PanelSection[]) => void
-    send: (text: string, showUserMessage?: boolean, displayText?: string) => void
+    send: (
+      text: string,
+      showUserMessage?: boolean,
+      displayText?: string,
+      displayKindOrExpandOverride?: string | ((value: string) => string),
+      expandOverride?: (value: string) => string,
+      goalToken?: string
+    ) => void
     setHistoryItems: StateSetter<Msg[]>
     sys: (text: string) => void
     trimLastExchange: (items: Msg[]) => Msg[]

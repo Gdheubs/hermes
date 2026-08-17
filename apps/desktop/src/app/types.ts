@@ -143,6 +143,10 @@ export interface SendCommandDispatchResponse {
   notice?: string
   /** Set for a skill-bundle send: see SkillCommandDispatchResponse.display. */
   display?: string
+  /** Durable projection type for model-facing synthetic sends. */
+  display_kind?: string
+  /** Persisted identity for a generation-specific goal continuation. */
+  goal_token?: string
 }
 
 export interface PrefillCommandDispatchResponse {

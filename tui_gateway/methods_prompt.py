@@ -312,19 +312,43 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
-    if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
-        return _err(rid, 4090, limit_message)
+    if (
+        limit_message := globals()["_ensure_active_session_slot"](sid, session)
+    ) is not None:
+        return globals()["_err"](rid, 4090, limit_message)
     # Which desktop window this message was typed into. Rewritten on every
     # submit, because one session can be driven from the app window and the HUD
     # in turn: a stale "hud" would tell the model the user is still floating
     # over another app when they are back in Hermes.
     session["client_surface"] = "hud" if params.get("surface") == "hud" else ""
-    has_truncation = (
-        truncate_user_ordinal is not None
-        or params.get("truncate_before_row_id") is not None
-        or params.get("truncate_before_message_id") is not None
-    )
-    if has_truncation and isinstance(text, str):
+    display_kind = None
+    display_metadata = None
+    goal_token = None
+    if params.get("display_kind") == "goal_resume":
+        with session["history_lock"]:
+            expected = session.get("_pending_goal_resume_projection")
+            submitted_token = params.get("goal_token")
+            if (
+                not isinstance(text, str)
+                or not isinstance(expected, dict)
+                or text != expected.get("prompt")
+                or not isinstance(submitted_token, str)
+                or submitted_token != expected.get("goal_token")
+            ):
+                # command.dispatch and prompt.submit are separate RPCs. A
+                # pause, clear, or replacement goal can invalidate the resume
+                # between them; never downgrade that stale synthetic request
+                # into an ordinary user turn.
+                return globals()["_err"](
+                    rid,
+                    4091,
+                    "stale goal resume — the goal changed before submission",
+                )
+            session.pop("_pending_goal_resume_projection", None)
+            display_kind = "goal_resume"
+            display_metadata = {"display_text": "/goal resume"}
+            goal_token = submitted_token
+    if truncate_user_ordinal is not None and isinstance(text, str):
         # A rewind/regenerate replays a turn from what the transcript shows. A
         # skill turn shows its invocation, so re-expand it here — otherwise
         # re-running `/work fix it` sends the agent nine literal characters
@@ -353,6 +377,9 @@ def _(rid, params: dict) -> dict:
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
             queued=bool(params.get("queued")),
+            display_kind=display_kind,
+            display_metadata=display_metadata,
+            goal_token=goal_token,
         )
         if busy_response is not None:
             return busy_response
@@ -707,7 +734,18 @@ def _(rid, params: dict) -> dict:
         _start_inflight_turn(session, text)
 
     if turn_isolation:
-        isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+        submit_to_compute_host = globals()["_submit_prompt_to_compute_host"]
+        if display_kind:
+            isolated_response = submit_to_compute_host(
+                rid,
+                sid,
+                session,
+                text,
+                display_kind=display_kind,
+                display_metadata=display_metadata,
+            )
+        else:
+            isolated_response = submit_to_compute_host(rid, sid, session, text)
         if not isolated_response.get("error"):
             if survivor_user_row_ids is not None:
                 # The truncation already happened inline above (memory + DB),
@@ -793,7 +831,19 @@ def _(rid, params: dict) -> dict:
                     },
                 )
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        run_prompt_submit = globals()["_run_prompt_submit"]
+        if display_kind:
+            run_prompt_submit(
+                rid,
+                sid,
+                session,
+                text,
+                display_kind=display_kind,
+                display_metadata=display_metadata,
+                goal_token=goal_token,
+            )
+        else:
+            run_prompt_submit(rid, sid, session, text)
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck

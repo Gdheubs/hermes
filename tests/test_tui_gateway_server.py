@@ -257,6 +257,7 @@ def test_default_config_seeds_dashboard_process_isolation_keys():
 
 
 def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(monkeypatch):
+    canonical = "[Continuing toward your standing goal]\nGoal: finish safely"
     class FakeSupervisor:
         def __init__(self):
             self.frames = []
@@ -272,6 +273,10 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
     server._sessions["iso-sid"] = _session(history=list(seed_history))
     server._sessions["iso-sid"]["agent"] = None
     server._sessions["iso-sid"]["agent_ready"] = threading.Event()
+    server._sessions["iso-sid"]["_pending_goal_resume_projection"] = {
+        "prompt": canonical,
+        "goal_token": "resume-generation",
+    }
     parent_writes = {"ensure_session": 0, "persist_seed": 0}
     monkeypatch.setattr(
         server,
@@ -299,13 +304,23 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
             {
                 "id": "submit",
                 "method": "prompt.submit",
-                "params": {"session_id": "iso-sid", "text": "hello"},
+                "params": {
+                    "session_id": "iso-sid",
+                    "text": canonical,
+                    "display_kind": "goal_resume",
+                    "goal_token": "resume-generation",
+                },
             }
         )
         assert resp["result"] == {"status": "streaming", "turn_isolation": True}
         assert fake_supervisor.frames[0]["type"] == "turn.start"
         assert fake_supervisor.frames[0]["sid"] == "iso-sid"
-        assert fake_supervisor.frames[0]["text"] == "hello"
+        assert fake_supervisor.frames[0]["text"] == canonical
+        assert fake_supervisor.frames[0]["display_kind"] == "goal_resume"
+        assert fake_supervisor.frames[0]["display_metadata"] == {
+            "display_text": "/goal resume"
+        }
+        assert "_pending_goal_resume_projection" not in server._sessions["iso-sid"]
         assert fake_supervisor.frames[0]["history"] == seed_history
         assert server._sessions["iso-sid"]["history"] == seed_history
         assert parent_writes == {"ensure_session": 0, "persist_seed": 0}
@@ -2640,6 +2655,29 @@ def test_tool_start_ships_full_args(monkeypatch):
     assert events[0][2]["args"] == {"command": long_command}
     # Empty args stay omitted. Argless tools get no noise key.
     assert "args" not in events[1][2]
+
+def test_history_to_messages_projects_durable_goal_continuations():
+    canonical = (
+        "[Continuing toward your standing goal]\n"
+        "Goal: finish safely\n\n"
+        "Continue working toward this goal."
+    )
+
+    assert server._history_to_messages(
+        [
+            {"role": "user", "content": canonical, "display_kind": "goal_resume"},
+            {"role": "assistant", "content": "first step"},
+            {"role": "user", "content": canonical, "display_kind": "goal_continue"},
+        ]
+    ) == [
+        {"role": "user", "text": "/goal resume", "display_kind": "goal_resume"},
+        {"role": "assistant", "text": "first step"},
+        {
+            "role": "user",
+            "text": "Continuing standing goal…",
+            "display_kind": "goal_continue",
+        },
+    ]
 
 
 def test_tool_ctx_sends_an_arg_preview_not_a_phrased_label():

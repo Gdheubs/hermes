@@ -80,8 +80,27 @@ class TestInterruptAutoPause:
             cli._maybe_continue_goal_after_turn()
         assert mgr.state.status == "paused"
 
-        mgr.resume()
+        cli._handle_goal_command("/goal resume")
+        assert mgr.state is not None
         assert mgr.state.status == "active"
+        assert mgr.state.turns_used == 0
+        queued = cli._pending_input.get_nowait()
+        assert queued.text == mgr.next_continuation_prompt()
+        assert queued.display_text == "/goal resume"
+        assert queued.display_kind == "goal_resume"
+        assert queued.goal_token == mgr.continuation_token()
+        assert cli._goal_continuation_is_current(queued.text, queued.goal_token) is True
+
+        mgr.pause(reason="user-paused")
+        assert cli._goal_continuation_is_current(queued.text, queued.goal_token) is False
+        mgr.resume()
+        current_token = mgr.continuation_token()
+        assert mgr.next_continuation_prompt() == queued.text
+        assert current_token != queued.goal_token
+        assert cli._goal_continuation_is_current(queued.text, queued.goal_token) is False
+        assert cli._goal_continuation_is_current(queued.text, current_token) is True
+        mgr.set("a replacement goal")
+        assert cli._goal_continuation_is_current(queued.text, queued.goal_token) is False
 
 
 
@@ -109,7 +128,10 @@ class TestHealthyTurnStillRuns:
         # Continuation prompt must be queued.
         assert not cli._pending_input.empty()
         queued = cli._pending_input.get_nowait()
-        assert "Continuing toward your standing goal" in queued
+        assert "Continuing toward your standing goal" in queued.text
+        assert queued.display_text == "Continuing standing goal…"
+        assert queued.display_kind == "goal_continue"
+        assert queued.goal_token == mgr.continuation_token()
         assert mgr.state.status == "active"
 
     def test_clean_response_marks_done_when_judge_says_done(self, hermes_home):
@@ -131,6 +153,20 @@ class TestHealthyTurnStillRuns:
 
 
 class TestInterruptFlagLifecycle:
+    def test_pending_projection_separates_model_and_display_text(self):
+        from cli import _unwrap_pending_input_projection
+        from hermes_cli.cli_commands_mixin import PendingInputProjection
+
+        canonical = "[Continuing toward your standing goal]\nGoal: finish safely"
+        assert _unwrap_pending_input_projection(
+            PendingInputProjection(
+                canonical,
+                "/goal resume",
+                "goal_resume",
+                goal_token="resume-generation",
+            )
+        ) == (canonical, "goal_resume", "/goal resume", "resume-generation")
+
     def test_chat_resets_flag_at_entry(self, hermes_home):
         """chat() must reset _last_turn_interrupted at the top of each turn.
 

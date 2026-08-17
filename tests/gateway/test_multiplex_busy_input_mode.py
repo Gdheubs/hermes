@@ -162,6 +162,8 @@ async def test_secondary_profile_busy_mode_controls_priority_path(
     )
     event = _event(profile="research")
     session_key = runner._session_key_for_source(event.source)
+    adapter_key = adapter.session_key_for_source(event.source)
+    assert adapter_key != session_key
     agent = MagicMock()
     agent._active_children = []
     agent.steer.return_value = True
@@ -172,10 +174,11 @@ async def test_secondary_profile_busy_mode_controls_priority_path(
     agent.interrupt.assert_not_called()
     if secondary_mode == "queue":
         agent.steer.assert_not_called()
-        assert adapter._pending_messages[session_key] is event
+        assert adapter._pending_messages[adapter_key] is event
+        assert session_key not in adapter._pending_messages
     else:
         agent.steer.assert_called_once_with("follow up")
-        assert session_key not in adapter._pending_messages
+        assert adapter_key not in adapter._pending_messages
 
 
 @pytest.mark.asyncio
@@ -223,6 +226,8 @@ async def test_secondary_profile_busy_mode_controls_priority_restart_drain(
     runner._restart_requested = True
     event = _event(profile="research")
     session_key = runner._session_key_for_source(event.source)
+    adapter_key = adapter.session_key_for_source(event.source)
+    assert adapter_key != session_key
     agent = MagicMock()
     agent._active_children = []
     runner._running_agents[session_key] = agent
@@ -231,7 +236,8 @@ async def test_secondary_profile_busy_mode_controls_priority_restart_drain(
 
     assert isinstance(response, str)
     assert "queued" in response
-    assert adapter._pending_messages[session_key] is event
+    assert adapter._pending_messages[adapter_key] is event
+    assert session_key not in adapter._pending_messages
     agent.interrupt.assert_not_called()
 
 
@@ -321,14 +327,12 @@ async def test_missing_or_invalid_secondary_mode_falls_back_to_gateway_default(
     assert runner._busy_text_mode == "queue"
 
 
-def test_profile_route_and_nonmultiplexed_resolution_preserve_boundaries(
-    tmp_path,
-    monkeypatch,
-):
+def test_profile_route_and_nonmultiplexed_resolution_preserve_boundaries(monkeypatch):
     runner = _runner(default_mode="interrupt")
     monkeypatch.setattr(
-        "hermes_cli.profiles.profiles_to_serve",
-        lambda **_: [("research", tmp_path / "research")],
+        "gateway.run._multiplex_profile_homes",
+        lambda _config: [("research", None)],
+    )
     )
     runner._snapshot_profile_busy_modes(
         "research",

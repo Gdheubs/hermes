@@ -137,6 +137,35 @@ class TestGoalManager:
         assert "port goal command to hermes" in prompt
         assert prompt.strip()  # non-empty
 
+    def test_continuation_generation_is_persisted_and_monotonic(self, hermes_home):
+        from hermes_cli.goals import GoalManager
+
+        mgr = GoalManager(session_id="continuation-generation")
+        mgr.set("same goal")
+        set_token = mgr.continuation_token()
+        mgr.pause()
+        paused_token = mgr.continuation_token()
+        mgr.resume()
+        first_resume_token = mgr.continuation_token()
+
+        reloaded = GoalManager(session_id="continuation-generation")
+        assert reloaded.continuation_token() == first_resume_token
+        reloaded.pause()
+        reloaded.resume()
+        second_resume_token = reloaded.continuation_token()
+
+        generations = [
+            int(set_token or 0),
+            int(paused_token or 0),
+            int(first_resume_token or 0),
+            int(second_resume_token or 0),
+        ]
+        assert generations == sorted(set(generations))
+
+        reloaded.clear()
+        replacement = reloaded.set("same goal")
+        assert replacement.continuation_generation > generations[-1]
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Smoke: CommandDef is wired
@@ -245,6 +274,7 @@ class TestGoalStateSubgoalsBackcompat:
         state = GoalState.from_json(legacy)
         assert state.goal == "do a thing"
         assert state.subgoals == []
+        assert state.continuation_generation == 0
 
 
 class TestMigrateGoalToSession:

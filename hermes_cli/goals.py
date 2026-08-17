@@ -597,6 +597,10 @@ class GoalState:
     # must ALL pass before the judge may declare the goal done. Empty by
     # default — a goal with no gates behaves exactly as before.
     gates: List[GoalGate] = field(default_factory=list)
+    # Persisted identity for synthetic continuation work. The canonical prompt
+    # is stable, so text alone cannot distinguish a delayed dispatch after a
+    # pause/resume cycle from the current one.
+    continuation_generation: int = 0
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -634,6 +638,7 @@ class GoalState:
                 for g in (data.get("gates") or [])
                 if isinstance(g, dict) and str(g.get("command") or "").strip()
             ],
+            continuation_generation=int(data.get("continuation_generation", 0) or 0),
         )
 
     # --- contract helpers -------------------------------------------------
@@ -1303,6 +1308,24 @@ class GoalManager:
 
     # --- mutation -----------------------------------------------------
 
+    def _next_continuation_generation(self) -> int:
+        """Return a generation newer than both cached and persisted state."""
+        generations = [int(getattr(self._state, "continuation_generation", 0) or 0)]
+        persisted = load_goal(self.session_id)
+        if persisted is not None:
+            generations.append(int(getattr(persisted, "continuation_generation", 0) or 0))
+        return max(generations) + 1
+
+    def _advance_continuation_generation(self) -> None:
+        if self._state is not None:
+            self._state.continuation_generation = self._next_continuation_generation()
+
+    def continuation_token(self) -> Optional[str]:
+        """Return the current persisted continuation identity for transports."""
+        if self._state is None:
+            return None
+        return str(int(self._state.continuation_generation or 0))
+
     def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
@@ -1315,6 +1338,7 @@ class GoalManager:
             created_at=time.time(),
             last_turn_at=0.0,
             contract=contract if contract is not None else GoalContract(),
+            continuation_generation=self._next_continuation_generation(),
         )
         self._state = state
         save_goal(self.session_id, state)
@@ -1342,6 +1366,7 @@ class GoalManager:
         self._state.waiting_until = 0.0
         self._state.waiting_reason = None
         self._state.waiting_since = 0.0
+        self._advance_continuation_generation()
         save_goal(self.session_id, self._state)
         return self._state
 
@@ -1358,6 +1383,7 @@ class GoalManager:
         self._state.waiting_since = 0.0
         if reset_budget:
             self._state.turns_used = 0
+        self._advance_continuation_generation()
         save_goal(self.session_id, self._state)
         return self._state
 
@@ -1365,6 +1391,7 @@ class GoalManager:
         if self._state is None:
             return
         self._state.status = "cleared"
+        self._advance_continuation_generation()
         save_goal(self.session_id, self._state)
         self._state = None
 
@@ -1374,6 +1401,7 @@ class GoalManager:
         self._state.status = "done"
         self._state.last_verdict = "done"
         self._state.last_reason = reason
+        self._advance_continuation_generation()
         save_goal(self.session_id, self._state)
 
     # --- /subgoal user controls ---------------------------------------

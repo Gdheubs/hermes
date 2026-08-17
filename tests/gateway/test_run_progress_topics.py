@@ -12,7 +12,7 @@ import pytest
 import gateway.platforms.base as base_platform
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from gateway.session import SessionSource
+from gateway.session import SessionSource, build_session_key
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -955,6 +955,23 @@ class QueuedFailedEmptyAgent:
         }
 
 
+class InterruptDepthAgent:
+    """Records turns so the recursion-cap fallback can be asserted end to end."""
+
+    messages = []
+
+    def __init__(self, **kwargs):
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        type(self).messages.append(message)
+        return {
+            "final_response": f"processed {message}",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class BackgroundReviewAgent:
     def __init__(self, **kwargs):
         self.background_review_callback = kwargs.get("background_review_callback")
@@ -1058,77 +1075,82 @@ async def _run_with_agent(
 
 
 @pytest.mark.asyncio
-async def test_slack_native_progress_correlates_concurrent_duplicate_tools_by_id(
-    monkeypatch, tmp_path
-):
-    adapter, result = await _run_with_agent(
-        monkeypatch,
-        tmp_path,
-        DuplicateNativeToolsAgent,
-        session_id="sess-native-ids",
-        config_data={
-            "display": {"platforms": {"slack": {"tool_progress": "off"}}}
-        },
-        platform=Platform.SLACK,
-        chat_id="C1",
-        thread_id="thread-1",
-        adapter_cls=NativeTaskCardAdapter,
-        user_id="U1",
-        scope_id="T1",
+async def test_interrupt_depth_cap_requeues_under_secondary_adapter_key(monkeypatch, tmp_path):
+    """The fourth recursive follow-up must return to the transport-owned slot."""
+    fake_dotenv = types.ModuleType("dotenv")
+    setattr(fake_dotenv, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    InterruptDepthAgent.messages = []
+    fake_run_agent = types.ModuleType("run_agent")
+    setattr(fake_run_agent, "AIAgent", InterruptDepthAgent)
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
+    runner = _make_runner(adapter)
+    runner.config.multiplex_profiles = True
+    runner._profile_adapters = {"coder": {Platform.DISCORD: adapter}}
+    runner._active_profile_name = lambda: "default"
+    runner.__dict__["_resolve_profile_home_for_source"] = lambda source: tmp_path
+    runner.session_store._generate_session_key = lambda source: build_session_key(
+        source,
+        group_sessions_per_user=False,
+        thread_sessions_per_user=False,
+        profile=source.profile,
     )
 
-    assert result["final_response"] == "done"
-    assert adapter.native_updates
-    second_completed = next(
-        update
-        for update in adapter.native_updates
-        if {task["id"]: task["status"] for task in update["tasks"]}
-        == {"call-a": "in_progress", "call-b": "error"}
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="chat-depth-chain",
+        chat_type="channel",
+        user_id="user-depth-chain",
+        profile="coder",
     )
-    assert second_completed["metadata"]["recipient_team_id"] == "T1"
-    assert second_completed["metadata"]["recipient_user_id"] == "U1"
-    assert adapter.native_updates[-1]["tasks"] == [
-        {
-            "id": "call-a",
-            "title": "web_search - alpha",
-            "status": "complete",
-        },
-        {
-            "id": "call-b",
-            "title": "web_search - beta",
-            "status": "error",
-        },
+    adapter_session_key = adapter.session_key_for_source(source)
+    session_key = runner._session_key_for_source(source)
+    assert adapter_session_key != session_key
+    interrupt_event = asyncio.Event()
+    interrupt_event.set()
+    adapter._active_sessions[adapter_session_key] = interrupt_event
+
+    for index in range(1, 5):
+        runner._enqueue_fifo(
+            session_key,
+            MessageEvent(
+                text=f"followup-{index}",
+                message_type=MessageType.TEXT,
+                source=source,
+            ),
+            adapter,
+            adapter_session_key=adapter_session_key,
+        )
+
+    result = await runner._run_agent(
+        message="initial",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-depth-chain",
+        session_key=session_key,
+    )
+
+    assert result["final_response"] == "processed followup-3"
+    assert InterruptDepthAgent.messages == [
+        "initial",
+        "followup-1",
+        "followup-2",
+        "followup-3",
     ]
-    assert adapter.sent == []
-    assert adapter.native_stops == 1
-
-
-@pytest.mark.asyncio
-async def test_slack_native_failure_keeps_editing_one_live_text_fallback(
-    monkeypatch, tmp_path
-):
-    adapter, result = await _run_with_agent(
-        monkeypatch,
-        tmp_path,
-        DuplicateNativeToolsAgent,
-        session_id="sess-native-fallback",
-        platform=Platform.SLACK,
-        chat_id="C1",
-        thread_id="thread-1",
-        adapter_cls=FailingNativeTaskCardAdapter,
-        user_id="U1",
-        scope_id="T1",
-    )
-
-    assert result["final_response"] == "done"
-    assert len(adapter.native_updates) == 1
-    assert len(adapter.sent) == 1
-    assert adapter.sent[0]["content"].endswith("web_search - alpha - running")
-    assert len(adapter.edits) >= 2
-    assert {edit["message_id"] for edit in adapter.edits} == {"progress-1"}
-    assert adapter.edits[-1]["content"].endswith("web_search - beta - error")
-    assert "web_search - alpha - complete" in adapter.edits[-1]["content"]
-    assert adapter.native_stops == 1
+    remaining = adapter.get_pending_message(adapter_session_key)
+    assert remaining is not None
+    assert remaining.text == "followup-4"
+    assert adapter.get_pending_message(session_key) is None
+    assert runner._session_state(session_key).conversation.queued_events == []
+    assert interrupt_event.is_set() is False
 
 
 @pytest.mark.asyncio

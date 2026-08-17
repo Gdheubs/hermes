@@ -180,6 +180,178 @@ def test_goal_bare_shows_status_when_none_set(server, session):
     assert "No active goal" in r["result"]["output"]
 
 
+def test_goal_resume_after_budget_exhaustion_dispatches_next_turn(server, session):
+    """Desktop /goal resume must restart work without another user message."""
+    from hermes_cli import goals
+
+    sid, session_key, _ = session
+    mgr = goals.GoalManager(session_id=session_key, default_max_turns=1)
+    mgr.set("finish the release")
+
+    with patch.object(
+        goals,
+        "judge_goal",
+        return_value=("continue", "more work remains", False, None, False),
+    ):
+        decision = mgr.evaluate_after_turn("I still need to verify the release")
+
+    assert decision["status"] == "paused"
+    assert mgr.state is not None
+    assert mgr.state.turns_used == 1
+    assert mgr.state.paused_reason == "turn budget exhausted (1/1)"
+
+    response = _call(
+        server, "command.dispatch", name="goal", arg="resume", session_id=sid
+    )
+
+    assert response["result"]["type"] == "send"
+    assert "Goal resumed: finish the release" in response["result"]["notice"]
+    assert response["result"]["display"] == "/goal resume"
+    assert response["result"]["display_kind"] == "goal_resume"
+    assert response["result"]["goal_token"]
+    assert server._sessions[sid]["_pending_goal_resume_projection"] == {
+        "prompt": response["result"]["message"],
+        "goal_token": response["result"]["goal_token"],
+    }
+    assert (
+        response["result"]["message"]
+        == goals.GoalManager(session_key).next_continuation_prompt()
+    )
+    resumed = goals.GoalManager(session_key).state
+    assert resumed is not None
+    assert resumed.status == "active"
+    assert resumed.turns_used == 0
+
+    server._sessions[sid]["running"] = True
+    queued = _call(
+        server,
+        "prompt.submit",
+        session_id=sid,
+        text=response["result"]["message"],
+        display_kind="goal_resume",
+        goal_token=response["result"]["goal_token"],
+    )
+    assert queued["result"]["status"] == "queued"
+    assert server._sessions[sid]["queued_prompt"]["display_kind"] == "goal_resume"
+    assert "_pending_goal_resume_projection" not in server._sessions[sid]
+
+    pause = _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
+    assert pause["result"]["type"] == "exec"
+    assert server._sessions[sid]["queued_prompt"] is None
+
+
+@pytest.mark.parametrize("invalidating_arg", ["pause", "clear", "replacement goal"])
+def test_stale_goal_resume_is_rejected_after_goal_state_changes(
+    server, session, invalidating_arg
+):
+    sid, _, s = session
+
+    _call(server, "command.dispatch", name="goal", arg="original goal", session_id=sid)
+    _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
+    resume = _call(
+        server, "command.dispatch", name="goal", arg="resume", session_id=sid
+    )
+    stale_prompt = resume["result"]["message"]
+    stale_token = resume["result"]["goal_token"]
+
+    _call(
+        server,
+        "command.dispatch",
+        name="goal",
+        arg=invalidating_arg,
+        session_id=sid,
+    )
+    response = _call(
+        server,
+        "prompt.submit",
+        session_id=sid,
+        text=stale_prompt,
+        display_kind="goal_resume",
+        goal_token=stale_token,
+    )
+
+    assert response["error"]["code"] == 4091
+    assert "stale goal resume" in response["error"]["message"]
+    assert s["history"] == []
+    assert s["running"] is False
+
+
+def test_goal_resume_projection_mismatch_is_not_downgraded_to_an_ordinary_prompt(
+    server, session
+):
+    sid, _, s = session
+
+    _call(server, "command.dispatch", name="goal", arg="original goal", session_id=sid)
+    _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
+    resume = _call(
+        server, "command.dispatch", name="goal", arg="resume", session_id=sid
+    )
+    expected = resume["result"]["message"]
+    goal_token = resume["result"]["goal_token"]
+
+    response = _call(
+        server,
+        "prompt.submit",
+        session_id=sid,
+        text=f"{expected} (stale copy)",
+        display_kind="goal_resume",
+        goal_token=goal_token,
+    )
+
+    assert response["error"]["code"] == 4091
+    assert s["_pending_goal_resume_projection"] == {
+        "prompt": expected,
+        "goal_token": goal_token,
+    }
+    assert s["history"] == []
+    assert s["running"] is False
+
+
+def test_stale_same_goal_resume_generation_is_rejected_without_consuming_current(
+    server, session
+):
+    """An old dispatch cannot impersonate a later resume with identical text."""
+    sid, _, s = session
+    _call(server, "command.dispatch", name="goal", arg="same goal", session_id=sid)
+    _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
+    old = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)[
+        "result"
+    ]
+    _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
+    current = _call(
+        server, "command.dispatch", name="goal", arg="resume", session_id=sid
+    )["result"]
+
+    assert old["message"] == current["message"]
+    assert old["goal_token"] != current["goal_token"]
+
+    stale = _call(
+        server,
+        "prompt.submit",
+        session_id=sid,
+        text=old["message"],
+        display_kind="goal_resume",
+        goal_token=old["goal_token"],
+    )
+    assert stale["error"]["code"] == 4091
+    assert s["_pending_goal_resume_projection"] == {
+        "prompt": current["message"],
+        "goal_token": current["goal_token"],
+    }
+
+    s["running"] = True
+    accepted = _call(
+        server,
+        "prompt.submit",
+        session_id=sid,
+        text=current["message"],
+        display_kind="goal_resume",
+        goal_token=current["goal_token"],
+    )
+    assert accepted["result"]["status"] == "queued"
+    assert s["queued_prompt"]["goal_token"] == current["goal_token"]
+
+
 # ── slash.exec /goal routing ──────────────────────────────────────────
 
 

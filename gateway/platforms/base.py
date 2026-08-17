@@ -2372,6 +2372,10 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # Persisted identity for synthetic standing-goal continuations. Ordinary
+    # platform messages leave this unset and retain their historical behavior.
+    goal_token: Optional[str] = None
+
     # Free-form per-event metadata.  Adapters may set platform-specific
     # signals here (e.g. WhatsApp sets ``whatsapp_from_owner=True`` when
     # the bridge is configured to forward owner-typed messages).  Plugins
@@ -3012,6 +3016,10 @@ class BasePlatformAdapter(ABC):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
+        # Secondary multiplex adapters must stamp their owning profile before
+        # the active-session guard can queue an event without calling the
+        # profile wrapper. Profile routes may still override this fallback.
+        self._inbound_profile_name: Optional[str] = None
         # Optional gateway-supplied fan-out for platform-native emoji
         # reaction events (see ``set_reaction_handler``).
         self._reaction_handler: Optional[
@@ -3629,18 +3637,9 @@ class BasePlatformAdapter(ABC):
         """
         self._message_handler = handler
 
-    def set_platform_event_handler(
-        self,
-        handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]],
-    ) -> None:
-        """Install the gateway-owned normalized platform-event boundary.
-
-        Adapters normalize SDK updates and pass only stable dictionaries plus an
-        internal ``SessionSource`` to this callback. The runner owns the final
-        authorization decision and plugin dispatch; an adapter with no callback
-        therefore fails closed instead of exposing pre-auth events.
-        """
-        self._platform_event_handler = handler
+    def set_inbound_profile_name(self, profile_name: Optional[str]) -> None:
+        """Set the fallback profile stamped at transport ingress."""
+        self._inbound_profile_name = profile_name or None
 
     def set_topic_recovery_fn(
         self,
@@ -5978,6 +5977,25 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    def session_key_for_source(self, source: SessionSource) -> str:
+        """Return the key used by this adapter's active and pending maps.
+
+        Profile isolation is already provided by separate adapter instances in
+        multiplex mode, so transport-local queues intentionally use the physical
+        chat/session key rather than the runner's profile-qualified state key.
+        Producers that enqueue directly into ``_pending_messages`` must use this
+        same helper as the drain path.
+        """
+        return build_session_key(
+            source,
+            group_sessions_per_user=self.config.extra.get(
+                "group_sessions_per_user", True
+            ),
+            thread_sessions_per_user=self.config.extra.get(
+                "thread_sessions_per_user", False
+            ),
+        )
+
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
@@ -5989,8 +6007,14 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
-        if event.allow_gateway_control:
-            coerce_plaintext_gateway_command(event)
+        if (
+            getattr(event, "source", None) is not None
+            and not event.source.profile
+            and getattr(self, "_inbound_profile_name", None)
+        ):
+            event.source.profile = self._inbound_profile_name
+
+        coerce_plaintext_gateway_command(event)
 
         # Telegram topic recovery only applies to private DM topic lanes. Do
         # not submit a no-op check for group/forum/channel traffic to the
@@ -7110,6 +7134,9 @@ class BasePlatformAdapter(ABC):
                     "Profile resolution failed for %s/%s, defaulting to active profile",
                     self.platform, chat_id, exc_info=True,
                 )
+
+        if not profile:
+            profile = getattr(self, "_inbound_profile_name", None)
 
         source = SessionSource(
             platform=self.platform,

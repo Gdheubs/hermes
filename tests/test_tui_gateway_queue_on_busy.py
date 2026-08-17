@@ -52,6 +52,39 @@ def test_enqueue_preserves_order_after_an_image_turn():
     ]
 
 
+def test_goal_resume_never_displaces_an_older_real_user_prompt():
+    session = _session(queued_prompt={"text": "older user", "transport": "ws-user"})
+
+    server._enqueue_prompt(
+        session,
+        "[Continuing toward your standing goal]\nGoal: finish safely",
+        "ws-goal",
+        display_kind="goal_resume",
+        display_metadata={"display_text": "/goal resume"},
+    )
+
+    assert session["queued_prompt"] == {
+        "text": "older user",
+        "transport": "ws-user",
+    }
+
+
+def test_real_user_prompt_displaces_a_queued_synthetic_goal_resume():
+    session = _session(
+        queued_prompt={
+            "text": "[Continuing toward your standing goal]\nGoal: finish safely",
+            "transport": "ws-goal",
+            "display_kind": "goal_resume",
+            "display_metadata": {"display_text": "/goal resume"},
+        }
+    )
+
+    server._enqueue_prompt(session, "new real user", "ws-user")
+
+    assert session["queued_prompt"] == {
+        "text": "new real user",
+        "transport": "ws-user",
+    }
 
 
 # ── _handle_busy_submit (policy) ───────────────────────────────────────────
@@ -314,6 +347,38 @@ def test_compress_no_rotation_does_not_bump_queue_generation(monkeypatch):
 
 
 
+
+
+def test_busy_goal_resume_is_queued_with_projection_not_redirected(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    redirected = []
+    agent = types.SimpleNamespace(
+        _supports_active_turn_redirect=True,
+        redirect=lambda text: redirected.append(text) or True,
+        interrupt=lambda *a, **k: None,
+    )
+    session = _session(agent=agent, running=True)
+    canonical = "[Continuing toward your standing goal]\nGoal: finish safely"
+
+    resp = server._handle_busy_submit(
+        "r1",
+        "sid",
+        session,
+        canonical,
+        "ws-1",
+        display_kind="goal_resume",
+        display_metadata={"display_text": "/goal resume"},
+    )
+
+    assert resp is not None
+    assert resp["result"]["status"] == "queued"
+    assert redirected == []
+    assert session["queued_prompt"] == {
+        "text": canonical,
+        "transport": "ws-1",
+        "display_kind": "goal_resume",
+        "display_metadata": {"display_text": "/goal resume"},
+    }
 
 
 def test_busy_interrupt_mode_ignores_completed_background_delegation(monkeypatch):
@@ -660,24 +725,71 @@ def test_drain_compute_host_forwards_queued_image_paths(monkeypatch):
 
 
 
-def test_drain_preserves_queued_prompt_when_session_is_closing(monkeypatch):
-    """A compute-host completion must not dispatch a successor after close."""
-    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+def test_drain_carries_goal_resume_projection(monkeypatch):
+    fired = {}
+    monkeypatch.setattr(server, "_goal_continuation_active", lambda *_args: True)
+
+    def _run(rid, sid, session, text, **kwargs):
+        fired.update(rid=rid, sid=sid, text=text, **kwargs)
+
+    monkeypatch.setattr(server, "_run_prompt_submit", _run)
+    canonical = "[Continuing toward your standing goal]\nGoal: finish safely"
+    session = _session(
+        queued_prompt={
+            "text": canonical,
+            "transport": "ws-9",
+            "display_kind": "goal_resume",
+            "display_metadata": {"display_text": "/goal resume"},
+        }
+    )
+
+    assert server._drain_queued_prompt("r1", "sid", session) is True
+    assert fired == {
+        "rid": "r1",
+        "sid": "sid",
+        "text": canonical,
+        "display_kind": "goal_resume",
+        "display_metadata": {"display_text": "/goal resume"},
+        "queued_prompt_generation": 0,
+    }
+
+
+def test_drain_drops_goal_resume_after_pause(monkeypatch):
+    fired = []
+    monkeypatch.setattr(server, "_goal_continuation_active", lambda *_args: False)
     monkeypatch.setattr(
         server,
-        "_submit_prompt_to_compute_host",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("closing session must not dispatch")
-        ),
+        "_run_prompt_submit",
+        lambda *args, **kwargs: fired.append((args, kwargs)),
     )
-    queued = {"text": "queued-after-close", "transport": "ws-9"}
-    session = _session(_closing=True, queued_prompt=queued)
+    session = _session(
+        queued_prompt={
+            "text": "[Continuing toward your standing goal]\nGoal: finish safely",
+            "transport": "ws-9",
+            "display_kind": "goal_resume",
+        }
+    )
 
     assert server._drain_queued_prompt("r1", "sid", session) is False
-    assert session["queued_prompt"] is queued
+    assert fired == []
+    assert session["queued_prompt"] is None
     assert session["running"] is False
 
 
+def test_run_prompt_submit_drops_stale_direct_goal_followup(monkeypatch):
+    monkeypatch.setattr(server, "_goal_continuation_active", lambda *_args: False)
+    session = _session(running=True, inflight_turn={"user": "synthetic"})
+
+    server._run_prompt_submit(
+        "r1",
+        "sid",
+        session,
+        "[Continuing toward your standing goal]\nGoal: finish safely",
+        display_kind="goal_continue",
+    )
+
+    assert session["running"] is False
+    assert session.get("inflight_turn") is None
 def test_drain_releases_running_on_dispatch_failure(monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("dispatch failed")

@@ -40,6 +40,25 @@ from hermes_cli.browser_connect import (
 )
 
 
+class PendingInputProjection:
+    """Model-facing queued input with a separate durable display projection."""
+
+    __slots__ = ("display_kind", "display_text", "goal_token", "text")
+
+    def __init__(
+        self,
+        text: str,
+        display_text: str,
+        display_kind: str,
+        *,
+        goal_token: str | None = None,
+    ) -> None:
+        self.text = text
+        self.display_text = display_text
+        self.display_kind = display_kind
+        self.goal_token = goal_token
+
+
 class CLICommandsMixin:
     """Mixin holding the interactive-CLI slash-command handlers.
 
@@ -2761,10 +2780,16 @@ class CLICommandsMixin:
                 _cprint(f"  {_DIM}No goal to resume.{_RST}")
             else:
                 _cprint(f"  ▶ Goal resumed: {state.goal}")
-                _cprint(
-                    f"  {_DIM}Send any message (or press Enter on an empty prompt "
-                    f"is a no-op; type 'continue' to kick it off).{_RST}"
-                )
+                prompt = mgr.next_continuation_prompt()
+                if prompt:
+                    getattr(self, "_pending_input").put(
+                        PendingInputProjection(
+                            prompt,
+                            "/goal resume",
+                            "goal_resume",
+                            goal_token=mgr.continuation_token(),
+                        )
+                    )
             return
 
         if lower in {"clear", "stop", "done"}:

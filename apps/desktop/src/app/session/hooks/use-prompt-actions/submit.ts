@@ -169,7 +169,9 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       if (
         !hasSendable ||
-        (!options?.fromQueue && isTargetSessionBusy($sessionStates.get(), guardSessionId, busyRef.current))
+        (!options?.fromQueue &&
+          options?.displayKind !== 'goal_resume' &&
+          isTargetSessionBusy($sessionStates.get(), guardSessionId, busyRef.current))
       ) {
         return false
       }
@@ -687,6 +689,8 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         const submitParams = (targetId: string) => ({
           session_id: targetId,
           text,
+          ...(options?.displayKind ? { display_kind: options.displayKind } : {}),
+          ...(options?.goalToken ? { goal_token: options.goalToken } : {}),
           ...(interrupted && { interrupted }),
           // Typed into the floating HUD, so the user is looking at another app
           // rather than at Hermes. The gateway turns this into a per-turn hint
