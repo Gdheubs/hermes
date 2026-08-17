@@ -41,6 +41,7 @@ from agent.skill_utils import (
     skill_matches_platform,
     skill_matches_platform_list,
 )
+from hermes_cli.config import load_config_readonly
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -2075,6 +2076,53 @@ def _build_skills_system_prompt_inner(
             "context, so their descriptions are omitted — the skills work "
             "normally and load with skill_view(name) as usual.)"
         )
+
+    # ── Cron context: trim the skill index to a whitelist ────────────
+    # Problem: when a large skill library is installed (e.g. 2890 skills),
+    # build_skills_system_prompt() renders the FULL sub-description index
+    # (~176K tokens) into every agent's system prompt — including cron jobs.
+    # Small/free models (e.g. tencent/hy3:free, context window ~128–262K)
+    # then hit a 403 context-limit error on the very first request and the
+    # cron job never completes.
+    #
+    # Fix: if skills.cron_enabled_toolsets is configured (e.g.
+    # ["terminal","web","file"]) and the current agent's available_toolsets
+    # match it exactly, we are in a cron context. In that case we render ONLY
+    # the whitelisted skills (skills.cron_whitelist) as `name: [category-tag]`
+    # (~3–5K tokens) instead of the full sub-description index.
+    #
+    # Human chat is unaffected: it uses a different toolset set, so the full
+    # sub-description index (needed for skill discovery) is preserved. The
+    # scheduler and agent lifecycle are NOT touched.
+    try:
+        _cron_cfg = (load_config_readonly() or {}).get("skills", {}) or {}
+        _cron_toolsets = _cron_cfg.get("cron_enabled_toolsets")
+        if _cron_toolsets and isinstance(_cron_toolsets, (list, tuple)):
+            _cron_toolsets_set = set(_cron_toolsets)
+            _avail_set = set(available_toolsets or set())
+            if _avail_set == _cron_toolsets_set:
+                _whitelist = set(_cron_cfg.get("cron_whitelist") or [])
+                _whitelisted_only = _cron_cfg.get("cron_whitelist_only", True)
+                if _whitelisted_only and _whitelist:
+                    _trimmed: dict[str, list[tuple[str, str]]] = {}
+                    for _cat, _skills in skills_by_category.items():
+                        for _name, _desc in _skills:
+                            if _name in _whitelist:
+                                _trimmed.setdefault(_cat, []).append(
+                                    (_name, f"[{_cat.split('/')[0]}]")
+                                )
+                    skills_by_category = _trimmed
+                elif not _whitelist:
+                    # No whitelist provided — fall back to names-only (tag per category)
+                    _trimmed = {}
+                    for _cat, _skills in skills_by_category.items():
+                        for _name, _desc in _skills:
+                            _trimmed.setdefault(_cat, []).append(
+                                (_name, f"[{_cat.split('/')[0]}]")
+                            )
+                    skills_by_category = _trimmed
+    except Exception as _e:
+        logger.debug("cron skill-index trim skipped: %s", _e)
 
     if not skills_by_category:
         result = ""
