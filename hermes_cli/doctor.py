@@ -346,8 +346,7 @@ def check_info(text: str):
     print(f"    {color('→', Colors.CYAN)} {text}")
 
 
-# ── state.db health/stats thresholds (advisory only — module constants,
-# deliberately NOT config: doctor warnings are guidance, not policy) ──
+# ── state.db health/stats thresholds (advisory only) ──
 STATE_DB_SIZE_WARN_BYTES = 1 * 1024 * 1024 * 1024   # 1 GiB logical size
 
 
@@ -356,7 +355,30 @@ STATE_DB_SIZE_WARN_BYTES = 1 * 1024 * 1024 * 1024   # 1 GiB logical size
 from hermes_cli.sizefmt import format_bytes as _human_bytes
 
 
-def _render_state_db_stats(stats: dict, holders=None) -> list:
+def _state_db_retention_policy() -> tuple[object, object]:
+    """Return raw auto-prune policy values through the canonical loader.
+
+    The renderer performs strict type validation so malformed config remains
+    actionable instead of being coerced into a false bounded-growth pass.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        sessions = (load_config() or {}).get("sessions")
+        if type(sessions) is dict:
+            return sessions.get("auto_prune"), sessions.get("retention_days")
+    except Exception:
+        pass
+    return None, None
+
+
+def _render_state_db_stats(
+    stats: dict,
+    holders=None,
+    *,
+    auto_prune=None,
+    retention_days=None,
+) -> list:
     """Turn a collect_state_db_stats() dict into doctor output lines.
 
     Returns a list of ``(kind, text, detail)`` tuples where kind is one of
@@ -403,30 +425,54 @@ def _render_state_db_stats(stats: dict, holders=None) -> list:
             "",
         ))
 
-    # Advisory: oversized database. Suggest auto_prune, and — when the v23
+    # Advisory: oversized database. Suggest auto_prune only when a valid
+    # bounded retention policy is not already active, and — when the v23
     # FTS rebuild is pending OR the DB still carries the legacy inline
     # trigram layout (fts_storage_version marker absent) — the offline
     # optimize-storage pass that migrates/compacts the FTS indexes.
     if logical is not None and logical > STATE_DB_SIZE_WARN_BYTES:
-        detail = (
-            "consider enabling sessions.auto_prune in config.yaml "
-            "to bound growth"
+        bounded = (
+            type(auto_prune) is bool
+            and auto_prune
+            and type(retention_days) is int
+            and retention_days > 0
         )
         legacy_trigram = (
             fts is not None
             and fts.get("messages_fts_trigram")
             and stats.get("fts_storage_version") is None
         )
-        if stats.get("fts_rebuild_pending") or legacy_trigram:
+        optimize_needed = bool(stats.get("fts_rebuild_pending") or legacy_trigram)
+        detail = ""
+
+        if bounded and not optimize_needed:
+            lines.append((
+                "info",
+                f"state.db is large ({_human_bytes(logical)})",
+                f"(growth bounded by sessions.auto_prune; retention {retention_days} days)",
+            ))
+        else:
+            if bounded:
+                detail = (
+                    "sessions.auto_prune is enabled "
+                    f"(retention {retention_days} days)"
+                )
+            else:
+                detail = (
+                    "consider enabling sessions.auto_prune in config.yaml "
+                    "to bound growth"
+                )
+        if optimize_needed:
             detail += (
                 "; run 'hermes sessions optimize-storage' offline "
                 "(with the gateway stopped) to compact FTS storage"
             )
-        lines.append((
-            "warn",
-            f"state.db is large ({_human_bytes(logical)})",
-            f"({detail})",
-        ))
+        if not bounded or optimize_needed:
+            lines.append((
+                "warn",
+                f"state.db is large ({_human_bytes(logical)})",
+                f"({detail})",
+            ))
 
     # WAL runaway is deliberately NOT warned here: the pre-existing WAL
     # check later in the state.db section already warns above 50 MB and
@@ -1826,21 +1872,25 @@ def run_doctor(args):
 
             _db_stats = collect_state_db_stats(state_db_path)
             _db_holders = count_db_holders(state_db_path)
+            _auto_prune, _retention_days = _state_db_retention_policy()
             for _kind, _text, _detail in _render_state_db_stats(
-                _db_stats, holders=_db_holders
+                _db_stats,
+                holders=_db_holders,
+                auto_prune=_auto_prune,
+                retention_days=_retention_days,
             ):
                 if _kind == "warn":
                     check_warn(_text, _detail)
-                    if "auto_prune" in _detail:
-                        issues.append(
-                            "state.db is large — enable sessions.auto_prune "
-                            "in config.yaml"
-                            + (
-                                " and run 'hermes sessions optimize-storage' "
-                                "offline (gateway stopped)"
-                                if "optimize-storage" in _detail else ""
-                            )
+                    _fixes = []
+                    if "consider enabling sessions.auto_prune" in _detail:
+                        _fixes.append("enable sessions.auto_prune in config.yaml")
+                    if "optimize-storage" in _detail:
+                        _fixes.append(
+                            "run 'hermes sessions optimize-storage' offline "
+                            "(gateway stopped)"
                         )
+                    if _fixes:
+                        issues.append("state.db is large — " + " and ".join(_fixes))
                 else:
                     check_info(_text + (f" {_detail}" if _detail else ""))
         except Exception as _stats_exc:

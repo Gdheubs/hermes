@@ -20,9 +20,65 @@ import threading
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
+
+_TELEGRAM_RECOVERY_STATE = "telegram_polling_recovery.json"
+
+
+def _process_start_ticks(pid: int) -> int:
+    """Return Linux process start ticks, which disambiguate PID reuse."""
+    raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    fields = raw[raw.rfind(")") + 2 :].split()
+    return int(fields[19])
+
+
+def _persist_telegram_polling_recovery(
+    platform_name: str, incident_started_at_unix_ns: int
+) -> None:
+    """Atomically persist non-log proof of successful post-error getUpdates I/O."""
+    pid = os.getpid()
+    home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+    runtime_dir = home / "runtime"
+    state_path = runtime_dir / _TELEGRAM_RECOVERY_STATE
+    tmp_path = runtime_dir / (
+        f".{_TELEGRAM_RECOVERY_STATE}.{pid}.{threading.get_ident()}.{time.time_ns()}.tmp"
+    )
+    payload = {
+        "schema_version": 1,
+        "platform": platform_name,
+        "pid": pid,
+        "process_start_ticks": _process_start_ticks(pid),
+        "incident_started_at_unix_ns": incident_started_at_unix_ns,
+        "recovered_at_unix_ns": time.time_ns(),
+    }
+    runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(runtime_dir, 0o700)
+    fd = os.open(
+        tmp_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, state_path)
+        os.chmod(state_path, 0o600)
+        directory_fd = os.open(runtime_dir, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _redact_telegram_error_text(error: object) -> str:
@@ -805,6 +861,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count: int = 0
         self._polling_conflict_recovery_generation: Optional[int] = None
         self._polling_network_error_count: int = 0
+        self._polling_network_error_started_at_ns: Optional[int] = None
         self._polling_generation: int = 0
         self._polling_progress_event = asyncio.Event()
         self._polling_progress_accepting: bool = False
@@ -2517,13 +2574,36 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         if generation != self._polling_generation:
             return
+        recovered_network_errors = self._polling_network_error_count
+        incident_started_at_ns = getattr(
+            self, "_polling_network_error_started_at_ns", None
+        )
         self._polling_progress_event.set()
         self._polling_network_error_count = 0
+        self._polling_network_error_started_at_ns = None
         if generation == self._polling_conflict_recovery_generation:
             self._polling_conflict_recovery_generation = None
         else:
             self._polling_conflict_count = 0
         self._send_path_degraded = False
+        if recovered_network_errors > 0:
+            try:
+                _persist_telegram_polling_recovery(
+                    self.name,
+                    incident_started_at_ns
+                    if isinstance(incident_started_at_ns, int)
+                    else time.time_ns(),
+                )
+            except Exception:
+                logger.warning(
+                    "[%s] Could not persist Telegram polling recovery state",
+                    self.name,
+                    exc_info=True,
+                )
+            logger.warning(
+                "[%s] Telegram polling recovered after successful getUpdates progress",
+                self.name,
+            )
 
     def _observe_polling_request_result(self, request, generation, result):
         """Record getUpdates progress from an observed do_request result.
@@ -2933,6 +3013,8 @@ class TelegramAdapter(BasePlatformAdapter):
         BASE_DELAY = 5
         MAX_DELAY = 60
 
+        if self._polling_network_error_count == 0:
+            self._polling_network_error_started_at_ns = time.time_ns()
         self._polling_network_error_count += 1
         self._send_path_degraded = True
         attempt = self._polling_network_error_count

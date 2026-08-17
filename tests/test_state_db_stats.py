@@ -184,6 +184,84 @@ def test_render_warns_on_large_db():
     assert "config.yaml" in blob
 
 
+def test_render_large_db_with_valid_auto_prune_is_bounded_info():
+    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
+
+    big = STATE_DB_SIZE_WARN_BYTES + 1
+    lines = _render_state_db_stats(
+        _base_stats(logical_size_bytes=big),
+        holders=None,
+        auto_prune=True,
+        retention_days=180,
+    )
+    assert not [line for line in lines if line[0] == "warn"]
+    blob = " ".join(" ".join(str(part) for part in line) for line in lines)
+    assert "auto_prune" in blob
+    assert "180 days" in blob
+
+
+def test_state_db_retention_policy_reads_canonical_config(monkeypatch):
+    from hermes_cli.doctor import _state_db_retention_policy
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"sessions": {"auto_prune": True, "retention_days": 180}},
+    )
+    assert _state_db_retention_policy() == (True, 180)
+
+
+def test_state_db_retention_policy_fails_closed_on_bad_shape(monkeypatch):
+    from hermes_cli.doctor import _state_db_retention_policy
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"sessions": []})
+    assert _state_db_retention_policy() == (None, None)
+
+
+@pytest.mark.parametrize(
+    ("auto_prune", "retention_days"),
+    [
+        (False, 180),
+        (1, 180),
+        (True, True),
+        (True, 0),
+        (True, -1),
+        (True, "180"),
+    ],
+)
+def test_render_large_db_malformed_or_disabled_policy_fails_closed(
+    auto_prune, retention_days
+):
+    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
+
+    lines = _render_state_db_stats(
+        _base_stats(logical_size_bytes=STATE_DB_SIZE_WARN_BYTES + 1),
+        holders=None,
+        auto_prune=auto_prune,
+        retention_days=retention_days,
+    )
+    blob = " ".join(" ".join(str(part) for part in line) for line in lines if line[0] == "warn")
+    assert "consider enabling sessions.auto_prune" in blob
+
+
+def test_render_large_db_valid_auto_prune_still_warns_on_pending_fts_rebuild():
+    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
+
+    lines = _render_state_db_stats(
+        _base_stats(
+            logical_size_bytes=STATE_DB_SIZE_WARN_BYTES + 1,
+            fts_rebuild_pending=True,
+        ),
+        holders=None,
+        auto_prune=True,
+        retention_days=180,
+    )
+    warns = [line for line in lines if line[0] == "warn"]
+    assert len(warns) == 1
+    blob = " ".join(str(part) for part in warns[0])
+    assert "optimize-storage" in blob
+    assert "enable sessions.auto_prune" not in blob
+
+
 def test_render_large_db_with_pending_rebuild_suggests_optimize():
     from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
 
