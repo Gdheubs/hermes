@@ -4423,6 +4423,12 @@ def copilot_model_api_mode(
     if _should_use_copilot_responses_api(normalized):
         return "codex_responses"
 
+    # Copilot Claude uses the provider's OpenAI-compatible chat transport,
+    # never Hermes' native Anthropic or Responses adapters. Keep that invariant
+    # ahead of generic catalog endpoint handling.
+    if normalized.lower().startswith(("claude-", "anthropic/claude-")):
+        return "chat_completions"
+
     # Catalog-driven fallback for models the pattern check does not cover.
     # Copilot advertises the accepted wire endpoint per model and rejects a
     # mismatch with ``unsupported_api_for_model``. Only upgrade a non-GPT
