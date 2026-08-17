@@ -715,6 +715,78 @@ class TestGatewayServiceDetection:
 
 
 class TestGatewaySystemServiceRouting:
+    def test_launchd_external_restart_uses_after_turn_graceful_path(
+        self, monkeypatch, capsys
+    ):
+        calls = []
+
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 654)
+        monkeypatch.setattr(
+            gateway_cli, "_request_gateway_self_restart", lambda pid: False
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_get_restart_exit_wait_budget", lambda: 27.0
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, timeout: calls.append((pid, timeout)) or True,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_service_restart",
+            lambda previous_pid=None, timeout=60.0: calls.append(
+                ("wait", previous_pid, timeout)
+            )
+            or True,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "terminate_pid",
+            lambda *args, **kwargs: pytest.fail("must not use SIGTERM fallback"),
+        )
+
+        gateway_cli.launchd_restart()
+
+        assert calls == [(654, 27.0), ("wait", 654, 60.0)]
+        output = capsys.readouterr().out.lower()
+        assert "restarting gracefully" in output
+        assert "in-flight turns + drain" in output
+
+    def test_launchd_graceful_exit_without_healthy_replacement_uses_kickstart(
+        self, monkeypatch
+    ):
+        run_calls = []
+
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 654)
+        monkeypatch.setattr(
+            gateway_cli, "_request_gateway_self_restart", lambda pid: False
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_graceful_restart_via_sigusr1", lambda pid, timeout: True
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_launchd_service_restart",
+            lambda previous_pid=None, timeout=60.0: False,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "terminate_pid",
+            lambda *args, **kwargs: pytest.fail("old PID already exited"),
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda cmd, **kwargs: run_calls.append(cmd)
+            or SimpleNamespace(returncode=0),
+        )
+
+        gateway_cli.launchd_restart()
+
+        assert len(run_calls) == 1
+        assert run_calls[0][:3] == ["launchctl", "kickstart", "-k"]
+
     def test_systemd_restart_gracefully_restarts_running_service_and_waits(self, monkeypatch, capsys):
         calls = []
 

@@ -1274,6 +1274,50 @@ def _wait_for_systemd_service_restart(
     return False
 
 
+def _wait_for_launchd_service_restart(
+    *, previous_pid: int | None = None, timeout: float = 60.0
+) -> bool:
+    """Wait for launchd to publish a healthy replacement gateway PID."""
+    import time
+
+    deadline = time.monotonic() + timeout
+    printed_runtime_wait = False
+    while time.monotonic() < deadline:
+        try:
+            from gateway.status import get_running_pid
+
+            new_pid = get_running_pid()
+        except Exception:
+            new_pid = None
+
+        if new_pid and (previous_pid is None or new_pid != previous_pid):
+            runtime_state = _gateway_runtime_status_for_pid(new_pid)
+            gateway_state = (runtime_state or {}).get("gateway_state")
+            if gateway_state == "running":
+                print(f"✓ Service restarted (PID {new_pid})")
+                return True
+            if gateway_state == "startup_failed":
+                reason = (runtime_state or {}).get("exit_reason") or "startup failed"
+                print(
+                    f"⚠ Service process restarted (PID {new_pid}), but gateway "
+                    f"startup failed: {reason}"
+                )
+                return False
+            if not printed_runtime_wait:
+                print(
+                    f"⏳ Service process started (PID {new_pid}); "
+                    "waiting for gateway runtime..."
+                )
+                printed_runtime_wait = True
+        time.sleep(0.5)
+
+    print(
+        "⚠ launchd did not publish a healthy replacement gateway within "
+        f"{timeout:.0f}s"
+    )
+    return False
+
+
 def _systemd_unit_is_start_limited(props: dict[str, str]) -> bool:
     result = props.get("Result", "").lower()
     sub_state = props.get("SubState", "").lower()
@@ -5143,26 +5187,49 @@ def launchd_restart():
             _escalate_wedged_gateway(pid)
             pid = None
         if pid is not None:
-            # Announce the drain BEFORE waiting on it. This wait can run for
-            # the full drain budget (180s by default) while the old gateway
-            # finishes in-flight agent runs, and it streams into surfaces with
-            # no other feedback — the desktop updater's live output most of
-            # all, where a silent stop here reads as "update stuck" (#44515).
-            # Mirrors the systemd branch's "draining (up to Ns)..." line.
+            # An external CLI is not a descendant of the gateway, so the
+            # asynchronous self-restart shortcut above intentionally refuses
+            # it. Still use the same SIGUSR1 in-band restart contract and wait
+            # for the old PID: the gateway first refuses new work, then waits
+            # up to restart_after_turn_timeout for active turns to finish.
+            # Falling straight through to SIGTERM used restart_drain_timeout
+            # instead (0s by default) and amputated active Telegram turns on
+            # macOS even though the safe restart path already existed.
+            wait_budget = _get_restart_exit_wait_budget()
             print(
-                f"→ Stopping gateway (PID {pid}) — draining in-flight runs "
-                f"(up to {drain_timeout:.0f}s)..."
+                f"⏳ Service restarting gracefully (PID {pid}) — "
+                f"waiting up to {wait_budget:.0f}s for in-flight turns + drain..."
             )
-            try:
-                terminate_pid(pid, force=False)
-            except (ProcessLookupError, PermissionError, OSError):
+            if _graceful_restart_via_sigusr1(pid, wait_budget):
+                if _wait_for_launchd_service_restart(previous_pid=pid):
+                    _clear_launchd_unsupported_marker()
+                    return
+                # The old process exited cleanly, but KeepAlive did not yield
+                # a healthy replacement. Skip the stale-PID SIGTERM step and
+                # let the launchctl kickstart fallback recover the service.
                 pid = None
+
             if pid is not None:
-                exited = _wait_for_gateway_exit(timeout=drain_timeout, force_after=None)
-                if not exited:
-                    print(
-                        f"⚠ Gateway drain timed out after {drain_timeout:.0f}s — forcing launchd restart"
+                # SIGUSR1 could not be delivered or the bounded after-turn
+                # wait expired. Preserve the existing hard-restart fallback
+                # so a wedged gateway remains recoverable.
+                print(
+                    f"→ Stopping gateway (PID {pid}) — draining in-flight runs "
+                    f"(up to {drain_timeout:.0f}s)..."
+                )
+                try:
+                    terminate_pid(pid, force=False)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pid = None
+                if pid is not None:
+                    exited = _wait_for_gateway_exit(
+                        timeout=drain_timeout, force_after=None
                     )
+                    if not exited:
+                        print(
+                            f"⚠ Gateway drain timed out after "
+                            f"{drain_timeout:.0f}s — forcing launchd restart"
+                        )
         subprocess.run(["launchctl", "kickstart", "-k", target], check=True, timeout=90)
         print("✓ Service restarted")
         _clear_launchd_unsupported_marker()
