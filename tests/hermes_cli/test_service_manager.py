@@ -194,6 +194,7 @@ def fake_subprocess_run(monkeypatch: pytest.MonkeyPatch):
 
 def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     """Verifies the dirs + FIFO + modes the helper lays down."""
+    import os
     import stat
 
     from hermes_cli.service_manager import _seed_supervise_skeleton
@@ -206,7 +207,10 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     # Top-level event/ — s6-svlisten1 event subscription dir.
     event = svc_dir / "event"
     assert event.is_dir(), "missing top-level event/"
-    assert stat.S_IMODE(event.stat().st_mode) == 0o3730, (
+    # An unprivileged macOS owner cannot set setgid on a root-group directory;
+    # the supervised container runs privileged and must retain the full mode.
+    expected_event_mode = 0o3730 if os.geteuid() == 0 else 0o1730
+    assert stat.S_IMODE(event.stat().st_mode) == expected_event_mode, (
         f"event/ mode = {oct(event.stat().st_mode)}, want 03730"
     )
 
@@ -218,7 +222,7 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     # supervise/event/.
     supervise_event = supervise / "event"
     assert supervise_event.is_dir(), "missing supervise/event/"
-    assert stat.S_IMODE(supervise_event.stat().st_mode) == 0o3730
+    assert stat.S_IMODE(supervise_event.stat().st_mode) == expected_event_mode
 
     # supervise/control FIFO.
     control = supervise / "control"

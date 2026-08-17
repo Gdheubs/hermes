@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -108,7 +109,8 @@ def snapshot_shutdown_context(received_signal: Any = None) -> Dict[str, Any]:
 
     * The signal number/name (so SIGINT vs SIGTERM is visible)
     * Our own PID/ppid + parent process info from /proc (Linux)
-    * Whether systemd is our parent (``ppid==1`` or ``INVOCATION_ID`` set)
+    * Whether systemd is our parent (``ppid==1`` on non-macOS or
+      ``INVOCATION_ID`` set)
     * Whether takeover/planned-stop markers exist (consumed lazily by the caller)
     * /proc/self limits + load average (1-min)
     * Wall-clock and monotonic timestamps for cross-correlating later phases
@@ -132,15 +134,26 @@ def snapshot_shutdown_context(received_signal: Any = None) -> Dict[str, Any]:
     }
 
     # systemd context.  If we were started by a systemd unit, INVOCATION_ID
-    # is set in our env.  ppid==1 (init) is also a strong signal that
-    # systemd reaped+forwarded the SIGTERM.
+    # is set in our env.  ppid==1 is *not* a reliable systemd signal on its
+    # own: launchd is also PID 1 on macOS, so this heuristic used to label
+    # every launchd-supervised shutdown as "under_systemd" too. XPC_SERVICE_NAME
+    # is launchd's equivalent of INVOCATION_ID (set for any launchd job) and
+    # disambiguates the two supervisors.
     invocation_id = os.environ.get("INVOCATION_ID")
     if invocation_id:
         ctx["systemd_invocation_id"] = invocation_id
     journal_stream = os.environ.get("JOURNAL_STREAM")
     if journal_stream:
         ctx["systemd_journal_stream"] = journal_stream
-    ctx["under_systemd"] = bool(invocation_id) or ppid == 1
+    launchd_service_name = os.environ.get("XPC_SERVICE_NAME")
+    launchd_marker = str(launchd_service_name or "").strip().lower()
+    launchd_supervised = launchd_marker not in {"", "0", "false", "off", "no"}
+    if launchd_supervised:
+        ctx["launchd_service_name"] = launchd_service_name
+    ctx["under_launchd"] = launchd_supervised
+    ctx["under_systemd"] = bool(invocation_id) or (
+        ppid == 1 and sys.platform != "darwin" and not launchd_supervised
+    )
 
     # Load average — high load points the finger at "something else
     # crushing the box" rather than "external killer".
@@ -249,13 +262,39 @@ def spawn_async_diagnostic(
         return None
 
     try:
+        # macOS does not ship GNU coreutils' ``timeout``. Prefer it when
+        # available, but keep the diagnostic self-contained on POSIX hosts.
+        timeout_bin = shutil.which("timeout")
+        if timeout_bin:
+            command = [timeout_bin, f"{timeout_seconds:.0f}", "bash", "-c", script]
+        else:
+            timeout_runner = (
+                "import os, signal, subprocess, sys\n"
+                "child = subprocess.Popen(['bash', '-c', sys.argv[2]], start_new_session=True)\n"
+                "try:\n"
+                "    child.wait(timeout=float(sys.argv[1]))\n"
+                "except subprocess.TimeoutExpired:\n"
+                "    if child.poll() is None:\n"
+                "        try:\n"
+                "            os.killpg(child.pid, signal.SIGKILL)\n"
+                "        except (ProcessLookupError, PermissionError):\n"
+                "            pass\n"
+                "    child.wait()\n"
+            )
+            command = [
+                sys.executable,
+                "-c",
+                timeout_runner,
+                f"{timeout_seconds:.0f}",
+                script,
+            ]
         # Detach from our process group so the subprocess survives even
         # if systemd kills our cgroup with KillMode=control-group (which
         # would also reap us anyway, but defense in depth).  Without
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            command,
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
@@ -286,6 +325,7 @@ def format_context_for_log(ctx: Dict[str, Any]) -> str:
     parent_name = parent.get("name") or "?"
     parent_pid = parent.get("pid") or "?"
     under_systemd = "yes" if ctx.get("under_systemd") else "no"
+    under_launchd = "yes" if ctx.get("under_launchd") else "no"
     load = ctx.get("loadavg_1m")
     load_str = f"{load:.2f}" if isinstance(load, (int, float)) else "?"
     extras: List[str] = []
@@ -303,6 +343,7 @@ def format_context_for_log(ctx: Dict[str, Any]) -> str:
     return (
         f"signal={sig} "
         f"under_systemd={under_systemd} "
+        f"under_launchd={under_launchd} "
         f"parent_pid={parent_pid} "
         f"parent_name={parent_name} "
         f"loadavg_1m={load_str}"

@@ -709,21 +709,25 @@ class TestHealthDetailedEndpoint:
             "exit_reason": None,
             "updated_at": "2026-04-14T00:00:00Z",
         }), patch("gateway.run._resolve_gateway_model", return_value="test/model"):
-            async with TestClient(TestServer(app)) as cli:
-                resp = await cli.get("/health/detailed")
-                assert resp.status == 200
-                data = await resp.json()
-                assert data["status"] == "ok"
-                assert data["platform"] == "hermes-agent"
-                assert data["gateway_state"] == "running"
-                assert data["platforms"] == {"telegram": {"state": "connected"}}
-                assert data["active_agents"] == 2
-                # Derived busy/drainable: this endpoint is served BY the live
-                # gateway, so running + 2 agents ⇒ busy and drainable.
-                assert data["gateway_busy"] is True
-                assert data["gateway_drainable"] is True
-                assert isinstance(data["pid"], int)
-                assert "updated_at" in data
+            with patch(
+                "gateway.readiness._probe_disk",
+                return_value={"status": "ok", "used_percent": 10.0, "free_bytes": 90},
+            ):
+                async with TestClient(TestServer(app)) as cli:
+                    resp = await cli.get("/health/detailed")
+                    assert resp.status == 200
+                    data = await resp.json()
+                    assert data["status"] == "ok"
+                    assert data["platform"] == "hermes-agent"
+                    assert data["gateway_state"] == "running"
+                    assert data["platforms"] == {"telegram": {"state": "connected"}}
+                    assert data["active_agents"] == 2
+                    # Derived busy/drainable: this endpoint is served BY the live
+                    # gateway, so running + 2 agents ⇒ busy and drainable.
+                    assert data["gateway_busy"] is True
+                    assert data["gateway_drainable"] is True
+                    assert isinstance(data["pid"], int)
+                    assert "updated_at" in data
 
 
     @pytest.mark.asyncio

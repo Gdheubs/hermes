@@ -149,6 +149,34 @@ class TestSlackApprovalAction:
 
 
     @pytest.mark.asyncio
+    async def test_reconciles_workspace_key_when_click_omits_team(self):
+        adapter = _make_adapter()
+        _attach_auth_runner(adapter)
+        adapter._approval_resolved[("T1", "1234.5678")] = False
+
+        ack = AsyncMock()
+        body = {
+            "message": {"ts": "1234.5678", "blocks": []},
+            "channel": {"id": "C1"},
+            "user": {"name": "alice", "id": "U_ALICE"},
+        }
+        action = {
+            "action_id": "hermes_approve_once",
+            "value": "session-key",
+        }
+
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_update = AsyncMock()
+
+        with patch(
+            "tools.approval.resolve_gateway_approval", return_value=1
+        ) as resolve:
+            await adapter._handle_approval_action(ack, body, action)
+
+        resolve.assert_called_once_with("session-key", "once")
+
+
+    @pytest.mark.asyncio
     async def test_truncates_inflated_original_text(self):
         """Interaction payload re-escapes HTML entities; text must be capped."""
         adapter = _make_adapter()

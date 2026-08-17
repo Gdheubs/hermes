@@ -271,6 +271,34 @@ def _validate_delete_target(skill_dir: Path) -> Optional[str]:
     )
 
 
+def _canonical_skill_name(name: str) -> str:
+    """Return the usage/provenance identity for a skill reference.
+
+    Gateway prompts may render categorized skills as ``category:skill`` while
+    filesystem paths and usage records remain keyed by the bare skill name.
+    Keep the qualified spelling for user-facing messages, but never let it
+    create a second authorization or lifecycle identity.
+    """
+    if not isinstance(name, str) or ":" not in name:
+        return name
+    try:
+        from tools import skill_usage
+
+        resolved = skill_usage.canonical_skill_name(name)
+        if resolved != name:
+            return resolved
+        from hermes_cli.plugins import get_plugin_manager
+
+        if get_plugin_manager().find_plugin_skill(name) is not None:
+            return name
+    except Exception:
+        pass
+    # Keep the lifecycle identity stable even when a temporary/test skill root
+    # is not visible to skill_usage's resolver.
+    category, bare_name = name.split(":", 1)
+    return bare_name if category and bare_name else name
+
+
 def _pinned_guard(name: str) -> Optional[str]:
     """Return a refusal message if *name* is pinned, else None.
 
@@ -284,7 +312,7 @@ def _pinned_guard(name: str) -> Optional[str]:
     """
     try:
         from tools import skill_usage
-        rec = skill_usage.get_record(name)
+        rec = skill_usage.get_record(_canonical_skill_name(name))
         if rec.get("pinned"):
             return (
                 f"Skill '{name}' is pinned and cannot be deleted by "
@@ -310,6 +338,7 @@ def _background_review_write_guard(
     it is autonomous lifecycle maintenance, so its write surface is restricted
     to local curator-owned sediment.
     """
+    skill_identity = _canonical_skill_name(name)
     try:
         from tools.skill_provenance import is_background_review
         if not is_background_review():
@@ -325,7 +354,7 @@ def _background_review_write_guard(
     # because there is no user in the loop to consent to an edit here.
     try:
         from tools import skill_usage
-        if skill_usage.get_record(name).get("pinned"):
+        if skill_usage.get_record(skill_identity).get("pinned"):
             return {
                 "success": False,
                 "error": (
@@ -354,7 +383,7 @@ def _background_review_write_guard(
 
     try:
         from tools import skill_usage
-        if skill_usage.is_protected_builtin(name):
+        if skill_usage.is_protected_builtin(skill_identity):
             return {
                 "success": False,
                 "error": (
@@ -362,7 +391,7 @@ def _background_review_write_guard(
                     f"built-in skill '{name}'."
                 ),
             }
-        if skill_usage.is_hub_installed(name):
+        if skill_usage.is_hub_installed(skill_identity):
             return {
                 "success": False,
                 "error": (
@@ -370,7 +399,7 @@ def _background_review_write_guard(
                     f"skill '{name}'."
                 ),
             }
-        if skill_usage.is_bundled(name):
+        if skill_usage.is_bundled(skill_identity):
             return {
                 "success": False,
                 "error": (
@@ -393,7 +422,7 @@ def _background_review_write_guard(
         # policy — it is a race with our own bookkeeping. Fail closed for both
         # shapes; `hermes curator adopt <name>` is the supported way in.
         usage_data = skill_usage.load_usage()
-        usage_rec = usage_data.get(name)
+        usage_rec = usage_data.get(skill_identity)
         if not skill_usage._is_curator_managed_record(usage_rec):
             if isinstance(usage_rec, dict):
                 _detail = f"created_by={usage_rec.get('created_by')!r}"
@@ -649,8 +678,20 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
     Searches the local skills dir (~/.hermes/skills/) first, then any
     external dirs configured via skills.external_dirs.  Returns
     {"path": Path} or None.
+
+    Accepts both a bare skill name and a categorized `category:skill` name
+    (the form the gateway prompt renders categorized skills as — see
+    prompt_builder.build_skills_system_prompt) by translating the latter to
+    the on-disk `category/skill` layout, matching skill_view's fallback in
+    skills_tool.py.
     """
     from agent.skill_utils import get_all_skills_dirs, is_excluded_skill_path
+
+    category_name: Optional[str] = None
+    bare_name = name
+    if ":" in name:
+        category_name, bare_name = name.split(":", 1)
+
     for skills_dir in get_all_skills_dirs():
         if not skills_dir.exists():
             continue
@@ -659,6 +700,16 @@ def _find_skill(name: str) -> Optional[Dict[str, Any]]:
                 continue
             if skill_md.parent.name == name:
                 return {"path": skill_md.parent}
+            if category_name and skill_md.parent.name == bare_name:
+                try:
+                    relative_parent = skill_md.parent.relative_to(skills_dir)
+                    relative_category = "/".join(relative_parent.parts[:-1])
+                except ValueError:
+                    continue
+                if relative_category == category_name or relative_category.endswith(
+                    f"/{category_name}"
+                ):
+                    return {"path": skill_md.parent}
     return None
 
 
@@ -681,7 +732,7 @@ def _maybe_auto_propose_org_edit(name: str, skill_path: Path) -> Optional[str]:
                 f"saved locally and will not be overwritten by org updates. "
                 f"Run `hermes sync propose {name}` to share it back."
             )
-        result = ssc.propose_skill(name)
+        result = ssc.propose_skill(_canonical_skill_name(name))
         if result.get("proposal_pending"):
             return (
                 f"Auto-proposed to your organisation as proposal "
@@ -1197,6 +1248,7 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
         target must exist on disk. Validated here so the model can't claim an
         umbrella that doesn't exist.
     """
+    skill_identity = _canonical_skill_name(name)
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
@@ -1227,7 +1279,7 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     is_consolidation = bool(absorbed_target)
     if is_consolidation:
         target_name = absorbed_target
-        if target_name == name:
+        if _canonical_skill_name(target_name) == skill_identity:
             return {
                 "success": False,
                 "error": f"absorbed_into='{target_name}' cannot equal the skill being deleted.",
@@ -1266,7 +1318,7 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     if curator_pass:
         try:
             from tools.skill_usage import archive_skill
-            ok, archive_msg = archive_skill(name)
+            ok, archive_msg = archive_skill(skill_identity)
         except Exception as e:
             return {"success": False, "error": f"failed to archive '{name}': {e}"}
         if not ok:
@@ -1664,6 +1716,7 @@ def skill_manage(
         try:
             from tools.skill_usage import bump_patch, forget, record_created
             from tools.skill_provenance import is_background_review
+            skill_identity = _canonical_skill_name(name)
             if action == "create":
                 record_created(
                     name,
@@ -1673,7 +1726,7 @@ def skill_manage(
                 )
             elif action in {"patch", "edit", "write_file", "remove_file"}:
                 bump_patch(
-                    name,
+                    skill_identity,
                     action=action,
                     task_id=task_id,
                     session_id=session_id,
@@ -1683,7 +1736,7 @@ def skill_manage(
                 # keeps its usage record as STATE_ARCHIVED so `hermes curator
                 # status`/`restore` still see it. Only a hard delete forgets.
                 if not result.get("_archived"):
-                    forget(name)
+                    forget(skill_identity)
         except Exception:
             pass
 
@@ -1695,7 +1748,7 @@ def skill_manage(
         # sync. Debounced so a burst of edits collapses to one push. Never
         # raises -- an agent write must never block on sync (M1-C invariant).
         try:
-            _maybe_debounced_sync_push(name)
+            _maybe_debounced_sync_push(_canonical_skill_name(name))
         except Exception:
             pass
 

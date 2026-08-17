@@ -575,6 +575,26 @@ def _missing_api_key_toolsets_for_summary(unavailable: list[dict]) -> list[dict]
     ]
 
 
+def _active_unavailable_toolsets_for_doctor(unavailable: list[dict]) -> list[dict]:
+    """Return unavailable toolsets that are active on the CLI surface.
+
+    The registry is global and includes optional integrations for every
+    platform. Reporting every unavailable integration from ``hermes doctor``
+    made explicitly disabled or unconfigured toolsets look like active
+    failures (for example Discord, X search, and image generation). Keep the
+    full registry for internal availability checks, but only warn about the
+    toolsets Hermes will actually load for the current CLI configuration.
+    """
+    enabled_toolsets = _enabled_cli_toolsets_for_doctor()
+    if enabled_toolsets is None:
+        return list(unavailable)
+    return [
+        item
+        for item in unavailable
+        if str(item.get("name") or "") in enabled_toolsets
+    ]
+
+
 def _read_pyproject_version() -> str | None:
     """Read the ``version = "..."`` from ``pyproject.toml`` at the project root.
 
@@ -1607,7 +1627,7 @@ def run_doctor(args):
         if nous_status.get("logged_in"):
             check_ok("Nous Portal auth", "(logged in)")
         else:
-            check_warn("Nous Portal auth", "(not logged in)")
+            check_info("Nous Portal auth (not logged in — optional)")
 
         codex_status = get_codex_auth_status()
         if codex_status.get("logged_in"):
@@ -1632,7 +1652,7 @@ def run_doctor(args):
             region = minimax_status.get("region", "global")
             check_ok("MiniMax OAuth", f"(logged in, region={region})")
         else:
-            check_warn("MiniMax OAuth", "(not logged in)")
+            check_info("MiniMax OAuth (not logged in — optional)")
     except Exception as e:
         check_warn("Auth provider status", f"(could not check: {e})")
 
@@ -1644,7 +1664,7 @@ def run_doctor(args):
         if xai_oauth_status.get("logged_in"):
             check_ok("xAI OAuth", "(logged in)")
         else:
-            check_warn("xAI OAuth", "(not logged in)")
+            check_info("xAI OAuth (not logged in — optional)")
             if xai_oauth_status.get("error"):
                 check_info(xai_oauth_status["error"])
     except Exception:
@@ -2786,6 +2806,7 @@ def run_doctor(args):
         
         available, unavailable = check_tool_availability()
         available, unavailable = _apply_doctor_tool_availability_overrides(available, unavailable)
+        unavailable = _active_unavailable_toolsets_for_doctor(unavailable)
         
         for tid in available:
             info = TOOLSET_REQUIREMENTS.get(tid, {})

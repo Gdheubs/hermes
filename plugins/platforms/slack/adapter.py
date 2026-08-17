@@ -7412,16 +7412,49 @@ class SlackAdapter(BasePlatformAdapter):
         }
         choice = choice_map.get(action_id, "deny")
 
-        # Prevent double-clicks — atomic pop; first caller gets False, others get True (default)
-        # Check both the workspace-scoped marker and the bare ts: the approval
-        # may have been stored without a team id (metadata-poor send path)
-        # while the click event carries one, and that mismatch must not
-        # swallow a legitimate first click.
+        # Prevent double-clicks — atomic pop; first caller gets False, others get True (default).
+        # Reconcile the workspace-scoped marker and bare timestamp because Slack
+        # interaction payloads do not always carry the same team metadata as the
+        # send path. Never guess when multiple workspaces share a timestamp.
         approval_key = self._workspace_message_marker(team_id, msg_ts)
         if msg_ts in self._approval_resolved:
             approval_key = msg_ts
+        if approval_key not in self._approval_resolved:
+            matching_keys = [
+                key
+                for key, resolved in self._approval_resolved.items()
+                if (
+                    isinstance(key, tuple)
+                    and len(key) == 2
+                    and str(key[1]) == str(msg_ts)
+                    and not resolved
+                )
+            ]
+            if len(matching_keys) == 1:
+                approval_key = matching_keys[0]
+            else:
+                logger.info(
+                    "[Slack] Approval click ignored: no unambiguous pending key "
+                    "for team_id=%s msg_ts=%s candidates=%s",
+                    team_id,
+                    msg_ts,
+                    len(matching_keys),
+                )
+                return
         if self._approval_resolved.pop(approval_key, True):
+            logger.info(
+                "[Slack] Approval click swallowed by double-click guard: "
+                "action_id=%s session=%s user=%s team_id=%s msg_ts=%s "
+                "approval_key=%s",
+                action_id,
+                session_key,
+                user_name,
+                team_id,
+                msg_ts,
+                approval_key,
+            )
             return
+
 
         # Resolve the approval FIRST — this unblocks the agent thread. Render
         # after, so a click that lands past the approval timeout (count == 0)

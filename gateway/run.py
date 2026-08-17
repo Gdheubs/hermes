@@ -30459,9 +30459,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # `hermes gateway stop` and interactive Ctrl+C are handled above as
     # planned stops and should not trigger service-manager revival.
     if _signal_initiated_shutdown and not runner._restart_requested:
+        _xpc_service_name = str(os.environ.get("XPC_SERVICE_NAME") or "").strip().lower()
+        _launchd_supervised = _xpc_service_name not in {"", "0", "false", "off", "no"}
+        _supervisor = (
+            "launchd KeepAlive" if _launchd_supervised else "systemd Restart=on-failure"
+        )
         logger.info(
             "Exiting with code 1 (signal-initiated shutdown without restart "
-            "request) so systemd Restart=on-failure can revive the gateway."
+            "request) so %s can revive the gateway.",
+            _supervisor,
         )
         return False  # → sys.exit(1) in the caller
 

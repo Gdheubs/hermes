@@ -16,6 +16,7 @@ from tools.skill_manager_tool import (
     _edit_skill,
     _patch_skill,
     _delete_skill,
+    _find_skill,
     _write_file,
     _remove_file,
     skill_manage,
@@ -261,6 +262,44 @@ class TestDeleteSkill:
             _create_skill("my-skill", VALID_SKILL_CONTENT, category="devops")
             _delete_skill("my-skill")
         assert not (tmp_path / "devops").exists()
+
+    def test_qualified_name_respects_bare_name_pin_record(self, tmp_path):
+        with _skill_dir(tmp_path):
+            _create_skill("my-skill", VALID_SKILL_CONTENT, category="devops")
+            with patch(
+                "tools.skill_usage.get_record",
+                side_effect=lambda name: {"pinned": name == "my-skill"},
+            ):
+                result = _delete_skill("devops:my-skill")
+
+        assert result["success"] is False
+        assert "pinned" in result["error"]
+        assert (tmp_path / "devops" / "my-skill").exists()
+
+    def test_nested_qualified_name_resolves_to_skill_directory(self, tmp_path):
+        nested = tmp_path / "social-media" / "twitter" / "search"
+        nested.mkdir(parents=True)
+        (nested / "SKILL.md").write_text(
+            "---\nname: search\ndescription: Search skill.\n---\n\n# Search\n",
+            encoding="utf-8",
+        )
+        with _skill_dir(tmp_path):
+            found = _find_skill("social-media/twitter:search")
+        assert found == {"path": nested}
+
+    def test_usage_pin_canonicalizes_nested_qualified_name(self, tmp_path, monkeypatch):
+        nested = tmp_path / "social-media" / "twitter" / "search"
+        nested.mkdir(parents=True)
+        (nested / "SKILL.md").write_text(
+            "---\nname: search\ndescription: Search skill.\n---\n\n# Search\n",
+            encoding="utf-8",
+        )
+        import tools.skill_usage as skill_usage
+
+        monkeypatch.setattr(skill_usage, "_skills_dir", lambda: tmp_path)
+        skill_usage.set_pinned("social-media/twitter:search", True)
+        assert skill_usage.get_record("search")["pinned"] is True
+        assert skill_usage.get_record("social-media/twitter:search")["pinned"] is True
 
 
     def test_delete_with_absorbed_into_equals_self_rejected(self, tmp_path):

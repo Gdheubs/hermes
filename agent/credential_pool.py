@@ -2548,7 +2548,14 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         anthropic_oauth_env = (
             _env_val("ANTHROPIC_TOKEN") or _env_val("CLAUDE_CODE_OAUTH_TOKEN")
         )
-        api_key_path_explicit = bool(anthropic_api_key and not anthropic_oauth_env)
+        manual_api_key_path = any(
+            _is_manual_source(entry.source)
+            and entry.auth_type == AUTH_TYPE_API_KEY
+            for entry in entries
+        )
+        api_key_path_explicit = bool(
+            (anthropic_api_key or manual_api_key_path) and not anthropic_oauth_env
+        )
 
         if api_key_path_explicit:
             # Prune any stale autodiscovered OAuth entries that may have been

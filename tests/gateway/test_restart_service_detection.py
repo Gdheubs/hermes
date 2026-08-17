@@ -20,7 +20,7 @@ import pytest
 
 import gateway.run as gateway_run
 from gateway.platforms.base import MessageEvent, MessageType
-from gateway.restart import EXTERNAL_GATEWAY_SUPERVISOR_ENV
+from gateway.restart import EXTERNAL_GATEWAY_SUPERVISOR_ENV, is_gateway_supervisor_process
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
@@ -76,3 +76,12 @@ async def test_false_external_supervisor_marker_keeps_detached_path(
     await runner._handle_restart_command(_make_restart_event())
 
     runner.request_restart.assert_called_once_with(detached=True, via_service=False)
+
+
+@pytest.mark.parametrize("value", ["", "0", "false", "off", "no"])
+def test_false_launchd_marker_is_not_supervised(value):
+    assert is_gateway_supervisor_process({"XPC_SERVICE_NAME": value}) is False
+
+
+def test_launchd_job_label_is_supervised():
+    assert is_gateway_supervisor_process({"XPC_SERVICE_NAME": "com.atlas.hermes"}) is True

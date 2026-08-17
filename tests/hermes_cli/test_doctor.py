@@ -77,6 +77,17 @@ class TestDoctorToolAvailabilitySummary:
 
         assert [item["name"] for item in filtered] == ["web"]
 
+    def test_active_unavailable_toolsets_ignore_disabled_integrations(self, monkeypatch):
+        unavailable = [
+            {"name": "image_gen", "env_vars": [], "tools": ["generate_image"]},
+            {"name": "web", "env_vars": [], "tools": ["web_search"]},
+        ]
+        monkeypatch.setattr(doctor, "_enabled_cli_toolsets_for_doctor", lambda: {"web"})
+
+        filtered = doctor._active_unavailable_toolsets_for_doctor(unavailable)
+
+        assert [item["name"] for item in filtered] == ["web"]
+
 
 class TestDoctorEnvFileEncoding:
     """Regression for #18637 (bug 3): `hermes doctor` crashed on Windows

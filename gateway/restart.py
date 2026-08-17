@@ -61,8 +61,8 @@ def is_gateway_supervisor_process(
         return True
     if env.get("HERMES_S6_SUPERVISED_CHILD"):
         return True
-    xpc_service = env.get("XPC_SERVICE_NAME", "")
-    if xpc_service and xpc_service != "0":
+    xpc_service = str(env.get("XPC_SERVICE_NAME", "")).strip().lower()
+    if xpc_service not in {"", "0", "false", "off", "no"}:
         return True
     return str(env.get(EXTERNAL_GATEWAY_SUPERVISOR_ENV, "")).strip().lower() in {
         "1",

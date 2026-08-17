@@ -1783,8 +1783,9 @@ def init_agent(
                     user_char_limit=mem_config.get("user_char_limit", 1375),
                 )
                 agent._memory_store.load_from_disk()
-        except Exception:
-            pass  # Memory is optional -- don't break agent init
+        except Exception as _mem_err:
+            agent._memory_store = None
+            _ra().logger.warning("Memory store init/load failed, continuing without it: %s", _mem_err)
     
 
 

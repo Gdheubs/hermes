@@ -1,6 +1,7 @@
 """Tests for the dangerous command approval module."""
 
 import os
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -101,8 +102,11 @@ class TestDetectDangerousRm:
 
     def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self):
         with mock_patch("tempfile.gettempdir", return_value="/tmp"):
+            canonical_temp = os.path.realpath(tempfile.gettempdir())
             for prefix in ("hermes-verify-", "hermes-ad-hoc-"):
-                assert detect_dangerous_command(f"rm -f /tmp/{prefix}example.py") == (
+                assert detect_dangerous_command(
+                    f"rm -f {canonical_temp}/{prefix}example.py"
+                ) == (
                     False,
                     None,
                     None,

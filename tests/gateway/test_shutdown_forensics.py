@@ -43,6 +43,17 @@ class TestSnapshotShutdownContext:
         assert before <= ctx["ts"] <= after
         assert isinstance(ctx["ts_monotonic"], float)
 
+    def test_interactive_macos_xpc_zero_is_not_supervised(self, monkeypatch):
+        monkeypatch.delenv("INVOCATION_ID", raising=False)
+        monkeypatch.setenv("XPC_SERVICE_NAME", "0")
+        monkeypatch.setattr(sf.sys, "platform", "darwin")
+        monkeypatch.setattr(sf.os, "getppid", lambda: 1)
+
+        ctx = sf.snapshot_shutdown_context(signal.SIGTERM)
+
+        assert ctx["under_launchd"] is False
+        assert ctx["under_systemd"] is False
+
 
     def test_under_systemd_false_without_invocation_id_and_normal_ppid(
         self, monkeypatch

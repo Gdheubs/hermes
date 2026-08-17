@@ -75,7 +75,7 @@ def is_protected_builtin(skill_name: str) -> bool:
     path: the automatic state-transition walk, the LLM consolidation pass (they
     are dropped from the candidate list), and direct ``archive_skill`` calls.
     """
-    return skill_name in PROTECTED_BUILTIN_SKILLS
+    return canonical_skill_name(skill_name) in PROTECTED_BUILTIN_SKILLS
 
 
 def _skills_dir() -> Path:
@@ -317,6 +317,7 @@ def _write_suppressed_names(names: Set[str]) -> None:
 
 def add_suppressed_name(skill_name: str) -> None:
     """Record that a built-in skill was pruned, so sync won't restore it."""
+    skill_name = canonical_skill_name(skill_name)
     if not skill_name:
         return
     names = read_suppressed_names()
@@ -327,6 +328,7 @@ def add_suppressed_name(skill_name: str) -> None:
 
 def remove_suppressed_name(skill_name: str) -> None:
     """Clear a built-in's suppression entry (e.g. on restore)."""
+    skill_name = canonical_skill_name(skill_name)
     if not skill_name:
         return
     names = read_suppressed_names()
@@ -426,8 +428,9 @@ def _read_skill_name(skill_md: Path, fallback: str) -> str:
 
 def is_agent_created(skill_name: str) -> bool:
     """Whether *skill_name* is neither bundled nor hub-installed."""
+    skill_identity = canonical_skill_name(skill_name)
     off_limits = _read_bundled_manifest_names() | _read_hub_installed_names()
-    if skill_name in off_limits:
+    if skill_identity in off_limits:
         return False
     return not (
         _find_skill_dir(skill_name) is None
@@ -437,12 +440,12 @@ def is_agent_created(skill_name: str) -> bool:
 
 def is_hub_installed(skill_name: str) -> bool:
     """Whether *skill_name* was installed via the Skills Hub."""
-    return skill_name in _read_hub_installed_names()
+    return canonical_skill_name(skill_name) in _read_hub_installed_names()
 
 
 def is_bundled(skill_name: str) -> bool:
     """Whether *skill_name* was seeded from the bundled repo skills."""
-    return skill_name in _read_bundled_manifest_names()
+    return canonical_skill_name(skill_name) in _read_bundled_manifest_names()
 
 
 def _external_read_only_message(skill_name: str) -> str:
@@ -466,6 +469,7 @@ def is_curation_eligible(skill_name: str, skill_path: Optional[Path] = None) -> 
     regardless of any flag — they back load-bearing UX and must never be
     archived or consolidated.
     """
+    skill_name = canonical_skill_name(skill_name)
     if skill_path is not None and is_external_skill_path(skill_path):
         return False
     if is_protected_builtin(skill_name):
@@ -512,7 +516,7 @@ def is_curator_managed(skill_name: str) -> bool:
     as the question they are actually asking (see ``_is_curator_managed_record``
     for why the stored field name says "created_by").
     """
-    return _is_curator_managed_record(load_usage().get(skill_name))
+    return _is_curator_managed_record(load_usage().get(canonical_skill_name(skill_name)))
 
 
 def list_unmanaged_skill_names() -> List[str]:
@@ -608,6 +612,7 @@ def adopt_skill(skill_name: str) -> Tuple[bool, str]:
     """
     if not skill_name:
         return False, "no skill name given"
+    skill_name = canonical_skill_name(skill_name)
     if is_protected_builtin(skill_name):
         return False, f"'{skill_name}' is a protected built-in; the curator never manages it"
     if is_hub_installed(skill_name):
@@ -707,6 +712,7 @@ def save_usage(data: Dict[str, Dict[str, Any]]) -> bool:
 
 def get_record(skill_name: str) -> Dict[str, Any]:
     """Return the record for *skill_name*, creating a fresh one if missing."""
+    skill_name = canonical_skill_name(skill_name)
     data = load_usage()
     rec = data.get(skill_name)
     if not isinstance(rec, dict):
@@ -727,6 +733,7 @@ def seed_record_if_missing(skill_name: str) -> None:
     archive/stale clock measures non-use FROM THEN — not from epoch. No-op when
     a record already exists or the skill isn't curation-eligible.
     """
+    skill_name = canonical_skill_name(skill_name)
     if not skill_name or not is_curation_eligible(skill_name):
         return
     try:
@@ -753,6 +760,7 @@ def _mutate(skill_name: str, mutator, *, require_curation_eligible: bool = False
     """
     if not skill_name:
         return None
+    skill_name = canonical_skill_name(skill_name)
     try:
         if require_curation_eligible and not is_curation_eligible(skill_name):
             return None
@@ -1052,6 +1060,7 @@ def is_sync_enabled(skill_name: str) -> bool:
 
 def forget(skill_name: str) -> None:
     """Drop a skill's usage entry entirely. Called when the skill is deleted."""
+    skill_name = canonical_skill_name(skill_name)
     if not skill_name:
         return
     try:
@@ -1076,6 +1085,7 @@ def archive_skill(skill_name: str) -> Tuple[bool, str]:
     when one is archived, its name is added to the suppression list so the
     update-time re-seeder leaves it archived instead of restoring it.
     """
+    skill_name = canonical_skill_name(skill_name)
     local_skill_dir = _find_skill_dir(skill_name)
     if local_skill_dir is None and _find_external_skill_dir(skill_name) is not None:
         return False, _external_read_only_message(skill_name)
@@ -1158,6 +1168,7 @@ def restore_skill(skill_name: str) -> Tuple[bool, str]:
     way to lift a prune). Restoring clears any suppression entry so future
     updates may re-seed the built-in again.
     """
+    skill_name = canonical_skill_name(skill_name)
     # Hub skills always have an external upstream owner — never shadow them.
     if is_hub_installed(skill_name):
         return False, (
@@ -1253,11 +1264,23 @@ def _find_skill_dir(skill_name: str) -> Optional[Path]:
         return None
     from agent.skill_utils import iter_skill_index_files
 
+    category_name, bare_name = _qualified_skill_parts(skill_name)
     for skill_md in iter_skill_index_files(base, "SKILL.md"):
         if is_external_skill_path(skill_md):
             continue
-        if _read_skill_name(skill_md, fallback=skill_md.parent.name) == skill_name:
+        frontmatter_name = _read_skill_name(skill_md, fallback=skill_md.parent.name)
+        if frontmatter_name == skill_name:
             return skill_md.parent
+        if category_name and frontmatter_name == bare_name:
+            try:
+                relative_parent = skill_md.parent.relative_to(base)
+                relative_category = "/".join(relative_parent.parts[:-1])
+            except ValueError:
+                continue
+            if relative_category == category_name or relative_category.endswith(
+                f"/{category_name}"
+            ):
+                return skill_md.parent
     return None
 
 
@@ -1265,15 +1288,60 @@ def _find_external_skill_dir(skill_name: str) -> Optional[Path]:
     """Locate a skill under configured external dirs by frontmatter name."""
     from agent.skill_utils import get_all_skills_dirs
 
+    category_name, bare_name = _qualified_skill_parts(skill_name)
     for base in get_all_skills_dirs()[1:]:
         if not base.exists():
             continue
         for skill_md in base.rglob("SKILL.md"):
             if is_excluded_skill_path(skill_md):
                 continue
-            if _read_skill_name(skill_md, fallback=skill_md.parent.name) == skill_name:
+            frontmatter_name = _read_skill_name(skill_md, fallback=skill_md.parent.name)
+            if frontmatter_name == skill_name:
                 return skill_md.parent
+            if category_name and frontmatter_name == bare_name:
+                try:
+                    relative_parent = skill_md.parent.relative_to(base)
+                    relative_category = "/".join(relative_parent.parts[:-1])
+                except ValueError:
+                    continue
+                if relative_category == category_name or relative_category.endswith(
+                    f"/{category_name}"
+                ):
+                    return skill_md.parent
     return None
+
+
+def _qualified_skill_parts(skill_name: str) -> Tuple[Optional[str], str]:
+    """Split a prompt-rendered ``category:skill`` reference."""
+    if not isinstance(skill_name, str) or ":" not in skill_name:
+        return None, skill_name
+    category, bare_name = skill_name.split(":", 1)
+    if not category or not bare_name:
+        return None, skill_name
+    return category, bare_name
+
+
+def canonical_skill_name(skill_name: str) -> str:
+    """Return the sidecar identity for a skill reference.
+
+    Category-qualified filesystem skills use ``category:skill`` in prompts but
+    store usage under the frontmatter name. Plugin-qualified names remain
+    untouched because they are separate logical identities.
+    """
+    if not isinstance(skill_name, str) or ":" not in skill_name:
+        return skill_name
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+
+        if get_plugin_manager().find_plugin_skill(skill_name) is not None:
+            return skill_name
+    except Exception:
+        pass
+    skill_dir = _find_skill_dir(skill_name) or _find_external_skill_dir(skill_name)
+    if skill_dir is None:
+        return skill_name
+    _, bare_name = _qualified_skill_parts(skill_name)
+    return _read_skill_name(skill_dir / "SKILL.md", fallback=bare_name)
 
 
 # ---------------------------------------------------------------------------
