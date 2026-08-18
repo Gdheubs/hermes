@@ -7697,6 +7697,118 @@ def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
 
 
+def _message_fingerprint(msg: Any) -> tuple[Any, ...]:
+    """Stable message identity for interrupt-merge comparisons.
+
+    Object identity (``is``) is too fragile: serialization, sanitization, DB
+    round-trips, and shallow copies all produce equivalent dicts that must
+    still count as the same transcript row.
+    """
+    if not isinstance(msg, dict):
+        return ("__non_dict__", type(msg).__name__, repr(msg))
+
+    content = msg.get("content")
+    if content is not None and not isinstance(content, str):
+        try:
+            content = json.dumps(content, sort_keys=True, default=str)
+        except TypeError:
+            content = repr(content)
+
+    tool_calls = msg.get("tool_calls")
+    if tool_calls is not None and not isinstance(tool_calls, str):
+        try:
+            tool_calls = json.dumps(tool_calls, sort_keys=True, default=str)
+        except TypeError:
+            tool_calls = repr(tool_calls)
+
+    return (
+        msg.get("role"),
+        content,
+        msg.get("tool_call_id"),
+        msg.get("name"),
+        tool_calls,
+    )
+
+
+def _merge_interrupted_api_history(
+    live_history: list[dict],
+    returned_history: list[dict],
+    *,
+    allow_rewrite: bool = False,
+) -> list[dict]:
+    """Keep a live transcript from being rolled back by an interrupted turn.
+
+    ``run_conversation`` normally returns the turn-start history plus its new
+    tail.  An API-call interruption can instead return an older snapshot.
+    Replacing the gateway's live history with that prefix silently drops the
+    newer rows.  Preserve the live prefix and append only the returned turn
+    tail unless the result explicitly marks a compaction/rewrite.
+    """
+    if not returned_history:
+        return list(live_history)
+    if not live_history:
+        return list(returned_history)
+    if allow_rewrite:
+        return list(returned_history)
+
+    shared = 0
+    limit = min(len(live_history), len(returned_history))
+    while (
+        shared < limit
+        and _message_fingerprint(live_history[shared])
+        == _message_fingerprint(returned_history[shared])
+    ):
+        shared += 1
+
+    # Returned is a strict prefix of (or equal to) live with no new tail.
+    if shared == len(returned_history) and len(returned_history) <= len(live_history):
+        return list(live_history)
+
+    # Returned extends the full live prefix — accept it.
+    if shared == len(live_history):
+        return list(returned_history)
+
+    # Shared some prefix, then diverged or returned a shorter stale view.
+    if shared > 0:
+        return [*live_history, *returned_history[shared:]]
+
+    # No shared prefix and no rewrite marker — prefer the longer live transcript.
+    if len(live_history) >= len(returned_history):
+        return list(live_history)
+    return list(returned_history)
+
+
+def _interrupted_result_allows_rewrite(
+    live_history: list[dict],
+    returned_history: list[dict],
+    result: dict,
+) -> bool:
+    """True when an interrupted result is a legitimate compaction rewrite.
+
+    ``run_conversation`` does not currently set ``compressed`` /
+    ``context_compressed`` / ``history_rewrite`` on its result dict.  Detect a
+    *new* ``_compressed_summary`` row in the returned transcript instead.
+    Compare against live fingerprints, not live markers: SessionDB replay
+    often drops ``_compressed_summary`` while keeping the summary text.
+    An older summary already present in live history must not flip this
+    on — that is the stale-snapshot case from #78010.
+    """
+    if result.get("compressed") or result.get("context_compressed") or result.get("history_rewrite"):
+        return True
+
+    # Fingerprints ignore ``_compressed_summary``. SessionDB-backed live rows
+    # often keep the summary text but drop that in-process flag, so matching
+    # against live content (not live markers) is what prevents a stale
+    # marked snapshot from looking like a brand-new rewrite.
+    live_fingerprints = {_message_fingerprint(msg) for msg in live_history}
+    return any(
+        isinstance(msg, dict)
+        and msg.get("_compressed_summary")
+        and _message_fingerprint(msg) not in live_fingerprints
+        for msg in returned_history
+    )
+
+
 def _fail_inflight_turn(session: dict, error: Any) -> None:
     """Mark the in-flight turn terminal-error but keep it replayable.
 
@@ -10905,7 +11017,25 @@ def _run_prompt_submit(
                     with session["history_lock"]:
                         current_version = int(session.get("history_version", 0))
                         if current_version == history_version:
-                            session["history"] = result["messages"]
+                            if result.get("turn_exit_reason") == "interrupted_during_api_call":
+                                # Merge against the live session history (not
+                                # the turn-start snapshot) so concurrent
+                                # appends that forgot to bump history_version
+                                # still cannot be clobbered by a stale result.
+                                # Fingerprint equality, not object identity.
+                                returned_messages = result["messages"]
+                                allow_rewrite = _interrupted_result_allows_rewrite(
+                                    session.get("history") or [],
+                                    returned_messages,
+                                    result,
+                                )
+                                session["history"] = _merge_interrupted_api_history(
+                                    session.get("history") or [],
+                                    returned_messages,
+                                    allow_rewrite=allow_rewrite,
+                                )
+                            else:
+                                session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
                         else:
                             # History mutated externally during the turn.
