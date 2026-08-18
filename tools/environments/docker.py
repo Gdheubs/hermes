@@ -920,12 +920,28 @@ class DockerEnvironment(BaseEnvironment):
         # they degrade gracefully on hosts without controller delegation,
         # e.g. unprivileged LXCs). The probe runs once per process and is
         # cached host-wide.
+        #
+        # Fail closed when limits were explicitly REQUESTED but cannot be
+        # enforced: a caller that asked for cpu/memory limits must not get a
+        # container that silently runs without them (the requested isolation
+        # would be absent). When no limits are requested, there is nothing to
+        # drop and normal operation proceeds.
+        _limits_requested = cpu > 0 or memory > 0
+        _limits_available = _cgroup_limits_available(image)
+        if _limits_requested and not _limits_available:
+            raise RuntimeError(
+                "Docker isolation unavailable: cpu/memory/pids resource limits "
+                "were requested but this environment does not delegate the "
+                "cpu/memory/pids cgroup controllers. Re-run with limits "
+                "disabled, or delegate the controllers (--cap-add, LXC/cgroup "
+                "config) before requesting bounded execution."
+            )
         resource_args = []
-        if cpu > 0 and _cgroup_limits_available(image):
+        if cpu > 0 and _limits_available:
             resource_args.extend(["--cpus", str(cpu)])
-        if memory > 0 and _cgroup_limits_available(image):
+        if memory > 0 and _limits_available:
             resource_args.extend(["--memory", f"{memory}m"])
-        if _cgroup_limits_available(image):
+        if _limits_available:
             resource_args.extend(["--pids-limit", _DEFAULT_PIDS_LIMIT])
         # /dev/shm size (not cgroup-gated: --shm-size is a tmpfs mount option,
         # no controller delegation required). Skip when the user already sets

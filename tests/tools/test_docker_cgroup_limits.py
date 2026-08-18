@@ -59,3 +59,73 @@ def test_probe_result_is_cached(monkeypatch):
     docker_env._cgroup_limits_available("img")
     docker_env._cgroup_limits_available("img")
     assert len(calls) == 1  # probe runs once, then cached
+
+
+def _docker_available_but_cgroup_fails(calls):
+    """Mock docker: ``docker version`` succeeds (Docker present) but the
+    cgroup probe (docker run with --cpus/--memory/--pids-limit) fails with
+    exit 126 (OCI runtime error — controllers not delegated)."""
+    def _run(cmd, *a, **k):
+        calls.append(cmd)
+        if cmd and cmd[0].endswith("version") or (len(cmd) > 1 and cmd[1] == "version"):
+            return subprocess.CompletedProcess(cmd, 0, stdout="docker version...", stderr="")
+        return subprocess.CompletedProcess(
+            cmd, 126, stdout="", stderr="OCI runtime error: cgroup delegation"
+        )
+    return _run
+
+
+def test_fails_closed_when_limits_requested_but_cgroup_unavailable(monkeypatch):
+    """Requesting cpu/memory limits when the cgroup probe fails must raise an
+    isolation-unavailable error (fail-closed), never silently run the
+    container without the requested resource limits."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = []
+    monkeypatch.setattr(docker_env.subprocess, "run", _docker_available_but_cgroup_fails(calls))
+
+    assert docker_env._cgroup_limits_available("img") is False
+
+    with pytest.raises(RuntimeError, match="isolation unavailable"):
+        docker_env.DockerEnvironment(
+            image="img",
+            cpu=2,  # explicitly requested resource limit
+            cwd="/root",
+        )
+
+
+def test_no_raise_when_no_limits_requested_and_cgroup_unavailable(monkeypatch):
+    """When the caller requests no cpu/memory limits, a failed cgroup probe
+    must NOT raise — there is nothing to drop, so normal operation continues."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = []
+    monkeypatch.setattr(docker_env.subprocess, "run", _docker_available_but_cgroup_fails(calls))
+
+    assert docker_env._cgroup_limits_available("img") is False
+
+    # No cpu/memory requested -> should construct without raising.
+    env = docker_env.DockerEnvironment(
+        image="img",
+        cpu=0,
+        memory=0,
+        cwd="/root",
+    )
+    assert env is not None
+
+
+def test_raises_when_memory_requested_and_cgroup_unavailable(monkeypatch):
+    """Same fail-closed guarantee when it is the memory limit that is
+    requested (not just cpu)."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = []
+    monkeypatch.setattr(docker_env.subprocess, "run", _docker_available_but_cgroup_fails(calls))
+
+    assert docker_env._cgroup_limits_available("img") is False
+
+    with pytest.raises(RuntimeError, match="isolation unavailable"):
+        docker_env.DockerEnvironment(
+            image="img",
+            memory=512,  # explicitly requested memory limit
+            cwd="/root",
+        )
+
+
