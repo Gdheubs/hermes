@@ -71,7 +71,7 @@ import {
 } from '../tab-selection'
 
 import { type DoubleTapContext, startPaneDrag } from './drag-session'
-import { forceLoneHeaderForPanes } from './lone-header'
+import { forceLoneHeaderForPanes, showRevealEdge } from './lone-header'
 import { useActiveTabVisible } from './tab-strip-scroll'
 import { paneChrome } from './track-model'
 
@@ -334,6 +334,18 @@ export function TreeGroup({
   // (insertAtGroup pins headerHidden false), the main tab's context menu
   // hides it, and full-page views veto it via paneChrome.headerVeto.
 
+  // ...which left an explicitly hidden header with NO way back (see
+  // `showRevealEdge`). The TOP EDGE is it, as `model.ts` has documented since
+  // the flag was added: double-click reveals the header, right-click opens the
+  // zone menu. A flex CHILD, not an overlay — 6px the content is laid out
+  // below, rather than 6px of the content's own top row swallowed.
+  const revealEdge = showRevealEdge({
+    headerHidden: node.headerHidden,
+    headerVetoed: paneChrome(active).headerVeto,
+    isEmpty,
+    minimized: node.minimized
+  })
+
   return (
     <div
       className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-(--ui-editor-surface-background)"
@@ -588,6 +600,31 @@ export function TreeGroup({
               </span>
             )}
           </PaneTabStrip>
+        </ZoneMenu>
+      )}
+
+      {/* Reveal edge: the only affordance a header-hidden zone has left (see
+          `revealEdge`). Double-click brings the header back; right-click opens
+          the zone menu, so Close is reachable without it. */}
+      {revealEdge && (
+        <ZoneMenu {...zoneMenu}>
+          <button
+            aria-label={t.zones.showHeader}
+            className="h-1.5 w-full shrink-0 cursor-pointer bg-(--ui-accent)/15 transition-colors hover:bg-(--ui-accent)/50"
+            // One handler, read through `detail`: a native button reports 0 for
+            // a keyboard (or assistive-tech) activation and 2 for the second
+            // click of a double-click. So Enter/Space and double-click both
+            // reveal, while a stray SINGLE click — aiming at the content row
+            // 6px below — is ignored. Listening on `dblclick` + `keydown`
+            // instead would miss the synthetic click AT dispatches.
+            onClick={event => {
+              if (event.detail === 0 || event.detail === 2) {
+                setTreeGroupHeaderHidden(node.id, false)
+              }
+            }}
+            title={t.zones.showHeader}
+            type="button"
+          />
         </ZoneMenu>
       )}
 
