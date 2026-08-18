@@ -7,20 +7,28 @@ readiness loop -> teardown), reimplemented as a plain subprocess runner.
 Commands come from the project's own recipe (its package.json scripts,
 Makefile targets, etc.) and are executed with ``shell=True`` on purpose:
 this is a developer tool running the project's own build commands in the
-project's own checkout — the same trust level as the terminal tool.
+project's own checkout — the same trust level as the terminal tool. Python
+recipes run in the git-ignored, project-owned ``.hermes/verify-venv`` so their
+bootstrap and later phases cannot install into Hermes' caller environment.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import signal
+import stat
 import subprocess
+import sys
+import threading
 import time
 import urllib.error
 import urllib.request
+import venv
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from agent.verify.recipes import Recipe
 
@@ -28,6 +36,210 @@ DEFAULT_PHASE_TIMEOUT = 600.0
 DEFAULT_READY_TIMEOUT = 60.0
 _TAIL_CHARS = 2000
 PHASE_ORDER = ("bootstrap", "build", "test")
+_PYTHON_RECIPE_KINDS = frozenset({"python", "django", "fastapi", "flask"})
+_VERIFY_VENV_RELPATH = Path(".hermes") / "verify-venv"
+_VERIFY_LOCK_NAME = "verify.lock"
+_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_THREAD_LOCKS_GUARD = threading.Lock()
+
+
+def _scripts_dir_for_venv(venv_dir: Path, os_name: str = os.name) -> Path:
+    """Return the platform-specific command directory for a virtual environment."""
+    return Path(venv_dir) / ("Scripts" if os_name == "nt" else "bin")
+
+
+def _environment_for_venv(
+    venv_dir: Path,
+    base_environment: Mapping[str, str],
+    os_name: str = os.name,
+) -> dict[str, str]:
+    """Build a child environment that resolves every Python command in ``venv_dir``."""
+    environment = dict(base_environment)
+    scripts_dir = _scripts_dir_for_venv(venv_dir, os_name=os_name)
+    separator = ";" if os_name == "nt" else ":"
+    inherited_path = environment.get("PATH", "")
+    environment["VIRTUAL_ENV"] = str(venv_dir)
+    environment["UV_PROJECT_ENVIRONMENT"] = str(venv_dir)
+    environment["PATH"] = (
+        f"{scripts_dir}{separator}{inherited_path}" if inherited_path else str(scripts_dir)
+    )
+    environment.pop("PYTHONHOME", None)
+    return environment
+
+
+def _python_for_venv(venv_dir: Path, os_name: str = os.name) -> Path:
+    executable = "python.exe" if os_name == "nt" else "python"
+    return _scripts_dir_for_venv(venv_dir, os_name=os_name) / executable
+
+
+def _path_is_redirect(
+    path: Path,
+    os_name: str = os.name,
+    lstat: Callable[[Path], os.stat_result] = os.lstat,
+) -> bool:
+    """Return whether ``path`` redirects traversal via a symlink or reparse point."""
+    info = lstat(path)
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    if os_name == "nt":
+        attributes = getattr(info, "st_file_attributes", 0)
+        return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+    return False
+
+
+def _reject_redirect(path: Path) -> None:
+    try:
+        redirected = _path_is_redirect(path)
+    except FileNotFoundError:
+        return
+    if redirected:
+        raise OSError(f"refusing redirected verification path: {path}")
+
+
+def _prepare_metadata_root(root: Path) -> Path:
+    metadata = root / ".hermes"
+    _reject_redirect(metadata)
+    if metadata.exists() and not metadata.is_dir():
+        raise OSError(f"verification metadata root is not a directory: {metadata}")
+    metadata.mkdir(mode=0o700, exist_ok=True)
+    _reject_redirect(metadata)
+    if metadata.resolve() != metadata:
+        raise OSError(f"verification metadata root escaped project: {metadata}")
+    return metadata
+
+
+def _thread_lock_for(root: Path) -> threading.Lock:
+    key = os.path.normcase(str(root))
+    with _THREAD_LOCKS_GUARD:
+        return _THREAD_LOCKS.setdefault(key, threading.Lock())
+
+
+def _try_lock_file(file: Any) -> bool:
+    if os.name == "nt":
+        import msvcrt
+
+        file.seek(0, os.SEEK_END)
+        if file.tell() == 0:
+            file.write(b"\0")
+            file.flush()
+        file.seek(0)
+        try:
+            msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+
+    import fcntl
+
+    try:
+        fcntl.flock(file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _unlock_file(file: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        file.seek(0)
+        msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+
+
+@contextmanager
+def _project_python_lock(root: Path, timeout: float):
+    """Serialize the complete Python verification lifecycle for one project."""
+    thread_lock = _thread_lock_for(root)
+    if not thread_lock.acquire(timeout=timeout):
+        raise TimeoutError(f"timed out waiting for Python verification lock for {root}")
+    file = None
+    locked = False
+    try:
+        metadata = _prepare_metadata_root(root)
+        lock_path = metadata / _VERIFY_LOCK_NAME
+        _reject_redirect(lock_path)
+        flags = os.O_RDWR | os.O_CREAT
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(lock_path, flags, 0o600)
+        file = os.fdopen(descriptor, "r+b", buffering=0)
+        if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
+            raise OSError(f"verification lock is not a regular file: {lock_path}")
+        _reject_redirect(lock_path)
+        deadline = time.monotonic() + timeout
+        while not _try_lock_file(file):
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"timed out waiting for Python verification lock at {lock_path}"
+                )
+            time.sleep(0.05)
+        locked = True
+        _reject_redirect(metadata)
+        _reject_redirect(lock_path)
+        yield
+    finally:
+        if locked and file is not None:
+            _unlock_file(file)
+        if file is not None:
+            file.close()
+        thread_lock.release()
+
+
+def _valid_python_environment(venv_dir: Path) -> bool:
+    config = venv_dir / "pyvenv.cfg"
+    python = _python_for_venv(venv_dir)
+    if not config.is_file() or not python.is_file():
+        return False
+
+    validation_environment = dict(os.environ)
+    validation_environment.pop("PYTHONHOME", None)
+    try:
+        proc = subprocess.run(
+            [str(python), "-I", "-c", "import sys; print(sys.prefix)"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+            text=True,
+            errors="replace",
+            env=validation_environment,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if proc.returncode != 0:
+        return False
+    reported_prefix = proc.stdout.strip()
+    if not reported_prefix:
+        return False
+    return os.path.normcase(str(Path(reported_prefix).resolve())) == os.path.normcase(
+        str(venv_dir.resolve())
+    )
+
+
+def _ensure_python_environment(root: Path) -> dict[str, str]:
+    """Create or reuse the project-owned verification environment."""
+    metadata = _prepare_metadata_root(root)
+    venv_dir = root / _VERIFY_VENV_RELPATH
+    _reject_redirect(venv_dir)
+    if not _valid_python_environment(venv_dir):
+        _reject_redirect(metadata)
+        _reject_redirect(venv_dir)
+        if os.path.lexists(venv_dir):
+            if venv_dir.is_dir():
+                shutil.rmtree(venv_dir)
+            else:
+                venv_dir.unlink()
+        _reject_redirect(metadata)
+        venv.EnvBuilder(with_pip=True).create(str(venv_dir))
+    _reject_redirect(metadata)
+    _reject_redirect(venv_dir)
+    if not _valid_python_environment(venv_dir):
+        raise OSError(f"virtual environment validation failed at {venv_dir}")
+    return _environment_for_venv(venv_dir, os.environ)
 
 
 @dataclass
@@ -106,6 +318,7 @@ def _run_phase_command(
     root: Path,
     timeout: float,
     on_output: Callable[[str], None] | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> PhaseResult:
     started = time.monotonic()
     try:
@@ -113,6 +326,7 @@ def _run_phase_command(
             command,
             shell=True,  # project-authored commands; see module docstring
             cwd=str(root),
+            env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=timeout,
@@ -204,6 +418,7 @@ def _run_start_phase(
     root: Path,
     ready_timeout: float,
     port_override: int | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> ReadinessResult:
     assert recipe.start is not None
     port = port_override or recipe.port or 8000
@@ -213,6 +428,7 @@ def _run_start_phase(
         recipe.start,
         shell=True,  # project-authored command; see module docstring
         cwd=str(root),
+        env=environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         start_new_session=True,  # own process group for clean teardown
@@ -256,24 +472,70 @@ def run_verify(
     ``skip_start`` or a phase failed) launches ``recipe.start`` in the
     background, polls the readiness URL, and tears the process group down.
     """
-    root = Path(root)
+    root = Path(root).resolve()
     selected = tuple(phases) if phases else PHASE_ORDER + ("start",)
     result = VerifyResult(recipe_name=recipe.name)
 
-    failed = False
-    for phase in PHASE_ORDER:
-        if phase not in selected:
-            continue
-        for command in getattr(recipe, phase):
-            phase_result = _run_phase_command(phase, command, root, phase_timeout, on_output)
-            result.phases.append(phase_result)
-            if not phase_result.ok:
-                failed = True
-                if stop_on_failure:
-                    return result
+    environment: Mapping[str, str] | None = None
+    lock_context = None
+    lock_acquired = False
+    if recipe.kind in _PYTHON_RECIPE_KINDS:
+        isolation_started = time.monotonic()
+        venv_dir = root / _VERIFY_VENV_RELPATH
+        lock_timeout = max(0.1, min(phase_timeout, DEFAULT_READY_TIMEOUT))
+        try:
+            lock_context = _project_python_lock(root, lock_timeout)
+            lock_context.__enter__()
+            lock_acquired = True
+            environment = _ensure_python_environment(root)
+        except Exception as exc:
+            if lock_acquired and lock_context is not None:
+                lock_context.__exit__(type(exc), exc, exc.__traceback__)
+            result.phases.append(
+                PhaseResult(
+                    phase="isolation",
+                    command=f"acquire lock; {sys.executable} -m venv {venv_dir}",
+                    exit_code=1,
+                    duration=time.monotonic() - isolation_started,
+                    output_tail=(
+                        f"Unable to lock, create, or validate the isolated Python environment at "
+                        f"{venv_dir}: {type(exc).__name__}: {exc}"
+                    ),
+                )
+            )
+            return result
 
-    if skip_start or "start" not in selected or failed or not recipe.start:
+    try:
+        failed = False
+        for phase in PHASE_ORDER:
+            if phase not in selected:
+                continue
+            for command in getattr(recipe, phase):
+                phase_result = _run_phase_command(
+                    phase,
+                    command,
+                    root,
+                    phase_timeout,
+                    on_output,
+                    environment,
+                )
+                result.phases.append(phase_result)
+                if not phase_result.ok:
+                    failed = True
+                    if stop_on_failure:
+                        return result
+
+        if skip_start or "start" not in selected or failed or not recipe.start:
+            return result
+
+        result.readiness = _run_start_phase(
+            recipe,
+            root,
+            ready_timeout,
+            port_override,
+            environment,
+        )
         return result
-
-    result.readiness = _run_start_phase(recipe, root, ready_timeout, port_override)
-    return result
+    finally:
+        if lock_acquired and lock_context is not None:
+            lock_context.__exit__(None, None, None)
