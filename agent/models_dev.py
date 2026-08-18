@@ -165,6 +165,29 @@ class ProviderInfo:
 # Provider ID mapping: Hermes ↔ models.dev
 # ---------------------------------------------------------------------------
 
+# Hermes custom providers are addressed as "custom:<name>"; models.dev
+# catalogs them under the bare name when it mirrors a public provider
+# (e.g. custom:hyper → hyper). Strip the prefix before lookup.
+def _mdev_provider_id(provider_id: str) -> str:
+    if provider_id.startswith("custom:"):
+        provider_id = provider_id[len("custom:"):]
+    return PROVIDER_TO_MODELS_DEV.get(provider_id, provider_id)
+
+
+def _mdev_provider_id_strict(provider_id: str) -> Optional[str]:
+    """Resolve a Hermes provider id to a models.dev catalog id, strictly.
+
+    Plain provider ids must be keys of PROVIDER_TO_MODELS_DEV — an unknown
+    id resolves to None instead of being passed through, so an arbitrary
+    string never triggers a catalog fetch. ``custom:<name>`` providers pass
+    through to the catalog under the bare name (custom:hyper → hyper),
+    matching the mapping's pass-through contract for custom endpoints.
+    """
+    if provider_id.startswith("custom:"):
+        provider_id = provider_id[len("custom:"):]
+        return PROVIDER_TO_MODELS_DEV.get(provider_id, provider_id)
+    return PROVIDER_TO_MODELS_DEV.get(provider_id)
+
 # Hermes provider names → models.dev provider IDs
 PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
     "openrouter": "openrouter",
@@ -754,7 +777,7 @@ def lookup_models_dev_context(
     if override_ctx is not None:
         return override_ctx
 
-    mdev_provider_id = PROVIDER_TO_MODELS_DEV.get(provider)
+    mdev_provider_id = _mdev_provider_id_strict(provider)
     if not mdev_provider_id:
         return _default_override_context(provider)
 
@@ -1104,7 +1127,7 @@ def _get_provider_models(
     ``allow_network`` defaults to False — this is called from hot paths
     (vision routing, image routing, capability checks) and must never block.
     """
-    mdev_provider_id = PROVIDER_TO_MODELS_DEV.get(provider)
+    mdev_provider_id = _mdev_provider_id_strict(provider)
     if not mdev_provider_id:
         return None
 
@@ -1454,7 +1477,7 @@ def get_provider_info(
     ``allow_network=False``.
     """
     # Resolve Hermes ID → models.dev ID
-    mdev_id = PROVIDER_TO_MODELS_DEV.get(provider_id, provider_id)
+    mdev_id = _mdev_provider_id(provider_id)
 
     # NOTE: keep the zero-argument call on the default path. Dozens of test
     # sites monkeypatch fetch_models_dev with zero-arg lambdas; passing the
@@ -1494,7 +1517,7 @@ def get_model_info(
     ``allow_network`` defaults to False — model info lookup is a hot path
     (cost guard, inventory) and must never block on the network.
     """
-    mdev_id = PROVIDER_TO_MODELS_DEV.get(provider_id, provider_id)
+    mdev_id = _mdev_provider_id(provider_id)
 
     def _from_override_alone() -> Optional[ModelInfo]:
         override = _override_for(provider_id, model_id, catalog_hit=False)
