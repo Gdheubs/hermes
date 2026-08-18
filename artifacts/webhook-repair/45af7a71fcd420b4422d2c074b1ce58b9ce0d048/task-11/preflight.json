@@ -1,0 +1,13 @@
+{
+  "branch": "wr/task-11-execution-registry",
+  "expected_head": "904ebb848a76b5b133296654cd337558021be946",
+  "head": "904ebb848a76b5b133296654cd337558021be946",
+  "mode": "existing_pr",
+  "phase": "preflight",
+  "repository": "D:\\HERMES-TEMP\\webhook-revolution\\task-11-execution-registry",
+  "schema_version": 1,
+  "status": "pass",
+  "task": 11,
+  "task_title": "Observable, cancellable, restart-safe execution registry",
+  "timestamp": "2026-08-15T15:14:36Z"
+}

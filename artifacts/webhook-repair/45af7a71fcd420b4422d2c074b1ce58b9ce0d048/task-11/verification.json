@@ -1,0 +1,19 @@
+{
+  "branch": "wr/task-11-execution-registry",
+  "changed_files": [
+    "artifacts/webhook-repair/45af7a71fcd420b4422d2c074b1ce58b9ce0d048/task-11/ceiling-exceptions.json",
+    "gateway/platforms/base.py",
+    "gateway/platforms/webhook.py",
+    "gateway/platforms/webhook_executions.py",
+    "tests/gateway/test_webhook_execution_persistence.py",
+    "tests/gateway/test_webhook_executions.py"
+  ],
+  "head": "904ebb848a76b5b133296654cd337558021be946",
+  "head_before_commit": "904ebb848a76b5b133296654cd337558021be946",
+  "phase": "verification",
+  "repository": "D:\\HERMES-TEMP\\webhook-revolution\\task-11-execution-registry",
+  "schema_version": 1,
+  "status": "pass",
+  "task": 11,
+  "timestamp": "2026-08-15T15:16:59Z"
+}

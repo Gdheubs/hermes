@@ -1,0 +1,7 @@
+{
+  "task": 11,
+  "path": "gateway/platforms/base.py",
+  "lines": 7328,
+  "reason": "pre-existing god-file; Task 11 adds the minimal real-task binding hook",
+  "type": "pre-existing-owner-exception"
+}
