@@ -455,6 +455,15 @@ export const host = {
     return close
   },
 
+  /** Bring a pane back to the front: un-dismisses it, un-collapses its side,
+   *  un-hides it, un-minimizes its zone, and fronts its tab. Idempotent —
+   *  safe to call on a pane that is already visible. Use this so a plugin
+   *  command can route into its own dismissed pane instead of falling back
+   *  to `ctx.os.openExternal`. */
+  revealPane: (paneId: string): void => {
+    revealTreePane(paneId)
+  },
+
   /** Start a fresh chat draft, optionally pointed at another profile (its
    *  backend spins up in the background — same door the sidebar's per-profile
    *  "+" uses). */

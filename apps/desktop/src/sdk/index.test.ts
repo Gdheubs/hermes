@@ -107,3 +107,47 @@ describe('host.state turn flags', () => {
     $sessionTiles.set([])
   })
 })
+
+describe('host.revealPane', () => {
+  it('un-dismisses a closed plugin pane and puts it back in the layout tree', async () => {
+    const { allPaneIds, group, split } = await import('@/components/pane-shell/tree/model')
+    const { $dismissedPanes, $layoutTree, dismissTreePane } = await import('@/components/pane-shell/tree/store')
+    const { registry } = await import('@/contrib/registry')
+
+    const disposers = [
+      registry.register({
+        area: 'panes',
+        data: { placement: 'main' },
+        id: 'workspace',
+        render: () => null,
+        title: 'workspace'
+      }),
+      registry.register({
+        area: 'panes',
+        data: { placement: 'right' },
+        id: 'plugin:reveal-target',
+        render: () => null,
+        title: 'reveal-target'
+      })
+    ]
+
+    $layoutTree.set(
+      split('row', [
+        group(['workspace'], { active: 'workspace', id: 'grp-main' }),
+        group(['plugin:reveal-target'], { active: 'plugin:reveal-target', id: 'grp-side' })
+      ])
+    )
+
+    dismissTreePane('plugin:reveal-target')
+    expect($dismissedPanes.get()).toContain('plugin:reveal-target')
+    expect(allPaneIds($layoutTree.get()!)).not.toContain('plugin:reveal-target')
+
+    host.revealPane('plugin:reveal-target')
+
+    expect($dismissedPanes.get()).not.toContain('plugin:reveal-target')
+    expect(allPaneIds($layoutTree.get()!)).toContain('plugin:reveal-target')
+
+    disposers.forEach(dispose => dispose())
+    $dismissedPanes.set(new Set())
+  })
+})

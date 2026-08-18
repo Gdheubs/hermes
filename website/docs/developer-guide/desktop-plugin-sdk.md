@@ -462,6 +462,7 @@ host.openSession(id, { profile?, intent? }) // open a stored session core-style;
                                            //   profile: soft-swap to that profile's backend first
                                            //   intent: 'in-place' (default) | 'stack' | 'tab' | 'window'
 host.newChat(profile?)                     // fresh chat draft, optionally in another profile
+host.revealPane(paneId)                    // un-dismiss + front a contributed pane; idempotent
 host.openWorkspace(id, { render, title?, minWidth?, onClose? })
                                            // dock a plugin-rendered tab into the MAIN
                                            //   workspace zone and reveal it; returns a disposer
@@ -481,6 +482,12 @@ cron, kanban, …). `host.requestProfile` accepts a descriptor from
 profile without changing the active chat or gateway. The profile-only overload is
 retained only for the sole-local/legacy topology; registry-aware plugins should pass
 the descriptor so two sources exposing the same profile name cannot collide.
+
+`host.revealPane(paneId)` un-dismisses a plugin-contributed pane the user
+closed, un-collapses/un-hides/un-minimizes whatever is hiding it, and fronts
+its tab — the same verb the app's own toggles (⌘B, ⌘G, tool-pane toggles) use
+internally. A plugin command can route into its own pane unconditionally
+instead of falling back to `ctx.os.openExternal`.
 
 `host.openWorkspace(id, { render, title?, minWidth?, onClose? })` docks a
 plugin-rendered view into the **main workspace zone** — the same center area
