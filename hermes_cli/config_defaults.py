@@ -3082,6 +3082,14 @@ DEFAULT_CONFIG = {
         # setting is inert when it isn't. False: never load the extension or
         # serve the cjk index. Bridged to HERMES_CJK_FTS (internal carrier).
         "cjk_fts": True,
+        # Base FTS5 full-text search index (messages_fts / messages_fts_trigram)
+        # over the session transcript. True (default): build and maintain the
+        # index for fast past-session search. False: take the no-FTS startup
+        # path — drop the sync triggers, skip index maintenance, and fall back
+        # to LIKE scans. Opt-out for hosts hitting the FTS5 write-corruption
+        # class (issue #69603): message/session persistence is unaffected.
+        # Bridged to HERMES_FTS5 (internal carrier).
+        "fts5": True,
         # Slow session-search log threshold in milliseconds: searches at or
         # above it log one INFO line with the routing path taken (fts_cjk /
         # fts5 / trigram / like_scan) so latency regressions stay
