@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-08-12T00:00:00Z",
+  "generated_at": "2026-08-17T00:00:00Z",
   "plugins": [
     {
       "name": "hermes-media-studio",
@@ -63,6 +63,18 @@
       "capabilities": ["tools"],
       "api_version": 1,
       "added_at": "2026-08-12"
+    },
+    {
+      "name": "jackal-verified",
+      "description": "JACKAL Mathematical Evidence Kernel (v1.7.0): 34 typed tools — 10 Lean-checked formal-bounded lanes (incl. the certified composed integral, theorem int_cert_sound), 21 honest weaker/exact-CAS lanes, and claim-bundle front doors. Every call runs inside an admitted, hash-pinned snapshot of the public release package; statuses pass through verbatim and never inflate.",
+      "author": "AnubisQuantumCipher",
+      "tags": ["mathematics", "verification", "formal-methods", "lean", "interval-arithmetic", "evidence", "tools"],
+      "repo": "AnubisQuantumCipher/hermes-jackal-verified",
+      "ref": "86596e2b0e2679db68eca16bd102378c5bfa27b7",
+      "homepage": "https://github.com/AnubisQuantumCipher/hermes-jackal-verified",
+      "capabilities": ["tools", "skills"],
+      "api_version": 1,
+      "added_at": "2026-08-17"
     }
   ]
 }
