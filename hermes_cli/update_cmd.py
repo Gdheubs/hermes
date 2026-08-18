@@ -4962,26 +4962,41 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 text=True, encoding="utf-8", errors="replace",
             )
             if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
+                # ff-only failed. This used to fall through to an unconditional
+                # `git reset --hard origin/<branch>`, which silently deleted
+                # every local-only commit: two data-loss incidents, both with
+                # human-authored work destroyed. Never reset here. Work out WHY
+                # the fast-forward failed instead. If local has commits origin
+                # doesn't, park them on a rescue ref and abort.
+                from hermes_cli.divergence_guard import (
+                    ABORT_DIVERGED,
+                    check_divergence_and_guard,
                 )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                    cwd=_m().PROJECT_ROOT,
-                    capture_output=True,
-                    text=True, encoding="utf-8", errors="replace",
-                )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
-                    )
+
+                guard = check_divergence_and_guard(git_cmd, _m().PROJECT_ROOT, branch)
+                if guard.action == ABORT_DIVERGED:
+                    print()
+                    print(guard.message)
+                    if auto_stash_ref is not None:
+                        # Put uncommitted work back before bailing so the tree
+                        # really is exactly where the user left it.
+                        _m()._restore_stashed_changes(
+                            git_cmd,
+                            _m().PROJECT_ROOT,
+                            auto_stash_ref,
+                        )
+                        auto_stash_ref = None
                     sys.exit(1)
+
+                # Not divergence (bad index, unmerged paths, ...). Still no
+                # reason to rewrite history: report and stop.
+                print(f"✗ Fast-forward to origin/{branch} failed.")
+                if pull_result.stderr.strip():
+                    print(f"  {pull_result.stderr.strip().splitlines()[0]}")
+                print(
+                    f"  Inspect with: git status && git log --oneline HEAD..origin/{branch}"
+                )
+                sys.exit(1)
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit
