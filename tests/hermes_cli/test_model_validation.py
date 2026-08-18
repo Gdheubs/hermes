@@ -523,3 +523,101 @@ class TestProbeApiModelsUserAgent:
         assert req.get_header("Authorization") is None
 
 
+    def test_probe_sends_client_context_to_gemini(self):
+        from unittest.mock import patch
+        from hermes_cli.models import _HERMES_VERSION
+
+        body = b'{"data":[]}'
+        with patch(
+            "hermes_cli.models._urlopen_model_catalog_request",
+            return_value=self._make_mock_response(body),
+        ) as mock_urlopen:
+            probe_api_models(
+                "gemini-key",
+                "https://generativelanguage.googleapis.com/v1beta/openai",
+            )
+
+        req = mock_urlopen.call_args[0][0]
+        assert req.get_header("X-goog-api-client") == f"hermes-agent/{_HERMES_VERSION}"
+
+    def test_probe_omits_gemini_client_context_for_other_providers(self):
+        from unittest.mock import patch
+
+        body = b'{"data":[]}'
+        with patch(
+            "hermes_cli.models._urlopen_model_catalog_request",
+            return_value=self._make_mock_response(body),
+        ) as mock_urlopen:
+            probe_api_models("provider-key", "https://api.example.com/v1")
+
+        req = mock_urlopen.call_args[0][0]
+        assert req.get_header("X-goog-api-client") is None
+
+
+# -- Regression: #73208 auto-correct must not strip meaningful qualifiers ------
+
+class TestAutoCorrectSupersetGuard:
+    """The switch pipeline must not apply every validator auto-correction."""
+
+    _BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+    _CORRECTED = "gemini-3.1-flash-preview"
+
+    def _switch_with_catalog(self, raw_input: str):
+        import contextlib
+        from hermes_cli.model_switch import switch_model
+
+        probe_payload = {
+            "models": [self._CORRECTED],
+            "probed_url": f"{self._BASE_URL}/models",
+            "resolved_base_url": self._BASE_URL,
+            "suggested_base_url": None,
+            "used_fallback": False,
+        }
+        patches = [
+            patch("hermes_cli.model_switch.resolve_alias", return_value=None),
+            patch("hermes_cli.model_switch.list_provider_models", return_value=[]),
+            patch(
+                "hermes_cli.model_switch.normalize_model_for_provider",
+                side_effect=lambda model, provider: model,
+            ),
+            patch("hermes_cli.model_switch.get_model_info", return_value=None),
+            patch("hermes_cli.model_switch.get_model_capabilities", return_value=None),
+            patch("hermes_cli.models.detect_provider_for_model", return_value=None),
+            patch("hermes_cli.models.fetch_api_models", return_value=[self._CORRECTED]),
+            patch("hermes_cli.models.probe_api_models", return_value=probe_payload),
+            patch(
+                "hermes_cli.runtime_provider.resolve_runtime_provider",
+                return_value={
+                    "api_key": "k",
+                    "base_url": self._BASE_URL,
+                    "api_mode": "chat_completions",
+                },
+            ),
+        ]
+        with contextlib.ExitStack() as stack:
+            for patcher in patches:
+                stack.enter_context(patcher)
+            return switch_model(
+                raw_input=raw_input,
+                current_provider="gemini",
+                current_model="gemini-2.5-flash",
+                current_base_url=self._BASE_URL,
+            )
+
+    def test_gemini_lite_not_corrected_to_non_lite(self):
+        result = self._switch_with_catalog("gemini-3.1-flash-lite-preview")
+
+        assert result.success is True
+        assert result.new_model == "gemini-3.1-flash-lite-preview"
+        assert "was not found in the model listing" in result.warning_message
+        assert f"Did you mean `{self._CORRECTED}`?" in result.warning_message
+
+    def test_real_typo_still_auto_corrected(self):
+        result = self._switch_with_catalog("gemini-3.1-flash-perview")
+
+        assert result.success is True
+        assert result.new_model == self._CORRECTED
+        assert (
+            "Auto-corrected `gemini-3.1-flash-perview` "
+            f"→ `{self._CORRECTED}`"
+        ) in result.warning_message
