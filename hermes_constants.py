@@ -1029,6 +1029,190 @@ def secure_parent_dir(path: Path) -> None:
         pass
 
 
+def _current_windows_user() -> str:
+    """Return the current Windows account name (best-effort, never raises)."""
+    try:
+        import getpass
+        return getpass.getuser()
+    except Exception:
+        return os.environ.get("USERNAME", "") or os.environ.get("USER", "")
+
+
+def restrict_credential_file(path: Path) -> bool:
+    """Restrict *path* so only the current OS user can read/write it.
+
+    POSIX: chmod ``0o600`` (mode bits are enforced by the kernel there).
+    Windows: POSIX mode bits are meaningless — ACLs govern access, and a
+    file created with ``os.open(..., 0o600)`` simply inherits the parent
+    directory's ACL (commonly granting ``Users`` / sandbox groups read
+    access). We therefore remove inherited ACEs and grant the current user
+    read/write only, via ``icacls``.
+
+    Returns True when the restriction was applied (or was already in
+    force), False when it could not be verified/applied. Callers decide
+    whether to refuse to continue (fail closed) or warn loudly.
+    """
+    try:
+        if os.name == "nt":
+            user = _current_windows_user()
+            if not user:
+                return False
+            import subprocess
+            # /inheritance:r drops inherited ACEs (the F1 exposure —
+            # inherited grants like CodexSandboxUsers:(I)(RX)); explicit
+            # group grants (Users/Everyone/Authenticated Users) are then
+            # removed defensively; /grant:r finally replaces the current
+            # user's ACE with read/write only. icacls is a standard
+            # Windows component (Vista+), safe to shell out to.
+            args = [
+                "icacls", str(path), "/inheritance:r",
+                "/remove:g", "Everyone",
+                "/remove:g", "Users",
+                "/remove:g", "Authenticated Users",
+                "/grant:r", f"{user}:(R,W)",
+            ]
+            result = subprocess.run(
+                args, capture_output=True, text=True, timeout=30
+            )
+            if result.returncode != 0:
+                return False
+            # Verify the file no longer carries ACEs for other accounts.
+            return credential_file_is_user_restricted(path)
+        # POSIX (and anything non-Windows): mode bits are authoritative.
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        return True
+    except Exception:
+        return False
+
+
+# Accounts that are permitted to appear in a credential file's ACL without
+# making it "group readable": the current user, the OS (SYSTEM), the local
+# Administrators group, and the Creator Owner pseudo-account. Anything else
+# (e.g. ``Users``, ``Everyone``, sandbox groups like ``CodexSandboxUsers``)
+# is a cross-account read exposure.
+_CREDENTIAL_ACL_BENIGN_ACCOUNTS = frozenset({
+    "system",
+    "nt authority\\system",
+    "administrators",
+    "builtin\\administrators",
+    "creator owner",
+    "nt authority\\creator owner",
+    "owner rights",
+    "*s-1-5-18",       # SYSTEM (SID form, when names cannot be resolved)
+    "*s-1-5-32-544",   # Administrators
+    "*s-1-3-4",        # Owner Rights
+})
+
+
+def _resolve_account_sid(account: str) -> str | None:
+    """Resolve a Windows account name to its SID string (or None).
+
+    Used to compare ACL principals by SID instead of display name — the
+    leaf-name comparison ``DOMAIN_A\\alice == DOMAIN_B\\alice`` conflates
+    distinct principals (F1). Best-effort via advapi32 LookupAccountNameW;
+    returns None when the account cannot be resolved (fail closed upstream).
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        advapi32.LookupAccountNameW.argtypes = [
+            wintypes.LPCWSTR, wintypes.LPCWSTR,
+            ctypes.c_void_p, wintypes.LPDWORD,
+            wintypes.LPWSTR, wintypes.LPDWORD, wintypes.LPDWORD,
+        ]
+        sid_size = wintypes.DWORD(0)
+        domain_size = wintypes.DWORD(0)
+        use = wintypes.DWORD(0)
+        ok = advapi32.LookupAccountNameW(
+            None, account, None,
+            ctypes.byref(sid_size), None, ctypes.byref(domain_size),
+            ctypes.byref(use),
+        )
+        if not ok and ctypes.get_last_error() != 122:  # 122: insufficient buffer
+            return None
+        sid_buf = ctypes.create_string_buffer(sid_size.value)
+        domain_buf = ctypes.create_unicode_buffer(domain_size.value)
+        if not advapi32.LookupAccountNameW(
+            None, account, sid_buf,
+            ctypes.byref(sid_size), domain_buf, ctypes.byref(domain_size),
+            ctypes.byref(use),
+        ):
+            return None
+        str_sid = ctypes.c_wchar_p()
+        advapi32.ConvertSidToStringSidW.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p),
+        ]
+        if not advapi32.ConvertSidToStringSidW(sid_buf, ctypes.byref(str_sid)):
+            return None
+        result = str_sid.value
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree(str_sid)
+        return result
+    except Exception:
+        return None
+
+
+def credential_file_is_user_restricted(path: Path) -> bool:
+    """Return True when only the current user (+OS/admin) can access *path*.
+
+    POSIX: checks the mode bits (group/other must have no read/write).
+    Windows: runs ``icacls`` and verifies every ACE belongs to the current
+    user, SYSTEM, or Administrators. Identity is compared by SID (resolved
+    via LookupAccountName), not display-name suffix — ``DOMAIN_A\\alice``
+    and ``DOMAIN_B\\alice`` are different principals even though their leaf
+    names match (F1). Returns False when the check cannot be performed
+    (missing icacls, unreadable path, unresolvable account) so callers fail
+    closed.
+    """
+    try:
+        if os.name != "nt":
+            mode = stat.S_IMODE(os.stat(path).st_mode)
+            return (mode & 0o077) == 0  # no group/other read/write/execute
+        user = _current_windows_user().lower()
+        user_sid = _resolve_account_sid(user) if user else None
+        import subprocess
+        result = subprocess.run(
+            ["icacls", str(path)], capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return False
+        path_text = str(path).lower()
+        for line in result.stdout.splitlines():
+            if ":(" not in line:
+                continue
+            # icacls lines look like:
+            #   C:\path\to\file USER:(R,W)
+            #   C:\path\to\file BUILTIN\Users:(I)(RX)
+            # The account is the text before the last ':(' segment. The
+            # FIRST line carries the file path itself before the first ACE,
+            # so strip that known prefix before reading the account name.
+            before = line.rsplit(":(", 1)[0].strip()
+            if before.lower().startswith(path_text):
+                before = before[len(path_text):].strip()
+            account = before.lower()
+            if not account:
+                continue
+            if account in _CREDENTIAL_ACL_BENIGN_ACCOUNTS:
+                continue
+            # The current user's own SID (name form or "*S-1-5-21-..." form)
+            # is the only non-benign account that may hold a grant.
+            if user_sid:
+                if account.startswith("*s-") and account[1:].lower() == user_sid.lower():
+                    continue
+                ace_sid = _resolve_account_sid(account)
+                if ace_sid is not None and ace_sid.lower() == user_sid.lower():
+                    continue
+            # Different principal (same leaf name on another domain included),
+            # or unresolvable -> fail closed: cross-account exposure.
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _norm_home_path(path: str | None) -> str:
     """Return a comparable absolute path string, or ``""`` for empty input."""
     raw = (path or "").strip()

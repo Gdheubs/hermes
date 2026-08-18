@@ -103,8 +103,15 @@ class TestParseConfigStringList:
     def test_none_returns_empty(self):
         assert parse_config_string_list(None) == []
 
-    def test_malformed_json_falls_back_to_single_name(self):
-        assert parse_config_string_list('["skill-a"') == ['["skill-a"']
+    def test_malformed_json_fails_closed(self):
+        """F7: a string that LOOKS like a list but is not valid JSON/Python
+        is a configuration error — not a single garbage name. Treating it as
+        one name made a curated disabled list silently disable nothing (the
+        restriction failed OPEN and the full toolset stayed enabled)."""
+        with pytest.raises(ValueError, match="fail closed"):
+            parse_config_string_list('["skill-a"')
+        with pytest.raises(ValueError, match="fail closed"):
+            parse_config_string_list("[skill-a, skill-b]")
 
     def test_empty_array_string_returns_empty(self):
         assert parse_config_string_list("[]") == []

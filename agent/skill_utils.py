@@ -480,6 +480,12 @@ def parse_config_string_list(value) -> List[str]:
     such a string as a single name makes a curated disabled list silently
     filter nothing (#86661); parsing it restores the intended list. A scalar
     string still means one name (#13026).
+
+    F7 (fail closed): a string that *looks* like a list (starts with ``[``)
+    but is not a valid Python/JSON list literal is a configuration error —
+    treat it as such (``ValueError``) instead of degrading it to a single
+    garbage name that disables nothing, which silently widened the toolset
+    back to the full default.
     """
     if value is None:
         return []
@@ -492,6 +498,12 @@ def parse_config_string_list(value) -> List[str]:
                 parsed = None
             if isinstance(parsed, list):
                 return [str(item) for item in parsed]
+            # F7: looks like a list but is not parseable as one — fail closed.
+            raise ValueError(
+                f"config list value {value!r} looks like a JSON list but is not "
+                "valid JSON/Python; refusing to treat it as a single name "
+                "(fail closed)"
+            )
         return [value]
     if isinstance(value, (list, tuple, set, frozenset)):
         return [str(item) for item in value]

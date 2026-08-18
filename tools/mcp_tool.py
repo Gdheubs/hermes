@@ -4288,17 +4288,50 @@ _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 #   skipping approval for calls the operator was already warned about when
 #   they marked the server untrusted. It can never widen access on top of
 #   the approval a write-capable tool would otherwise need.
-# - Default trust for servers with NO ``trust`` key is ``full`` (gate off)
-#   for backward compatibility — existing configs keep working unchanged.
-#   Operators opt servers into gating explicitly with ``trust: untrusted``.
+# - Default trust for servers with NO ``trust`` key is ``untrusted``
+#   (gate on, fail closed): a server added without an explicit trust
+#   decision must not silently get write-capable tools past approval
+#   (F5). Operators opt servers into ungated access explicitly with
+#   ``trust: full``. This changed from the historical ``full`` default —
+#   existing configs that relied on the implicit default (e.g.
+#   cua-driver, penpot) must add ``trust: full`` to keep their previous
+#   behavior.
 # - Any unrecognized ``trust`` value normalizes to ``untrusted``
 #   (fail closed): a typo must never silently disable the gate.
 #
 # Classification happens at CALL TIME from data captured at DISCOVERY —
 # no toolset or schema mutation, so the conversation's toolset stays
 # byte-stable and prompt caching is preserved.
-_server_trust_levels: Dict[str, str] = {}
-_tool_read_only_hints: Dict[str, Dict[str, bool]] = {}
+_server_trust_levels: Dict[tuple, str] = {}
+_tool_read_only_hints: Dict[tuple, Dict[str, bool]] = {}
+# Which profile home owns the live connection for a server name. One live
+# connection per name exists in a process (the tool namespace is global), so
+# a second profile requesting the same name must never silently attach to
+# the first profile's connection/credentials (F5).
+_server_home: Dict[str, str] = {}
+
+
+def _mcp_current_home() -> str:
+    """Return the current profile/home identity for MCP scope, best-effort."""
+    try:
+        from hermes_constants import get_hermes_home
+        return str(get_hermes_home())
+    except Exception:
+        return ""
+
+
+def _mcp_scope_key(server_name: str) -> tuple:
+    """Return the (profile/home identity, server name) scope key.
+
+    The same server name in two profiles is two different servers — separate
+    credentials, separate trust decisions. Keying MCP ownership/trust state
+    by raw server name lets the first registered profile's trust tier (e.g.
+    ``trust: full``) silently apply to the second profile's calls, bypassing
+    the second profile's ``trust: untrusted`` decision (F5). All trust and
+    ownership state uses this key so each profile's approval boundary is
+    evaluated under its own identity.
+    """
+    return (_mcp_current_home(), server_name)
 
 _TRUST_FULL = "full"
 _TRUST_UNTRUSTED = "untrusted"
@@ -4307,12 +4340,12 @@ _TRUST_UNTRUSTED = "untrusted"
 def _normalize_server_trust(value: Any) -> str:
     """Normalize a config ``trust`` value to ``full`` or ``untrusted``.
 
-    Missing (None) → ``full`` (backward-compatible default, documented
-    above). Any string other than the two known tiers → ``untrusted``:
-    a misspelled tier must fail closed, never silently disable gating.
+    Missing (None) → ``untrusted`` (fail-closed default, F5). Any string
+    other than the two known tiers → ``untrusted``: a misspelled tier must
+    fail closed, never silently disable gating.
     """
     if value is None:
-        return _TRUST_FULL
+        return _TRUST_UNTRUSTED
     text = str(value).strip().lower()
     if text == _TRUST_FULL:
         return _TRUST_FULL
@@ -4346,12 +4379,25 @@ def _annotation_read_only_hint(mcp_tool: Any) -> bool:
 def _record_tool_trust_metadata(
     server_name: str, config: dict, tools: List[Any]
 ) -> None:
-    """Capture per-server trust and per-tool readOnlyHint at discovery."""
+    """Capture per-server trust and per-tool readOnlyHint at discovery.
+
+    Keyed by (profile home, server name) so one profile's trust decision can
+    never leak into another profile's approval gate for a same-named server
+    (F5).
+    """
+    key = _mcp_scope_key(server_name)
     with _lock:
-        _server_trust_levels[server_name] = _normalize_server_trust(
+        _server_trust_levels[key] = _normalize_server_trust(
             (config or {}).get("trust")
         )
-        hints = _tool_read_only_hints.setdefault(server_name, {})
+        hints = _tool_read_only_hints.setdefault(key, {})
+        # F5/P2: readOnlyHint is a SELF-declaration from the server. It is
+        # only meaningful on trusted servers (where the gate is off anyway);
+        # for untrusted servers the hint must never bypass approval, so we
+        # do not record it at all.
+        if _server_trust_levels[key] == _TRUST_UNTRUSTED:
+            hints.clear()
+            return
         for tool in tools:
             name = getattr(tool, "name", None)
             if name:
@@ -4364,12 +4410,24 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
     Returns None when the call may proceed, or an error string (already
     formatted via ``tool_error``) when the call is blocked. Fail-closed:
     approval-system errors block the call.
+
+    The trust decision is resolved under the CALLER's profile home: a server
+    name trusted by another profile is still UNTRUSTED here until THIS
+    profile's config says otherwise (F5). A profile that never configured the
+    server gets the fail-closed untrusted default.
     """
-    trust = _server_trust_levels.get(server_name, _TRUST_FULL)
+    trust = _server_trust_levels.get(
+        _mcp_scope_key(server_name), _TRUST_UNTRUSTED
+    )
     if trust != _TRUST_UNTRUSTED:
         return None
-    if _tool_read_only_hints.get(server_name, {}).get(tool_name) is True:
-        return None
+    # F5/P2 (Purple round 2): readOnlyHint is supplied by the server itself
+    # — the same party we marked untrusted. A self-declared read-only hint
+    # must NOT skip the approval gate: an untrusted server can declare its
+    # destructive tools read-only to bypass approval. Every tool on an
+    # untrusted server consults approval.
+    # (Hints are recorded only for trusted servers — see
+    # _record_tool_trust_metadata — so none can appear here for untrusted.)
 
     # Lazy import mirrors the elicitation handler's pattern: tools.approval
     # routes the prompt to whichever surface owns the session (CLI, TUI,
@@ -4380,8 +4438,8 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
         answer = request_elicitation_consent(
             (
                 f"MCP tool '{tool_name}' on UNTRUSTED server "
-                f"'{server_name}' wants to run. This tool is write-capable "
-                f"(no readOnlyHint=true annotation) and may modify external "
+                f"'{server_name}' wants to run. This tool is not "
+                f"operator-confirmed read-only and may modify external "
                 f"state."
             ),
             (
@@ -5619,7 +5677,19 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     with _lock:
         server = _servers.get(server_name)
         if server is not None and server.session is not None:
-            return True
+            # F5: the live connection is owned by a profile home. Reuse it
+            # only for the SAME home — a different profile must never run its
+            # calls against another profile's connection and credentials.
+            if _server_home.get(server_name) == _mcp_current_home():
+                return True
+            logger.warning(
+                "MCP server '%s' is already connected for profile home %s; "
+                "refusing to attach this profile's calls to that connection "
+                "(different credentials/trust — F5). Rename the server in "
+                "one profile to resolve the collision.",
+                server_name, _server_home.get(server_name, "?"),
+            )
+            return False
         config = _lazy_server_configs.get(server_name)
         if not config:
             return False
@@ -7141,6 +7211,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
             # self-probe, so adopt it into the registry for shutdown/revival.
             with _lock:
                 _servers[name] = server
+                _server_home[name] = _mcp_current_home()
         elif server is not None:
             await server.shutdown()
         raise
@@ -7151,6 +7222,9 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         _server_connecting.discard(name)
         _server_connect_errors.pop(name, None)
         _servers[name] = server
+        # F5: record which profile home owns this live connection so another
+        # profile requesting the same name can never silently attach to it.
+        _server_home[name] = _mcp_current_home()
 
     registered_names = _register_server_tools(name, server, config)
     server._registered_tool_names = list(registered_names)
@@ -7212,6 +7286,23 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             # connect or by a manual /mcp refresh.
             and not _connect_cooldown_active(k)
         }
+        # F5: a server name already connected under a DIFFERENT profile home
+        # is never re-registered for this profile — the existing connection
+        # carries the other profile's credentials, and this profile's trust
+        # decision must not be silently inherited by (or from) it. The
+        # trust gate resolves under THIS profile's home, so a profile that
+        # never configured the name stays fail-closed untrusted.
+        _current_home = _mcp_current_home()
+        for _name in list(new_servers):
+            if _name in _servers and _server_home.get(_name) != _current_home:
+                new_servers.pop(_name)
+                logger.warning(
+                    "MCP server '%s' is already connected for profile home "
+                    "%s; not registering this profile's '%s' (different "
+                    "credentials/trust — F5). Rename the server in one "
+                    "profile to resolve the collision.",
+                    _name, _server_home.get(_name, "?"), _name,
+                )
         # Cached entries with no live session are parked or mid-reconnect.
         # Their tools are deregistered, so nothing else can reach
         # _signal_reconnect — without this nudge a new session silently

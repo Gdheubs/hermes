@@ -5245,6 +5245,24 @@ def _looks_structured_value(value: str) -> bool:
     return False
 
 
+def _is_restriction_config_key(key: str) -> bool:
+    """Return True when *key* is a toolset/feature RESTRICTION value.
+
+    F7: these are fail-closed. A value that looks like structured data but
+    cannot be parsed into a list/mapping must not be stored as a raw string —
+    every reader gates on ``isinstance(..., list)`` and would silently ignore
+    the string, widening the toolset back to the full default (fail open).
+    For restriction keys such a value is a configuration error: refuse to
+    write it (loudly) instead.
+    """
+    k = key.strip().lower()
+    if k == "agent.disabled_toolsets":
+        return True
+    if k == "platform_toolsets" or k.startswith("platform_toolsets."):
+        return True
+    return False
+
+
 def set_config_value(key: str, value: str, force: bool = False):
     """Set a configuration value.
 
@@ -5354,6 +5372,18 @@ def set_config_value(key: str, value: str, force: bool = False):
                 parsed = yaml.safe_load(value)
                 if isinstance(parsed, (list, dict)):
                     coerced_value = parsed
+                elif _is_restriction_config_key(key):
+                    # F7 fail-closed: storing the raw string would make every
+                    # isinstance-gated reader (``_get_platform_tools``, ...)
+                    # silently fall back to the FULL default toolset — the
+                    # restriction the operator tried to apply never takes
+                    # effect. Refuse the write loudly instead.
+                    raise ValueError(
+                        f"Cannot set '{key}': value {value!r} looks like a "
+                        f"list/mapping but parsed as {type(parsed).__name__}. "
+                        f"Refusing to store it as a string — restriction values "
+                        f"must be real lists (fail closed)."
+                    )
                 else:
                     print(
                         f"Warning: value for '{key}' looks like a list/mapping but "
@@ -5361,6 +5391,16 @@ def set_config_value(key: str, value: str, force: bool = False):
                         file=sys.stderr,
                     )
             except yaml.YAMLError:
+                if _is_restriction_config_key(key):
+                    # F7 fail-closed: same rationale as above — a malformed
+                    # list literal for a restriction key must not silently
+                    # become the full toolset at read time.
+                    raise ValueError(
+                        f"Cannot set '{key}': value {value!r} looks like a "
+                        f"list/mapping but is not valid YAML/JSON. Refusing to "
+                        f"store it as a string — restriction values must be real "
+                        f"lists (fail closed)."
+                    )
                 print(
                     f"Warning: value for '{key}' looks like a list/mapping but is "
                     f"not valid YAML/JSON; storing as string. Most isinstance-gated "

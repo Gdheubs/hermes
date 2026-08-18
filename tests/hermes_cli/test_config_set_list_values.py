@@ -49,14 +49,22 @@ def test_yaml_flow_list_is_parsed(user_home):
     assert raw["plugins"]["enabled"] == ["model-providers/gemini"]
 
 
-def test_invalid_list_literal_warns_and_stores_string(user_home, capsys):
+def test_invalid_list_literal_warns_and_stores_string(user_home):
+    """F7: a malformed list literal for a RESTRICTION key is a config error
+    (fail closed) — the raw string must not be stored, because every
+    isinstance-gated reader would silently fall back to the FULL default
+    toolset. Non-restriction keys keep the historical warn-and-store."""
     from hermes_cli.config import set_config_value, read_raw_config
 
-    set_config_value("platform_toolsets.line", '["unclosed')
-    captured = capsys.readouterr()
-    assert "not valid" in captured.err.lower() or "warning" in captured.err.lower()
+    with pytest.raises(ValueError, match="fail closed"):
+        set_config_value("platform_toolsets.line", '["unclosed')
     raw = read_raw_config()
-    assert raw["platform_toolsets"]["line"] == '["unclosed'
+    assert "line" not in (raw.get("platform_toolsets") or {})
+
+    # Non-restriction keys keep the historical warn-and-store behavior.
+    set_config_value("display.tool_progress_overrides", '{"unclosed')
+    raw = read_raw_config()
+    assert raw["display"]["tool_progress_overrides"] == '{"unclosed'
 
 
 def test_scalar_values_unaffected(user_home):

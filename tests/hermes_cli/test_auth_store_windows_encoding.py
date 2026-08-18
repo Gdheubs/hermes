@@ -149,8 +149,10 @@ class TestExplicitEncodingPassed:
         auth_path = hermes_home / "auth.json"
         _write_utf8(auth_path, {"version": auth.AUTH_STORE_VERSION, "providers": {}})
 
+        real_read_text = Path.read_text
+
         with mock.patch.object(
-            Path, "read_text", wraps=Path.read_text
+            Path, "read_text", autospec=True, side_effect=real_read_text
         ) as spy:
             auth._load_auth_store(auth_path)
 
@@ -163,10 +165,17 @@ class TestExplicitEncodingPassed:
         """The ~/.codex/auth.json reader must pass an explicit UTF-8 encoding."""
         codex_home = tmp_path / "codex"
         codex_home.mkdir()
-        (codex_home / "auth.json").write_text(
+        codex_auth = codex_home / "auth.json"
+        codex_auth.write_text(
             json.dumps({"tokens": {"access_token": "a", "refresh_token": "r"}}),
             encoding="utf-8",
         )
+        # F1: _import_codex_cli_tokens refuses to read a shared file whose
+        # ACL grants accounts other than the current user, so the fixture
+        # must be user-restricted for the read to proceed.
+        import os as _os
+        import stat as _stat
+        _os.chmod(codex_auth, _stat.S_IRUSR | _stat.S_IWUSR)
         monkeypatch.setenv("CODEX_HOME", str(codex_home))
         # Bypass the JWT-expiry check so a fake token doesn't short-circuit.
         monkeypatch.setattr(auth, "_codex_access_token_is_expiring", lambda *a, **k: False)

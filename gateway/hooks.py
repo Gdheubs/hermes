@@ -51,6 +51,33 @@ from hermes_cli.config import get_hermes_home
 HOOKS_DIR = get_hermes_home() / "hooks"
 
 
+def event_hooks_enabled() -> bool:
+    """Whether event-hook discovery is enabled in config.
+
+    F2: hook directories under ~/.hermes/hooks/ are discovered and their
+    handler.py importlib-exec'd at gateway startup — arbitrary Python in
+    the gateway process. Discovery is therefore OFF by default and only
+    happens when the operator explicitly sets ``gateway.event_hooks_enabled:
+    true`` in config.yaml. Built-in hooks (registered separately) are not
+    affected by this gate.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+        config = load_config_readonly()
+        raw = cfg_get(config, "gateway", "event_hooks_enabled", default=False)
+    except Exception:
+        return False
+    # F2/P2 (Purple round 2): strict coercion. ``bool("false")`` is True —
+    # a quoted config value (editor save, hand edit) must NOT open a gate
+    # that guards importlib-exec of arbitrary hook Python. Only an explicit
+    # true value enables discovery; everything else fails closed.
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() in ("1", "true", "yes", "on")
+    return False
+
+
 class HookRegistry:
     """
     Discovers, loads, and fires event hooks.
@@ -59,6 +86,9 @@ class HookRegistry:
         registry = HookRegistry()
         registry.discover_and_load()
         await registry.emit("agent:start", {"platform": "telegram", ...})
+
+    User hook discovery is gated by ``event_hooks_enabled()`` (default
+    OFF, F2); built-in hooks are always registered.
     """
 
     def __init__(self):
@@ -86,11 +116,20 @@ class HookRegistry:
 
         Also registers built-in hooks that are always active.
 
+        User-hook discovery is gated: when ``gateway.event_hooks_enabled``
+        is not explicitly true (default OFF), the hooks directory is never
+        scanned and no handler.py is importlib-exec'd (F2). This prevents
+        arbitrary code dropped into ~/.hermes/hooks/ from auto-running at
+        gateway startup with no approval or scan.
+
         Each hook directory must contain:
           - HOOK.yaml with at least 'name' and 'events' keys
           - handler.py with a top-level 'handle' function (sync or async)
         """
         self._register_builtin_hooks()
+
+        if not event_hooks_enabled():
+            return
 
         if not HOOKS_DIR.exists():
             return

@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import uuid
+import stat as _stat_mod
 from datetime import datetime, timezone
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
@@ -2293,6 +2294,225 @@ def _expand_routing_tokens(part: str) -> List[str]:
     return expanded
 
 
+# F9: colon-form delivery targets (``platform:chat_id``) must resolve to a
+# chat the operator owns or has explicitly allowlisted for that platform.
+# A raw chat id typed into ``deliver`` is otherwise handed straight to the
+# adapter at fire time (pass_unresolved_references=True), letting any chat
+# user who can create a job exfil its output to an arbitrary chat on the
+# same platform — the platform's allow_from / group allowlists are never
+# consulted. Home channels, channel-directory entries, and the creating
+# session's own chat are all operator-owned and accepted; everything else is
+# rejected at create time (fail closed).
+
+# Per-platform env allowlists consulted for the ownership check. Mirrors the
+# gateway authorization env maps (gateway/authz_mixin.py) so a colon-form
+# target only counts as "known" when the operator allowed that user/chat.
+_PLATFORM_USER_ALLOWLIST_ENV = {
+    "telegram": "TELEGRAM_ALLOWED_USERS",
+    "discord": "DISCORD_ALLOWED_USERS",
+    "whatsapp": "WHATSAPP_ALLOWED_USERS",
+    "whatsapp_cloud": "WHATSAPP_CLOUD_ALLOWED_USERS",
+    "slack": "SLACK_ALLOWED_USERS",
+    "signal": "SIGNAL_ALLOWED_USERS",
+    "email": "EMAIL_ALLOWED_USERS",
+    "sms": "SMS_ALLOWED_USERS",
+    "mattermost": "MATTERMOST_ALLOWED_USERS",
+    "matrix": "MATRIX_ALLOWED_USERS",
+    "dingtalk": "DINGTALK_ALLOWED_USERS",
+    "feishu": "FEISHU_ALLOWED_USERS",
+    "wecom": "WECOM_ALLOWED_USERS",
+    "wecom_callback": "WECOM_CALLBACK_ALLOWED_USERS",
+    "weixin": "WEIXIN_ALLOWED_USERS",
+    "bluebubbles": "BLUEBUBBLES_ALLOWED_USERS",
+    "qqbot": "QQ_ALLOWED_USERS",
+    "yuanbao": "YUANBAO_ALLOWED_USERS",
+}
+_PLATFORM_CHAT_ALLOWLIST_ENV = {
+    "telegram": "TELEGRAM_GROUP_ALLOWED_CHATS",
+    "qqbot": "QQ_GROUP_ALLOWED_USERS",
+}
+
+
+def _delivery_chat_is_operator_owned(
+    platform_name: str, chat_id: str, origin: Optional[dict]
+) -> bool:
+    """Return True when a colon-form cron delivery chat is operator-owned.
+
+    Accepted sources (fail-closed: anything else is unknown):
+      1. the platform's configured home channel chat_id
+      2. the creating session's own chat (origin)
+      3. a channel-directory entry (operator-registered name/id)
+      4. the platform's allowlists — env vars ({PLATFORM}_ALLOWED_USERS,
+         {PLATFORM}_GROUP_ALLOWED_CHATS, GATEWAY_ALLOWED_USERS) and
+         config.yaml ``allow_from`` / ``group_allow_from`` /
+         ``group_allowed_chats`` under the platform's extra block.
+    """
+    platform_lower = platform_name.lower()
+
+    # 1. Home channel — explicitly operator-configured.
+    try:
+        if str(chat_id) == str(_get_home_target_chat_id(platform_lower)):
+            return True
+    except Exception:
+        pass
+
+    # 2. The creating session's own chat (origin ownership). Also covers
+    #    cron-context creates, where the creating run's own persistent
+    #    target is published via HERMES_CRON_AUTO_DELIVER_* contextvars
+    #    (that IS the operator-owned chat the parent job delivers to).
+    if origin:
+        try:
+            if (
+                str(origin.get("platform") or "").lower() == platform_lower
+                and str(origin.get("chat_id")) == str(chat_id)
+            ):
+                return True
+        except Exception:
+            pass
+    try:
+        from gateway.session_context import get_session_env
+
+        if (
+            str(get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM", "") or "").strip().lower()
+            == platform_lower
+            and str(get_session_env("HERMES_CRON_AUTO_DELIVER_CHAT_ID", "") or "").strip()
+            == str(chat_id)
+        ):
+            return True
+    except Exception:
+        pass
+
+    # 3. Channel directory — operator-registered names/ids.
+    try:
+        from gateway.channel_directory import resolve_channel_name
+
+        if resolve_channel_name(platform_lower, chat_id):
+            return True
+    except Exception:
+        pass
+
+    # 4a. Env allowlists.
+    allowed: set = set()
+    env_vars = [
+        _PLATFORM_USER_ALLOWLIST_ENV.get(platform_lower, ""),
+        _PLATFORM_CHAT_ALLOWLIST_ENV.get(platform_lower, ""),
+        "GATEWAY_ALLOWED_USERS",
+    ]
+    for env_var in env_vars:
+        if not env_var:
+            continue
+        try:
+            from gateway.authz_mixin import _platform_gate_env, _coerce_allow_set
+
+            raw = _platform_gate_env(env_var)
+        except Exception:
+            raw = os.getenv(env_var, "") or ""
+        if raw:
+            allowed |= _coerce_allow_set(raw)
+
+    # 4b. config.yaml allow_from / group_allow_from / group_allowed_chats.
+    try:
+        from gateway.config import load_gateway_config
+
+        cfg = load_gateway_config()
+        platform_cfg = cfg.platforms.get(platform_lower)
+        if platform_cfg is not None:
+            extra = getattr(platform_cfg, "extra", None) or {}
+            for key in ("allow_from", "group_allow_from", "group_allowed_chats"):
+                raw = extra.get(key)
+                if raw:
+                    from gateway.authz_mixin import _coerce_allow_set
+
+                    allowed |= _coerce_allow_set(raw)
+    except Exception:
+        pass
+
+    # F9/P2: a wildcard is inbound-anyone authorization, NOT outbound
+    # ownership — one star must not bless delivery to every chat on the
+    # platform. Only an exact operator-owned / allowlisted chat id passes.
+    if str(chat_id) in allowed:
+        return True
+    return False
+
+
+def _validate_deliver_targets_owned(deliver_value: Optional[str], origin: Optional[dict]) -> Optional[str]:
+    """Return an error string when a colon-form ``deliver`` element targets a
+    chat that isn't operator-owned/allowlisted, else None (F9).
+
+    ``local`` / ``origin`` / ``all`` / bare platform names need no concrete
+    chat validation (they resolve to the operator's own home channel or the
+    creating session at fire time). Only ``platform:...`` colon forms are
+    checked.
+
+    The identity checked is the identity the delivery path will actually use:
+    each colon-form element is resolved through the canonical platform-aware
+    target parser (``resolve_send_target``) and ownership is verified on the
+    RESOLVED chat_id. Native identifiers legitimately contain colons of their
+    own — ``matrix:!roomid:server.org``, ``matrix:@user:server.org``,
+    ``yuanbao:direct:<account>``, ``yuanbao:group:<code>``, Signal
+    ``group:<id>`` — so naively splitting at the second colon (the old
+    ``rest.split(\":\", 1)[0]``) authorized a TRUNCATED identity (``!roomid``,
+    ``direct``, ``group``) while delivery consumed the full one: it rejected
+    legitimate owned targets and separated the authorized identity from the
+    delivered identity.
+
+    Callers should run this at CREATE/UPDATE time so an unknown target is
+    rejected before the job is stored. This is the single invariant function;
+    every mutation surface (model tool, CLI, API PATCH, dashboard, migration)
+    passes through the canonical create/update layer which invokes it.
+    """
+    if not deliver_value:
+        return None
+    for part in str(deliver_value).split(","):
+        part = part.strip()
+        if not part or part.lower() in {"local", "origin", "all"}:
+            continue
+        if ":" not in part:
+            continue  # bare platform name → home channel at fire time
+        platform_name, rest = part.split(":", 1)
+        platform_key = platform_name.strip().lower()
+        rest = rest.strip()
+        if not platform_key or not rest:
+            continue
+        # Resolve through the same parser the fire-time delivery path uses
+        # (_resolve_single_delivery_target → resolve_send_target), so the
+        # chat id ownership is checked against is the chat id delivered.
+        try:
+            from tools.send_message_tool import (
+                prepare_send_message_platforms,
+                resolve_send_target,
+            )
+
+            prepare_send_message_platforms()
+            chat_id, _thread_id, resolution_error = resolve_send_target(
+                platform_key, rest, pass_unresolved_references=True
+            )
+        except Exception as exc:
+            logger.debug(
+                "cron deliver validation: target resolution failed for %s: %s",
+                part, exc,
+            )
+            chat_id, resolution_error = None, str(exc)
+        if chat_id is None:
+            return (
+                f"deliver target '{part}' could not be resolved to a chat on "
+                f"{platform_key} ({resolution_error or 'unresolvable target'}). "
+                f"Colon-form delivery targets must resolve through the "
+                f"platform's own target grammar."
+            )
+        if _delivery_chat_is_operator_owned(platform_key, str(chat_id), origin):
+            continue
+        return (
+            f"deliver target '{part}' is not a chat you own or have allowlisted "
+            f"for {platform_key}. Colon-form delivery targets must be the "
+            f"platform's home channel, a channel-directory entry, a chat in the "
+            f"platform's allowlist (allow_from / group_allow_from / "
+            f"group_allowed_chats / {platform_key.upper()}_ALLOWED_USERS), or "
+            f"the chat this job was created from."
+        )
+    return None
+
+
 def _resolve_delivery_targets(job: dict) -> List[dict]:
     """Resolve all concrete auto-delivery targets for a cron job.
 
@@ -3479,6 +3699,230 @@ def _windows_cron_bootstrap_argv(
     return [python_exe, "-c", bootstrap, script_path]
 
 
+def _snapshot_config_yaml() -> Optional[tuple]:
+    """Snapshot the Hermes config.yaml for tamper detection and restoration.
+
+    Returns ``(path, bytes_or_None, mtime_ns_or_None, stat_or_None)``:
+
+    - ``bytes`` — the exact pre-run contents (None means the config did NOT
+      exist before the run: an explicit ABSENT sentinel, so a script that
+      CREATES config.yaml is detected and removed instead of persisting).
+    - ``mtime_ns`` — pre-run mtime, restored on revert so the mtime-keyed
+      approval-policy cache never observes a flip.
+    - ``stat`` — pre-run metadata (mode/uid/gid), restored on revert so the
+      restored file does not inherit a broader umask-derived mode.
+
+    Returns None only when the config cannot even be stat/read (unreadable
+    path, filesystem error) — in that case no restore is possible and
+    callers fall back to the completion-time byte check where feasible.
+
+    Used by the F4 script-lane guard to revert config.yaml modifications
+    made by a no_agent script subprocess.
+    """
+    try:
+        from hermes_cli.config import get_config_path
+        path = get_config_path()
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            # Explicitly-absent sentinel: no config yet. A script-created
+            # config must be removed after the run, never silently blessed.
+            return (path, None, None, None)
+        return (path, path.read_bytes(), st.st_mtime_ns, st)
+    except Exception:
+        return None
+
+
+def _restore_config_yaml_if_tampered(snapshot: Optional[tuple]) -> Optional[str]:
+    """Restore config.yaml if a script subprocess modified it (F4).
+
+    Returns an error message when tampering was detected AND reverted,
+    None when the config is untouched (or the snapshot is unavailable).
+
+    config.yaml is the security policy (approvals.cron_mode / mode / yolo)
+    and approval-policy reads are mtime-keyed — a no_agent script that
+    rewrites it would silently flip the approval gate for the next tick.
+    Scripts run outside the file_tools/terminal hard-blocks that protect
+    config.yaml, so the restore here is the script lane's equivalent of
+    the file_tools deny.
+
+    P3: the restore is metadata-preserving (mode/owner/mtime restored with
+    the bytes — os.replace alone would swap in a umask-derived inode, e.g.
+    a 0600 policy file becoming 0644), and the ABSENT sentinel is honored
+    (a script-created config is removed, not preserved).
+    """
+    if snapshot is None:
+        return None
+    path, original_bytes, original_mtime, original_stat = snapshot
+    if original_bytes is None:
+        # The config did not exist before the run. A script-created config
+        # must NOT persist (the P2 code had no snapshot to restore because
+        # the absent case returned None — the created file survived).
+        try:
+            current_exists = path.exists()
+        except OSError:
+            current_exists = False
+        if not current_exists:
+            return None
+        try:
+            path.unlink()
+        except OSError as exc:
+            logger.error(
+                "Security: cron script CREATED %s during its run; "
+                "attempted removal FAILED: %s",
+                path, exc,
+            )
+            return (
+                f"Security: script created {path} during its run; "
+                f"attempted removal FAILED ({exc}). Check the file "
+                "immediately — it did not exist before the run."
+            )
+        logger.warning(
+            "Security: cron script created %s during its run — removing it "
+            "(the config did not exist before the run).",
+            path,
+        )
+        return (
+            f"Security: script created {path} during its run; the file was "
+            "removed (it did not exist before the run)."
+        )
+    try:
+        current = path.read_bytes()
+    except OSError:
+        # Config disappeared mid-run (deleted by the script). Restore it.
+        current = None
+    if current == original_bytes:
+        return None
+    logger.warning(
+        "Security: cron script modified %s during its run — reverting the "
+        "change (approval-policy tampering guard F4).",
+        path,
+    )
+    try:
+        tmp = path.with_name(f"{path.name}.hermes-restore-{os.getpid()}.tmp")
+        tmp.write_bytes(original_bytes)
+        os.replace(tmp, path)
+        try:
+            os.utime(path, ns=(original_mtime, original_mtime))
+        except OSError:
+            pass
+        # P3: os.replace swapped in a NEW inode with umask-derived mode —
+        # restore the pre-run security metadata (mode/owner/group) so a 0600
+        # policy file is never replaced by a broader-mode file. Windows
+        # ignores chmod/chown (ACLs govern there; the write-protection pass
+        # restores the ACL on its own exit path).
+        if original_stat is not None:
+            try:
+                os.chmod(path, _stat_mod.S_IMODE(original_stat.st_mode))
+            except OSError:
+                pass
+            try:
+                os.chown(path, original_stat.st_uid, original_stat.st_gid)
+            except (OSError, AttributeError):
+                pass
+    except OSError as exc:
+        logger.error(
+            "Security: could not revert %s after script tampering: %s",
+            path, exc,
+        )
+        return (
+            f"Security: script modified {path}; attempted revert FAILED ({exc}). "
+            "Check the file's approval settings immediately."
+        )
+    return (
+        f"Security: script modified {path} during its run; the change was "
+        "reverted (approval-policy tampering guard). Review the script."
+    )
+
+
+@contextlib.contextmanager
+def _config_write_protection(snapshot: Optional[tuple]):
+    """Prevent a script subprocess from WRITING config.yaml during its run.
+
+    F4 (prevention, not just rollback): the completion-time revert only
+    undoes exposure AFTER the child finishes — during the child's lifetime
+    the flipped policy is live and consumable (another gateway task, a
+    nested ``hermes`` invocation, or the script's own next command). Making
+    config.yaml non-writable for the duration of the run stops passive
+    writes at the source (``open(..., 'w')`` / ``echo >> config.yaml`` get
+    Permission denied); the completion-time byte-check + revert remains as
+    defense in depth for writers that deliberately restore writability
+    first, and the settle loop catches detached children that outlive this
+    block.
+
+    Mechanism: ``os.chmod(path, mode & ~0o222)`` — on POSIX this strips the
+    kernel-enforced write bits; on Windows CPython maps it to the read-only
+    FILE ATTRIBUTE (writes blocked, reads allowed), which is trivially
+    reversible. Deliberately NOT a Windows deny-write ACE: the deny ACE
+    also blocked READS on Windows and its removal is SID-fragile (the bare
+    username form fails to match the machine-qualified deny entry, leaving
+    the file locked). Best-effort — if protection cannot be applied the
+    completion-time revert still covers the run.
+    """
+    if snapshot is None:
+        yield
+        return
+    path, original_bytes, _mtime, original_stat = snapshot
+    if original_bytes is None or original_stat is None:
+        yield
+        return
+    try:
+        os.chmod(path, original_stat.st_mode & ~0o222)
+    except Exception:
+        # Protection is best-effort; the completion-time revert still runs.
+        pass
+    try:
+        yield
+    finally:
+        try:
+            os.chmod(path, _stat_mod.S_IMODE(original_stat.st_mode))
+        except Exception:
+            pass
+
+
+def _write_script_exec_copy(original: Path, script_text: str) -> Optional[Path]:
+    """Write *script_text* to a random-named, user-only copy next to
+    *original* (same directory + same suffix) and return it.
+
+    F3 execution binding: the subprocess runs THIS copy, so the bytes that
+    execute are exactly the bytes that were read and scanned
+    (``read_and_scan_script_text``) — an in-place overwrite of the original
+    between scan and exec (or during the run) cannot change what executes.
+    Same-directory placement preserves the script's relative-import /
+    ``dirname $0`` semantics; the copy is deleted by ``_run_job_script``'s
+    finally block after the run.
+
+    Returns None (and removes any partial file) when the copy cannot be
+    created — callers fail closed rather than executing unbound bytes.
+    """
+    import secrets
+    import stat
+
+    copy_path: Optional[Path] = None
+    try:
+        suffix = original.suffix.lower()
+        copy_path = original.with_name(
+            f".hermes-exec-{os.getpid()}-{secrets.token_hex(4)}{suffix}"
+        )
+        fd = os.open(
+            str(copy_path),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(script_text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        return copy_path
+    except OSError:
+        if copy_path is not None:
+            try:
+                copy_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return None
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -3566,6 +4010,31 @@ def _run_job_script(
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
+    # F3 (execution boundary): scan the EXACT bytes that are about to run.
+    # The create/update door scans at authoring time, but the file can be
+    # overwritten in place afterwards (or the job may pre-date this gate),
+    # so the bytes are re-read and re-scanned here, immediately before
+    # execution. Execution then binds to those bytes by running a validated
+    # copy of the scanned text (see _write_script_exec_copy), closing the
+    # scan/use race: whatever overwrites the original cannot change what
+    # executes. Fail closed: an un-scannable script (oversized, non-regular,
+    # cloud placeholder) or a dangerous payload refuses to run.
+    try:
+        from cron.lifecycle_guard import (
+            CronScriptContentBlocked,
+            read_and_scan_script_text,
+        )
+
+        script_text = read_and_scan_script_text(path)
+    except CronScriptContentBlocked as exc:
+        return False, str(exc)
+    exec_path = _write_script_exec_copy(path, script_text)
+    if exec_path is None:
+        return False, (
+            f"Blocked: could not prepare a validated execution copy of "
+            f"{path}; refusing to run the script unbound from its scan."
+        )
+
     script_timeout = _get_script_timeout()
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
@@ -3588,7 +4057,7 @@ def _run_job_script(
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
         )
-        argv = [_bash, str(path)]
+        argv = [_bash, str(exec_path)]
         env_overlay: dict[str, str] = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
@@ -3596,9 +4065,9 @@ def _run_job_script(
             # Overlay mode (Windows uv venv): PYTHONPATH alone cannot make
             # editable installs importable — .pth processing needs
             # site.addsitedir() (see _windows_cron_bootstrap_argv).
-            argv = _windows_cron_bootstrap_argv(python_exe, env_overlay, str(path))
+            argv = _windows_cron_bootstrap_argv(python_exe, env_overlay, str(exec_path))
         else:
-            argv = [python_exe, str(path)]
+            argv = [python_exe, str(exec_path)]
 
     try:
         from tools.environments.local import build_subprocess_env
@@ -3616,33 +4085,85 @@ def _run_job_script(
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into
-        # concurrent gateway sessions (#69396).
+        # concurrent gateway sessions (#69396). The validated exec copy
+        # lives in the SAME directory as the original script, so
+        # ``dirname $0`` / ``sys.path[0]`` semantics are preserved.
         _script_cwd = workdir or str(path.parent)
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=_script_cwd,
-            env=env,
-            **popen_kwargs,
-        )
-        deadline = time.monotonic() + script_timeout
-        while True:
-            if cancel_event is not None and cancel_event.is_set():
-                _terminate_cron_script_process(proc)
-                _drain_script_pipes(proc)
-                return False, "Script cancelled because cron fire ownership was lost"
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                _terminate_cron_script_process(proc)
-                _drain_script_pipes(proc)
-                return False, f"Script timed out after {script_timeout}s: {path}"
-            try:
-                stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
-                break
-            except subprocess.TimeoutExpired:
-                continue
+
+        # F4: config.yaml is the security policy (approvals.cron_mode,
+        # approvals.mode, yolo) and the approval-policy reads are
+        # mtime-keyed — a no_agent script that rewrites it would flip the
+        # policy and the next tick would pick the flip up. Scripts run as
+        # subprocesses OUTSIDE the file_tools/terminal hard-blocks that
+        # protect config.yaml, so we snapshot it before the run and
+        # restore it if the script modified it.
+        config_snapshot = _snapshot_config_yaml()
+
+        # P3 (prevention, not just rollback): while the child is alive,
+        # config.yaml is made non-writable (mode-bits / deny-write ACE), so
+        # the script cannot flip the policy mid-run and consume it. The
+        # completion-time byte-check + revert (below) remains as defense in
+        # depth for writers that deliberately restore writability, and the
+        # settle loop catches detached children that outlive this block.
+        with _config_write_protection(config_snapshot):
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=_script_cwd,
+                env=env,
+                **popen_kwargs,
+            )
+            deadline = time.monotonic() + script_timeout
+            early_error = None
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    _terminate_cron_script_process(proc)
+                    _drain_script_pipes(proc)
+                    early_error = "Script cancelled because cron fire ownership was lost"
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _terminate_cron_script_process(proc)
+                    _drain_script_pipes(proc)
+                    early_error = f"Script timed out after {script_timeout}s: {path}"
+                    break
+                try:
+                    stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+
+        # Detect and revert any config.yaml modification the script made.
+        # Runs on EVERY completion path (success, cancel, timeout) so the
+        # mtime-keyed approval-policy cache can never observe a flipped
+        # config from the script lane.
+        tamper_message = _restore_config_yaml_if_tampered(config_snapshot)
+
+        # F4/P2 (Purple round 2): a script may have detached a child
+        # (nohup / double-fork) that re-flips config.yaml AFTER this
+        # completion revert. When tampering was detected, settle-check the
+        # config for a few seconds and re-revert any re-flip so a lingering
+        # child cannot win. Clean runs add no delay.
+        # F4/P3: the loop no longer breaks on the FIRST clean observation —
+        # a detached child can write AFTER that observation and would
+        # otherwise win. The full settle window is checked whenever
+        # tampering was detected.
+        if tamper_message:
+            for _delay in (1.0, 2.0, 4.0):
+                time.sleep(_delay)
+                _later = _restore_config_yaml_if_tampered(config_snapshot)
+                if _later is not None:
+                    tamper_message = _later
+                # P3: NO break on a clean observation. A detached child may
+                # write AFTER the first clean check; the full settle window
+                # must be watched once tampering was detected.
+
+        if early_error:
+            return False, early_error
+        if tamper_message:
+            return False, tamper_message
 
         stdout = (stdout_raw or "").strip()
         stderr = (stderr_raw or "").strip()
@@ -3669,6 +4190,14 @@ def _run_job_script(
 
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
+    finally:
+        # F3: the validated execution copy is per-run scratch — remove it on
+        # every exit path (success, cancel, timeout, tamper revert, error) so
+        # no scanned-bytes copy lingers in the scripts dir.
+        try:
+            exec_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _run_job_script_with_claim_heartbeat(
@@ -6710,6 +7239,17 @@ def create_job_with_scheduler_registration(**kwargs) -> dict:
     """Persist one job and register its first trigger with the active provider."""
     from cron.jobs import create_job
     from cron.scheduler_provider import resolve_cron_scheduler
+
+    # F9: reject colon-form delivery targets that aren't operator-owned /
+    # allowlisted BEFORE the job is stored. Fire-time resolution hands raw
+    # colon-form ids straight to the adapter (pass_unresolved_references),
+    # so an unchecked ``deliver=telegram:<arbitrary>`` would let any chat
+    # user exfil job output to a chat they don't own.
+    _deliver_error = _validate_deliver_targets_owned(
+        kwargs.get("deliver"), kwargs.get("origin")
+    )
+    if _deliver_error:
+        raise ValueError(_deliver_error)
 
     job = create_job(**kwargs)
     try:

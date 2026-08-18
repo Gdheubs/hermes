@@ -21,7 +21,11 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlparse
 
-from hermes_constants import get_hermes_home
+from hermes_constants import (
+    credential_file_is_user_restricted,
+    get_hermes_home,
+    restrict_credential_file,
+)
 from typing import Any, Dict, List, Optional, Tuple
 from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_vars
 from agent.secret_scope import get_secret as _get_secret
@@ -1296,10 +1300,41 @@ def _write_claude_code_credentials(
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL,
                 stat.S_IRUSR | stat.S_IWUSR,
             )
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(existing, fh, indent=2)
-                fh.flush()
-                os.fsync(fh.fileno())
+            _fd_open = True
+            try:
+                # F1 (P3): apply the user-only ACL to the TEMP file BEFORE
+                # any credential bytes are written. On Windows the 0o600 mode
+                # above is meaningless — the file inherits the parent
+                # directory's DACL (commonly granting ``Users`` / sandbox
+                # groups read access) until icacls runs — so bytes written
+                # before restriction are exposed to every account the parent
+                # grants. Fail closed: if the temp cannot be restricted, no
+                # credential bytes are ever written and the destination is
+                # never touched.
+                if not restrict_credential_file(_tmp_cred):
+                    raise OSError(
+                        f"F1: could not restrict temp credential file "
+                        f"{_tmp_cred} before writing; refusing to persist."
+                    )
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    _fd_open = False
+                    json.dump(existing, fh, indent=2)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                # Re-verify the bytes-bearing temp is still user-restricted
+                # (icacls race / exotic filesystem) before it becomes the
+                # destination.
+                if not credential_file_is_user_restricted(_tmp_cred):
+                    raise OSError(
+                        f"F1: temp credential file {_tmp_cred} lost its "
+                        "user-only ACL before replacement; refusing to persist."
+                    )
+            finally:
+                if _fd_open:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
             os.replace(_tmp_cred, cred_path)
         except OSError:
             try:
@@ -1307,6 +1342,24 @@ def _write_claude_code_credentials(
             except OSError:
                 pass
             raise
+        # Verify the replaced destination retained the user-only restriction.
+        # (The temp's ACL survives os.replace, but an exotic filesystem or a
+        # concurrent writer could still change it — fail closed either way.)
+        if not credential_file_is_user_restricted(cred_path):
+            logger.warning(
+                "Wrote refreshed credentials to %s but could not restrict "
+                "the file to the current user; refusing to persist the "
+                "refresh so the token is not left group-readable.",
+                cred_path,
+            )
+            try:
+                cred_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise OSError(
+                f"Refusing to persist refreshed credentials: could not "
+                f"restrict {cred_path} to the current user"
+            )
     except (OSError, IOError) as e:
         logger.debug("Failed to write refreshed credentials: %s", e)
 

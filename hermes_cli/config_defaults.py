@@ -2812,6 +2812,15 @@ DEFAULT_CONFIG = {
         # the historical serve-all behavior; [] serves only the default.
         "multiplex_profile_allowlist": None,
 
+        # Event hooks (gateway/hooks.py): directories under
+        # ~/.hermes/hooks/ containing HOOK.yaml + handler.py are discovered
+        # and importlib-exec'd at gateway startup. A hook handler runs
+        # arbitrary Python in the gateway process, so discovery is gated OFF
+        # by default and only enabled by an explicit opt-in (F2). Built-in
+        # hooks (currently none) are unaffected.
+        "event_hooks_enabled": False,
+
+
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
         # died between finalize and platform ACK redelivers the stored
@@ -2948,13 +2957,14 @@ DEFAULT_CONFIG = {
         # operator allowlist — useful for ``pandoc -o /tmp/report.pdf`` or
         # PDFs the agent writes into a working directory. System paths
         # (/etc, /proc, ~/.ssh, ~/.aws, etc.) remain blocked regardless.
-        # Disable to fall back to pure-allowlist mode. Bridged to
-        # HERMES_MEDIA_TRUST_RECENT_FILES. Only consulted when ``strict``
-        # is true; in default mode the denylist alone gates delivery.
-        "trust_recent_files": True,
+        # F6 (P3): OFF BY DEFAULT. mtime is writable metadata, not evidence
+        # that Hermes produced a file — a pre-existing personal file at the
+        # home root must not become deliverable because someone ``touch``ed
+        # it. This is an explicit operator opt-in convenience, not a
+        # provenance signal. Bridged to HERMES_MEDIA_TRUST_RECENT_FILES.
+        "trust_recent_files": False,
         # Recency window in seconds. 600 (10 min) comfortably covers a
         # multi-tool agent turn. Bridged to HERMES_MEDIA_TRUST_RECENT_SECONDS.
-        # Only consulted when ``strict`` is true.
         "trust_recent_files_seconds": 600,
 
         # OpenAI-compatible API server platform

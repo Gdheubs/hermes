@@ -1283,7 +1283,16 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
     try:
-        raw = json.loads(auth_file.read_text(encoding="utf-8-sig"))
+        raw_text = auth_file.read_text(encoding="utf-8-sig")
+        # F10 (fail closed): an existing file that is zero-byte or
+        # whitespace-only is NOT a legitimately-initialized store — this
+        # module never creates one (every write path persists the full JSON
+        # envelope atomically), so an empty file is indistinguishable from
+        # interruption, failed replacement, disk damage, or manual
+        # truncation (``> auth.json``). Treat it as corruption: preserve it
+        # for recovery and refuse to continue. A missing file is the only
+        # state that means "not initialized yet" (handled above).
+        raw = json.loads(raw_text)
     except OSError:
         # The file exists (checked above) but could not be READ: EMFILE under
         # fd exhaustion, EACCES, EIO, a stalled network mount. None of those
@@ -1299,6 +1308,12 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         raise
     except Exception as exc:
         # Genuine corruption: unparseable JSON, or bytes that are not UTF-8.
+        # F10 (fail closed): DO NOT degrade to an empty store. This module does
+        # read-modify-write in ~15 places, so an empty store here is one
+        # _save_auth_store() away from erasing every stored credential. The
+        # corrupt file is preserved for recovery, then we refuse to continue —
+        # callers surface the error and the operator resolves it explicitly
+        # (restore the .corrupt copy, or clear the file knowing it is empty).
         corrupt_path = auth_file.with_suffix(".json.corrupt")
         preserved = False
         try:
@@ -1311,19 +1326,24 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
                 corrupt_path, exc_info=True,
             )
         if preserved:
-            logger.warning(
-                "auth: failed to parse %s (%s), starting with empty store. "
-                "Corrupt file preserved at %s",
+            logger.error(
+                "auth: failed to parse %s (%s), refusing to continue with an "
+                "empty store (fail closed). Corrupt file preserved at %s",
                 auth_file, exc, corrupt_path,
             )
         else:
             # Do not advertise a backup that was never written.
-            logger.warning(
-                "auth: failed to parse %s (%s), starting with empty store. "
-                "A copy could NOT be preserved at %s",
+            logger.error(
+                "auth: failed to parse %s (%s), refusing to continue with an "
+                "empty store (fail closed). A copy could NOT be preserved at %s",
                 auth_file, exc, corrupt_path,
             )
-        return {"version": AUTH_STORE_VERSION, "providers": {}}
+        raise ValueError(
+            f"auth store {auth_file} is corrupt and was not loaded: {exc}. "
+            f"Refusing to continue with an empty store (fail closed). "
+            f"Restore the preserved copy at {corrupt_path} or fix the file, "
+            f"then retry."
+        ) from exc
 
     if isinstance(raw, dict) and (
         isinstance(raw.get("providers"), dict)
@@ -1372,10 +1392,43 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
             stat.S_IRUSR | stat.S_IWUSR,
         )
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
+        _fd_open = True
+        try:
+            # F1 (P3): apply the user-only ACL to the TEMP file BEFORE any
+            # credential bytes are written. On Windows the 0o600 mode above
+            # is meaningless — the file inherits the parent directory's ACL
+            # until icacls runs — so bytes written before restriction are
+            # exposed to every account the parent grants. Fail closed: if
+            # the temp cannot be restricted, no credential bytes are ever
+            # written and the destination is never touched.
+            from hermes_constants import (
+                credential_file_is_user_restricted,
+                restrict_credential_file,
+            )
+
+            if not restrict_credential_file(tmp_path):
+                raise OSError(
+                    f"F1: could not restrict temp auth store {tmp_path} "
+                    "before writing; refusing to persist."
+                )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                _fd_open = False
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            # Re-verify the bytes-bearing temp is still user-restricted
+            # (icacls race / exotic filesystem) before it becomes the store.
+            if not credential_file_is_user_restricted(tmp_path):
+                raise OSError(
+                    f"F1: temp auth store {tmp_path} lost its user-only ACL "
+                    "before replacement; refusing to persist."
+                )
+        finally:
+            if _fd_open:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         atomic_replace(tmp_path, auth_file)
         try:
             dir_fd = os.open(str(auth_file.parent), os.O_RDONLY)
@@ -1392,11 +1445,36 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
                 tmp_path.unlink()
         except OSError:
             pass
-    # Restrict file permissions to owner only
+    # Restrict file permissions to owner only (POSIX no-op on Windows).
     try:
         auth_file.chmod(stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass
+    # F1 (P3): the destination must be user-restricted AFTER the atomic
+    # replace. The temp's ACL normally survives os.replace, but an exotic
+    # filesystem or a concurrent writer could still widen it — fail closed
+    # (raise) rather than silently leaving every stored credential exposed.
+    try:
+        from hermes_constants import credential_file_is_user_restricted
+
+        if not credential_file_is_user_restricted(auth_file):
+            raise OSError(
+                f"F1: wrote {auth_file} but could not restrict it to the "
+                "current user; refusing to leave an exposed credential "
+                "store (fail closed). Check the file's permissions "
+                "(POSIX: chmod 600; Windows: icacls /inheritance:r "
+                '/grant:r "%USERNAME%":(R,W)) and retry.'
+            )
+    except OSError:
+        raise
+    except Exception as exc:
+        # The verification itself failed (icacls unavailable, unreadable
+        # path) — we cannot prove the store is user-only, so fail closed.
+        raise OSError(
+            f"F1: could not verify {auth_file} is user-restricted after "
+            f"write ({exc}); refusing to leave an exposed credential "
+            "store (fail closed)."
+        ) from exc
     return auth_file
 
 
@@ -4054,12 +4132,39 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
     
     Returns tokens dict if valid and not expired, None otherwise.
     Does NOT write to the shared file.
+
+    Refuses to import when the shared file is readable by accounts other
+    than the current user (group/other read on POSIX; non-benign ACEs on
+    Windows, e.g. ``CodexSandboxUsers:(I)(RX)``). Importing from an
+    already-exposed file would silently bless a credential the operator
+    believes is private — fail closed and tell them to fix the ACL
+    (``chmod 600 ~/.codex/auth.json`` / ``icacls ~/.codex/auth.json
+    /inheritance:r /grant:r \"%USERNAME%\":(R,W)``) instead.
     """
     codex_home = os.getenv("CODEX_HOME", "").strip()
     if not codex_home:
         codex_home = str(Path.home() / ".codex")
     auth_path = Path(codex_home).expanduser() / "auth.json"
     if not auth_path.is_file():
+        return None
+    try:
+        from hermes_constants import credential_file_is_user_restricted
+        if not credential_file_is_user_restricted(auth_path):
+            logger.warning(
+                "Refusing to import tokens from %s: the file is readable "
+                "by accounts other than the current user. Restrict it to "
+                "the current user (POSIX: chmod 600; Windows: icacls %s "
+                "/inheritance:r /grant:r \"%%USERNAME%%\":(R,W)) and retry.",
+                auth_path, auth_path,
+            )
+            return None
+    except Exception as exc:
+        # ACL check itself failed — fail closed rather than importing from
+        # a file whose exposure we could not verify.
+        logger.warning(
+            "Refusing to import tokens from %s: could not verify the file "
+            "is user-restricted (%s).", auth_path, exc,
+        )
         return None
     try:
         payload = json.loads(auth_path.read_text(encoding="utf-8-sig"))

@@ -368,6 +368,10 @@ def _translate_remote(config: Mapping[str, Any]) -> Dict[str, Any]:
     translated: Dict[str, Any] = {
         "url": url,
         "strict_redirect_headers": True,
+        # F5: same as _translate_stdio — plugin-portable remote servers are
+        # explicitly UNTRUSTED by default (write-capable tools go through
+        # the approval gate).
+        "trust": "untrusted",
     }
     headers = config.get("headers")
     if headers:
@@ -425,11 +429,17 @@ def _translate_stdio(
     }
     translated_env["PLUGIN_ROOT"] = str(plugin_root)
     translated_env["PLUGIN_DATA"] = str(data_root)
+    # F5: plugin-portable servers carry no ``trust`` field in their schema,
+    # so every translated server is explicitly UNTRUSTED — write-capable
+    # MCP tools from a plugin go through the approval gate by default. The
+    # portable format has no way to express ``trust: full``; operators who
+    # need it must move the server into the main mcp_servers config.
     return {
         "command": command_value,
         "args": [_expand(value, plugin_root, data_root) for value in args],
         "env": translated_env,
         "cwd": str(cwd_value),
+        "trust": "untrusted",
     }
 
 

@@ -72,6 +72,10 @@ def test_loads_manifest_skill_and_stdio_server(tmp_path: Path) -> None:
     assert server["env"]["PLUGIN_ROOT"] == str(root.resolve())
     assert server["env"]["PLUGIN_DATA"] == str((tmp_path / "data").resolve())
     assert server["env"]["CACHE"] == str((tmp_path / "data").resolve() / "cache")
+    # F5: plugin-portable servers default to trust: untrusted — the
+    # portable schema has no trust field, so write-capable MCP tools from
+    # plugins must go through the approval gate by default.
+    assert server.get("trust") == "untrusted"
     assert (tmp_path / "data").is_dir()
 
 
@@ -451,11 +455,13 @@ def test_streamable_http_translates_to_native_remote_config(tmp_path: Path) -> N
         "url": "https://deploy.example.test/mcp",
         "headers": {"X-Tenant": "public-tenant"},
         "strict_redirect_headers": True,
+        "trust": "untrusted",  # F5: portable remote servers default untrusted
     }
     assert "command" not in deploy
     assert package.mcp_servers["bare"] == {
         "url": "https://bare.example.test/mcp",
         "strict_redirect_headers": True,
+        "trust": "untrusted",
     }
 
 

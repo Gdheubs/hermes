@@ -2411,13 +2411,35 @@ def _get_platform_tools(
 
     platform_toolsets = config.get("platform_toolsets") or {}
     toolset_names = platform_toolsets.get(platform)
+
+    # F7: a restriction value that arrived as a string (quoted-JSON editor
+    # save, hand edit, or a `config set` that stored the raw string) must
+    # NOT silently fall back to the platform's FULL default toolset — that
+    # is fail-open. Recover the intended list when it parses; malformed list
+    # literals raise (fail closed, refuse to resolve); a bare scalar is a
+    # single-name list (#13026); an empty/whitespace string is an explicit
+    # disable-all.
+    if isinstance(toolset_names, str):
+        _stripped = toolset_names.strip()
+        if not _stripped:
+            # F7/P2: an explicitly saved empty STRING restriction means
+            # "no toolsets" (fail closed) — not "no restriction" (which fell
+            # back to the full default).
+            toolset_names = []
+        else:
+            from agent.skill_utils import parse_config_string_list
+
+            # Scalars become single-name lists; [/{ literals are parsed
+            # (malformed -> ValueError, F7 fail-closed).
+            toolset_names = parse_config_string_list(_stripped)
+
     # Track whether the user explicitly saved a toolset list for this platform
     # (vs. falling back to the platform default). An explicit composite (e.g.
     # ``hermes-discord``) is an opt-in to the platform's native default-off
     # toolsets — see _exempt_explicit_platform_native (#35527).
     explicitly_configured = isinstance(toolset_names, list)
 
-    if toolset_names is None or not isinstance(toolset_names, list):
+    if toolset_names is None:
         plat_info = PLATFORMS.get(platform)
         if plat_info:
             default_ts = plat_info["default_toolset"]
@@ -2425,10 +2447,22 @@ def _get_platform_tools(
             # Plugin platform — derive toolset name from platform key
             default_ts = f"hermes-{platform}"
         toolset_names = [default_ts]
+    elif not isinstance(toolset_names, list):
+        # F7/P2: a non-list, non-None value (e.g. YAML parses a bare numeric
+        # key like ``12306:`` as int) is an EXPLICIT restriction, not
+        # "unset" — never fall back to the full default. Coerce to a
+        # single-name list (fail closed).
+        toolset_names = [str(toolset_names)]
 
     # YAML may parse bare numeric names (e.g. ``12306:``) as int.
     # Normalise to str so downstream sorted() never mixes types.
     toolset_names = [str(ts) for ts in toolset_names]
+
+    # F7: an EXPLICITLY saved EMPTY list means "no toolsets for this
+    # platform" (disable all / fail closed) — NOT "no restriction". The
+    # default-composite inference below and the non-configurable recovery
+    # pass must not resurrect the platform's full toolset for ``[]``.
+    explicit_empty = explicitly_configured and not toolset_names
 
     configurable_keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
     plugin_ts_keys = _get_plugin_toolset_keys()
@@ -2445,7 +2479,14 @@ def _get_platform_tools(
     # toolsets to re-appear as enabled.
     has_explicit_config = any(ts in explicit_known_keys for ts in toolset_names)
 
-    if has_explicit_config:
+    if explicit_empty:
+        # F7: an explicitly saved EMPTY toolset list means "no toolsets for
+        # this platform" (disable all / fail closed). Skip the default
+        # composite inference, x_search auto-enable, and recently-shipped
+        # auto-enable — none of them may resurrect tools the operator
+        # explicitly removed.
+        enabled_toolsets = set()
+    elif has_explicit_config:
         enabled_toolsets = {
             ts for ts in toolset_names
             if ts in explicit_known_keys and _toolset_allowed_for_platform(ts, platform)
@@ -2561,38 +2602,43 @@ def _get_platform_tools(
     # checklist or in a user-saved config.  Must run in BOTH branches —
     # otherwise saving via `hermes tools` (which flips has_explicit_config
     # to True) silently drops them.
-    _plat_info = PLATFORMS.get(platform)
-    _default_ts = _plat_info["default_toolset"] if _plat_info else f"hermes-{platform}"
-    platform_tool_universe = set(resolve_toolset(_default_ts))
-    configurable_tool_universe = set()
-    for ck in configurable_keys:
-        configurable_tool_universe.update(resolve_toolset(ck))
-    claimed = set()
-    for ts_key in enabled_toolsets:
-        claimed.update(resolve_toolset(ts_key))
-    skip = configurable_keys | plugin_ts_keys | platform_default_keys
-    skip |= {k for k in TOOLSETS if k.startswith("hermes-")}
-    skip |= set(_DEFAULT_OFF_TOOLSETS) - {platform}
-    for ts_key, ts_def in TOOLSETS.items():
-        if ts_key in skip:
-            continue
-        if ts_def.get("includes"):
-            continue
-        # Posture toolsets (e.g. ``coding``) are session-level selections made
-        # by agent/coding_context.py — not per-platform capabilities to recover.
-        if ts_def.get("posture"):
-            continue
-        # Static membership (see #49622): a registry-added tool absent from the
-        # platform composite must not block recovery of a non-configurable
-        # toolset whose authored tools the composite does list.
-        ts_tools = set(resolve_toolset(ts_key, include_registry=False))
-        if not ts_tools or not ts_tools.issubset(platform_tool_universe):
-            continue
-        if ts_tools.issubset(configurable_tool_universe):
-            continue
-        if not ts_tools.issubset(claimed):
-            enabled_toolsets.add(ts_key)
-            claimed.update(ts_tools)
+    # F7: never recover for an EXPLICITLY EMPTY list — ``[]`` means "no
+    # toolsets for this platform" (fail closed), and resurrecting the
+    # platform's native toolsets would turn the restriction into the full
+    # default toolset again.
+    if not explicit_empty:
+        _plat_info = PLATFORMS.get(platform)
+        _default_ts = _plat_info["default_toolset"] if _plat_info else f"hermes-{platform}"
+        platform_tool_universe = set(resolve_toolset(_default_ts))
+        configurable_tool_universe = set()
+        for ck in configurable_keys:
+            configurable_tool_universe.update(resolve_toolset(ck))
+        claimed = set()
+        for ts_key in enabled_toolsets:
+            claimed.update(resolve_toolset(ts_key))
+        skip = configurable_keys | plugin_ts_keys | platform_default_keys
+        skip |= {k for k in TOOLSETS if k.startswith("hermes-")}
+        skip |= set(_DEFAULT_OFF_TOOLSETS) - {platform}
+        for ts_key, ts_def in TOOLSETS.items():
+            if ts_key in skip:
+                continue
+            if ts_def.get("includes"):
+                continue
+            # Posture toolsets (e.g. ``coding``) are session-level selections made
+            # by agent/coding_context.py — not per-platform capabilities to recover.
+            if ts_def.get("posture"):
+                continue
+            # Static membership (see #49622): a registry-added tool absent from the
+            # platform composite must not block recovery of a non-configurable
+            # toolset whose authored tools the composite does list.
+            ts_tools = set(resolve_toolset(ts_key, include_registry=False))
+            if not ts_tools or not ts_tools.issubset(platform_tool_universe):
+                continue
+            if ts_tools.issubset(configurable_tool_universe):
+                continue
+            if not ts_tools.issubset(claimed):
+                enabled_toolsets.add(ts_key)
+                claimed.update(ts_tools)
 
     # Plugin toolsets: enabled by default unless explicitly disabled, or
     # unless the toolset is in _DEFAULT_OFF_TOOLSETS (e.g. spotify —
@@ -2601,7 +2647,13 @@ def _get_platform_tools(
     # A plugin toolset is "known" for a platform once `hermes tools`
     # has been saved for that platform (tracked via known_plugin_toolsets).
     # Unknown plugins default to enabled; known-but-absent = disabled.
-    if plugin_ts_keys:
+    #
+    # F7 (explicit empty): an explicitly saved EMPTY toolset list is the
+    # operator saying "no toolsets for this platform" — a newly discovered
+    # plugin toolset must NOT auto-enable and resurrect tools the operator
+    # explicitly removed. With `[]`, plugin toolsets only appear once the
+    # operator opts in via `hermes tools` (which writes the list).
+    if plugin_ts_keys and not explicit_empty:
         known_map = config.get("known_plugin_toolsets", {}) or {}
         known_for_platform = set(known_map.get(platform, []) or [])
         for pts in plugin_ts_keys:

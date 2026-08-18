@@ -32,13 +32,18 @@ def _patch_no_builtins(reg):
     return patch.object(reg, "_register_builtin_hooks")
 
 
+def _opt_in_hooks():
+    """Simulate gateway.event_hooks_enabled: true (F2 gate)."""
+    return patch("gateway.hooks.event_hooks_enabled", return_value=True)
+
+
 class TestDiscoverAndLoad:
     def test_loads_valid_hook(self, tmp_path):
         _create_hook(tmp_path, "my-hook", '["agent:start"]',
                       "def handle(event_type, context):\n    pass\n")
 
         reg = HookRegistry()
-        with patch("gateway.hooks.HOOKS_DIR", tmp_path), _patch_no_builtins(reg):
+        with patch("gateway.hooks.HOOKS_DIR", tmp_path), _patch_no_builtins(reg), _opt_in_hooks():
             reg.discover_and_load()
 
         assert len(reg.loaded_hooks) == 1
@@ -53,10 +58,93 @@ class TestDiscoverAndLoad:
         (hook_dir / "handler.py").write_text("def handle(e, c): pass\n")
 
         reg = HookRegistry()
-        with patch("gateway.hooks.HOOKS_DIR", tmp_path), _patch_no_builtins(reg):
+        with patch("gateway.hooks.HOOKS_DIR", tmp_path), _patch_no_builtins(reg), _opt_in_hooks():
             reg.discover_and_load()
 
         assert len(reg.loaded_hooks) == 0
+
+
+class TestEventHooksGate:
+    """F2: discovery is OFF by default and requires explicit opt-in."""
+
+    def test_discovery_skipped_when_gate_off(self, tmp_path, monkeypatch):
+        """A hook dir with a valid handler must NOT load when the gate is off."""
+        _create_hook(tmp_path, "my-hook", '["agent:start"]',
+                      "def handle(event_type, context):\n    pass\n")
+        monkeypatch.setattr("gateway.hooks.event_hooks_enabled", lambda: False)
+
+        reg = HookRegistry()
+        with patch("gateway.hooks.HOOKS_DIR", tmp_path), _patch_no_builtins(reg):
+            reg.discover_and_load()
+
+        assert reg.loaded_hooks == []
+        assert reg._handlers == {}
+
+    def test_discovery_runs_when_gate_on(self, tmp_path, monkeypatch):
+        _create_hook(tmp_path, "my-hook", '["agent:start"]',
+                      "def handle(event_type, context):\n    pass\n")
+        monkeypatch.setattr("gateway.hooks.event_hooks_enabled", lambda: True)
+
+        reg = HookRegistry()
+        with patch("gateway.hooks.HOOKS_DIR", tmp_path), _patch_no_builtins(reg):
+            reg.discover_and_load()
+
+        assert len(reg.loaded_hooks) == 1
+
+    def test_event_hooks_enabled_reads_config_default_false(self, monkeypatch):
+        """The gate reads gateway.event_hooks_enabled with default False."""
+        from gateway import hooks
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"gateway": {}},
+        )
+        assert hooks.event_hooks_enabled() is False
+
+    def test_event_hooks_enabled_true_when_configured(self, monkeypatch):
+        from gateway import hooks
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"gateway": {"event_hooks_enabled": True}},
+        )
+        assert hooks.event_hooks_enabled() is True
+
+    def test_event_hooks_enabled_fails_closed_on_config_error(self, monkeypatch):
+        from gateway import hooks
+
+        def _boom():
+            raise RuntimeError("config unavailable")
+        monkeypatch.setattr("hermes_cli.config.load_config_readonly", _boom)
+        assert hooks.event_hooks_enabled() is False
+
+    def test_event_hooks_enabled_quoted_false_is_closed(self, monkeypatch):
+        """F2/P2: a QUOTED string ``"false"`` must NOT open the gate —
+        ``bool("false")`` is True, which would enable arbitrary hook
+        execution on a mis-saved config value."""
+        from gateway import hooks
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"gateway": {"event_hooks_enabled": "false"}},
+        )
+        assert hooks.event_hooks_enabled() is False
+
+    def test_event_hooks_enabled_quoted_true_opens(self, monkeypatch):
+        """F2/P2 control: a quoted ``"true"`` is parsed as true."""
+        from gateway import hooks
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {"gateway": {"event_hooks_enabled": "true"}},
+        )
+        assert hooks.event_hooks_enabled() is True
+
+    def test_event_hooks_enabled_non_bool_value_is_closed(self, monkeypatch):
+        """F2/P2: any non-bool, non-parseable value (int, junk) fails closed."""
+        from gateway import hooks
+        for bad in (1, "maybe", None, ["yes"]):
+            monkeypatch.setattr(
+                "hermes_cli.config.load_config_readonly",
+                lambda b=bad: {"gateway": {"event_hooks_enabled": b}},
+            )
+            assert hooks.event_hooks_enabled() is False, bad
 
 
 class TestEmit:
@@ -78,7 +166,7 @@ class TestEmit:
         )
 
         reg = HookRegistry()
-        with patch("gateway.hooks.HOOKS_DIR", tmp_path):
+        with patch("gateway.hooks.HOOKS_DIR", tmp_path), _opt_in_hooks():
             reg.discover_and_load()
 
         handler_fn = reg._handlers["agent:end"][0]
@@ -97,7 +185,7 @@ class TestEmit:
                       "    results.append(event_type)\n")
 
         reg = HookRegistry()
-        with patch("gateway.hooks.HOOKS_DIR", tmp_path):
+        with patch("gateway.hooks.HOOKS_DIR", tmp_path), _opt_in_hooks():
             reg.discover_and_load()
 
         handler_fn = reg._handlers["command:*"][0]

@@ -235,6 +235,73 @@ async def test_admin_runs_quick_command_when_gating_enabled():
 
 
 # ---------------------------------------------------------------------------
+# F8 — exec quick commands fail closed when allow_admin_from is unset
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_exec_quick_command_disabled_when_no_admin_policy():
+    """F8: with ``allow_admin_from`` unset, the slash-access policy is
+    disabled (backward-compat: everyone unrestricted) — which would let ANY
+    chat user run a ``type:exec`` quick command (a shell command in the
+    gateway process). Exec quick commands must default to DISABLED (fail
+    closed), not reachable by every chat user."""
+    runner = _make_runner(platform_extra={})  # no allow_admin_from
+    runner.config.quick_commands = {
+        "limits": {"type": "exec", "command": "printf f8-bypass-confirmed"}
+    }
+
+    result = await runner._handle_message(
+        _make_event("/limits", _make_source(user_id="anyone"))
+    )
+
+    assert result is not None
+    assert "⛔" in result
+    assert "allow_admin_from" in result
+    assert "f8-bypass-confirmed" not in result
+
+
+@pytest.mark.asyncio
+async def test_exec_quick_command_admin_runs_with_admin_policy():
+    """F8 control: once an admin policy IS configured, an admin can run the
+    exec quick command — the fail-closed default only applies while
+    allow_admin_from is unset."""
+    runner = _make_runner(
+        platform_extra={
+            "allow_admin_from": ["111"],
+            "user_allowed_commands": [],
+        }
+    )
+    runner.config.quick_commands = {
+        "limits": {"type": "exec", "command": "printf f8-admin-ok"}
+    }
+
+    result = await runner._handle_message(
+        _make_event("/limits", _make_source(user_id="111"))
+    )
+
+    assert result == "f8-admin-ok"
+
+
+@pytest.mark.asyncio
+async def test_non_exec_quick_command_still_works_without_admin_policy():
+    """F8 control: the fail-closed default is scoped to ``type:exec`` only —
+    non-exec quick commands (alias) keep the backward-compat behavior when no
+    admin policy is configured."""
+    runner = _make_runner(platform_extra={})  # no allow_admin_from
+    runner.config.quick_commands = {
+        "greet": {"type": "alias", "target": "/whoami"},
+    }
+
+    result = await runner._handle_message(
+        _make_event("/greet", _make_source(user_id="anyone"))
+    )
+
+    assert result is not None
+    assert "⛔" not in result
+
+
+# ---------------------------------------------------------------------------
 # Running-agent fast-path gating — admin/user split must hold even when an
 # agent is already running. The fast-path block in _handle_message dispatches
 # /stop, /restart, /new, /steer, /model, /approve, /deny, /agents,

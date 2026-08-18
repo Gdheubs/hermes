@@ -799,3 +799,155 @@ def check_gateway_lifecycle(
             "(#30719). Run `hermes gateway restart` from a shell outside "
             "the running gateway instead."
         )
+
+
+class CronScriptContentBlocked(ValueError):
+    """Raised when a no_agent cron script contains dangerous content.
+
+    F3: no_agent script jobs run their script via subprocess with no
+    approval check and no content scan. The create-time lifecycle guard
+    scans prompt + script path only. This exception backs a creation-time
+    scan of the script BYTES for patterns that would let a script tamper
+    with the approval policy, exfiltrate credentials, or destroy data —
+    the payloads that make an unvetted script dangerous.
+    """
+
+
+# Script-content threat patterns for no_agent jobs (F3). These target
+# unambiguous payloads — the same class of commands the prompt scanner
+# blocks, plus the approval-policy tampering a script subprocess can
+# perform that a prompt never could (config.yaml rewrites that flip
+# cron_mode deny->approve / mode off — F4). Deliberately narrower than
+# the terminal scanner: a cron watchdog script legitimately greps, parses,
+# and reads; we block only what has no benign reading.
+_CRON_SCRIPT_THREAT_PATTERNS: list[tuple[str, str]] = [
+    # ── Approval-policy tampering (F4 chain) ──────────────────────────
+    # config.yaml IS the security policy (approvals.mode, cron_mode, yolo).
+    # The file_tools hard-block denies write_file/patch on it and the
+    # terminal scanner gates sed/tee/redirect — but a cron SCRIPT runs in
+    # a subprocess outside both. Block scripts that rewrite it.
+    (r'(?:sed|perl|ruby)\s+-[^\s]*i\b[^\n;|&]*config\.ya?ml', "in-place config.yaml edit"),
+    (r'(?:sed|perl|ruby)\s+--in-place\b[^\n;|&]*config\.ya?ml', "in-place config.yaml edit (long flag)"),
+    (r'(?:tee|cat)\s+[>\|][^\n;|&]*config\.ya?ml', "config.yaml overwrite via tee/cat"),
+    (r'\btee\s+[^\n;|&]*config\.ya?ml', "config.yaml overwrite via tee argument"),
+    (r'config\.ya?ml[^\n;|&]*(?:>>|>|2>)\s*[^\n;|&]*', "config.yaml redirection write"),
+    (r'open\s*\([^\n]*config\.ya?ml[^\n]*["\'](?:w|a|r\+|w\+|a\+)["\']', "config.yaml open-for-write (python)"),
+    (r'yaml\.(?:dump|safe_dump)\s*\([^\n]*\)', "yaml dump (python)"),
+    # Flipping the approval policy itself — a smoking gun in any language.
+    (r'approvals\.cron_mode\s*[:=]\s*["\']?approve', "cron approval policy flip"),
+    (r'approvals\.mode\s*[:=]\s*["\']?off', "approval mode disable"),
+    (r'cron_mode\s*[:=]\s*["\']?approve', "cron approval policy flip"),
+    (r'["\'](?:mode|yolo)["\']\s*[:=]\s*["\']?on', "yolo/mode enable"),
+    # ── Credential reads / exfil ──────────────────────────────────────
+    (r'cat\s+[^\n;|&]*\.hermes[^\n;|&]*\.env', "read Hermes .env"),
+    (r'cat\s+[^\n;|&]*(?:auth\.json|\.anthropic_oauth\.json|google_token\.json)', "read Hermes credential file"),
+    (r'curl\s+[^\n]*https?://[^\s"\'`]*\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)\w*\}?', "exfil via curl URL"),
+    (r'wget\s+[^\n]*https?://[^\s"\'`]*\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)\w*\}?', "exfil via wget URL"),
+    (r'nc\s+[^\n]*-\w*e\b', "netcat reverse shell (-e)"),
+    # ── Destructive ───────────────────────────────────────────────────
+    (r'rm\s+-rf\s+/(?:\s|$)', "destructive root rm"),
+    (r'mkfs\b|format-volume\b|clear-disk\b', "filesystem destruction"),
+    # ── F3/P2 (Purple round 2): obfuscation / alternative exfil shapes ──
+    (r'base64\s*(?:-d|--decode)\b[^\n]*\|\s*(?:sh|bash|python)|b64decode\s*\(|openssl\s+enc[^\n]*-d\b|certutil\s+[^\n]*-decode\b', "encoded payload decode"),
+    (r'\beval\s*\(|\bexec\s*\(', "dynamic code construction"),
+    (r'(?:curl|wget)\s+[^\n]*(?:-d|-F|--data|--data-binary|--form)\s+[^@\s]*@[^\s]*(?:\.hermes|auth\.json|\.env|credentials|token)', "file-upload exfil of secrets"),
+    (r'(?:curl|wget)\s+[^\n]*@\s*[^\s]*(?:\.hermes|auth\.json|\.env)', "file-read exfil via curl/wget"),
+]
+
+
+def scan_cron_script_text(script_text: str) -> None:
+    """Raise ``CronScriptContentBlocked`` if *script_text* contains a
+    dangerous payload.
+
+    The pure-text core of the F3 content gate — shared by the create/update
+    door (``check_cron_script_content``) and the execution boundary
+    (``read_and_scan_script_text``) so both surfaces scan the IDENTICAL
+    pattern set over the identical text. Scans for approval-policy
+    tampering, credential exfil, and destructive payloads, including
+    base64-encoded shapes.
+    """
+    if not script_text:
+        return
+    scan_text = script_text
+    # F3/P2: also scan base64-encoded blobs — a payload can hide the raw
+    # ASCII patterns inside a base64 string (``echo <b64> | base64 -d | sh``).
+    # Only decoded text that references security targets is added, keeping
+    # the scan narrow (no false positives on random base64 tokens).
+    import base64 as _b64
+    for _tok in re.findall(r"[A-Za-z0-9+/=]{40,}", script_text):
+        try:
+            _decoded = _b64.b64decode(_tok).decode("utf-8", "ignore")
+        except Exception:
+            continue
+        if _decoded and any(
+            _marker in _decoded
+            for _marker in ("config.yaml", "cron_mode", ".env", "auth.json")
+        ):
+            scan_text = f"{scan_text}\n{_decoded}"
+    for pattern, label in _CRON_SCRIPT_THREAT_PATTERNS:
+        if re.search(pattern, scan_text, re.IGNORECASE):
+            raise CronScriptContentBlocked(
+                f"Blocked: cron script contains a {label} payload. "
+                "no_agent scripts run in a subprocess with no approval "
+                "gate, so scripts that would rewrite the Hermes config, "
+                "exfiltrate credentials, or destroy data are refused at "
+                "create time. Move the logic out of the script or review "
+                "the script content."
+            )
+
+
+def read_and_scan_script_text(path: Path) -> str:
+    """Read the EXACT bytes of *path* with the guard's bounded, regular-file
+    contract and scan them — raising ``CronScriptContentBlocked`` on
+    dangerous content or on an un-scannable file (oversized / non-regular /
+    cloud placeholder).
+
+    This is the execution-boundary counterpart of ``check_cron_script_content``:
+    the create/update door scans the script at authoring time, but the bytes
+    that actually run can change afterwards (in-place overwrite after
+    creation, pre-existing stored jobs). ``_run_job_script`` calls this right
+    before Popen and executes the returned text (via a validated copy), so
+    the scanned bytes ARE the executed bytes.
+    """
+    text, unsafe = _read_referenced_script(path)
+    if unsafe:
+        raise CronScriptContentBlocked(
+            "Blocked: cron script is oversized or not a regular readable "
+            "text file; refusing to execute it (fail closed)."
+        )
+    script_text = text or ""
+    scan_cron_script_text(script_text)
+    return script_text
+
+
+def check_cron_script_content(script: Optional[str]) -> None:
+    """Raise ``CronScriptContentBlocked`` if a no_agent script contains
+    dangerous content.
+
+    F3: no_agent script jobs run via subprocess with zero approval and no
+    content scan; the pre-existing create-time guard (check_gateway_lifecycle)
+    scans prompt + path only. This reads the script BYTES (bounded, same
+    ingestion contract as the lifecycle guard) and scans them for
+    approval-policy tampering, credential exfil, and destructive payloads.
+
+    The gate is at CREATE time with a clear error so existing deliberate
+    watchdog jobs (memory-watchdog.sh etc.) keep working — the scan blocks
+    only payloads with no benign reading. Callers let the exception
+    propagate so the cronjob tool / CLI surface it as a create failure.
+    """
+    if not script:
+        return
+    script_text = _read_script_for_scanning(script)
+    if script_text == "hermes gateway restart":
+        # F3/P2: the lifecycle guard's sentinel for oversized / non-regular
+        # scripts must NOT silently pass the content scan (an update-door
+        # script could otherwise swap in an oversized payload that evades
+        # this gate). Refuse loudly instead.
+        raise CronScriptContentBlocked(
+            "Blocked: cron script is oversized or not a regular readable "
+            "text file; refusing to scan it (fail closed)."
+        )
+    if not script_text:
+        # Unreadable/missing script is reported by normal path validation.
+        return
+    scan_cron_script_text(script_text)

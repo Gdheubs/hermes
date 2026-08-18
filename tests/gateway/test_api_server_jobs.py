@@ -241,6 +241,64 @@ class TestUpdateJob:
                 assert "evil_field" not in sanitized
                 assert "__proto__" not in sanitized
 
+    @pytest.mark.asyncio
+    async def test_patch_deliver_unowned_chat_rejected(self, adapter, tmp_path):
+        """F9: the API PATCH surface must NOT bypass the deliver-ownership
+        gate. PATCHing ``deliver`` to a chat the operator doesn't own is
+        rejected by the canonical update layer (update_job) that
+        ``_handle_update_job`` calls — the model-tool wrapper check alone
+        left this HTTP surface open. The stored deliver is untouched."""
+        from cron import jobs as cron_jobs
+
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.ensure_dirs()
+            created = cron_jobs.create_job(
+                prompt="check",
+                schedule="every 5m",
+                name="api-job",
+                deliver="local",
+                origin={"platform": "telegram", "chat_id": "-100123456"},
+            )
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                # _cron_update is the REAL update_job here — no mock, so the
+                # HTTP surface exercises the canonical invariant.
+                with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                    resp = await cli.patch(
+                        f"/api/jobs/{created['id']}",
+                        json={"deliver": "telegram:-100999999999"},
+                    )
+                    assert resp.status == 500
+                    data = await resp.json()
+                    assert "not a chat you own" in data.get("error", "")
+            assert cron_jobs.get_job(created["id"])["deliver"] == "local"
+
+    @pytest.mark.asyncio
+    async def test_patch_deliver_owned_chat_accepted(self, adapter, tmp_path):
+        """Control: PATCHing deliver to the operator's own chat still works
+        through the same surface."""
+        from cron import jobs as cron_jobs
+
+        with cron_jobs.use_cron_store(tmp_path):
+            cron_jobs.ensure_dirs()
+            created = cron_jobs.create_job(
+                prompt="check",
+                schedule="every 5m",
+                name="api-job",
+                deliver="local",
+                origin={"platform": "telegram", "chat_id": "-100123456"},
+            )
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                    resp = await cli.patch(
+                        f"/api/jobs/{created['id']}",
+                        json={"deliver": "telegram:-100123456"},
+                    )
+                    assert resp.status == 200
+                    data = await resp.json()
+                    assert data["job"]["deliver"] == "telegram:-100123456"
+
 
 # ---------------------------------------------------------------------------
 # 13. test_delete_job
