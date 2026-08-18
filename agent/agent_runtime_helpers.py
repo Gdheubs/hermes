@@ -8,7 +8,7 @@ keeps thin forwarders for backward compatibility.
 Methods covered:
 * ``convert_to_trajectory_format`` — internal -> trajectory-file format
 * ``sanitize_tool_call_arguments`` — repair corrupted JSON in tool_calls
-* ``repair_message_sequence`` — enforce alternation invariants
+* ``repair_message_sequence`` — repair canonical assistant/tool structure
 * ``strip_think_blocks`` — remove inline reasoning from stored content
 * ``recover_with_credential_pool`` — rotate pool entries on 429
 * ``try_recover_primary_transport`` — re-create OpenAI client after rate-limit
@@ -39,6 +39,7 @@ from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_res
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED, credential_pool_matches_provider
 from agent.error_classifier import FailoverReason
+from run_agent import _is_ephemeral_scaffolding
 from agent.turn_context import drop_stale_api_content
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
 
@@ -164,7 +165,13 @@ def convert_to_trajectory_format(agent, messages: List[Dict[str, Any]], user_que
     
     while i < len(messages):
         msg = messages[i]
-        
+
+        # Skip ephemeral scaffolding (synthetic nudges, prefill sentinels, etc.)
+        # so they don't leak into saved trajectories as training data.
+        if _is_ephemeral_scaffolding(msg):
+            i += 1
+            continue
+
         if msg["role"] == "assistant":
             # Check if this message has tool calls
             if "tool_calls" in msg and msg["tool_calls"]:
@@ -548,19 +555,12 @@ def note_turn_persisted(agent):
 
 
 def repair_message_sequence(agent, messages: List[Dict]) -> int:
-    """Collapse malformed role-alternation left in the live history.
+    """Repair malformed assistant/tool structure in canonical history.
 
-    Providers (OpenAI, OpenRouter, Anthropic) expect strict alternation:
-    after the system message, user/tool alternates with assistant, with
-    no two consecutive user messages and no tool-result that doesn't
-    follow an assistant-with-tool_calls. Violations cause silent empty
-    responses on most providers, which triggers the empty-retry loop.
-
-    This runs right before the API call as a defensive belt — by the
-    time it fires, the scaffolding strip should already have prevented
-    most shapes, but external callers (gateway multi-queue replay,
-    session resume, cron, explicit conversation_history passed in by
-    host code) can feed in already-broken histories.
+    This canonical-history repair deliberately preserves adjacent ``user``
+    messages as distinct source turns. Provider role alternation is repaired
+    later on the per-request ``api_messages`` copy by
+    :func:`drop_thinking_only_and_merge_users`.
 
     Repairs applied:
       0. Consecutive ``assistant`` messages with no intervening
@@ -577,8 +577,6 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
          resumed histories. Refs #29148, #49147.
       1. Stray ``tool`` messages whose ``tool_call_id`` doesn't match
          any preceding assistant tool_call — dropped.
-      2. Consecutive ``user`` messages — merged with newline separator
-         so no user input is lost.
 
     Deliberately does NOT rewind orphan ``assistant(tool_calls)+tool``
     pairs that precede a user message — that pattern IS valid when the
@@ -743,41 +741,14 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 known_tool_ids = set()
             filtered.append(msg)
 
-    # Pass 2: merge consecutive user messages. Preserves all user input
-    # so nothing the user typed is lost.
-    merged: List[Dict] = []
-    for msg in filtered:
-        if (
-            merged
-            and isinstance(msg, dict)
-            and msg.get("role") == "user"
-            and isinstance(merged[-1], dict)
-            and merged[-1].get("role") == "user"
-        ):
-            prev = merged[-1]
-            prev_content = prev.get("content", "")
-            new_content = msg.get("content", "")
-            # Only merge plain-text content; leave multimodal (list)
-            # content alone — collapsing image/audio blocks risks
-            # mangling the attachment structure.
-            if isinstance(prev_content, str) and isinstance(new_content, str):
-                prev["content"] = (
-                    (prev_content + "\n\n" + new_content)
-                    if prev_content and new_content
-                    else (prev_content or new_content)
-                )
-                # Merged content invalidates the api_content sidecar (exact
-                # bytes previously sent for the pre-merge message) — drop it
-                # so replay can't substitute stale bytes.
-                drop_stale_api_content(prev)
-                repairs += 1
-                continue
-        merged.append(msg)
+    # Adjacent user messages are canonical source boundaries, not malformed
+    # history. Keep them distinct here; the per-request wire copy is merged
+    # later by ``drop_thinking_only_and_merge_users`` for strict providers.
 
     if repairs > 0:
         # Rewrite in place so downstream paths (persistence, return
         # value, session DB flush) see the repaired sequence.
-        messages[:] = merged
+        messages[:] = filtered
 
     return repairs
 
@@ -786,11 +757,11 @@ def repair_message_sequence_with_cursor(agent, messages: List[Dict]) -> int:
     """Run :func:`repair_message_sequence` and keep the SessionDB flush
     cursor consistent with the compacted list (#44837).
 
-    ``repair_message_sequence`` merges/drops messages in place, shrinking
-    the list. ``_last_flushed_db_idx`` (the DB-write cursor) indexes into
-    that list, so after compaction it can point past the new end — the
-    turn-end flush would then skip the assistant/tool chain entirely — or
-    past unflushed messages shifted to lower indexes.
+    ``repair_message_sequence`` merges assistant messages and drops orphaned
+    tool messages in place, shrinking the list. ``_last_flushed_db_idx`` (the
+    DB-write cursor) indexes into that list, so after compaction it can point
+    past the new end — the turn-end flush would then skip the assistant/tool
+    chain entirely — or past unflushed messages shifted to lower indexes.
 
     Repair preserves object identity for surviving messages, so counting
     the survivors from the previously-flushed prefix gives the exact new
@@ -1396,13 +1367,12 @@ def drop_thinking_only_and_merge_users(
     *,
     drop_codex_reasoning_items: bool = True,
 ) -> List[Dict[str, Any]]:
-    """Drop thinking-only assistant turns; merge any adjacent user messages left behind.
+    """Drop thinking-only turns and merge adjacent users on the wire copy.
 
     Runs on the per-call ``api_messages`` copy only. The stored
-    conversation history (``agent.messages``) is never mutated, so the
-    user still sees the thinking block in the CLI/gateway transcript and
-    session persistence keeps the full trace. Only the wire copy sent to
-    the provider is cleaned.
+    conversation history (``agent.messages``) is never mutated, so canonical
+    user source boundaries and thinking blocks remain available to the UI and
+    session persistence. Only the wire copy sent to the provider is cleaned.
 
     Why drop-and-merge rather than inject stub text:
     - Fabricating ``"."`` / ``"(continued)"`` text lies in the history
@@ -1424,10 +1394,18 @@ def drop_thinking_only_and_merge_users(
         )
     ]
     dropped = len(messages) - len(kept)
-    if dropped == 0:
+    has_adjacent_users = any(
+        previous.get("role") == "user" and current.get("role") == "user"
+        for previous, current in zip(kept, kept[1:])
+    )
+    if dropped == 0 and not has_adjacent_users:
         return messages
 
-    # Pass 2: merge any newly-adjacent user messages.
+    # Pass 2: merge adjacent source turns for provider compatibility while
+    # retaining an explicit semantic boundary in the transient wire content.
+    # This marker never reaches canonical history or SessionDB.
+    boundary_text = "[Next user message]"
+    boundary_block = {"type": "text", "text": boundary_text}
     merged: List[Dict[str, Any]] = []
     merges = 0
     for m in kept:
@@ -1448,21 +1426,25 @@ def drop_thinking_only_and_merge_users(
             # purposes. If either side is a list (multimodal), append as a
             # separate block rather than collapsing.
             if isinstance(prev_content, str) and isinstance(cur_content, str):
-                sep = "\n\n" if prev_content and cur_content else ""
-                prev_copy["content"] = prev_content + sep + cur_content
+                prev_copy["content"] = "\n\n".join(
+                    part
+                    for part in (prev_content, boundary_text, cur_content)
+                    if part
+                )
             elif isinstance(prev_content, list) and isinstance(cur_content, list):
-                prev_copy["content"] = list(prev_content) + list(cur_content)
+                prev_copy["content"] = (
+                    list(prev_content) + [dict(boundary_block)] + list(cur_content)
+                )
             elif isinstance(prev_content, list) and isinstance(cur_content, str):
+                new_blocks = list(prev_content) + [dict(boundary_block)]
                 if cur_content:
-                    prev_copy["content"] = list(prev_content) + [
-                        {"type": "text", "text": cur_content}
-                    ]
-                else:
-                    prev_copy["content"] = list(prev_content)
+                    new_blocks.append({"type": "text", "text": cur_content})
+                prev_copy["content"] = new_blocks
             elif isinstance(prev_content, str) and isinstance(cur_content, list):
                 new_blocks: List[Dict[str, Any]] = []
                 if prev_content:
                     new_blocks.append({"type": "text", "text": prev_content})
+                new_blocks.append(dict(boundary_block))
                 new_blocks.extend(cur_content)
                 prev_copy["content"] = new_blocks
             else:
@@ -1594,6 +1576,12 @@ def restore_primary_runtime(agent) -> bool:
             agent._use_prompt_caching = False
             agent._use_native_cache_layout = False
 
+        # Revert the per-provider reasoning-echo opt-in to the primary's
+        # snapshot value — a fallback entry's opt-in must not persist into
+        # the restored primary runtime (default False for snapshots taken
+        # before this field existed).
+        agent._reasoning_echo_flag = bool(rt.get("reasoning_echo_flag", False))
+
         # ── Rebuild client for the primary provider ──
         if agent.provider == "moa":
             # MoA is a virtual chat-completions provider.  It never has real
@@ -1624,8 +1612,11 @@ def restore_primary_runtime(agent) -> bool:
             )
 
         # ── Restore context engine state ──
-        cc = agent.context_compressor
-        cc.update_model(
+        # The compressor may not exist yet (e.g. partially-constructed agents
+        # in gateway/CLI paths that create it lazily); skip the rebind then.
+        cc = getattr(agent, "context_compressor", None)
+        if cc is not None:
+            cc.update_model(
             model=rt["compressor_model"],
             context_length=rt["compressor_context_length"],
             base_url=rt["compressor_base_url"],
@@ -2919,6 +2910,54 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             config_context_length=_effective_context_length,
             custom_providers=_sm_custom_providers,
         )
+        # Resolve the NEW route's threshold default before updating the
+        # compressor: Codex-autoraise routes (gpt-5.4/5.5/5.6 on the
+        # codex_responses wire, gpt-5.3-codex-spark) raise the configured
+        # baseline; switching back restores the preserved config value. The
+        # resolver is raise-only for autoraises and never lowers a higher
+        # user-configured threshold. Same math as agent_init's startup path,
+        # with the compressor's immutable config baseline standing in when the
+        # agent wasn't constructed through __init__.
+        _route_default_pct = None
+        try:
+            from agent.agent_init import _resolve_compression_threshold
+            from agent.auxiliary_client import (
+                _compression_threshold_for_model as _cthresh_fn,
+                _is_codex_gpt54_or_gpt55 as _is_codex_gpt54_or_gpt55_fn,
+                _is_codex_spark as _is_codex_spark_fn,
+            )
+            _global_pct = getattr(agent, "_compression_global_threshold", None)
+            if _global_pct is None:
+                _global_pct = getattr(
+                    agent.context_compressor,
+                    "_config_threshold_percent",
+                    agent.context_compressor.threshold_percent,
+                )
+            _model_cthresh = _cthresh_fn(
+                agent.model,
+                agent.provider,
+                allow_codex_gpt55_autoraise=getattr(
+                    agent, "_codex_gpt55_autoraise", True,
+                ),
+                api_mode=agent.api_mode,
+            )
+            _route_default_pct, agent._compression_threshold_autoraised = (
+                _resolve_compression_threshold(
+                    _global_pct,
+                    _model_cthresh,
+                    model=agent.model,
+                    is_codex_autoraise=(
+                        _is_codex_gpt54_or_gpt55_fn(
+                            agent.model,
+                            agent.provider,
+                            api_mode=agent.api_mode,
+                        )
+                        or _is_codex_spark_fn(agent.model, agent.provider)
+                    ),
+                )
+            )
+        except Exception:
+            _route_default_pct = None
         agent.context_compressor.update_model(
             model=agent.model,
             context_length=new_context_length,
@@ -2926,6 +2965,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             api_key=agent.api_key,  # context_compressor forwards to call_llm; callable preserved
             provider=agent.provider,
             api_mode=agent.api_mode,
+            default_threshold_percent=_route_default_pct,
         )
 
     # ── Re-resolve reasoning_config from per-model override ──
@@ -3509,6 +3549,21 @@ def repair_empty_non_final_messages(
         return repaired
     return messages
 
+_API_SOURCE_METADATA_KEYS = (
+    "timestamp",
+    "message_id",
+    "platform_message_id",
+    "_source_message_id",
+)
+
+
+def copy_message_for_api(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy one canonical message without transcript-only source metadata."""
+    api_message = message.copy()
+    for key in _API_SOURCE_METADATA_KEYS:
+        api_message.pop(key, None)
+    return api_message
+
 
 def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Fix orphaned tool_call / tool_result pairs before every LLM call.
@@ -3529,6 +3584,31 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             continue
         filtered.append(msg)
     messages = filtered
+
+    # --- Close interrupted tool tails on the API copy (#48879/#63292) ---
+    # ``mark_interrupted_tool_tail`` keeps the durable transcript at the real
+    # tool row and stamps provenance instead of persisting a synthetic
+    # assistant closure. Strict providers (Gemini, Claude) reject — or
+    # hallucinate continuations for — a direct tool → user alternation, so
+    # this per-call copy closes the sequence with an interim assistant
+    # marker when the next wire message isn't already an assistant. The
+    # provenance key is internal; strip it from the copy either way.
+    from agent.message_sanitization import INTERRUPTED_TOOL_TAIL_KEY
+
+    closed_tail: List[Dict[str, Any]] = []
+    for i, msg in enumerate(messages):
+        if isinstance(msg, dict) and INTERRUPTED_TOOL_TAIL_KEY in msg:
+            closed_tail.append(
+                {k: v for k, v in msg.items() if k != INTERRUPTED_TOOL_TAIL_KEY}
+            )
+            nxt = messages[i + 1] if i + 1 < len(messages) else None
+            if not (isinstance(nxt, dict) and nxt.get("role") == "assistant"):
+                closed_tail.append(
+                    {"role": "assistant", "content": "Operation interrupted."}
+                )
+        else:
+            closed_tail.append(msg)
+    messages = closed_tail
 
     # --- Heal empty-content non-final messages (self-recovery) ---
     # A dead stream can leave an empty assistant stub (or an empty user turn)
@@ -4351,6 +4431,7 @@ __all__ = [
     "invoke_tool",
     "repair_tool_call",
     "sanitize_api_messages",
+    "copy_message_for_api",
     "looks_like_codex_intermediate_ack",
     "copy_reasoning_content_for_api",
     "cleanup_dead_connections",

@@ -1074,6 +1074,12 @@ _MAX_TAIL_MESSAGE_FLOOR = 8
 # strike exists), skip the LLM summary call — deterministic dropping alone
 # recovers the negligible savings such a summary could deliver.
 _FEASIBILITY_SKIP_MIDDLE_FRACTION = 0.10
+# Default cap for the compaction tail message floor.  ``protect_last_n`` is
+# honored up to this cap; the cap avoids preserving a whole run of bulky
+# tool outputs on every compaction.  Overridable via
+# ``compression.max_tail_message_floor`` in config.yaml (#45259 hardened the
+# floor from 3 to ``min(protect_last_n, 8)``; this makes the 8 configurable).
+_DEFAULT_MAX_TAIL_MESSAGE_FLOOR = 8
 # Under context pressure (protected-tail tool bodies alone exceed the soft
 # tail budget), demote large completed tool/file outputs even inside the
 # protected region — but always keep this many trailing messages verbatim so
@@ -2594,6 +2600,8 @@ class ContextCompressor(ContextEngine):
         provider: str = "",
         api_mode: str = "",
         max_tokens: int | None = None,
+        default_threshold_percent: float | None = None,
+        protect_delivered_count: int = 1,
     ) -> None:
         """Update model info after a model switch or fallback activation."""
         runtime_changed = any((
@@ -2609,15 +2617,22 @@ class ContextCompressor(ContextEngine):
         self.api_mode = api_mode
         self.context_length = context_length
         # Re-resolve per-model threshold for the NEW model, then re-apply the
-        # small-context threshold floor. Starting from _config_threshold_percent
-        # (the raw config value) so a switch from a model with an override to
-        # one without correctly falls back to the global threshold.
+        # small-context threshold floor. Callers may provide a route-specific
+        # default for this update; the immutable _config_threshold_percent
+        # remains the fallback on later switches. Explicit model_thresholds
+        # still win because resolve_model_threshold applies them last.
         _config_pct = getattr(
             self, "_config_threshold_percent", self.threshold_percent,
         )
-        _new_base = resolve_model_threshold(
-            model, self.model_thresholds, _config_pct,
+        _default_pct = (
+            _config_pct
+            if default_threshold_percent is None
+            else default_threshold_percent
         )
+        _new_base = resolve_model_threshold(
+            model, self.model_thresholds, _default_pct,
+        )
+        self._configured_threshold_percent = _new_base
         self._base_threshold_percent = _new_base
         self.threshold_percent = self._effective_threshold_percent(
             context_length, _new_base,
@@ -2828,7 +2843,11 @@ class ContextCompressor(ContextEngine):
         proactive_prune_min_reclaim_tokens: int = 4096,
         min_tail_user_messages: int = 1,
         tail_mode: str = "legacy",
-    ):
+        hygiene_hard_message_limit: int = 0,
+        max_tail_message_floor: int = 0,
+        default_threshold_percent: float | None = None,
+        protect_delivered_count: int = 1,
+    ) -> None:
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
@@ -2842,13 +2861,18 @@ class ContextCompressor(ContextEngine):
         # Stored as a plain dict; resolved in _resolve_threshold(), then the
         # small-context floor is applied on top.
         self.model_thresholds = model_thresholds or {}
-        # _config_threshold_percent is the raw config value (before per-model
-        # override or small-context floor). Used as the fallback when switching
-        # to a model with no matching override.
+        # _config_threshold_percent is the immutable raw config value. A
+        # route-specific default affects only this model; explicit
+        # model_thresholds still take precedence and later switches without an
+        # override return to the raw baseline.
         self._config_threshold_percent = threshold_percent
-        # Resolve per-model override first, then apply the small-context floor.
+        _default_pct = (
+            threshold_percent
+            if default_threshold_percent is None
+            else default_threshold_percent
+        )
         self._base_threshold_percent = resolve_model_threshold(
-            model, self.model_thresholds, threshold_percent,
+            model, self.model_thresholds, _default_pct,
         )
         self.threshold_percent = self._base_threshold_percent
         # Absolute token cap from config (compression.threshold_tokens). When
@@ -2861,6 +2885,7 @@ class ContextCompressor(ContextEngine):
         )
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
+        self.protect_delivered_count = protect_delivered_count
         # Proactive tool-result pruning (cost-oriented; runs INDEPENDENTLY of the
         # full-compression trigger, via prune_tool_results_only()). 0 = disabled.
         self.proactive_prune_tokens = int(proactive_prune_tokens or 0)
@@ -2904,6 +2929,18 @@ class ContextCompressor(ContextEngine):
         # When False (default = historical behavior), insert a
         # deterministic "summary unavailable" handoff and drop the middle window.
         self.abort_on_summary_failure = abort_on_summary_failure
+        # Hard message-count safety valve: force compression when the number
+        # of messages exceeds this limit, regardless of token estimates.
+        # Mirrors the gateway hygiene hard limit (gateway/run.py, #2153/#4750).
+        # 0 = disabled (only token-based compression triggers apply).
+        self.hygiene_hard_message_limit = max(0, int(hygiene_hard_message_limit or 0))
+        # Configurable cap for the tail message floor (see
+        # _find_tail_cut_by_tokens).  0 = use the module-level default
+        # (_DEFAULT_MAX_TAIL_MESSAGE_FLOOR = 8), preserving backward
+        # compatibility.  Set higher (e.g. 20) to keep more recent
+        # messages verbatim during compaction at the cost of a smaller
+        # summarization window when tool outputs are bulky.
+        self.max_tail_message_floor = max(0, int(max_tail_message_floor or 0))
 
         # ── Micro-compaction (per-turn rolling compaction) ─────────
         # Default: OFF. Each pass rewrites already-sent history, so it breaks
@@ -3203,7 +3240,7 @@ class ContextCompressor(ContextEngine):
         projected_real = self.last_real_prompt_tokens + growth
         return projected_real < self.threshold_tokens
 
-    def should_compress(self, prompt_tokens: int = None) -> bool:
+    def should_compress(self, prompt_tokens: int = None, force: bool = False) -> bool:
         """Check if context exceeds the compression threshold.
 
         Returns ``True`` when compression should run now. For the caller-facing
@@ -3215,11 +3252,11 @@ class ContextCompressor(ContextEngine):
         each saved less than 10%, skip compression to avoid infinite loops
         where each pass removes only 1-2 messages.
         """
-        decision, _reason = self.should_compress_info(prompt_tokens)
+        decision, _reason = self.should_compress_info(prompt_tokens, force=force)
         return decision
 
     def should_compress_info(
-        self, prompt_tokens: int = None
+        self, prompt_tokens: int = None, force: bool = False
     ) -> "tuple[bool, str | None]":
         """Check if context exceeds the compression threshold.
 
@@ -3243,11 +3280,16 @@ class ContextCompressor(ContextEngine):
         Includes anti-thrashing protection: if the last two compressions
         each saved less than 10%, skip compression to avoid infinite loops
         where each pass removes only 1-2 messages.
+
+        When *force* is True (e.g. the hard message-count safety valve
+        triggered), the anti-thrashing check is bypassed — the session
+        is too large to leave uncompressed regardless of recent
+        effectiveness.
         """
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if tokens < self.threshold_tokens:
             return False, None
-        if self._automatic_compression_blocked():
+        if self._automatic_compression_blocked(force=force):
             return False, self._compression_block_reason() or "blocked"
         return True, None
 
@@ -3297,9 +3339,9 @@ class ContextCompressor(ContextEngine):
         except Exception as exc:
             logger.debug("compression ineffective-count refresh failed: %s", exc)
 
-    def _automatic_compression_blocked(self) -> bool:
+    def _automatic_compression_blocked(self, force: bool = False) -> bool:
         """Return whether automatic compaction is in cooldown or tripped."""
-        if not self._automatic_compression_blocked_locally():
+        if not self._automatic_compression_blocked_locally(force=force):
             return False
         # Blocked on the in-memory snapshot. Durable guard rows may have
         # been cleared by another agent since bind_session_state() — a
@@ -3309,9 +3351,9 @@ class ContextCompressor(ContextEngine):
         # local block outlive the durable state that justified it. The
         # unblocked hot path above never pays for the DB reads.
         self._refresh_durable_guards()
-        return self._automatic_compression_blocked_locally()
+        return self._automatic_compression_blocked_locally(force=force)
 
-    def _automatic_compression_blocked_locally(self) -> bool:
+    def _automatic_compression_blocked_locally(self, force: bool = False) -> bool:
         """Evaluate the automatic-compaction gate on in-memory state only."""
         # Do not trigger compression while the summary LLM is in cooldown.
         # On a 429/transient failure _generate_summary() sets a cooldown and
@@ -3348,7 +3390,7 @@ class ContextCompressor(ContextEngine):
         # than persisted at trip time: a fresh process that loads a durable
         # tripped counter (#69872) therefore starts a full window blocked,
         # preserving the restart-must-not-disarm contract (#54923).
-        if (
+        if not force and (
             self._ineffective_compression_count >= 2
             or self._fallback_compression_streak >= 2
         ):
@@ -5612,6 +5654,15 @@ This compaction should PRIORITISE preserving all information related to the focu
                 return 0
         return self.protect_first_n
 
+    @property
+    def _effective_max_tail_message_floor(self) -> int:
+        """Resolved tail-floor cap: config override or module default."""
+        # getattr guards partially-initialised instances (tests constructing
+        # via __new__ set only the attributes under test).
+        if getattr(self, "max_tail_message_floor", 0) > 0:
+            return self.max_tail_message_floor
+        return _DEFAULT_MAX_TAIL_MESSAGE_FLOOR
+
     def _protect_head_size(self, messages: List[Dict[str, Any]]) -> int:
         """Total count of head messages to protect.
 
@@ -5739,8 +5790,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         messages: List[Dict[str, Any]],
         cut_idx: int,
         head_end: int,
+        protect_delivered_count: int = 1,
     ) -> int:
-        """Guarantee the most recent assistant message is in the protected tail.
+        """Guarantee the most recent delivered assistant replies are in the protected tail.
 
         WebUI / TUI / SessionsPage bug (#29824). Without this anchor,
         ``_find_tail_cut_by_tokens`` can leave the user's most recent
@@ -5766,28 +5818,58 @@ This compaction should PRIORITISE preserving all information related to the focu
         tool messages would otherwise be removed by
         ``_sanitize_tool_pairs`` and trigger the same data-loss symptom
         we're trying to prevent.
+
+        Extended (#78100 ghost-reply / protect-delivered fix): protect
+        up to *protect_delivered_count* recent content-bearing assistant
+        replies, not just the single most recent one. This prevents
+        earlier delivered answers — which the user may not have read yet
+        — from being archived into the compaction summary. The default of
+        3 is conservative: assistant replies are typically small compared
+        to tool outputs, so the impact on compression ratio is minimal.
         """
-        last_asst_idx = self._find_last_assistant_message_idx(messages, head_end)
-        if last_asst_idx < 0:
-            # No assistant message in the compressible region — nothing
-            # to anchor (single-turn pre-reply state, etc.).
+        # Find up to N delivered assistant messages (content-bearing,
+        # non-summary) in the compressible region.
+        delivered_indices: List[int] = []
+        for i in range(len(messages) - 1, head_end - 1, -1):
+            if len(delivered_indices) >= protect_delivered_count:
+                break
+            msg = messages[i]
+            if msg.get("role") != "assistant":
+                continue
+            if self._is_context_summary_content(msg.get("content")):
+                continue
+            if self._is_context_summary_message(msg):
+                continue
+            content = msg.get("content")
+            if isinstance(content, str) and content.strip():
+                delivered_indices.append(i)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict):
+                        text = part.get("text") or part.get("content")
+                        if isinstance(text, str) and text.strip():
+                            delivered_indices.append(i)
+                            break
+
+        if not delivered_indices:
             return cut_idx
-        if last_asst_idx >= cut_idx:
-            # Already in the tail — the token-budget walk did the right
-            # thing on its own.
+
+        # The earliest of the delivered answers is the one most at risk
+        # of being in the compressed region. Anchor cut_idx to it.
+        earliest_delivered = min(delivered_indices)
+        if earliest_delivered >= cut_idx:
+            # All delivered answers already in the tail.
             return cut_idx
-        # Pull cut_idx back to the assistant message, then re-align so
-        # we don't split a tool group that immediately precedes it
-        # (e.g. an ``assistant(tool_calls)`` → ``tool(result)`` →
-        # ``assistant(final reply)`` sequence would otherwise leave the
-        # ``tool`` orphan when cut lands at the final reply).
-        new_cut = self._align_boundary_backward(messages, last_asst_idx)
+
+        # Pull cut_idx back to the earliest delivered answer, then
+        # re-align so we don't split a tool group that immediately
+        # precedes it.
+        new_cut = self._align_boundary_backward(messages, earliest_delivered)
         if not self.quiet_mode:
             logger.debug(
-                "Anchoring tail cut to last assistant message at index %d "
-                "(was %d, aligned to %d) to keep the previously-visible "
-                "reply out of the compaction summary (#29824)",
-                last_asst_idx, cut_idx, new_cut,
+                "Anchoring tail cut to protect %d delivered assistant messages "
+                "(earliest at index %d, was %d, aligned to %d) (#29824, #78100)",
+                len(delivered_indices), earliest_delivered, cut_idx, new_cut,
             )
         # Safety: never go back into the head region.
         return max(new_cut, head_end + 1)
@@ -5984,7 +6066,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # ``protect_last_n`` remains a minimum up to the cap; the cap avoids
         # preserving a whole run of bulky tool outputs on every compaction.
         available_tail = max(0, n - head_end - 1)
-        min_tail_floor = max(3, min(self.protect_last_n, _MAX_TAIL_MESSAGE_FLOOR))
+        min_tail_floor = max(3, min(self.protect_last_n, self._effective_max_tail_message_floor))
         # Leave at least two non-head messages available to summarize on short
         # transcripts; otherwise compression can replace a tiny middle with a
         # summary and save no messages at all.
@@ -6066,7 +6148,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         # ``[CONTEXT COMPACTION — REFERENCE ONLY]`` block (fixes #29824).
         # Each anchor only walks ``cut_idx`` backward, so chaining them is
         # monotonic — the tail can only grow, never shrink.
-        cut_idx = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)
+        cut_idx = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end, protect_delivered_count=getattr(self, "protect_delivered_count", 3))
 
         # Extend to the last N actionable user messages when configured
         # (compression.min_tail_user_messages > 1).  This prevents the
