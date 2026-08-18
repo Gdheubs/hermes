@@ -312,6 +312,10 @@ def _silent_bg_harness(monkeypatch, tmp_path):
             watcher_thread_id="",
             watcher_message_id="",
             watcher_interval=0,
+            # exited/completion_reason mirror ProcessSession's real defaults
+            # (terminal_tool checks these for a synchronous failed-start signal).
+            exited=False,
+            completion_reason="exited",
         )
 
     monkeypatch.setattr(terminal_tool_module, "_get_env_config", lambda: config)

@@ -130,7 +130,11 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
 
         def spawn_local(self, **kwargs):
             self.calls.append(kwargs)
-            return SimpleNamespace(id="proc_test", pid=1234)
+            # exited/completion_reason mirror ProcessSession's real defaults
+            # (terminal_tool checks these for a synchronous failed-start signal).
+            return SimpleNamespace(
+                id="proc_test", pid=1234, exited=False, completion_reason="exited",
+            )
 
     import tools.process_registry as process_registry_mod
 
@@ -170,6 +174,7 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
         "session_key": task_id,
         "env_vars": {},
         "use_pty": False,
+        "heavy_work_lease": None,
     }]
 
 

@@ -349,6 +349,9 @@ DEFAULT_CONFIG = {
         # it here without patching the built desktop app.
         "font_family": "",
         "timeout": 180,
+        # Optional cross-process guard for resource-heavy terminal jobs (test
+        # suites, Supabase/PGlite labs, and AI reviewer CLIs). Zero disables it.
+        "max_concurrent_heavy_jobs": 0,
         # Bounded grace period (seconds) between SIGTERM and an escalated
         # SIGKILL when terminating a host process tree (browser daemons, etc.).
         # A daemon that stalls in its SIGTERM handler is force-killed after this
@@ -3074,6 +3077,11 @@ DEFAULT_CONFIG = {
         #     enforcement is a copy/gating change, not new migration code.
         #   "off": suppress the notice entirely.
         "fts_optimize_notice": "advise",
+        # Trigram substring index used for CJK and other substring queries.
+        # True preserves upstream behavior. False quarantines any existing
+        # index by removing its write triggers while preserving canonical
+        # messages and the standard FTS index. Bridged to HERMES_TRIGRAM_FTS.
+        "trigram_fts": True,
         # CJK-bigram search index (messages_fts_cjk, cjk_unicode61 loadable
         # tokenizer). When the extension is built (native/fts5_cjk/build.sh →
         # ~/.hermes/lib/libfts5_cjk.so), 1-2 char CJK terms (일본, 项目, ...)

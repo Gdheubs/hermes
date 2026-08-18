@@ -2367,7 +2367,7 @@ class SessionSearchMixin:
         index internally, then VACUUM returns the freed pages to the OS.
 
         Skips any FTS table that does not exist (e.g. the trigram index when
-        disabled via ``HERMES_DISABLE_FTS_TRIGRAM`` or not yet created), so
+        disabled via ``sessions.trigram_fts: false`` or not yet created), so
         it is safe to call unconditionally.
 
         Returns the number of FTS indexes that were optimized.

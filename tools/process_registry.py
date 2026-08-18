@@ -419,6 +419,7 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
+    _heavy_work_lease: Any = field(default=None, repr=False)
 
 
 class ProcessRegistry:
@@ -976,8 +977,9 @@ class ProcessRegistry:
         cwd: str = None,
         task_id: str = "",
         session_key: str = "",
-        env_vars: dict = None,
+        env_vars: Optional[dict] = None,
         use_pty: bool = False,
+        heavy_work_lease: Any = None,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -989,6 +991,15 @@ class ProcessRegistry:
                      CLI tools (Codex, Claude Code, Python REPL). Falls back to
                      subprocess.Popen if ptyprocess is not installed.
         """
+        if heavy_work_lease is not None and _IS_WINDOWS:
+            heavy_work_lease.release()
+            raise RuntimeError(
+                "Heavy-work execution is fail-closed on Windows because child lock inheritance is unavailable"
+            )
+        lease_fds = (
+            heavy_work_lease.child_pass_fds() if heavy_work_lease is not None else ()
+        )
+
         # Guard against the `A && B &` subshell-wait trap (issue #68915).
         # Bash parses ``A && B &`` as ``(A && B) &`` — a subshell that holds
         # the stdout pipe open forever when B is a long-running server.
@@ -1005,6 +1016,7 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            _heavy_work_lease=heavy_work_lease,
         )
 
         pty_scope_attempted = False
@@ -1044,11 +1056,19 @@ class ProcessRegistry:
                         "worker shares the gateway cgroup."
                     )
 
+                _pty_spawn_kwargs: Dict[str, Any] = {}
+                if not _IS_WINDOWS:
+                    # pywinpty (Windows) has no POSIX fd-inheritance model, and
+                    # heavy_work_lease is always None here (Windows fail-closed
+                    # above) — only pass pass_fds to ptyprocess so the Windows
+                    # spawn call stays byte-identical to upstream.
+                    _pty_spawn_kwargs["pass_fds"] = lease_fds
                 pty_proc = _PtyProcessCls.spawn(
                     pty_argv,
                     cwd=session.cwd,
                     env=pty_env,
                     dimensions=(30, 120),
+                    **_pty_spawn_kwargs,
                 )
                 session.pid = pty_proc.pid
                 session.host_start_time = self._safe_host_start_time(session.pid)
@@ -1093,7 +1113,11 @@ class ProcessRegistry:
         # stdout is a pipe, hiding output from process(action="poll")).
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
-        _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        _popen_kwargs: Dict[str, Any] = (
+            {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        )
+        if not _IS_WINDOWS:
+            _popen_kwargs["pass_fds"] = lease_fds
 
         # Cgroup isolation (#70716): when running in the live, supervised
         # systemd gateway, wrap the worker in its own transient systemd
@@ -1216,6 +1240,7 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        heavy_work_lease: Any = None,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -1227,7 +1252,16 @@ class ProcessRegistry:
 
         This is less capable than local spawn (no live stdout pipe, no stdin),
         but it ensures the command runs in the correct sandbox context.
+
+        Heavy guarded work is rejected here: a remote/container process cannot
+        inherit the host kernel-lock FD, so gateway death could otherwise free
+        the slot while the remote job remains alive.
         """
+        if heavy_work_lease is not None:
+            heavy_work_lease.release()
+            raise RuntimeError(
+                "Heavy-work execution is fail-closed for non-local backends because the job cannot inherit the host lock"
+            )
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
@@ -1237,6 +1271,7 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            _heavy_work_lease=heavy_work_lease,
         )
 
         # Run the command in the sandbox with output capture
@@ -1305,6 +1340,8 @@ class ProcessRegistry:
 
         if not session.exited:
             self._write_checkpoint()
+        else:
+            self._release_heavy_work_lease(session)
 
         return session
 
@@ -1551,6 +1588,17 @@ class ProcessRegistry:
             session.completion_reason = "exited"
         self._move_to_finished(session)
 
+    @staticmethod
+    def _release_heavy_work_lease(session: ProcessSession) -> None:
+        with session._lock:
+            lease = session._heavy_work_lease
+            session._heavy_work_lease = None
+        if lease is not None:
+            try:
+                lease.release()
+            except Exception:
+                logger.debug("Failed to release heavy-work lease", exc_info=True)
+
     def _move_to_finished(self, session: ProcessSession):
         """Move a session from running to finished.
 
@@ -1558,6 +1606,7 @@ class ProcessRegistry:
         with the reader thread), the second call is a no-op — no duplicate
         completion notification is enqueued.
         """
+        self._release_heavy_work_lease(session)
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session

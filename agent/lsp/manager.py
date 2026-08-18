@@ -176,6 +176,10 @@ class LSPService:
         self._broken: set = set()
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
+        # Operation refcount — a positive count means some in-flight
+        # snapshot/diagnostics call is actively using the client, so the
+        # idle reaper must not evict it regardless of _last_used.
+        self._client_refcount: Dict[Tuple[str, str], int] = {}
         self._state_lock = threading.Lock()
         self._idle_reaper_task: Optional[asyncio.Task] = None
 
@@ -187,6 +191,9 @@ class LSPService:
 
         if self._enabled and self._idle_timeout > 0:
             self._loop.run(self._start_idle_reaper(), timeout=2.0)
+
+        if self._enabled:
+            self._publish_status()
 
     @classmethod
     def create_from_config(cls) -> Optional["LSPService"]:
@@ -461,6 +468,7 @@ class LSPService:
 
         if not already_broken:
             eventlog.log_spawn_failed(srv.server_id, per_server_root, exc)
+            self._publish_status()
 
     def shutdown(self) -> None:
         """Tear down all clients and stop the background loop."""
@@ -481,19 +489,24 @@ class LSPService:
         client = await self._get_or_spawn(file_path)
         if client is None:
             return []
+        key = (client.server_id, client.workspace_root)
+        self._acquire_client(key)
         try:
-            version = await client.open_file(file_path, language_id=language_id_for(file_path))
-            fresh = await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("snapshot open/wait failed: %s", e)
-            return []
-        self._touch(client)
-        if not fresh:
-            # No fresh data for the pre-edit content — an empty baseline
-            # is safe: worst case the delta filter removes less, never
-            # more.  Never seed the baseline from stale stores.
-            return []
-        return list(client.diagnostics_for(file_path, fresh_only=True))
+            try:
+                version = await client.open_file(file_path, language_id=language_id_for(file_path))
+                fresh = await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("snapshot open/wait failed: %s", e)
+                return []
+            self._touch(client)
+            if not fresh:
+                # No fresh data for the pre-edit content — an empty baseline
+                # is safe: worst case the delta filter removes less, never
+                # more.  Never seed the baseline from stale stores.
+                return []
+            return list(client.diagnostics_for(file_path, fresh_only=True))
+        finally:
+            self._release_client(key)
 
     async def _open_and_wait_async(self, file_path: str) -> Optional[List[Dict[str, Any]]]:
         """Open + wait for FRESH diagnostics.
@@ -507,19 +520,24 @@ class LSPService:
         client = await self._get_or_spawn(file_path)
         if client is None:
             return None
+        key = (client.server_id, client.workspace_root)
+        self._acquire_client(key)
         try:
-            version = await client.open_file(file_path, language_id=language_id_for(file_path))
-            await client.save_file(file_path)
-            fresh = await client.wait_for_diagnostics(
-                file_path, version, mode=self._wait_mode, timeout=self._wait_timeout
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.debug("open/wait failed for %s: %s", file_path, e)
-            return None
-        self._touch(client)
-        if not fresh:
-            return None
-        return list(client.diagnostics_for(file_path, fresh_only=True))
+            try:
+                version = await client.open_file(file_path, language_id=language_id_for(file_path))
+                await client.save_file(file_path)
+                fresh = await client.wait_for_diagnostics(
+                    file_path, version, mode=self._wait_mode, timeout=self._wait_timeout
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("open/wait failed for %s: %s", file_path, e)
+                return None
+            self._touch(client)
+            if not fresh:
+                return None
+            return list(client.diagnostics_for(file_path, fresh_only=True))
+        finally:
+            self._release_client(key)
 
     async def _current_diags_async(self, file_path: str) -> List[Dict[str, Any]]:
         ws, gated = resolve_workspace_for_file(file_path)
@@ -556,7 +574,7 @@ class LSPService:
         with self._state_lock:
             client = self._clients.get(key)
             if client is not None and client.is_running:
-                self._last_used[key] = time.time()
+                self._last_used[key] = time.monotonic()
                 eventlog.log_active(srv.server_id, per_server_root)
                 return client
             spawning = self._spawning.get(key)
@@ -588,6 +606,7 @@ class LSPService:
                 eventlog.log_server_unavailable(srv.server_id, srv.server_id)
                 self._broken.add(key)
                 spawn_future.set_result(None)
+                self._publish_status()
                 return None
             client = LSPClient(
                 server_id=srv.server_id,
@@ -604,12 +623,14 @@ class LSPService:
                 eventlog.log_spawn_failed(srv.server_id, per_server_root, e)
                 self._broken.add(key)
                 spawn_future.set_result(None)
+                self._publish_status()
                 return None
             with self._state_lock:
                 self._clients[key] = client
-                self._last_used[key] = time.time()
+                self._last_used[key] = time.monotonic()
             eventlog.log_active(srv.server_id, per_server_root)
             spawn_future.set_result(client)
+            self._publish_status()
             return client
         finally:
             with self._state_lock:
@@ -625,11 +646,56 @@ class LSPService:
         resurrect an orphan ``_last_used`` entry after the reaper popped
         the key.  All writers and the reaper run on the background loop
         thread; the lock keeps this consistent with the reader anyway.
+
+        Uses ``time.monotonic()`` rather than the wall clock — idle
+        timing is a duration comparison, and the wall clock can jump
+        (NTP step, DST, manual change) in ways that would falsely reap a
+        fresh client or keep a truly idle one alive indefinitely.
         """
         key = (client.server_id, client.workspace_root)
         with self._state_lock:
             if key in self._clients:
-                self._last_used[key] = time.time()
+                self._last_used[key] = time.monotonic()
+
+    def _acquire_client(self, key: Tuple[str, str]) -> None:
+        """Lease a client for the duration of an in-flight operation.
+
+        A held lease blocks ``_reap_idle_once`` from evicting the client
+        out from under a slow ``open_file``/``wait_for_diagnostics`` call
+        that outlives ``idle_timeout`` — the sweep and the operation both
+        run as coroutines on the same background loop and can interleave
+        at any ``await`` point.
+        """
+        with self._state_lock:
+            self._client_refcount[key] = self._client_refcount.get(key, 0) + 1
+
+    def _release_client(self, key: Tuple[str, str]) -> None:
+        """Release a lease acquired via :meth:`_acquire_client`.
+
+        Clamped at zero so an unmatched release can never leave the
+        refcount negative, which would require multiple future acquires
+        to counteract a single lease and could block reaping forever.
+        """
+        with self._state_lock:
+            remaining = self._client_refcount.get(key, 0) - 1
+            if remaining > 0:
+                self._client_refcount[key] = remaining
+            else:
+                self._client_refcount.pop(key, None)
+
+    def _publish_status(self) -> None:
+        """Publish a cross-process snapshot to ``<HERMES_HOME>/runtime/lsp-status.json``.
+
+        ``hermes lsp status`` runs as its own process and must not spin up
+        a second, disconnected :class:`LSPService` to answer — it reads
+        this file instead.  Best-effort: a publish failure must never
+        break the service itself.
+        """
+        try:
+            from agent.lsp.status import write_lsp_status
+            write_lsp_status(self.get_status())
+        except Exception as e:  # noqa: BLE001
+            logger.debug("LSP status publish failed: %s", e)
 
     async def _idle_reaper_loop(self) -> None:
         interval = min(60.0, self._idle_timeout)
@@ -646,12 +712,13 @@ class LSPService:
                 logger.debug("LSP idle reaper sweep error: %s", e)
 
     async def _reap_idle_once(self) -> None:
-        cutoff = time.time() - self._idle_timeout
+        cutoff = time.monotonic() - self._idle_timeout
         with self._state_lock:
             idle_keys = [
                 key
                 for key in self._clients
                 if self._last_used.get(key, 0) < cutoff
+                and self._client_refcount.get(key, 0) <= 0
             ]
             clients = [self._clients.pop(key) for key in idle_keys]
             for key in idle_keys:
@@ -665,6 +732,7 @@ class LSPService:
                 *(client.shutdown() for client in clients),
                 return_exceptions=True,
             )
+            self._publish_status()
 
     async def _shutdown_async(self) -> None:
         reaper = self._idle_reaper_task
@@ -677,10 +745,12 @@ class LSPService:
             self._clients.clear()
             self._broken.clear()
             self._last_used.clear()
+            self._client_refcount.clear()
         await asyncio.gather(
             *(c.shutdown() for c in clients),
             return_exceptions=True,
         )
+        self._publish_status()
 
     # ------------------------------------------------------------------
     # status / introspection (used by ``hermes lsp status``)

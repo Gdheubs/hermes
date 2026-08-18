@@ -2751,6 +2751,41 @@ def terminal_tool(
         # Start cleanup thread
         _start_cleanup_thread()
 
+        # Optional cross-process guard for resource-heavy local commands.  Only
+        # classify here; the lease itself is acquired after security approvals
+        # so waiting for a human never consumes a concurrency slot.
+        from tools import heavy_work_guard
+
+        _heavy_limit = heavy_work_guard.configured_heavy_work_limit()
+        _heavy_category = (
+            heavy_work_guard.classify_heavy_work(command)
+            if _heavy_limit > 0 else None
+        )
+        if _heavy_category and heavy_work_guard.heavy_work_requests_detach(command):
+            return json.dumps({
+                "output": "",
+                "exit_code": 78,
+                "error": (
+                    "Blocked: guarded heavy work may not self-detach. Use "
+                    "background=true without shell-level '&', disown, or daemon mode."
+                ),
+                "status": "unsupported",
+                "heavy_work": True,
+            }, ensure_ascii=False)
+        if _heavy_category and (
+            env_type != "local" or not heavy_work_guard.lease_fd_inheritable()
+        ):
+            return json.dumps({
+                "output": "",
+                "exit_code": 78,
+                "error": (
+                    "Blocked: guarded heavy work requires a local POSIX backend "
+                    "that can pass the kernel-lock file descriptor to child processes."
+                ),
+                "status": "unsupported",
+                "heavy_work": True,
+            }, ensure_ascii=False)
+
         # Get or create environment.
         # Use a per-task creation lock so concurrent tool calls for the same
         # task_id wait for the first one to finish creating the sandbox,
@@ -3060,6 +3095,25 @@ def terminal_tool(
                 "EOF."
             )
 
+        # Security approval and workdir validation are complete. Acquire the
+        # non-blocking kernel lease only now, immediately before execution.
+        _heavy_lease = None
+        if _heavy_category:
+            _heavy_lease, _heavy_conflict = heavy_work_guard.acquire_heavy_work_lease(
+                command,
+                limit=_heavy_limit,
+                session_key=session_key,
+            )
+            if _heavy_conflict is not None:
+                owner_category = (_heavy_conflict.owner or {}).get("category", "heavy-work")
+                return json.dumps({
+                    "output": "",
+                    "exit_code": 75,
+                    "error": f"Busy: another {owner_category} job holds the concurrency slot.",
+                    "status": "busy",
+                    "heavy_work": True,
+                }, ensure_ascii=False)
+
         # The session key is already computed above the gateway guard.
         if background:
             # Spawn a tracked background process via the process registry.
@@ -3082,7 +3136,10 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        heavy_work_lease=_heavy_lease,
                     )
+                    # The registry owns and releases the lease from this point.
+                    _heavy_lease = None
                 else:
                     proc_session = process_registry.spawn_via_env(
                         env=env,
@@ -3091,6 +3148,17 @@ def terminal_tool(
                         task_id=effective_task_id,
                         session_key=session_key,
                     )
+
+                if (
+                    proc_session.exited
+                    and proc_session.completion_reason == "failed_start"
+                ):
+                    return json.dumps({
+                        "output": proc_session.output_buffer,
+                        "exit_code": proc_session.exit_code,
+                        "error": "Background process failed to start",
+                        "status": "failed_start",
+                    }, ensure_ascii=False)
 
                 result_data = {
                     "output": "Background process started",
@@ -3314,6 +3382,9 @@ def terminal_tool(
 
                 return json.dumps(result_data, ensure_ascii=False)
             except Exception as e:
+                if _heavy_lease is not None:
+                    _heavy_lease.release()
+                    _heavy_lease = None
                 return json.dumps({
                     "output": "",
                     "exit_code": -1,
@@ -3338,55 +3409,61 @@ def terminal_tool(
                 from tools.interrupt import clear_current_thread_interrupt
                 clear_current_thread_interrupt()
 
-            while retry_count <= max_retries:
-                try:
-                    command_cwd = _resolve_command_cwd(
-                        workdir=workdir,
-                        default_cwd=cwd,
-                        session_key=session_key,
-                        env_type=env_type,
-                    )
-                    execute_kwargs = {
-                        "timeout": effective_timeout,
-                        "cwd": command_cwd,
-                        # Foreground model-facing output: cap retention while
-                        # streaming (head/tail window) so a verbose command
-                        # can't OOM the gateway before truncation (#64435).
-                        # Internal env.execute() consumers (file ops cat
-                        # reads, RPC reads) intentionally stay unbounded.
-                        "bounded_capture": True,
-                    }
-                    result = env.execute(command, **execute_kwargs)
-                except Exception as e:
-                    error_str = str(e).lower()
-                    if "timeout" in error_str:
+            try:
+                while retry_count <= max_retries:
+                    try:
+                        command_cwd = _resolve_command_cwd(
+                            workdir=workdir,
+                            default_cwd=cwd,
+                            session_key=session_key,
+                            env_type=env_type,
+                        )
+                        execute_kwargs = {
+                            "timeout": effective_timeout,
+                            "cwd": command_cwd,
+                            # Foreground model-facing output: cap retention while
+                            # streaming (head/tail window) so a verbose command
+                            # can't OOM the gateway before truncation (#64435).
+                            # Internal env.execute() consumers (file ops cat
+                            # reads, RPC reads) intentionally stay unbounded.
+                            "bounded_capture": True,
+                        }
+                        with heavy_work_guard.inherit_heavy_work_lease(_heavy_lease):
+                            result = env.execute(command, **execute_kwargs)
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        if "timeout" in error_str:
+                            return json.dumps({
+                                "output": "",
+                                "exit_code": 124,
+                                "error": f"Command timed out after {effective_timeout} seconds"
+                            }, ensure_ascii=False)
+
+                        # Retry on transient errors
+                        if retry_count < max_retries:
+                            retry_count += 1
+                            wait_time = 2 ** retry_count
+                            logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
+                                           wait_time, retry_count, max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
+                            time.sleep(wait_time)
+                            continue
+
+                        logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
+                                     max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
                         return json.dumps({
                             "output": "",
-                            "exit_code": 124,
-                            "error": f"Command timed out after {effective_timeout} seconds"
+                            "exit_code": -1,
+                            "error": _redact_terminal_error_text(
+                                f"Command execution failed: {type(e).__name__}: {e}"
+                            )
                         }, ensure_ascii=False)
-                    
-                    # Retry on transient errors
-                    if retry_count < max_retries:
-                        retry_count += 1
-                        wait_time = 2 ** retry_count
-                        logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                       wait_time, retry_count, max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
-                        time.sleep(wait_time)
-                        continue
-                    
-                    logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                 max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
-                    return json.dumps({
-                        "output": "",
-                        "exit_code": -1,
-                        "error": _redact_terminal_error_text(
-                            f"Command execution failed: {type(e).__name__}: {e}"
-                        )
-                    }, ensure_ascii=False)
-                
-                # Got a result
-                break
+
+                    # Got a result
+                    break
+            finally:
+                if _heavy_lease is not None:
+                    _heavy_lease.release()
+                    _heavy_lease = None
 
             # Dual-write (cwd rearch step 1): the env's post-command tracking
             # (marker parse / local sync) has just updated env.cwd with the

@@ -93,6 +93,24 @@ def shutdown_service() -> None:
             logger.debug("LSP shutdown error: %s", e)
 
 
+def publish_service_status() -> None:
+    """Publish the current singleton state without creating a service.
+
+    Lifecycle callers such as the gateway use this hook next to their own
+    runtime-status writes. Reading ``_service`` is deliberate: calling
+    :func:`get_service` here would instantiate a disconnected service merely
+    to report status.
+    """
+    with _service_lock:
+        svc = _service
+    if svc is not None and svc.is_active():
+        svc._publish_status()
+        return
+    from agent.lsp.status import write_lsp_status
+
+    write_lsp_status({"enabled": False, "clients": [], "broken": []})
+
+
 def _atexit_shutdown() -> None:
     """atexit-registered wrapper.  Logs at debug because by the time
     atexit fires the user has already seen the agent's final output —
@@ -103,4 +121,9 @@ def _atexit_shutdown() -> None:
         logger.debug("atexit LSP shutdown failed: %s", e)
 
 
-__all__ = ["get_service", "shutdown_service", "LSPService"]
+__all__ = [
+    "get_service",
+    "shutdown_service",
+    "publish_service_status",
+    "LSPService",
+]

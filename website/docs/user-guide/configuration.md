@@ -142,6 +142,7 @@ terminal:
   cwd: "."          # Gateway/cron working directory (CLI always uses launch dir)
   font_family: ""   # Desktop terminal font; e.g. "MesloLGS NF"
   timeout: 180      # Per-command timeout in seconds
+  max_concurrent_heavy_jobs: 0  # Cross-process limit for tests/builds; 0 disables
   home_mode: auto   # auto | real | profile — subprocess HOME policy
   env_passthrough: []  # Env var names to forward to sandboxed execution (terminal + execute_code)
   singularity_image: "docker://nikolaik/python-nodejs:python3.11-nodejs20"  # Container image for Singularity backend
@@ -150,6 +151,8 @@ terminal:
 ```
 
 `terminal.font_family` controls the embedded terminal in Hermes Desktop. It accepts either one locally installed family name (for example, `MesloLGS NF`) or a CSS font stack. Hermes appends its bundled JetBrains Mono stack as a fallback, and an empty value keeps the default. You can edit the same profile-scoped setting in **Settings → Appearance → Terminal Font**; no Google Fonts download or system-font permission is required.
+
+`terminal.max_concurrent_heavy_jobs` limits concurrently running test suites, builds, and other resource-heavy commands across Hermes processes that share the same `HERMES_HOME`. The default `0` disables the guard. A positive value uses inherited kernel locks, so guarded heavy commands are supported only by the local backend on platforms with file-descriptor inheritance. Heavy commands that self-detach, use a remote/container backend, or run on an unsupported platform fail closed instead of losing their slot. Use `background=true` rather than shell-level `nohup`, `disown`, daemon mode, or a trailing `&`.
 
 For cloud sandboxes such as Modal, Daytona, and Vercel Sandbox, `container_persistent: true` means Hermes will try to preserve filesystem state across sandbox recreation. It does not promise that the same live sandbox, PID space, or background processes will still be running later.
 
@@ -2093,6 +2096,22 @@ The cap is enforced with a local runtime lease file and is best-effort: Hermes
 fails open if the registry cannot be read or locked so users are not stranded.
 It is intended for a single host/profile runtime, not a shared `$HERMES_HOME`
 mounted across multiple machines.
+
+### Session search indexes
+
+The trigram substring index is enabled by default. If repeated trigram-index
+corruption affects message writes, disable only that optional index:
+
+```yaml
+sessions:
+  trigram_fts: false
+```
+
+Hermes then removes the trigram write triggers and routes affected searches to
+the standard FTS index or a safe `LIKE` fallback. Canonical messages and the
+standard FTS index are preserved. Re-enabling the setting performs a controlled
+rebuild from canonical messages. The `HERMES_TRIGRAM_FTS` environment variable
+is an internal cross-process carrier; configure the YAML key instead.
 
 Control whether shared chats keep one conversation per room or one conversation per participant:
 

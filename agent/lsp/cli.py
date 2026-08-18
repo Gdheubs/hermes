@@ -89,13 +89,17 @@ def run_lsp_command(args: argparse.Namespace) -> int:
 
 
 def _cmd_status(emit_json: bool) -> int:
-    from agent.lsp import get_service
+    from agent.lsp.status import read_lsp_status
     from agent.lsp.servers import SERVERS
     from agent.lsp.install import detect_status
 
-    svc = get_service()
-    service_active = svc is not None
-    info = svc.get_status() if svc is not None else {"enabled": False}
+    # Read the cross-process snapshot rather than calling get_service():
+    # this CLI invocation is normally a separate process from whichever
+    # one is actually running the LSP service, so instantiating a local
+    # singleton here would spin up a brand-new, disconnected service with
+    # zero real clients instead of showing what's actually running.
+    info = read_lsp_status() or {"enabled": False}
+    service_active = bool(info.get("enabled"))
 
     if emit_json:
         import json

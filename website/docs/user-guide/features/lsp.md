@@ -135,7 +135,11 @@ hermes lsp which <id>      # print resolved binary path
 
 `hermes lsp status` is the best starting point — it shows which
 languages will get semantic diagnostics today and which need a
-binary installed.
+binary installed. The command reads the owning process's atomically
+published snapshot at `<HERMES_HOME>/runtime/lsp-status.json`; it does
+not start a second local LSP service merely to report status. The
+snapshot is refreshed when clients spawn, fail, become idle, shut down,
+and when the gateway publishes a lifecycle transition.
 
 ## Configuration
 

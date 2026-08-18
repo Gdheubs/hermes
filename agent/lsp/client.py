@@ -50,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -490,7 +491,9 @@ class LSPClient:
         self._proc = None
         if proc is None:
             return
-        if proc.returncode is None:
+        if proc.returncode is not None:
+            return
+        if sys.platform == "win32":
             try:
                 proc.terminate()
                 try:
@@ -503,6 +506,44 @@ class LSPClient:
                         pass
             except ProcessLookupError:
                 pass
+            return
+        await self._terminate_process_group(proc)
+
+    async def _terminate_process_group(self, proc: "asyncio.subprocess.Process") -> None:
+        """POSIX: SIGTERM the server's whole process group, wait, then
+        SIGKILL if it lingers.
+
+        ``_spawn`` launches the server with ``start_new_session=True`` so
+        it leads its own process group — signalling only ``proc.pid``
+        would leave behind any children a wrapper script (npx shims,
+        launcher scripts) forked under that group.  ``os.killpg`` reaches
+        all of them.
+        """
+        try:
+            pgid = os.getpgid(proc.pid)
+        except ProcessLookupError:
+            return
+
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+        try:
+            await proc.wait()
+        except ProcessLookupError:
+            pass
 
     # ------------------------------------------------------------------
     # request / notification plumbing
