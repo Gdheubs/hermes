@@ -1855,7 +1855,28 @@ class AIAgent:
         t = threading.Thread(
             target=propagate_context_to_thread(target), daemon=True, name="bg-review"
         )
+        # Keep a handle. The review runs AFTER the turn ends and keeps writing
+        # (token counters, memory, skills), so an owner that disposes of shared
+        # per-run state at turn end — the cron runner closes the SQLite session
+        # store — needs to be able to WAIT for it. ``_background_review_agent``
+        # (added for cross-turn cancellation) can interrupt a review but gives no
+        # way to join one, and cancelling is the wrong move where the review's
+        # writes are wanted.
+        self._background_review_thread = t
         t.start()
+
+    def wait_for_background_review(self, timeout: float = 180.0) -> bool:
+        """Block until the background review thread finishes. True if it is done.
+
+        Call before disposing of anything the review shares with this agent — the
+        session store above all. Bounded, so a wedged review cannot hang a
+        scheduler; the caller decides what a False means.
+        """
+        t = getattr(self, "_background_review_thread", None)
+        if t is None or not t.is_alive():
+            return True
+        t.join(timeout)
+        return not t.is_alive()
 
     def _build_memory_write_metadata(
         self,

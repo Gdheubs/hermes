@@ -5862,6 +5862,25 @@ def run_job(
             exit_non_dispatcher_owned_context(_non_dispatcher_token)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
+        # The background skill/memory review is spawned when the turn ends and
+        # keeps calling the model — and writing — for another 40-100s. It accounts
+        # its tokens onto THIS SessionDB (see agent/background_review.py's
+        # _token_accounting_db), so closing below while it runs sets `_conn = None`
+        # under it and every one of its writes dies on `'NoneType' object has no
+        # attribute 'execute'`. That failure is caught per-call, so the only
+        # symptom is a cron pass under-reporting its own cost — measured at 10-15%
+        # (gpt-5.4-mini) to 27-29% (claude-sonnet-4-6). Wait for it first, so
+        # end_session()'s `ended_at` covers the whole pass and close() — which
+        # drains the token queue — is genuinely the last write.
+        if agent is not None:
+            try:
+                if not agent.wait_for_background_review():
+                    logger.warning(
+                        "Job '%s': background review still running after the wait; "
+                        "closing the session store anyway — its remaining token "
+                        "deltas will be lost.", job_id)
+            except (Exception, KeyboardInterrupt) as e:
+                logger.debug("Job '%s': background review wait failed: %s", job_id, e)
         if _session_db:
             # The agent turn has already returned. Bound every subsequent DB
             # operation so storage failure cannot hold the dispatch guard.

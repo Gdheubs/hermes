@@ -1062,6 +1062,17 @@ def _run_review_in_thread(
             review_agent._persist_disabled = True
             review_agent._session_db = None
             review_agent._session_json_enabled = False
+            # ...but its TOKENS still belong to the session it shares an id with.
+            # The provider bills the review's calls and the observability backend
+            # files them under the parent's session_id, so leaving them out of
+            # state.db makes that session's own cost read low — measured at 10-15%
+            # of a gpt-5.4-mini pass and 27-29% of a claude-sonnet-4-6 one on a
+            # scheduled workload, against the provider's per-call usage as ground
+            # truth. This channel carries counters ONLY: `_persist_disabled` above
+            # still hard-stops every message/lazy-open path, so the curator-takeover
+            # isolation is untouched.
+            review_agent._token_accounting_db = getattr(agent, "_session_db", None)
+            review_agent._token_accounting_session_id = agent.session_id
             # Suppress all status/warning emits from the fork so the
             # user only sees the final successful-action summary.
             # Without this, mid-review "Iteration budget exhausted",

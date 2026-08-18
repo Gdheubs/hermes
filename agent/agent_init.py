@@ -1682,6 +1682,13 @@ def init_agent(
     # background skill/memory review fork so its harness turn can't leak into
     # the user's real session and hijack the next live turn. Default False.
     agent._persist_disabled = False
+    # Narrow token-accounting channel. Normally None: an agent accounts on its own
+    # ``_session_db`` / ``session_id``. A persistence-isolated fork (background
+    # review) sets these to the OWNER's store + session id so its token counters —
+    # and only its counters, never a message — reach the session it shares an id
+    # with. See agent/conversation_loop.py's persist block.
+    agent._token_accounting_db = None
+    agent._token_accounting_session_id = None
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,

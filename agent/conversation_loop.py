@@ -4120,7 +4120,22 @@ def run_conversation(
                     # is skipped or fails. Gateway/session-store writes use
                     # absolute totals, so they safely overwrite these per-call
                     # deltas instead of double-counting them.
-                    if agent._session_db and agent.session_id:
+                    # A persistence-isolated fork (the background review) has
+                    # ``_session_db = None`` on purpose — it must never write a
+                    # MESSAGE into the session it shares an id with. Its tokens are
+                    # a different matter: the provider bills them and the
+                    # observability backend attributes them to that same session, so
+                    # dropping them makes the session's own cost read low (measured
+                    # 10-27% on a scheduled workload). ``_token_accounting_db`` is
+                    # the narrow channel for exactly that: counters only, on a
+                    # session row somebody else owns and has already created.
+                    _acct_db = getattr(agent, "_token_accounting_db", None)
+                    _acct_session = getattr(agent, "_token_accounting_session_id", None)
+                    # Own store vs borrowed one. Only the owner may create the row.
+                    _acct_owned = _acct_db is None
+                    if _acct_owned:
+                        _acct_db, _acct_session = agent._session_db, agent.session_id
+                    if _acct_db and _acct_session:
                         try:
                             # Ensure the session row exists before attempting UPDATE.
                             # Under concurrent load (cron/kanban), the initial
@@ -4128,7 +4143,7 @@ def run_conversation(
                             # locking.  Retry here so per-call token deltas are
                             # not silently lost (UPDATE on a non-existent row
                             # affects 0 rows without error).
-                            if not agent._session_db_created:
+                            if _acct_owned and not agent._session_db_created:
                                 agent._ensure_db_session()
                             # Per-call cost delta = aggregator cost + MoA
                             # advisor cost (each priced at its own rate). Folded
@@ -4147,8 +4162,8 @@ def run_conversation(
                             # state.db UPDATE here stalled the tool loop for
                             # up to hundreds of ms per API call). Drained at
                             # turn finalize via _persist_session.
-                            agent._session_db.queue_token_counts(
-                                agent.session_id,
+                            _acct_db.queue_token_counts(
+                                _acct_session,
                                 input_tokens=canonical_usage.input_tokens,
                                 output_tokens=canonical_usage.output_tokens,
                                 cache_read_tokens=canonical_usage.cache_read_tokens,
@@ -4168,9 +4183,16 @@ def run_conversation(
                             # Log token persistence failures so they're
                             # visible in agent.log — silent loss here is
                             # the root cause of undercounted analytics.
-                            logger.debug(
+                            # WARNING, not debug: this comment was right about the
+                            # consequence and wrong about the level. At debug it is
+                            # invisible on a normal deployment, and a session store
+                            # closed out from under a still-running background review
+                            # swallowed every one of its writes for weeks while cost
+                            # analytics quietly ran low. An accounting write that
+                            # fails has to say so.
+                            logger.warning(
                                 "Token persistence failed (session=%s, tokens=%d): %s",
-                                agent.session_id, total_tokens, e,
+                                _acct_session, total_tokens, e,
                             )
                     
                     if agent.verbose_logging:
