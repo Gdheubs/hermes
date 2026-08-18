@@ -78,11 +78,13 @@ def _clean_trust_state():
 
 
 def _set_trust(server: str, trust: str):
-    mcp_tool._server_trust_levels[server] = trust
+    mcp_tool._server_trust_levels[mcp_tool._mcp_scope_key(server)] = trust
 
 
 def _set_read_only(server: str, tool: str, value: bool):
-    mcp_tool._tool_read_only_hints.setdefault(server, {})[tool] = value
+    mcp_tool._tool_read_only_hints.setdefault(
+        mcp_tool._mcp_scope_key(server), {}
+    )[tool] = value
 
 
 class TestTrustGateAtCallTime:
@@ -238,10 +240,12 @@ class TestAnnotationCaptureAtDiscovery:
              patch("tools.mcp_tool._track_mcp_tool_server"):
             mcp_tool._register_server_tools("srv", server, config)
 
-        assert mcp_tool._server_trust_levels["srv"] == "untrusted"
+        assert mcp_tool._server_trust_levels[mcp_tool._mcp_scope_key("srv")] == "untrusted"
         # No hints recorded for untrusted servers — a self-declared hint
         # must never bypass approval.
-        assert mcp_tool._tool_read_only_hints.get("srv", {}) == {}
+        assert mcp_tool._tool_read_only_hints.get(
+            mcp_tool._mcp_scope_key("srv"), {}
+        ) == {}
 
     def test_registration_records_hints_for_trusted(self):
         """F5/P2: hints are recorded only for TRUSTED servers (where the
@@ -267,8 +271,8 @@ class TestAnnotationCaptureAtDiscovery:
              patch("tools.mcp_tool._track_mcp_tool_server"):
             mcp_tool._register_server_tools("srv", server, config)
 
-        assert mcp_tool._server_trust_levels["srv"] == "full"
-        hints = mcp_tool._tool_read_only_hints["srv"]
+        assert mcp_tool._server_trust_levels[mcp_tool._mcp_scope_key("srv")] == "full"
+        hints = mcp_tool._tool_read_only_hints[mcp_tool._mcp_scope_key("srv")]
         assert hints.get("list_repos") is True
         # Anything not exactly True is write-capable.
         assert not hints.get("delete_repo")
@@ -288,3 +292,88 @@ class TestAnnotationCaptureAtDiscovery:
         assert mcp_tool._annotation_read_only_hint(
             SimpleNamespace()
         ) is False
+
+
+class TestProfileScopedTrust:
+    """F5: MCP trust state is keyed by (profile home, server name). The same
+    server name in two profiles is two different servers — separate
+    credentials, separate trust decisions. Profile A marking the server
+    ``trust: full`` must not lift the approval gate for profile B's calls on
+    the same name, and a profile that never configured the name stays
+    fail-closed untrusted."""
+
+    def test_opposite_trust_across_profiles_keeps_boundary(
+        self, fake_session, monkeypatch
+    ):
+        """Profile A trusts the server; profile B (same name) never did.
+        B's write-capable calls still consult approval; A's stay ungated."""
+        homes = {"current": "profile-A"}
+        monkeypatch.setattr(mcp_tool, "_mcp_current_home", lambda: homes["current"])
+
+        # Profile A registers 'srv' with trust: full.
+        mcp_tool._record_tool_trust_metadata("srv", {"trust": "full"}, [])
+
+        # Profile B's session: same server name, no trust decision of its own.
+        homes["current"] = "profile-B"
+        handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
+        with patch(
+            "tools.approval.request_elicitation_consent",
+            return_value="decline",
+        ) as consent:
+            raw = handler({"repo": "x"})
+        # B's approval gate fires — A's 'full' did NOT leak across profiles.
+        consent.assert_called_once()
+        fake_session.call_tool.assert_not_awaited()
+        assert "did not approve" in json.loads(raw)["error"]
+
+        # Profile A's own calls remain ungated.
+        homes["current"] = "profile-A"
+        with patch("tools.approval.request_elicitation_consent") as consent2:
+            raw2 = handler({"repo": "x"})
+        consent2.assert_not_called()
+        assert json.loads(raw2) == {"result": "ok"}
+
+    def test_unconfigured_profile_defaults_untrusted_for_same_name(
+        self, fake_session, monkeypatch
+    ):
+        """Even when another profile trusted the name, a profile that never
+        configured it gets the fail-closed untrusted default."""
+        homes = {"current": "profile-A"}
+        monkeypatch.setattr(mcp_tool, "_mcp_current_home", lambda: homes["current"])
+        mcp_tool._record_tool_trust_metadata("srv", {"trust": "full"}, [])
+
+        homes["current"] = "profile-B"
+        handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
+        with patch(
+            "tools.approval.request_elicitation_consent",
+            return_value="decline",
+        ) as consent:
+            handler({"repo": "x"})
+        consent.assert_called_once()
+        fake_session.call_tool.assert_not_awaited()
+
+    def test_same_profile_reuses_its_own_decision(self, fake_session, monkeypatch):
+        """Same profile, same name: the recorded trust decision applies."""
+        homes = {"current": "profile-A"}
+        monkeypatch.setattr(mcp_tool, "_mcp_current_home", lambda: homes["current"])
+        mcp_tool._record_tool_trust_metadata("srv", {"trust": "full"}, [])
+        handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
+        with patch("tools.approval.request_elicitation_consent") as consent:
+            handler({"repo": "x"})
+        consent.assert_not_called()
+
+    def test_opposite_untrusted_profile_does_not_block_trusted_profile(
+        self, fake_session, monkeypatch
+    ):
+        """The converse: profile B marking the name untrusted must not flip
+        profile A's trusted decision."""
+        homes = {"current": "profile-A"}
+        monkeypatch.setattr(mcp_tool, "_mcp_current_home", lambda: homes["current"])
+        mcp_tool._record_tool_trust_metadata("srv", {"trust": "full"}, [])
+        homes["current"] = "profile-B"
+        mcp_tool._record_tool_trust_metadata("srv", {"trust": "untrusted"}, [])
+        homes["current"] = "profile-A"
+        handler = mcp_tool._make_tool_handler("srv", "delete_repo", 30.0)
+        with patch("tools.approval.request_elicitation_consent") as consent:
+            handler({"repo": "x"})
+        consent.assert_not_called()
