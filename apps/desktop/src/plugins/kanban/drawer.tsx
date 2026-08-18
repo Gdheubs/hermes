@@ -45,6 +45,7 @@ import {
   taskKey,
   uploadAttachment
 } from './api'
+import { LinkifiedFilePath } from './filepath-links'
 import { ModelOverrideField, overridePatch } from './model-override'
 import {
   type Diagnostic,
@@ -856,7 +857,9 @@ export function TaskDrawer({
                       <span className="ml-2 text-[0.625rem] text-(--ui-text-quaternary)">
                         {ago(comment.created_at)}
                       </span>
-                      <p className="whitespace-pre-wrap text-(--ui-text-tertiary)">{comment.body}</p>
+                      <p className="whitespace-pre-wrap text-(--ui-text-tertiary)">
+                        <LinkifiedFilePath text={comment.body} />
+                      </p>
                     </li>
                   ))}
                 </ul>
