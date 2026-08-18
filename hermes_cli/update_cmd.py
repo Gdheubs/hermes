@@ -2127,8 +2127,9 @@ def _refresh_active_memory_provider_dependencies() -> None:
     """Refresh pip dependencies for the configured external memory provider.
 
     Memory-provider bridge packages are declared in each provider's
-    ``plugin.yaml`` (plus mode-dependent extras like Hindsight's
-    ``hindsight-all``), NOT in Hermes' editable-install extras or
+    ``plugin.yaml`` (for Hindsight: ``hindsight-client`` plus the lightweight
+    ``hindsight-embed`` runtime — the ML stack lives in the dedicated server
+    venv), NOT in Hermes' editable-install extras or
     ``LAZY_DEPS`` alone — so the core dependency reinstall above can strip
     or downgrade them (#53272 mem0ai, #70636 hindsight-embed). Re-run the
     provider's declared install for the ACTIVE provider only, after the
@@ -4434,7 +4435,49 @@ def _rebuild_desktop_after_update(
 
         print(f"  Full build log: {_dhh()}/logs/update.log")
     else:
-        print("  ✓ Desktop app up to date")
+        # The build succeeded. `--build-only` rebuilds into the
+        # release/ tree but does NOT install the rebuilt app to the
+        # system location (e.g. /Applications/Hermes.app). The
+        # in-app updater handles that swap itself, but a CLI
+        # `hermes update` otherwise leaves the installed app stale.
+        if _m()._desktop_bundle_install_supported():
+            installed = _m()._install_rebuilt_desktop_app(desktop_dir)
+            if installed:
+                print(f"  ✓ Desktop app updated at {installed}")
+            else:
+                print("  ✓ Desktop app up to date")
+        else:
+            print(
+                "  ✓ Desktop app rebuilt; automatic installed-package "
+                f"replacement is unsupported on {sys.platform}"
+            )
+
+
+def _migrate_all_profiles() -> None:
+    """Run config migration for every named profile (best-effort).
+
+    ``hermes update`` runs with the default profile active, so named
+    profiles keep their stale config version and break when the desktop
+    app spawns ``hermes serve --profile <name>``.  This loop catches them
+    up.  Per-profile failures are surfaced as visible stderr warnings.
+    """
+    try:
+        from hermes_cli.main import _migrate_profile_config
+        from hermes_cli.profiles import list_profiles
+
+        all_profiles = list_profiles()
+        for p in all_profiles:
+            try:
+                _migrate_profile_config(p)
+            except Exception as pe:
+                print(
+                    f"  ⚠️  Config migration for profile '{p.name}' "
+                    f"failed: {pe}. Run `hermes --profile {p.name} "
+                    f"config migrate` manually.",
+                    file=sys.stderr,
+                )
+    except Exception:
+        pass  # profiles module not available or no profiles
 
 
 def _cmd_update_impl(args, gateway_mode: bool):
@@ -5594,6 +5637,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 print("Skipped. Run 'hermes config migrate' later to configure.")
         else:
             print("  ✓ Configuration is up to date")
+
+        # Migrate config for ALL profiles, not just the active one.
+        _migrate_all_profiles()
 
         # Safety net: config-version migrations have been observed to leave
         # cron/jobs.json valid-but-empty, silently dropping every scheduled
