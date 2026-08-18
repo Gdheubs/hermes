@@ -2472,6 +2472,23 @@ export interface Translations {
       unreachableDescription: string
       openTarget: (url: string) => string
       fallbackTitle: string
+      goBack: string
+      goForward: string
+      reload: string
+      address: string
+      navigate: string
+      viewport: string
+      viewportFree: string
+      viewportDesktop: string
+      viewportLaptop: string
+      viewportMobile: string
+      viewportWidth: string
+      viewportHeight: string
+      viewportApply: string
+      pick: string
+      pickCancel: string
+      pickFailed: string
+      pickUnavailable: string
     }
   }
 

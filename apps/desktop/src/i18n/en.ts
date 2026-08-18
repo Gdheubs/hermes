@@ -2897,7 +2897,24 @@ export const en: Translations = {
       loadFailedConsole: (code, message) => `Load failed${code ? ` (${code})` : ''}: ${message}`,
       unreachableDescription: 'The preview page could not be reached.',
       openTarget: url => `Open ${url}`,
-      fallbackTitle: 'Preview'
+      fallbackTitle: 'Preview',
+      goBack: 'Go back',
+      goForward: 'Go forward',
+      reload: 'Reload preview',
+      address: 'Preview URL',
+      navigate: 'Navigate preview',
+      viewport: 'Preview viewport',
+      viewportFree: 'Free size',
+      viewportDesktop: 'Desktop',
+      viewportLaptop: 'Laptop',
+      viewportMobile: 'Mobile',
+      viewportWidth: 'Viewport width',
+      viewportHeight: 'Viewport height',
+      viewportApply: 'Apply',
+      pick: 'Select page element for chat',
+      pickCancel: 'Cancel element selection',
+      pickFailed: 'Failed to select page element',
+      pickUnavailable: 'The preview page is not ready yet.'
     }
   },
 
