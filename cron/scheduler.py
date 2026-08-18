@@ -2625,6 +2625,19 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         chat_id = target["chat_id"]
         thread_id = target.get("thread_id")
 
+        if str(platform_name).lower() in {"desktop", "tui", "cli"}:
+            # No gateway adapter. origin.chat_id is the creating session_id.
+            if mirror_enabled and mirror_text:
+                _maybe_mirror_cron_delivery(
+                    job, platform_name, str(chat_id), mirror_text,
+                    thread_id=None, user_id=None, enabled=True,
+                )
+            logger.info(
+                "Job '%s': mirrored to %s session %s (no adapter)",
+                job["id"], platform_name, chat_id,
+            )
+            continue
+
         # Diagnostic: log thread_id for topic-aware delivery debugging
         origin = _resolve_origin(job) or {}
         origin_thread = origin.get("thread_id")

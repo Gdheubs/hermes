@@ -111,6 +111,10 @@ def _find_session_id(
     same-chat candidates exist and none matches the user, return None instead
     of guessing and contaminating another participant's session.
     """
+    # Local surfaces stamp origin.chat_id = HERMES_SESSION_ID.
+    if str(platform or "").lower() in {"desktop", "tui", "cli"} and chat_id:
+        return str(chat_id)
+
     # Primary: state.db
     try:
         from hermes_state import SessionDB

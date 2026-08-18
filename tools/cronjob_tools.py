@@ -353,6 +353,19 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
             # gateway.mirror.mirror_to_session. Harmless for DMs/shared sessions.
             "user_id": get_session_env("HERMES_SESSION_USER_ID") or None,
         }
+    # Desktop / TUI / CLI have no messaging platform+chat_id. Stamp the live
+    # session_id so deliver=origin + attach_to_session can mirror back into
+    # that transcript (otherwise output dies in an invisible cron_* session).
+    session_id = get_session_env("HERMES_SESSION_ID") or None
+    source = (get_session_env("HERMES_SESSION_SOURCE") or "").strip().lower()
+    if session_id and source in {"desktop", "tui", "cli"}:
+        return {
+            "platform": source,
+            "chat_id": session_id,
+            "chat_name": get_session_env("HERMES_SESSION_CHAT_NAME") or None,
+            "thread_id": None,
+            "user_id": get_session_env("HERMES_SESSION_USER_ID") or None,
+        }
     return None
 
 
