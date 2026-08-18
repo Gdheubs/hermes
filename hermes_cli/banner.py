@@ -731,7 +731,26 @@ def _defer_update_notice(console: "Console", max_wait: float = 30.0) -> None:
             behind = _update_result
             if behind is None or behind == 0:
                 return
-            console.print(_format_update_notice(behind))
+            # Route through prompt_toolkit's native renderer (cprint)
+            # instead of console.print(). This fires from a daemon
+            # thread while patch_stdout() may be active in the
+            # interactive chat loop; a plain Rich console.print()
+            # writes raw ANSI to stdout, which prompt_toolkit's
+            # StdoutProxy mangles into garbled '?[1;33m...?[0m' text.
+            # Render the Rich markup to ANSI first, then let cprint()
+            # feed it through print_formatted_text(ANSI(...)) which
+            # prompt_toolkit parses and renders correctly.
+            from io import StringIO
+            from rich.console import Console as _RenderConsole
+            markup = _format_update_notice(behind)
+            buf = StringIO()
+            rc = _RenderConsole(
+                file=buf, force_terminal=True, color_system="truecolor",
+                highlight=False,
+            )
+            rc.width = shutil.get_terminal_size((80, 24)).columns
+            rc.print(markup)
+            cprint(buf.getvalue().rstrip("\n"))
         except Exception:
             pass  # never break the session over an update notice
 

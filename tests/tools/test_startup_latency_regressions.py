@@ -179,10 +179,14 @@ class TestBannerUpdateCheckNonBlocking:
             def print(self, msg, *a, **k):
                 printed.append(msg)
 
+        def _capture(text):
+            printed.append(text)
+
         done = threading.Event()
         with patch.object(banner, "_update_check_done", done), \
              patch.object(banner, "_update_result", None), \
-             patch.object(banner, "_deferred_update_notice_started", False):
+             patch.object(banner, "_deferred_update_notice_started", False), \
+             patch.object(banner, "cprint", _capture):
             banner._defer_update_notice(_Console(), max_wait=5.0)
             banner._update_result = 3
             done.set()
@@ -190,7 +194,9 @@ class TestBannerUpdateCheckNonBlocking:
             while not printed and time.time() < deadline:
                 time.sleep(0.02)
         assert printed, "deferred update notice never printed"
-        assert "3 commits behind" in printed[0]
+        # cprint receives ANSI-rendered text, not Rich markup; the
+        # "3 commits behind" text must still be present in the output.
+        assert any("3 commits behind" in line for line in printed)
 
     def test_deferred_notice_silent_when_up_to_date(self):
         import hermes_cli.banner as banner
@@ -201,10 +207,14 @@ class TestBannerUpdateCheckNonBlocking:
             def print(self, msg, *a, **k):
                 printed.append(msg)
 
+        def _capture(text):
+            printed.append(text)
+
         done = threading.Event()
         with patch.object(banner, "_update_check_done", done), \
              patch.object(banner, "_update_result", 0), \
-             patch.object(banner, "_deferred_update_notice_started", False):
+             patch.object(banner, "_deferred_update_notice_started", False), \
+             patch.object(banner, "cprint", _capture):
             banner._defer_update_notice(_Console(), max_wait=2.0)
             done.set()
             time.sleep(0.3)
