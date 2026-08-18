@@ -5,6 +5,7 @@ background session) across gateway messenger platforms.
 """
 
 import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -81,6 +82,31 @@ class TestHandleBackgroundCommand:
         result = await runner._handle_background_command(event)
         assert "Usage:" in result
 
+    @pytest.mark.asyncio
+    async def test_passes_parent_and_complete_reply_context(self):
+        runner = _make_runner()
+        parent = MagicMock(session_id="parent-session")
+        runner.session_store.get_or_create_session.return_value = parent
+        runner._run_background_task = AsyncMock(return_value=None)
+        event = _make_event(text="/background inspect this")
+        decision_after_old_limit = "APPROVE_THE_REPORT_AFTER_CHARACTER_500"
+        event.reply_to_text = "q" * 700 + decision_after_old_limit
+        event.reply_to_is_own_message = True
+
+        result = await runner._handle_background_command(event)
+        await asyncio.sleep(0)
+
+        assert "Background" in result
+        kwargs = runner._run_background_task.await_args.kwargs
+        assert kwargs["parent_session_id"] == "parent-session"
+        assert kwargs["parent_session_key"] == runner._session_key_for_source(event.source)
+        assert kwargs["reply_to_text"] == event.reply_to_text
+        assert decision_after_old_limit in kwargs["reply_to_text"]
+        assert kwargs["reply_to_is_own_message"] is True
+        assert kwargs["origin"]["execution_kind"] == "user_explicit_background"
+        assert kwargs["origin"]["user_initiated"] is True
+        assert kwargs["origin"]["command"] == "/background"
+
 
 # ---------------------------------------------------------------------------
 # _run_background_task
@@ -118,7 +144,7 @@ class TestRunBackgroundTask:
     async def test_successful_task_sends_result(self):
         """When the agent completes successfully, the result is sent."""
         runner = _make_runner()
-        mock_adapter = AsyncMock()
+        mock_adapter = MagicMock()
         mock_adapter.send = AsyncMock()
         mock_adapter.extract_media = MagicMock(return_value=([], "Hello from background!"))
         mock_adapter.extract_images = MagicMock(return_value=([], "Hello from background!"))
@@ -150,7 +176,22 @@ class TestRunBackgroundTask:
             mock_agent_instance.run_conversation.return_value = mock_result
             MockAgent.return_value = mock_agent_instance
 
-            await runner._run_background_task("say hello", source, "bg_test")
+            decision_after_old_limit = "APPROVE_THE_REPORT_AFTER_CHARACTER_500"
+            complete_reply = "q" * 700 + decision_after_old_limit
+            await runner._run_background_task(
+                "say hello",
+                source,
+                "bg_test",
+                parent_session_id="parent-session",
+                parent_session_key="telegram:67890",
+                reply_to_text=complete_reply,
+                reply_to_is_own_message=True,
+                origin={
+                    "execution_kind": "user_explicit_background",
+                    "user_initiated": True,
+                    "command": "/background",
+                },
+            )
 
         # Should have sent the result
         mock_adapter.send.assert_called_once()
@@ -163,8 +204,140 @@ class TestRunBackgroundTask:
         assert agent_kwargs["checkpoint_max_snapshots"] == 8
         assert agent_kwargs["checkpoint_max_total_size_mb"] == 222
         assert agent_kwargs["checkpoint_max_file_size_mb"] == 3
+        assert agent_kwargs["parent_session_id"] == "parent-session"
+        assert agent_kwargs["gateway_session_key"] == "telegram:67890"
+        run_kwargs = mock_agent_instance.run_conversation.call_args.kwargs
+        assert run_kwargs["user_message"] == (
+            f'[Replying to your previous message: "{complete_reply}"]\n\nsay hello'
+        )
+        assert decision_after_old_limit in run_kwargs["user_message"]
+        record_kwargs = mock_agent_instance.record_gateway_session_peer.call_args.kwargs
+        origin = record_kwargs["origin"]
+        assert origin["execution_kind"] == "user_explicit_background"
+        assert origin["user_initiated"] is True
+        assert origin["command"] == "/background"
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_generic_caller_supplies_its_own_provenance(self):
+        runner = _make_runner()
+        mock_adapter = MagicMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(return_value=([], "done"))
+        mock_adapter.extract_images = MagicMock(return_value=([], "done"))
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+        source = _make_event().source
+        caller_origin = {"execution_kind": "scheduled_background"}
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
+             patch("gateway.run._load_gateway_config", return_value={}), \
+             patch("run_agent.AIAgent") as MockAgent:
+            agent = MockAgent.return_value
+            agent.run_conversation.return_value = {"final_response": "done", "messages": []}
+            await runner._run_background_task(
+                "scheduled work",
+                source,
+                "bg_other",
+                parent_session_id="parent-session",
+                parent_session_key="telegram:67890",
+                origin=caller_origin,
+            )
+
+        assert agent.record_gateway_session_peer.call_args.kwargs == {
+            "origin": caller_origin,
+        }
+        assert "command" not in caller_origin
+
+    @pytest.mark.asyncio
+    async def test_peer_record_failure_still_cleans_up_agent(self):
+        runner = _make_runner()
+        mock_adapter = MagicMock()
+        mock_adapter.send = AsyncMock()
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+        source = _make_event().source
+
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}), \
+             patch("gateway.run._load_gateway_config", return_value={}), \
+             patch("run_agent.AIAgent") as MockAgent:
+            agent = MockAgent.return_value
+            agent.record_gateway_session_peer.side_effect = RuntimeError(
+                "Session DB unavailable; gateway peer was not recorded"
+            )
+
+            await runner._run_background_task(
+                "scheduled work",
+                source,
+                "bg_failure",
+                parent_session_id="parent-session",
+                parent_session_key="telegram:67890",
+                origin={"execution_kind": "scheduled_background"},
+            )
+
+        agent.run_conversation.assert_not_called()
+        agent.shutdown_memory_provider.assert_called_once()
+        agent.close.assert_called_once()
+        assert "Session DB unavailable" in mock_adapter.send.call_args.kwargs["content"]
+
+
+class TestAIAgentGatewayPeerContract:
+    def test_records_peer_through_public_contract(self):
+        from run_agent import AIAgent
+
+        agent = object.__new__(AIAgent)
+        agent.session_id = "bg_test"
+        agent.platform = "telegram"
+        agent._session_db = MagicMock()
+        agent._ensure_db_session = MagicMock()
+        agent._user_id = "user"
+        agent._gateway_session_key = "telegram:chat"
+        agent._chat_id = "chat"
+        agent._chat_type = "group"
+        agent._thread_id = "topic"
+        agent._chat_name = "Test chat"
+        origin = {"execution_kind": "user_explicit_background"}
+
+        agent.record_gateway_session_peer(origin=origin)
+
+        agent._ensure_db_session.assert_called_once_with()
+        record_kwargs = agent._session_db.record_gateway_session_peer.call_args.kwargs
+        assert record_kwargs == {
+            "source": "telegram",
+            "user_id": "user",
+            "session_key": "telegram:chat",
+            "chat_id": "chat",
+            "chat_type": "group",
+            "thread_id": "topic",
+            "display_name": "Test chat",
+            "origin_json": json.dumps(origin),
+        }
+        record_args = agent._session_db.record_gateway_session_peer.call_args.args
+        assert record_args == ("bg_test",)
+
+    def test_missing_session_db_fails_explicitly(self):
+        from run_agent import AIAgent
+
+        agent = object.__new__(AIAgent)
+        agent.session_id = "bg_test"
+        agent._session_db = None
+        agent._ensure_db_session = MagicMock()
+
+        with pytest.raises(RuntimeError, match="Session DB unavailable"):
+            agent.record_gateway_session_peer(origin={})
+
+    def test_missing_gateway_session_key_fails_explicitly(self):
+        from run_agent import AIAgent
+
+        agent = object.__new__(AIAgent)
+        agent.session_id = "bg_test"
+        agent._session_db = MagicMock()
+        agent._ensure_db_session = MagicMock()
+        agent._gateway_session_key = ""
+
+        with pytest.raises(RuntimeError, match="Gateway session key missing"):
+            agent.record_gateway_session_peer(origin={})
+
+        agent._session_db.record_gateway_session_peer.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

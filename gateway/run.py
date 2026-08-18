@@ -22054,6 +22054,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        parent_session_id: Optional[str] = None,
+        parent_session_key: Optional[str] = None,
+        reply_to_text: Optional[str] = None,
+        reply_to_is_own_message: bool = False,
+        origin: Optional[dict] = None,
     ) -> None:
         """Profile-scoping wrapper around the background agent task.
 
@@ -22064,13 +22069,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
+                prompt,
+                source,
+                task_id,
+                event_message_id=event_message_id,
+                media_urls=media_urls,
+                media_types=media_types,
+                parent_session_id=parent_session_id,
+                parent_session_key=parent_session_key,
+                reply_to_text=reply_to_text,
+                reply_to_is_own_message=reply_to_is_own_message,
+                origin=origin,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
         with _profile_runtime_scope(profile_home):
             return await self._run_background_task_inner(
-                prompt, source, task_id, event_message_id, media_urls, media_types,
+                prompt,
+                source,
+                task_id,
+                event_message_id=event_message_id,
+                media_urls=media_urls,
+                media_types=media_types,
+                parent_session_id=parent_session_id,
+                parent_session_key=parent_session_key,
+                reply_to_text=reply_to_text,
+                reply_to_is_own_message=reply_to_is_own_message,
+                origin=origin,
             )
 
     def _resolve_enabled_toolsets_for_source(
@@ -22116,6 +22141,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        parent_session_id: Optional[str] = None,
+        parent_session_key: Optional[str] = None,
+        reply_to_text: Optional[str] = None,
+        reply_to_is_own_message: bool = False,
+        origin: Optional[dict] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
@@ -22180,7 +22210,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception as e:
                         logger.warning("Background task vision enrichment failed: %s", e)
 
+            reply_context = str(reply_to_text or "")
+            if reply_context:
+                reply_label = (
+                    "Replying to your previous message"
+                    if reply_to_is_own_message
+                    else "Replying to"
+                )
+                enriched_prompt = (
+                    f'[{reply_label}: "{reply_context}"]\n\n{enriched_prompt}'
+                )
+
             def run_sync():
+                if bool(parent_session_id) != bool(parent_session_key):
+                    raise RuntimeError(
+                        "Background parent session metadata is incomplete"
+                    )
                 agent = AIAgent(
                     model=turn_route["model"],
                     **turn_route["runtime"],
@@ -22208,11 +22253,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_name=source.chat_name,
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
+                    gateway_session_key=parent_session_key,
+                    parent_session_id=parent_session_id,
                     session_db=getattr(self._session_db, "_db", self._session_db),
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
                 try:
+                    if parent_session_id and parent_session_key:
+                        agent.record_gateway_session_peer(origin=origin)
                     return agent.run_conversation(
                         user_message=enriched_prompt,
                         task_id=task_id,
