@@ -120,6 +120,91 @@ def _make_plugin_dir(base: Path, name: str, *, register_body: str = "pass",
 class TestPluginDiscovery:
     """Tests for plugin discovery from directories and entry points."""
 
+    def test_enabled_plugins_load_in_config_order(self, tmp_path, monkeypatch):
+        """Explicit enable order wins over alphabetical directory discovery."""
+        from hermes_cli import plugins as plugins_mod
+
+        home = tmp_path / "home"
+        plugins_dir = home / "plugins"
+        _make_plugin_dir(
+            plugins_dir,
+            "alpha",
+            register_body='import plugin_order_trace; plugin_order_trace.events.append("alpha")',
+            auto_enable=False,
+        )
+        _make_plugin_dir(
+            plugins_dir,
+            "zeta",
+            register_body='import plugin_order_trace; plugin_order_trace.events.append("zeta")',
+            auto_enable=False,
+        )
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["zeta", "alpha"]}})
+        )
+        bundled = tmp_path / "bundled"
+        bundled.mkdir()
+        trace = types.SimpleNamespace(events=[])
+        monkeypatch.setitem(sys.modules, "plugin_order_trace", trace)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(plugins_mod, "get_bundled_plugins_dir", lambda: bundled)
+
+        PluginManager().discover_and_load()
+
+        assert trace.events == ["zeta", "alpha"]
+
+    def test_enabled_plugins_accepts_path_key_for_named_category_plugin(
+        self, tmp_path, monkeypatch
+    ):
+        """A category path key is ordered even when it differs from manifest.name."""
+        from hermes_cli import plugins as plugins_mod
+
+        home = tmp_path / "home"
+        plugins_dir = home / "plugins"
+        _make_plugin_dir(
+            plugins_dir,
+            "alpha",
+            register_body='import plugin_order_trace; plugin_order_trace.events.append("alpha")',
+            auto_enable=False,
+        )
+        _make_plugin_dir(
+            plugins_dir / "wrappers",
+            "zeta-dir",
+            register_body='import plugin_order_trace; plugin_order_trace.events.append("zeta")',
+            manifest_extra={"name": "zeta"},
+            auto_enable=False,
+        )
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["wrappers/zeta-dir", "alpha"]}})
+        )
+        bundled = tmp_path / "bundled"
+        bundled.mkdir()
+        trace = types.SimpleNamespace(events=[])
+        monkeypatch.setitem(sys.modules, "plugin_order_trace", trace)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(plugins_mod, "get_bundled_plugins_dir", lambda: bundled)
+
+        PluginManager().discover_and_load()
+
+        assert trace.events == ["zeta", "alpha"]
+
+    def test_malformed_enabled_plugins_logs_warning_and_fails_closed(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """Invalid enable-list entries explain why opt-in discovery is disabled."""
+        from hermes_cli import plugins as plugins_mod
+
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["valid", 42]}})
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+            assert plugins_mod._get_enabled_plugins() is None
+
+        assert "Ignoring malformed plugins.enabled" in caplog.text
+
     def test_enabled_portable_plugin_registers_components(
         self, tmp_path, monkeypatch
     ):

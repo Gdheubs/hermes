@@ -583,19 +583,21 @@ def _get_disabled_plugins() -> set:
         return set()
 
 
-def _get_enabled_plugins() -> Optional[set]:
-    """Read the enabled-plugins allow-list from config.yaml.
+def _get_enabled_plugins() -> Optional[List[str]]:
+    """Read the ordered enabled-plugins allow-list from config.yaml.
 
-    Plugins are opt-in by default — only plugins whose name appears in
-    this set are loaded. Returns:
+    Plugins are opt-in by default — only plugins whose name appears in this
+    list are loaded. Its order is also the registration order for explicitly
+    enabled plugins, which lets composition-sensitive plugins deliberately wrap
+    one another. Returns:
 
     * ``None`` — the key is missing or malformed. Callers should treat
       this as "nothing enabled yet" (the opt-in default); the first
       ``migrate_config`` run populates the key with a grandfathered set
       of currently-installed user plugins so existing setups don't
       break on upgrade.
-    * ``set()`` — an empty list was explicitly set; nothing loads.
-    * ``set(...)`` — the concrete allow-list.
+    * ``[]`` — an empty list was explicitly set; nothing loads.
+    * ``[...]`` — the concrete ordered allow-list.
     """
     try:
         from hermes_cli.config import load_config
@@ -606,9 +608,12 @@ def _get_enabled_plugins() -> Optional[set]:
         if "enabled" not in plugins_cfg:
             return None
         enabled = plugins_cfg.get("enabled")
-        if not isinstance(enabled, list):
+        if not isinstance(enabled, list) or not all(isinstance(item, str) for item in enabled):
+            logger.warning(
+                "Ignoring malformed plugins.enabled; expected a list of plugin names"
+            )
             return None
-        return set(enabled)
+        return enabled
     except Exception:
         return None
 
@@ -853,13 +858,16 @@ def validate_config_schema(
 
 def resolve_plugin_load_order(
     manifests: Mapping[str, "PluginManifest"],
+    *,
+    preferred_order: Optional[Iterable[str]] = None,
 ) -> List[str]:
     """Return plugin keys in dependency-respecting load order (#64165).
 
     When A requires B, B sorts before A (so B's ``register()`` runs first).
-    Ties break alphabetically for determinism. Dependency cycles are
-    detected, warned about, and the members of the cycle fall back to
-    alphabetical order after every non-cycle plugin they depend on.
+    Among dependency-independent plugins, ``preferred_order`` wins over the
+    deterministic alphabetical fallback. Entries may be a plugin key or its
+    legacy manifest name. Dependency cycles are detected, warned about, and
+    fall back to the same preference/alphabetical ordering.
     Missing dependencies are warned about here (once, at discovery) but do
     not remove the dependent plugin from the order — loads never hard-fail
     on a missing advisory dependency.
@@ -872,6 +880,20 @@ def resolve_plugin_load_order(
         name = manifests[k].name
         if name and name not in by_name:
             by_name[name] = k
+
+    preferred_positions = {
+        plugin_id: position
+        for position, plugin_id in enumerate(preferred_order or ())
+    }
+
+    def _load_priority(plugin_id: str) -> tuple[int, str]:
+        manifest = manifests[plugin_id]
+        positions = [
+            preferred_positions[candidate]
+            for candidate in (plugin_id, manifest.name)
+            if candidate in preferred_positions
+        ]
+        return (min(positions) if positions else len(preferred_positions), plugin_id)
 
     def _resolve_dep(dep_id: str) -> Optional[str]:
         if dep_id in manifests:
@@ -905,15 +927,15 @@ def resolve_plugin_load_order(
     except graphlib.CycleError as exc:
         cycle = exc.args[1] if len(exc.args) > 1 else []
         logger.warning(
-            "Plugin dependency cycle detected (%s); falling back to "
-            "alphabetical load order for all plugins",
+            "Plugin dependency cycle detected (%s); falling back to configured "
+            "preference/alphabetical load order for all plugins",
             " -> ".join(str(c) for c in cycle),
         )
-        return keys
+        return sorted(keys, key=_load_priority)
 
     ordered: List[str] = []
     while sorter.is_active():
-        ready = sorted(sorter.get_ready())
+        ready = sorted(sorter.get_ready(), key=_load_priority)
         ordered.extend(ready)
         sorter.done(*ready)
     return ordered
@@ -3896,8 +3918,9 @@ class PluginManager:
         for manifest in manifests:
             winners[manifest.key or manifest.name] = manifest
         # Standalone/user plugins that pass the gates below are collected
-        # here and loaded AFTER the sweep in dependency-respecting order
-        # (requires_plugins topological sort, #64165).
+        # here and loaded after the sweep in dependency-respecting order
+        # (requires_plugins topological sort, #64165). When multiple plugins
+        # are ready at once, their explicit config order is the tiebreak.
         to_load: Dict[str, PluginManifest] = {}
         for manifest in winners.values():
             lookup_key = manifest.key or manifest.name
@@ -3986,10 +4009,12 @@ class PluginManager:
             to_load[lookup_key] = manifest
 
         # Load the surviving standalone plugins in dependency order:
-        # when A requires B, B's register() runs before A's (topological
-        # sort, stable alphabetical tiebreak; cycles warn and fall back to
-        # alphabetical order). Missing deps warn but never block the load.
-        for lookup_key in resolve_plugin_load_order(to_load):
+        # when A requires B, B's register() runs before A's. Explicit config
+        # order breaks ties between ready plugins; otherwise the fallback is
+        # stable alphabetical order. Missing deps warn but never block the load.
+        for lookup_key in resolve_plugin_load_order(
+            to_load, preferred_order=enabled
+        ):
             manifest = to_load[lookup_key]
             self._warn_python_dependencies(manifest)
             self._validate_plugin_config_schema(manifest)
