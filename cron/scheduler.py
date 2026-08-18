@@ -14,12 +14,14 @@ import concurrent.futures
 import contextlib
 import contextvars
 import errno
+import hashlib
 import json
 import logging
 import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -1621,10 +1623,11 @@ def _maybe_mirror_cron_delivery(
         # The brief is not the agent speaking; an assistant-role mirror lands as
         # assistant→assistant after the agent's last turn and breaks strict
         # alternation (issue #2221, the exact failure #2313 removed). A
-        # user-role turn collapses safely via repair_message_sequence's
-        # consecutive-user merge on every provider, and the prefix preserves the
-        # "this came from cron" context that the dropped SQLite mirror metadata
-        # would otherwise lose on replay.
+        # user-role turn merges safely on the per-request API copy through
+        # ``_drop_thinking_only_and_merge_users`` for strict providers, while
+        # remaining a distinct canonical source message. The prefix preserves
+        # the "this came from cron" context that the dropped SQLite mirror
+        # metadata would otherwise lose on replay.
         ok = mirror_to_session(
             platform_name,
             str(chat_id),
@@ -4455,6 +4458,70 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
             continue
         if reason:
             return reason
+
+
+def _resolve_cron_session_db_timeout() -> float:
+    """Resolve the bounded SessionDB constructor timeout for cron paths."""
+    timeout: float | None = None
+    raw_env_timeout = os.getenv("HERMES_CRON_SESSION_DB_TIMEOUT", "").strip()
+    if raw_env_timeout:
+        try:
+            timeout = float(raw_env_timeout)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid HERMES_CRON_SESSION_DB_TIMEOUT=%r; using config/default",
+                raw_env_timeout,
+            )
+    if timeout is None:
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+            cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+            configured = cron_cfg.get("session_db_timeout_seconds")
+            if configured is not None:
+                timeout = float(configured)
+        except Exception as exc:
+            logger.debug(
+                "Failed to load cron.session_db_timeout_seconds from config: %s",
+                exc,
+            )
+    return 10.0 if timeout is None else timeout
+
+
+def _open_cron_session_db(log_context: str):
+    """Open SessionDB without allowing a wedged constructor to block cron."""
+    timeout = _resolve_cron_session_db_timeout()
+    try:
+        from hermes_state import SessionDB
+
+        if timeout <= 0:
+            return SessionDB()
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = pool.submit(SessionDB)
+        # If SessionDB() later completes inside the abandoned worker, the
+        # future's result — an open SessionDB holding .db / WAL / SHM file
+        # handles — would be orphaned and never closed, leaking descriptors
+        # until EMFILE (#72782).  Register the done-callback ONLY on the
+        # timeout path so it fires for a late result; adding it before
+        # .result() would immediately close a db that completed on time.
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            future.add_done_callback(_close_late_session_db_result)
+            raise
+        finally:
+            # A wedged constructor must not hold up the tick or job monitor.
+            pool.shutdown(wait=False)
+    except concurrent.futures.TimeoutError:
+        logger.error(
+            "%s: SessionDB init did not return within %.0fs — proceeding "
+            "without a session store instead of blocking forever",
+            log_context,
+            timeout,
+        )
+    except Exception as exc:
+        logger.debug("%s: SQLite session store not available: %s", log_context, exc)
     return None
 
 
@@ -4620,8 +4687,13 @@ def run_job(
     # entirely: no AIAgent, no prompt, no tool loop, no token spend.
     #
     # We check this BEFORE importing run_agent / constructing SessionDB so
-    # a pure-script tick never pays for the agent machinery it isn't going
-    # to use. Keep this block self-contained.
+    # silent and failed script ticks keep the zero-agent-machinery fast path.
+    # A successful run with visible stdout is recorded lazily, after the script
+    # completes, so it appears in ``/api/cron/jobs/{id}/runs`` without taxing
+    # the high-frequency no-op path. The tradeoff is deliberate: no_agent runs
+    # do not get an in-flight session row, and silent/failed runs remain visible
+    # through the existing cron status/output lifecycle rather than SessionDB.
+    # Keep this block self-contained.
     #
     # Semantics:
     #   - script stdout (trimmed) → delivered verbatim as the final message
@@ -4652,6 +4724,60 @@ def run_job(
             err = "no_agent=True but no script is set for this job"
             logger.error("Job '%s': %s", job_id, err)
             return False, "", "", err
+
+        def _record_visible_run(run_doc: str) -> None:
+            """Persist one completed, user-visible run without taxing no-op ticks."""
+            session_db = None
+            session_created = False
+            run_session_id = (
+                f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+            )
+            try:
+                from hermes_state import SessionDB
+
+                session_db = SessionDB()
+            except (Exception, KeyboardInterrupt) as e:
+                logger.debug(
+                    "Job '%s': SQLite session store not available for no_agent run: %s",
+                    job_id, e,
+                )
+                return
+
+            try:
+                session_db.create_session(run_session_id, source="cron")
+                session_created = True
+                # First user message becomes the run's preview in run history.
+                session_db.append_message(
+                    run_session_id, "user", f"no_agent script: {script_path}"
+                )
+                session_db.append_message(run_session_id, "assistant", run_doc)
+                # Same titling scheme as the agent path so sidebars/history show
+                # a meaningful label; the run-time suffix keeps it unique against
+                # the sessions.title index across runs.
+                title_base = " ".join(job_name.split())[:60].strip() or f"cron {job_id}"
+                session_db.set_session_title(
+                    run_session_id,
+                    f"{title_base} · {_hermes_now().strftime('%b %d %H:%M')}",
+                )
+            except (Exception, KeyboardInterrupt) as e:
+                logger.debug(
+                    "Job '%s': failed to record no_agent run output: %s", job_id, e
+                )
+            finally:
+                if session_created:
+                    try:
+                        session_db.end_session(run_session_id, "cron_complete")
+                    except (Exception, KeyboardInterrupt) as e:
+                        logger.debug(
+                            "Job '%s': failed to end no_agent run session: %s",
+                            job_id, e,
+                        )
+                try:
+                    session_db.close()
+                except (Exception, KeyboardInterrupt) as e:
+                    logger.debug(
+                        "Job '%s': failed to close SQLite session store: %s", job_id, e
+                    )
 
         # Apply workdir if configured — lets scripts use predictable relative
         # paths. For no_agent jobs this is passed as the subprocess cwd so the
@@ -4730,6 +4856,7 @@ def run_job(
             f"---\n\n"
             f"{output}\n"
         )
+        _record_visible_run(doc)
         return True, doc, output, None
 
     # ---------------------------------------------------------------
@@ -4808,68 +4935,7 @@ def run_job(
     # _running_job_ids never runs, so the job stays wedged "running" until
     # the whole gateway process is restarted, silently skipping every
     # scheduled fire in between with "already running — skipping".
-    _session_db = None
-    try:
-        from hermes_state import SessionDB
-
-        # Resolve timeout: env override → config.yaml → default 10s.
-        # Mirrors the script_timeout_seconds resolution pattern.
-        _session_db_timeout: float | None = None
-        _raw_env_timeout = os.getenv("HERMES_CRON_SESSION_DB_TIMEOUT", "").strip()
-        if _raw_env_timeout:
-            try:
-                _session_db_timeout = float(_raw_env_timeout)
-            except (ValueError, TypeError):
-                logger.warning(
-                    "Invalid HERMES_CRON_SESSION_DB_TIMEOUT=%r; using config/default",
-                    _raw_env_timeout,
-                )
-        if _session_db_timeout is None:
-            try:
-                from hermes_cli.config import load_config
-                _cfg = load_config() or {}
-                _cron_cfg = _cfg.get("cron", {}) if isinstance(_cfg, dict) else {}
-                _configured = _cron_cfg.get("session_db_timeout_seconds")
-                if _configured is not None:
-                    _session_db_timeout = float(_configured)
-            except Exception as exc:
-                logger.debug(
-                    "Failed to load cron.session_db_timeout_seconds from config: %s",
-                    exc,
-                )
-        if _session_db_timeout is None:
-            _session_db_timeout = 10.0
-
-        if _session_db_timeout > 0:
-            _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-            _session_db_future = _session_db_pool.submit(SessionDB)
-            try:
-                _session_db = _session_db_future.result(timeout=_session_db_timeout)
-            except concurrent.futures.TimeoutError:
-                # The worker is abandoned (shutdown below doesn't wait for it).
-                # If SessionDB() later completes inside it, the future's result
-                # would be orphaned and its SQLite FDs (.db, WAL, SHM) leak
-                # until process exit.  Register a done-callback that retrieves
-                # and closes any eventual late result (#72782).
-                _session_db_future.add_done_callback(_close_late_session_db_result)
-                raise
-            finally:
-                # Don't wait for a wedged connect() to unwind — abandon the
-                # worker thread (same pattern as the agent inactivity timeout
-                # further down) rather than blocking shutdown on it too.
-                _session_db_pool.shutdown(wait=False)
-        else:
-            # 0 = unlimited (legacy behavior, opt-in for debugging)
-            _session_db = SessionDB()
-    except concurrent.futures.TimeoutError:
-        logger.error(
-            "Job '%s': SessionDB init did not return within %.0fs — proceeding "
-            "without a session store for this run instead of blocking it "
-            "forever",
-            job.get("id", "?"), _session_db_timeout,
-        )
-    except Exception as e:
-        logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
+    _session_db = _open_cron_session_db(f"Job '{job.get('id', '?')}'")
 
     # Wake-gate: if this job has a pre-check script, run it BEFORE building
     # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
@@ -4997,67 +5063,34 @@ def run_job(
     for _var_name in _cron_delivery_vars:
         _VAR_MAP[_var_name].set("")
 
-    # Per-job working directory — _SESSION_CWD was already set via
-    # set_session_vars(cwd=...) above. Here we only handle the
-    # process-global TERMINAL_CWD env var, which is serialized by
-    # _terminal_cwd_lock to avoid leaking into concurrent jobs.
+    # Per-job working directory.  When set (and validated at create/update
+    # time), we pin it via the _SESSION_CWD ContextVar (set_session_cwd) so:
+    #   - build_context_files_prompt() picks up AGENTS.md / CLAUDE.md /
+    #     .cursorrules from the job's project dir, AND
+    #   - the terminal, file, and code-exec tools run commands from there.
     #
-    # os.environ["TERMINAL_CWD"] is process-global, so this override is
-    # serialized by _terminal_cwd_lock (acquired just below): a workdir job
-    # holds it as a writer for its whole run, excluding every other job, while
-    # workdir-less jobs hold it as readers and stay parallel with each other.
-    # The sequential pool only keeps workdir jobs from overlapping EACH OTHER;
-    # the lock is what additionally keeps a concurrently-firing workdir-less
-    # parallel-pool job from observing this override and running its shell /
-    # file / code-exec commands in the wrong directory.  For workdir-less jobs
-    # we leave TERMINAL_CWD untouched — preserves the original behaviour
-    # (skip_context_files=True, tools use whatever cwd the scheduler has).
-    #
-    # The critical path (resolve_context_cwd / build_context_files_prompt)
-    # checks _SESSION_CWD first, so gateway sessions with no override see
-    # their own cwd, not the cron's workdir (#69396).
+    # ContextVar isolation means each cron job's workdir is visible only
+    # within that job's execution context (propagated through
+    # contextvars.copy_context() in _submit_with_guard and
+    # propagate_context_to_thread in tool dispatch).  Multiple workdir
+    # jobs can run in parallel without colliding — no process-global
+    # os.environ mutation, no ReadWriteLock, no sequential pool.
+    _job_workdir = (job.get("workdir") or "").strip() or None
+    if _job_workdir and not Path(_job_workdir).is_dir():
+        # Directory was removed between create-time validation and now.  Log
+        # and drop back to old behaviour rather than crashing the job.
+        logger.warning(
+            "Job '%s': configured workdir %r no longer exists — running without it",
+            job_id, _job_workdir,
+        )
+        _job_workdir = None
 
-    # Snapshot the current env value BEFORE acquiring the lock so the finally
-    # below can always restore it, even if an exception fires before we set the
-    # override inside the try.  This read can't leak the lock (it precedes the
-    # acquire) and is a no-op for workdir-less jobs (they never mutate the env).
-    _prior_terminal_cwd = os.environ.get("TERMINAL_CWD", "_UNSET_")
+    _cwd_token = None
 
-    _holds_cwd_write = _job_workdir is not None
-    _cwd_lock_timeout = _cwd_lock_timeout_seconds()
-    _cwd_lock_acquired = True
-    if _holds_cwd_write:
-        if not _terminal_cwd_lock.acquire_write(timeout=_cwd_lock_timeout):
-            _cwd_lock_acquired = False
-    else:
-        if not _terminal_cwd_lock.acquire_read(timeout=_cwd_lock_timeout):
-            _cwd_lock_acquired = False
-
-    # Everything after the acquire MUST live inside this try, so the finally
-    # below always releases the lock even if the env override or any later
-    # statement raises.  A leaked writer would deadlock the whole scheduler
-    # (every future job blocks on acquire_*); a leaked reader blocks all
-    # future writers.  Acquire itself can't leak (it either blocks or returns).
     _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
     _cron_session_token = None
     _non_dispatcher_token = None
     try:
-        if not _cwd_lock_acquired:
-            # Fail closed (#79768): running without the lock would let a
-            # concurrent workdir job's process-global TERMINAL_CWD override
-            # leak into this job's shell/file/code-exec commands — silent
-            # wrong-directory execution, the exact corruption the lock
-            # exists to prevent. A loud failure is recoverable (next tick /
-            # manual rerun); a job that ran in the wrong directory is not.
-            raise TimeoutError(
-                f"Timed out waiting for the TERMINAL_CWD "
-                f"{'write' if _holds_cwd_write else 'read'} lock after "
-                f"{_cwd_lock_timeout:.0f}s — another cron job (a workdir "
-                f"writer, or long-running readers) has held it for longer "
-                f"than the cron inactivity limit. If a workdir job is the "
-                f"holder, stagger its schedule or remove its workdir to "
-                f"unblock this job (#79768)."
-            )
         # Scope cron approval policy to this job. Keep the token so the finally
         # restores the pre-job state instead of pinning an explicit empty value,
         # which would suppress the legacy os.environ fallback used by standalone
@@ -5084,7 +5117,8 @@ def run_job(
         # at the run_conversation hop carries this into the agent thread.
         _non_dispatcher_token = enter_non_dispatcher_owned_context()
         if _job_workdir:
-            os.environ["TERMINAL_CWD"] = _job_workdir
+            from agent.runtime_cwd import set_session_cwd
+            _cwd_token = set_session_cwd(_job_workdir)
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
 
         # Re-read .env and config.yaml fresh every run so provider/key
@@ -5583,6 +5617,14 @@ def run_job(
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+
+        # Register the ownership lease so the stale-session reaper can prove
+        # this run is dead before closing its session row.  Done AFTER
+        # AIAgent/session init and BEFORE run_conversation. Failure is
+        # non-fatal; without a lease the row is recoverable only after the
+        # full stale-session grace window.
+        _cron_lease = _register_cron_session_lease(_cron_session_id, job_id)
+        _last_lease_heartbeat = time.monotonic()
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,
@@ -5636,6 +5678,22 @@ def run_job(
                     "Job '%s': run_claim heartbeat failed", job_name, exc_info=True
                 )
 
+        def _heartbeat_cron_lease_if_due():
+            """Heartbeat the session ownership lease for ALL AI cron runs.
+
+            Unlike the run_claim heartbeat (one-shots only), this fires for
+            every run so a stale lease reliably means the owning run stopped
+            progressing.  Throttled by ``_LEASE_HEARTBEAT_INTERVAL_SECONDS``
+            and best-effort — a failed heartbeat does not weaken the existing
+            run_claim heartbeat or abort the run.
+            """
+            nonlocal _last_lease_heartbeat
+            _mono = time.monotonic()
+            if _mono - _last_lease_heartbeat < _LEASE_HEARTBEAT_INTERVAL_SECONDS:
+                return
+            _last_lease_heartbeat = _mono
+            _heartbeat_cron_session_lease(_cron_session_id)
+
         _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         # Preserve scheduler-scoped ContextVar state (for example skill-declared
         # env passthrough registrations) when the cron run hops into the worker
@@ -5648,9 +5706,10 @@ def run_job(
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
-                # Unlimited — no inactivity watchdog, but a one-shot still
-                # needs its run_claim heartbeat, so poll instead of blocking.
-                if _is_oneshot or cancel_event is not None:
+                # Unlimited — no inactivity watchdog, but one-shots still
+                # need their run_claim heartbeat and every registered lease
+                # needs its own heartbeat, so poll instead of blocking.
+                if _is_oneshot or _cron_lease is not None:
                     result = None
                     while True:
                         done, _ = concurrent.futures.wait(
@@ -5662,7 +5721,10 @@ def run_job(
                             break
                         _abort_if_fire_claim_lost()
                         _heartbeat_run_claim_if_due()
+                        _heartbeat_cron_lease_if_due()
                 else:
+                    # Lease registration failed, so there is nothing to
+                    # heartbeat. The age grace still protects this live run.
                     result = _cron_future.result()
             else:
                 result = None
@@ -5676,6 +5738,7 @@ def run_job(
                         break
                     _abort_if_fire_claim_lost()
                     _heartbeat_run_claim_if_due()
+                    _heartbeat_cron_lease_if_due()
                     # Agent still running — check inactivity.
                     _idle_secs = 0.0
                     if hasattr(agent, "get_activity_summary"):
@@ -5883,23 +5946,13 @@ def run_job(
         return False, output, "", error_msg
 
     finally:
-        # Restore TERMINAL_CWD to whatever it was before this job ran.  We
-        # only ever mutate it when the job has a workdir AND actually held
-        # the write lock — a fail-closed timeout raised before the env-set,
-        # so restoring there would replay a pre-wait snapshot over the
-        # ACTIVE holder's live override.
-        if _job_workdir and _cwd_lock_acquired:
-            if _prior_terminal_cwd == "_UNSET_":
-                os.environ.pop("TERMINAL_CWD", None)
-            else:
-                os.environ["TERMINAL_CWD"] = _prior_terminal_cwd
-        # Release the cwd lock now that the env is restored, so a waiting
-        # workdir job (or queued reader) can proceed without seeing the override.
-        if _cwd_lock_acquired:
-            if _holds_cwd_write:
-                _terminal_cwd_lock.release_write()
-            else:
-                _terminal_cwd_lock.release_read()
+        # Reset the per-context _SESSION_CWD ContextVar if we overrode it.
+        # clear_session_vars (below) also resets _SESSION_CWD to "", but
+        # resetting the token explicitly is cleaner and handles the case
+        # where clear_session_vars is skipped due to an earlier exception.
+        if _cwd_token is not None:
+            from agent.runtime_cwd import _SESSION_CWD
+            _SESSION_CWD.reset(_cwd_token)
         # Clean up ContextVar session/delivery state for this job.
         # clear_session_vars also clears _SESSION_CWD internally, so no
         # separate clear_session_cwd() call is needed.
@@ -5910,6 +5963,7 @@ def run_job(
             exit_non_dispatcher_owned_context(_non_dispatcher_token)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
+        _cron_session_ended = True
         if _session_db:
             # The agent turn has already returned. Bound every subsequent DB
             # operation so storage failure cannot hold the dispatch guard.
@@ -5978,11 +6032,20 @@ def run_job(
                     _final_cron_session_id, "cron_complete"
                 )
             except (Exception, KeyboardInterrupt) as e:
+                # end_session failed — retain the lease so a later process can
+                # recover this session via the reaper once the owner is dead.
+                _cron_session_ended = False
                 logger.debug("Job '%s': failed to end session: %s", job_id, e)
             try:
                 _session_db.close()
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
+        # Remove the ownership lease only after a successful end_session (or
+        # when no session DB row could exist because _session_db was never
+        # opened).  If end_session failed the lease is retained so the reaper
+        # can recover the orphaned row later.  Idempotent (missing file = no-op).
+        if _cron_session_ended:
+            _remove_cron_session_lease(_cron_session_id)
         # Release subprocesses, terminal sandboxes, browser daemons, and the
         # main OpenAI/httpx client held by this ephemeral cron agent. Without
         # this, a gateway that ticks cron every N minutes leaks fds per job
@@ -6726,6 +6789,314 @@ def create_job_with_scheduler_registration(**kwargs) -> dict:
 _DEAD_OWNER_REAP_INTERVAL_SECONDS = 300.0
 _last_dead_owner_reap_at: Optional[float] = None
 
+# ── Cron session ownership leases ────────────────────────────────────
+# Every AI-backed cron run registers a *lease* sidecar so the reaper can
+# prove the owning run is dead before closing its session row.  This avoids
+# the cross-process hazard of the previous design (which only checked this
+# process's ``_running_job_ids`` and would reap another process's active
+# >45m run).  Leases live in a profile-local directory under ``cron/`` — no
+# schema bump — and are named by a SHA-256 hash of the session_id so
+# untrusted ids are never interpolated into a filesystem path.
+
+
+_CRON_LEASE_DIR_NAME = "cron_session_leases"
+_STALE_CRON_SESSION_MAX_AGE_SECONDS = 45 * 60
+_LEASE_HEARTBEAT_INTERVAL_SECONDS = 30.0
+
+
+def _cron_lease_dir() -> Path:
+    return _get_hermes_home() / "cron" / _CRON_LEASE_DIR_NAME
+
+
+def _cron_lease_path(session_id: str) -> Path:
+    """Return the on-disk lease path for ``session_id``.
+
+    The filename is a SHA-256 hex digest of the session id — never the raw
+    id — so an untrusted session id cannot escape the lease directory or
+    inject path separators (``..`` / ``/`` / NUL).  The directory is created
+    lazily; callers that only *read* leases should tolerate its absence.
+    """
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    return _cron_lease_dir() / f"{digest}.json"
+
+
+def _cron_local_host_id() -> str:
+    """A best-effort stable identifier for this host.
+
+    Used only to decide whether a lease's owner *could* be probed locally
+    (same host) — never as a trust assertion.  When it cannot be determined
+    the reaper treats the lease as cross-host and refuses to reap it.
+    """
+    try:
+        return socket.gethostname() or ""
+    except Exception:
+        return ""
+
+
+def _write_cron_session_lease(path: Path, lease: dict) -> None:
+    """Atomically replace ``path`` with a complete lease document."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".tmp.{os.getpid()}.{threading.get_ident()}")
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(lease, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _register_cron_session_lease(
+    session_id: str, job_id: str
+) -> Optional[dict]:
+    """Atomically write the ownership lease for a cron session.
+
+    Called after ``AIAgent`` / session initialization, before
+    ``run_conversation``. Returns the lease dict on success, or ``None`` on
+    failure. The run proceeds; an ownerless row remains protected by the
+    stale-session age grace.
+    """
+    try:
+        from gateway.status import _get_process_start_time
+
+        owner_pid = os.getpid()
+        lease = {
+            "session_id": session_id,
+            "job_id": job_id,
+            "owner_pid": owner_pid,
+            "owner_start_time": _get_process_start_time(owner_pid),
+            "host": _cron_local_host_id(),
+            "heartbeat_at": time.time(),
+        }
+        path = _cron_lease_path(session_id)
+        _write_cron_session_lease(path, lease)
+        return lease
+    except Exception:
+        logger.debug("Failed to register cron session lease: %s", exc_info=True)
+        return None
+
+
+def _heartbeat_cron_session_lease(session_id: str) -> None:
+    """Refresh a lease heartbeat without changing its owner identity.
+
+    Called from the run monitor loop for every AI cron run.  The recorded
+    PID and process-start fingerprint must still match this process; a stale
+    runner must never refresh a replacement owner's lease.
+    """
+    try:
+        from gateway.status import _get_process_start_time
+
+        lease = _read_cron_session_lease(session_id)
+        if not lease or lease.get("session_id") != session_id:
+            return
+        owner_pid = os.getpid()
+        try:
+            recorded_pid = int(lease.get("owner_pid") or 0)
+        except (TypeError, ValueError):
+            return
+        if recorded_pid != owner_pid:
+            return
+
+        recorded_start = lease.get("owner_start_time")
+        if recorded_start is not None:
+            try:
+                recorded_start = int(recorded_start)
+                current_start = _get_process_start_time(owner_pid)
+                if current_start is None or recorded_start != int(current_start):
+                    return
+            except (TypeError, ValueError):
+                return
+
+        lease["heartbeat_at"] = time.time()
+        _write_cron_session_lease(_cron_lease_path(session_id), lease)
+    except Exception:
+        logger.debug("Failed to heartbeat cron session lease: %s", exc_info=True)
+
+
+def _remove_cron_session_lease(session_id: str) -> None:
+    """Delete the lease sidecar.  Idempotent (missing file is a no-op)."""
+    try:
+        path = _cron_lease_path(session_id)
+        path.unlink(missing_ok=True)
+    except Exception:
+        logger.debug("Failed to remove cron session lease: %s", exc_info=True)
+
+
+def _read_cron_session_lease(session_id: str) -> Optional[dict]:
+    """Read and parse the lease for ``session_id``, or ``None``.
+
+    ``None`` covers missing, unreadable, and malformed leases. After the age
+    grace, that means the legacy row has no live ownership evidence and is
+    eligible for recovery.
+    """
+    path = _cron_lease_path(session_id)
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    if not raw.strip():
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _lease_runner_identity(lease: Optional[dict]) -> tuple[Any, Any]:
+    """Return runner PID/id evidence from current or pre-fencing leases."""
+    if not isinstance(lease, dict):
+        return None, None
+    runner_pid = lease.get("runner_pid", lease.get("owner_pid"))
+    runner_id = lease.get("runner_id", lease.get("owner_start_time"))
+    return runner_pid, runner_id
+
+def _session_has_active_in_process_owner(session_id: str) -> bool:
+    """Return whether the session belongs to a job running in this process."""
+    return any(
+        session_id.startswith(f"cron_{job_id}_")
+        for job_id in get_running_job_ids()
+    )
+
+
+def _owner_definitively_dead(lease: dict) -> bool:
+    """Return True only when the lease owner is *provably* no longer alive.
+
+    Fail-closed: any uncertainty (cross-host, unparseable pid, missing
+    start-time fingerprint, ambiguous probe) returns ``False`` so the
+    session is left alone.  For the local host we use the gateway.status
+    process-liveness probe plus the recorded start-time fingerprint to
+    distinguish PID reuse — a recycled PID yields a different start time
+    and is never mistaken for the original owner.
+    """
+    runner_pid, _runner_id = _lease_runner_identity(lease)
+    try:
+        pid = int(runner_pid or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+
+    try:
+        from gateway.status import _pid_exists, _get_process_start_time
+        local_host = _cron_local_host_id()
+    except Exception:
+        return False
+
+    # Different host / unknown host → cannot probe locally → fail closed.
+    if not local_host or lease.get("host") != local_host:
+        return False
+
+    try:
+        if not _pid_exists(pid):
+            return True
+    except Exception:
+        return False
+
+    # PID is alive — guard against PID reuse via the start-time fingerprint.
+    recorded_start = lease.get("owner_start_time")
+    if recorded_start is None:
+        # No fingerprint recorded → cannot prove reuse → fail closed.
+        return False
+    try:
+        recorded_start = int(recorded_start)
+    except (TypeError, ValueError):
+        return False
+    try:
+        current_start = _get_process_start_time(pid)
+    except Exception:
+        return False
+    if current_start is None:
+        # Probe uncertain → fail closed.
+        return False
+    # Start-time mismatch → the original owner died and the PID was reused
+    # by a different process → the owner is definitively dead.
+    return current_start != recorded_start
+
+
+def _reap_stale_cron_sessions() -> int:
+    """Close expired cron sessions with no live ownership evidence.
+
+    Every candidate must exceed ``_STALE_CRON_SESSION_MAX_AGE_SECONDS``.
+    A matching entry in ``_running_job_ids`` always fences the current
+    process's active run, including the lease-write-failure path. Legacy or
+    malformed rows without either runner PID or runner identity are otherwise
+    eligible after the grace window. Rows carrying owner evidence use the
+    stricter lease path — matching session id, stale heartbeat, and a
+    definitively dead local owner. Fresh, active, cross-host, mismatched, or
+    otherwise uncertain owned leases remain open.
+
+    Closing uses ``end_session`` (exact id + ``ended_at IS NULL`` guard) so
+    concurrent closes are idempotent.
+    """
+    try:
+        db = _open_cron_session_db("Stale cron session reaper")
+        if db is None:
+            return 0
+        try:
+            open_sessions = db.list_open_cron_sessions()
+        finally:
+            db.close()
+        if not open_sessions:
+            return 0
+
+        now = time.time()
+        cutoff = now - _STALE_CRON_SESSION_MAX_AGE_SECONDS
+        reaped = 0
+        for row in open_sessions:
+            session_id = row.get("id", "")
+            started_at = row.get("started_at")
+            if started_at is None or started_at >= cutoff:
+                continue  # not old enough
+            if _session_has_active_in_process_owner(session_id):
+                continue  # this process still owns the active run
+            lease = _read_cron_session_lease(session_id)
+            runner_pid, runner_id = _lease_runner_identity(lease)
+            has_owner_evidence = runner_pid is not None or runner_id is not None
+            if has_owner_evidence:
+                if lease.get("session_id") != session_id:
+                    continue  # ownership evidence for another/unknown session
+                heartbeat_at = lease.get("heartbeat_at")
+                try:
+                    heartbeat_at = float(heartbeat_at)
+                except (TypeError, ValueError):
+                    continue  # owned lease with unknown freshness → preserve
+                if heartbeat_at >= cutoff:
+                    continue  # heartbeat is fresh — run may still be alive
+                if not _owner_definitively_dead(lease):
+                    continue  # owner alive / PID reuse / uncertain → preserve
+            try:
+                db2 = _open_cron_session_db("Stale cron session reaper")
+                if db2 is None:
+                    continue
+                try:
+                    db2.end_session(session_id, "stale_reaped")
+                finally:
+                    db2.close()
+                _remove_cron_session_lease(session_id)
+                reaped += 1
+                lease_details = lease or {}
+                if has_owner_evidence:
+                    recovery_reason = (
+                        f"runner pid {runner_pid} dead, heartbeat stale"
+                    )
+                else:
+                    recovery_reason = "no live ownership evidence after grace"
+                logger.warning(
+                    "Reaped stale cron session %s (job %s) — %s",
+                    session_id,
+                    lease_details.get("job_id", "?"),
+                    recovery_reason,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to reap stale cron session %s: %s",
+                    session_id, exc_info=True,
+                )
+        return reaped
+    except Exception:
+        logger.debug("Stale cron session reaper failed: %s", exc_info=True)
+        return 0
+
 
 def tick(
     verbose: bool = True,
@@ -6734,6 +7105,7 @@ def tick(
     sync: bool = True,
     *,
     can_dispatch=None,
+    reap_stale_sessions: bool = True,
 ):
     """
     Check and run all due jobs.
@@ -6747,6 +7119,7 @@ def tick(
         loop: Optional asyncio event loop (from gateway) for live adapter sends
         can_dispatch: Optional synchronous gate; false leaves due jobs untouched
             for the next allowed tick
+        reap_stale_sessions: Run periodic lease-aware recovery on this tick
 
     Returns:
         Number of jobs executed (0 if another tick is already running)
@@ -6796,6 +7169,16 @@ def tick(
         else:
             logger.error("Cron tick could not acquire tick lock: %s", exc)
         raise
+
+    # ── Stale-session reaper (periodic ticks) ─────────────────────────
+    # Startup performs an unconditional pass. Minute-or-slower ticker cadences
+    # also recover between restarts; genuine sub-minute loops skip the repeated
+    # SessionDB scan.
+    if reap_stale_sessions:
+        try:
+            _reap_stale_cron_sessions()
+        except Exception:
+            logger.debug("tick reaper invocation failed: %s", exc_info=True)
 
     try:
         # Global emergency stop (`hermes pause`): skip dispatch entirely while
@@ -6955,14 +7338,13 @@ def tick(
                 verbose=verbose,
             )
 
-        # Partition due jobs: those with a per-job workdir mutate
-        # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
-        # they queue on the single-thread sequential pool to run one at a time.
-        # That alone only keeps workdir jobs from overlapping EACH OTHER;
-        # run_job's _terminal_cwd_lock is what additionally stops a concurrently
-        # firing workdir-less parallel-pool job from observing the override.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        # All due jobs run in the parallel pool. Workdir jobs no longer need
+        # sequential execution because the workdir is pinned via a per-context
+        # ContextVar (_SESSION_CWD), not the process-global os.environ.
+        # contextvars.copy_context() in _submit_with_guard ensures each job's
+        # ContextVar is isolated from every other concurrently running job.
+        sequential_jobs: list = []
+        parallel_jobs = list(due_jobs)
 
         _results: list = []
         _all_futures: list = []
