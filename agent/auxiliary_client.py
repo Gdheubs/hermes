@@ -161,6 +161,7 @@ def aux_probe_mode():
         _aux_probe_state.active = prev
 
 from agent.credential_pool import load_pool
+from agent.message_content import flatten_message_text
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
@@ -8971,13 +8972,20 @@ class _ChatStreamAccumulator:
             return
         piece = getattr(delta, "content", None)
         if piece:
-            self.content_parts.append(piece)
+            # Stream deltas are fragments joined by "".join() in finish(),
+            # so flatten with sep="" to match cross-delta concatenation.
+            # Structured parts that need newlines include them in their text.
+            piece = flatten_message_text(piece, sep="")
+            if piece:
+                self.content_parts.append(piece)
         reasoning_piece = (
             getattr(delta, "reasoning", None)
             or getattr(delta, "reasoning_content", None)
         )
-        if reasoning_piece and isinstance(reasoning_piece, str):
-            self.reasoning_parts.append(reasoning_piece)
+        if reasoning_piece:
+            reasoning_piece = flatten_message_text(reasoning_piece, sep="")
+            if reasoning_piece:
+                self.reasoning_parts.append(reasoning_piece)
         for tc in (getattr(delta, "tool_calls", None) or []):
             idx = getattr(tc, "index", 0) or 0
             acc = self.tool_calls_acc.setdefault(

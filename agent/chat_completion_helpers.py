@@ -4125,8 +4125,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 model_name = chunk.model
 
             # Accumulate reasoning content
+            # Some OpenAI-compatible providers return delta.reasoning_content
+            # as a list of content parts instead of a string.  Flatten so
+            # downstream joins and .strip() calls don't raise.
             reasoning_text = getattr(delta, "reasoning_content", None) or getattr(delta, "reasoning", None)
             if reasoning_text:
+                # Stream deltas are fragments joined by "".join() downstream,
+                # so flatten with sep="" to match cross-delta concatenation.
+                reasoning_text = flatten_message_text(reasoning_text, sep="")
                 # Summary-part models (gpt-5.x and other Responses relays) send
                 # one complete markdown block per delta with no separator, so
                 # the parts glue into a single unreadable run. Only the tail of
