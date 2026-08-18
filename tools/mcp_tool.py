@@ -1071,6 +1071,31 @@ def _strip_reserved_meta_keys(meta) -> "Optional[Dict[str, Any]]":
     return out or None
 
 
+def _sanitize_json_value_unicode_tags(value: Any) -> Any:
+    """Recursively strip invisible Unicode TAG characters from a JSON value.
+
+    ``structuredContent`` and ``_meta`` are arbitrary JSON returned by the
+    MCP server -- the same untrusted-server threat model that motivated
+    stripping tag characters (U+E0000-U+E007F) from tool-result text,
+    embedded-resource text, prompt content, and tool descriptions (ported
+    from block/goose#10746). Those sweeps only ever walked ``content``
+    blocks; a server aware that ``content`` text gets sanitized can move
+    the same invisible-instruction payload into a ``structuredContent`` or
+    ``_meta`` string value instead, which is JSON-serialized straight into
+    the tool result the model reads. Only string leaves are rewritten --
+    keys are left alone (``_strip_reserved_meta_keys`` already gates
+    ``_meta`` keys by protocol prefix, and structural identifiers aren't
+    rendered as prose the way values are).
+    """
+    if isinstance(value, str):
+        return strip_unicode_tags(value)
+    if isinstance(value, dict):
+        return {k: _sanitize_json_value_unicode_tags(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_json_value_unicode_tags(v) for v in value]
+    return value
+
+
 def _mcp_image_extension_for_mime_type(mime_type: str) -> str:
     """Return a reasonable file extension for an MCP image MIME type."""
     import mimetypes
@@ -5884,8 +5909,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # host/protocol plumbing, not model-facing data. Unprefixed and
             # vendor-namespaced keys (`com.example.mcp/...`) pass through —
             # their semantics belong to the server.
-            structured = mcp_field(result, "structured_content", "structuredContent")
-            meta = _strip_reserved_meta_keys(mcp_field(result, "meta", "meta"))
+            structured = _sanitize_json_value_unicode_tags(
+                mcp_field(result, "structured_content", "structuredContent")
+            )
+            meta = _sanitize_json_value_unicode_tags(
+                _strip_reserved_meta_keys(mcp_field(result, "meta", "meta"))
+            )
             if structured is not None or meta is not None:
                 payload: Dict[str, Any] = {}
                 if text_result:
