@@ -43,6 +43,7 @@ import {
   requestGatewayForProfile,
   retireLocalProfileGateways
 } from '@/store/gateway'
+import { revealFileInTree } from '@/store/layout'
 import { notify, notifyError } from '@/store/notifications'
 import {
   $activeGatewayProfile,
@@ -251,6 +252,13 @@ export const host = {
   navigate: (path: string) => {
     window.location.hash = path.startsWith('#') ? path : `#${path}`
   },
+
+  /** Open the file-browser pane and reveal + select `path` in the workspace
+   *  tree (expanding ancestor folders, scrolling it into view) — the same
+   *  door the sidebar's "Reveal in file tree" command uses. Paths outside the
+   *  active workspace's cwd are safely ignored by the tree, so callers can
+   *  link any absolute path without worrying about arbitrary system files. */
+  revealFileInTree: (path: string): void => revealFileInTree(path),
 
   /** Open a stored session the way core surfaces do (focus an existing
    *  tile/main, else load into main). When `profile` names a non-active
