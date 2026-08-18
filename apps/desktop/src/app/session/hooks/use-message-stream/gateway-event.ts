@@ -15,6 +15,7 @@ import { coerceGatewayText, coerceThinkingText, normalizePersonalityValue } from
 import { playCompletionSound } from '@/lib/completion-sound'
 import {
   approvalReplaySessionId,
+  isBlockingPromptEvent,
   resolveGatewayEventSessionId,
   UNSCOPED_STREAM_EVENT_TYPES
 } from '@/lib/gateway-events'
@@ -406,6 +407,14 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
       if (replaySessionId) {
         void replayPendingApproval($gateway.get(), replaySessionId).catch(() => undefined)
+      }
+
+      // Stop/delete marks the runtime interrupted before awaiting the backend.
+      // Drop a prompt already queued on the event transport during that window;
+      // otherwise it can recreate its overlay and native notification after the
+      // conversation has been stopped or removed.
+      if (sessionId && isBlockingPromptEvent(event.type) && sessionInterrupted(sessionId)) {
+        return
       }
 
       // Mid-turn compaction does not emit another message.start. The first
