@@ -1363,10 +1363,17 @@ class MatrixAdapter(BasePlatformAdapter):
             self._approval_timeout_seconds = 300
         self._model_picker_prompts_by_event: Dict[str, _MatrixModelPickerPrompt] = {}
         self._choice_picker_prompts_by_event: Dict[str, _MatrixChoicePickerPrompt] = {}
-        allowed_users_raw = _startup_env_secret("MATRIX_ALLOWED_USERS")
-        self._allowed_user_ids: Set[str] = {
-            u.strip() for u in allowed_users_raw.split(",") if u.strip()
-        }
+        allowed_users_raw = config.extra.get("allowed_users")
+        if allowed_users_raw is None:
+            allowed_users_raw = _startup_env_secret("MATRIX_ALLOWED_USERS")
+        if isinstance(allowed_users_raw, list):
+            self._allowed_user_ids: Set[str] = {
+                str(u).strip() for u in allowed_users_raw if str(u).strip()
+            }
+        else:
+            self._allowed_user_ids: Set[str] = {
+                u.strip() for u in str(allowed_users_raw).split(",") if u.strip()
+            }
         self._allowed_room_ids: Set[str] = set(self._allowed_rooms)
         ignore_patterns_raw = os.getenv("MATRIX_IGNORE_USER_PATTERNS", "")
         self._ignored_user_patterns: list[re.Pattern[str]] = []
@@ -5371,35 +5378,47 @@ def interactive_setup() -> None:
                 print_info("Home room cleared.")
 
 
-def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
-    """Translate config.yaml matrix: keys into MATRIX_* env vars.
+def _csv_or_raw(value):
+    if isinstance(value, list):
+        return ",".join(str(v) for v in value)
+    return str(value)
 
-    Implements the apply_yaml_config_fn contract (#24849). Mirrors the legacy
-    matrix_cfg block from gateway/config.py::load_gateway_config(). Env vars
-    take precedence over YAML. Returns None — everything flows through env.
+
+def _profile_scoped_config_load() -> bool:
+    """True when this YAML load belongs to a multiplexed named profile."""
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+        return bool(is_multiplex_active() and current_secret_scope() is not None)
+    except Exception:
+        return False
+
+
+def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
+    """Translate config.yaml matrix: keys into extra + optional MATRIX_* env.
+
+    Authorization keys are always seeded into PlatformConfig.extra so a
+    named profile's YAML allowlists survive a scoped secret miss. The
+    process-global env bridge stays first-writer-wins for single-profile
+    callers and is skipped under an active multiplex scope.
     """
+    _skip_env_bridge = _profile_scoped_config_load()
+    extras: dict = {}
+
+    def _bridge(env_name: str, extra_key: str, raw) -> None:
+        if raw is None:
+            return
+        value = _csv_or_raw(raw)
+        extras[extra_key] = value
+        if not _skip_env_bridge and not os.getenv(env_name):
+            os.environ[env_name] = value
+
     if "require_mention" in matrix_cfg and not os.getenv("MATRIX_REQUIRE_MENTION"):
         os.environ["MATRIX_REQUIRE_MENTION"] = str(matrix_cfg["require_mention"]).lower()
-    au = matrix_cfg.get("allowed_users")
-    if au is not None and not os.getenv("MATRIX_ALLOWED_USERS"):
-        if isinstance(au, list):
-            au = ",".join(str(v) for v in au)
-        os.environ["MATRIX_ALLOWED_USERS"] = str(au)
-    frc = matrix_cfg.get("free_response_rooms")
-    if frc is not None and not os.getenv("MATRIX_FREE_RESPONSE_ROOMS"):
-        if isinstance(frc, list):
-            frc = ",".join(str(v) for v in frc)
-        os.environ["MATRIX_FREE_RESPONSE_ROOMS"] = str(frc)
-    ar = matrix_cfg.get("allowed_rooms")
-    if ar is not None and not os.getenv("MATRIX_ALLOWED_ROOMS"):
-        if isinstance(ar, list):
-            ar = ",".join(str(v) for v in ar)
-        os.environ["MATRIX_ALLOWED_ROOMS"] = str(ar)
-    ignore_patterns = matrix_cfg.get("ignore_user_patterns")
-    if ignore_patterns is not None and not os.getenv("MATRIX_IGNORE_USER_PATTERNS"):
-        if isinstance(ignore_patterns, list):
-            ignore_patterns = ",".join(str(v) for v in ignore_patterns)
-        os.environ["MATRIX_IGNORE_USER_PATTERNS"] = str(ignore_patterns)
+    _bridge("MATRIX_ALLOWED_USERS", "allowed_users", matrix_cfg.get("allowed_users"))
+    _bridge("MATRIX_FREE_RESPONSE_ROOMS", "free_response_rooms", matrix_cfg.get("free_response_rooms"))
+    _bridge("MATRIX_ALLOWED_ROOMS", "allowed_rooms", matrix_cfg.get("allowed_rooms"))
+    _bridge("MATRIX_IGNORE_USER_PATTERNS", "ignore_user_patterns", matrix_cfg.get("ignore_user_patterns"))
     if "process_notices" in matrix_cfg and not os.getenv("MATRIX_PROCESS_NOTICES"):
         os.environ["MATRIX_PROCESS_NOTICES"] = str(matrix_cfg["process_notices"]).lower()
     if "session_scope" in matrix_cfg and not os.getenv("MATRIX_SESSION_SCOPE"):
@@ -5410,7 +5429,7 @@ def _apply_yaml_config(yaml_cfg: dict, matrix_cfg: dict) -> dict | None:
         os.environ["MATRIX_DM_MENTION_THREADS"] = str(matrix_cfg["dm_mention_threads"]).lower()
     if "max_message_length" in matrix_cfg and not os.getenv("MATRIX_MAX_MESSAGE_LENGTH"):
         os.environ["MATRIX_MAX_MESSAGE_LENGTH"] = str(matrix_cfg["max_message_length"])
-    return None
+    return extras or None
 
 
 def _is_connected(config) -> bool:

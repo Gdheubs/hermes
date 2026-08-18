@@ -291,12 +291,12 @@ class SignalAdapter(BasePlatformAdapter):
 
         # DM allowlist — mirrors SIGNAL_ALLOWED_USERS checked by run.py.
         # Stored here so the reaction hooks can skip unauthorized senders
-        # (reactions fire before run.py's auth gate, so without this check
-        # every inbound DM from any contact gets a 👀 reaction).
-        # "*" means all users allowed (open mode); empty means no restriction
-        # recorded at adapter level (run.py still enforces auth separately).
-        dm_allowed_str = _startup_env_secret("SIGNAL_ALLOWED_USERS", "*")
-        self.dm_allow_from = set(_parse_comma_list(dm_allowed_str))
+        # (reactions fire before run.py's auth gate). A scoped miss must
+        # stay empty — "*" is only an explicit open-access opt-in.
+        dm_allowed_raw = extra.get("allowed_users")
+        if dm_allowed_raw is None:
+            dm_allowed_raw = _startup_env_secret("SIGNAL_ALLOWED_USERS", "")
+        self.dm_allow_from = set(_parse_comma_list(str(dm_allowed_raw)))
 
         # HTTP client
         self.client: Optional[httpx.AsyncClient] = None
@@ -1645,16 +1645,17 @@ class SignalAdapter(BasePlatformAdapter):
 
         Two gates:
         1. SIGNAL_REACTIONS env var — set to false/0/no to disable globally.
-        2. DM allowlist — if SIGNAL_ALLOWED_USERS is set, only react to
-           messages from senders in that list.  This prevents unauthorized
-           contacts from seeing the 👀 reaction (which fires before run.py's
-           auth gate and would otherwise reveal that a bot is listening).
+        2. DM allowlist — react only to senders in SIGNAL_ALLOWED_USERS.
+           Empty (scoped miss / no allowlist) is closed: no pre-auth 👀.
+           Explicit "*" remains the open-access opt-in.
         """
-        if os.getenv("SIGNAL_REACTIONS", "true").lower() in {"false", "0", "no"}:
+        if _startup_env_secret("SIGNAL_REACTIONS", "true").lower() in {"false", "0", "no"}:
             return False
         if event is not None:
             sender = getattr(getattr(event, "source", None), "user_id", None)
-            if sender and "*" not in self.dm_allow_from and sender not in self.dm_allow_from:
+            if "*" in self.dm_allow_from:
+                return True
+            if not sender or sender not in self.dm_allow_from:
                 return False
         return True
 
