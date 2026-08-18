@@ -223,7 +223,8 @@ export async function runRewindSubmit(
   interruptFirst: boolean,
   recovery?: { storedSessionId?: null | string; onSessionRecovered?: (sessionId: string) => void },
   truncateRowId?: number,
-  sourceText?: string
+  sourceText?: string,
+  transcriptPossiblyTruncated?: boolean
 ): Promise<SurvivorUserRowIds | undefined> {
   // Recovery may rebind the live id mid-flight; interrupt/submit must both
   // follow it rather than pinning the dead one.
@@ -260,6 +261,18 @@ export async function runRewindSubmit(
     // gateway's 4030 cross-check. Unresolved: plain resubmit, no truncation.
     resolvedOrdinal = undefined
     resolvedMessageId = undefined
+  }
+
+  // Tail-only transcript (#88082): the cold-open prefetch hydrates only the
+  // newest page (older rows arrive via "Show earlier" backfill), so a renderer
+  // ordinal counts a WINDOW-relative space while the gateway counts the full
+  // durable history — its 4030 cross-check reads the offset as drift and
+  // refuses every edit in the session. When older pages may be missing, the
+  // durable id alone is the address — the same rule the content-resolved path
+  // above applies. The ordinal's tripwire value only exists when the
+  // transcript is complete, so it stays on otherwise.
+  if (wantsTruncation && hasDurableAddress && transcriptPossiblyTruncated) {
+    resolvedOrdinal = undefined
   }
 
   const interrupt = async () => {

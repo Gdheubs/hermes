@@ -487,6 +487,77 @@ describe('runRewindSubmit durable-address discipline (#87059)', () => {
     expect(submit?.params?.truncate_before_row_id).toBe(13)
     expect(submit?.params?.truncate_before_user_ordinal).toBe(1)
   })
+
+  it('drops the window-relative ordinal on a tail-only transcript, aiming by durable id alone (#88082)', async () => {
+    const calls: Call[] = []
+
+    await runRewindSubmit(
+      makeGateway(calls),
+      'sid',
+      'fixed prompt',
+      1, // window-relative ordinal: the newest-120 prefetch hid the older turns
+      undefined,
+      false,
+      undefined,
+      13,
+      'typo prompt',
+      true // transcript possibly truncated
+    )
+
+    // No content-resolution read needed — the bubble already holds a durable id.
+    expect(calls.some(call => call.method === 'session.history')).toBe(false)
+
+    const submit = calls.find(call => call.method === 'prompt.submit')
+
+    expect(submit?.params?.confirm_truncate).toBe(true)
+    expect(submit?.params?.truncate_before_row_id).toBe(13)
+    expect(submit?.params?.truncate_before_user_ordinal).toBeUndefined()
+  })
+
+  it('keeps the ordinal tripwire on a tail-only-flagged transcript when it is explicitly complete', async () => {
+    const calls: Call[] = []
+
+    await runRewindSubmit(
+      makeGateway(calls),
+      'sid',
+      'fixed prompt',
+      1,
+      undefined,
+      false,
+      undefined,
+      13,
+      'typo prompt',
+      false
+    )
+
+    const submit = calls.find(call => call.method === 'prompt.submit')
+
+    expect(submit?.params?.truncate_before_row_id).toBe(13)
+    expect(submit?.params?.truncate_before_user_ordinal).toBe(1)
+  })
+
+  it('drops the window-relative ordinal on a tail-only transcript addressed by durable message id', async () => {
+    const calls: Call[] = []
+
+    await runRewindSubmit(
+      makeGateway(calls),
+      'sid',
+      'fixed prompt',
+      1,
+      'durable-platform-msg-1',
+      false,
+      undefined,
+      undefined,
+      'typo prompt',
+      true
+    )
+
+    const submit = calls.find(call => call.method === 'prompt.submit')
+
+    expect(submit?.params?.confirm_truncate).toBe(true)
+    expect(submit?.params?.truncate_before_message_id).toBe('durable-platform-msg-1')
+    expect(submit?.params?.truncate_before_user_ordinal).toBeUndefined()
+  })
 })
 
 describe('optimistic rewind/reload turn-clock seeding (#86795)', () => {
