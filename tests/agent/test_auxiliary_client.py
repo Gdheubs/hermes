@@ -2386,7 +2386,21 @@ class TestAuxiliaryTaskExtraBody:
             "thinking": {"type": "disabled"}, "metadata": {"user_id": "u1"},
         }
 
-
+    def test_anthropic_aux_strips_response_format(self):
+        """response_format is OpenAI/Chat-Completions-only; Anthropic's native
+        Messages API 400s with "response_format: Extra inputs are not
+        permitted" if it leaks through. title_generator.generate_title() sends
+        exactly this field to force JSON-schema output, so any main-provider
+        Anthropic user hit this on every title generation. Vendor fields in
+        the same extra_body dict must still pass through untouched."""
+        api_kwargs = self._run_anthropic_adapter(
+            call_extra_body={
+                "response_format": {"type": "json_schema", "json_schema": {"name": "x"}},
+                "metadata": {"user_id": "u1"},
+            },
+        )
+        assert "response_format" not in api_kwargs.get("extra_body", {})
+        assert api_kwargs["extra_body"] == {"metadata": {"user_id": "u1"}}
 
 
 

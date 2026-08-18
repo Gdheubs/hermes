@@ -2056,18 +2056,28 @@ class _AnthropicCompletionsAdapter:
         # form is the documented Anthropic SDK passthrough for non-standard
         # request body keys; merge on top of whatever build_anthropic_kwargs
         # already produced (e.g. fast-mode ``speed``) so call-time settings
-        # survive. Two exclusions:
+        # survive. Exclusions:
         #   - ``reasoning``: the OpenAI-shaped config dict is TRANSLATED into
         #     the native ``thinking`` field above (build_anthropic_kwargs);
         #     forwarding the raw field alongside would double-specify
         #     reasoning and 400 on strict gateways.
+        #   - ``response_format``: OpenAI/Chat-Completions-only field (used by
+        #     e.g. title_generator's JSON-schema-constrained calls). Anthropic's
+        #     native Messages API has no such top-level field and 400s with
+        #     "response_format: Extra inputs are not permitted" if forwarded.
+        #     Callers relying on response_format already have prose-fallback
+        #     parsing for providers that don't honor it (see
+        #     title_generator._extract_title_text), so dropping it here just
+        #     means Anthropic answers in prose instead of erroring.
         #   - ``_``-prefixed keys: private Hermes plumbing (_reasoning_config
         #     et al.), never wire fields.
+        _ANTHROPIC_UNSUPPORTED_EXTRA_BODY_KEYS = {"reasoning", "response_format"}
         caller_extra_body = kwargs.get("extra_body")
         if caller_extra_body and isinstance(caller_extra_body, dict):
             passthrough = {
                 k: v for k, v in caller_extra_body.items()
-                if k != "reasoning" and not str(k).startswith("_")
+                if k not in _ANTHROPIC_UNSUPPORTED_EXTRA_BODY_KEYS
+                and not str(k).startswith("_")
             }
             if passthrough:
                 existing = anthropic_kwargs.get("extra_body") or {}
