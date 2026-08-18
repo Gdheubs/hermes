@@ -5749,6 +5749,27 @@ def run_job(
                 or "agent reported failure"
             )
             raise RuntimeError(_err_text)
+        # A tool-guardrail halt ends the turn with an *explanation of the halt*
+        # in `final_response`, while leaving `failed`/`completed` untouched.
+        # Interactive surfaces deliberately show that text, but for a scheduled
+        # job it is not the report the job was asked to produce: delivering it
+        # ships guardrail internals to the recipient and records the run as
+        # `last_status: "ok"`, so no health check ever notices the job produced
+        # nothing. Classify it as a failure like the paths above, keeping the
+        # guardrail's own code and tool in the error for diagnosis.
+        if turn_exit_reason == "guardrail_halt":
+            _guardrail = result.get("guardrail")
+            if not isinstance(_guardrail, dict):
+                _guardrail = {}
+            _detail = ", ".join(
+                f"{_key}={_guardrail[_key]}"
+                for _key in ("code", "tool_name")
+                if _guardrail.get(_key)
+            )
+            raise RuntimeError(
+                "agent run halted by tool guardrail"
+                + (f" ({_detail})" if _detail else "")
+            )
         if max_iteration_summary:
             logger.warning(
                 "Job '%s' reached the iteration limit but produced a final fallback response; "
