@@ -2608,8 +2608,9 @@ def compress_context(
             except Exception:
                 existing = None
             logger.warning(
-                "compression skipped: another path is compressing session=%s "
-                "(holder=%s) — returning messages unchanged to avoid session fork",
+                "compression skipped: lock unavailable, held, or session already "
+                "rotated for session=%s (holder=%s) — returning messages "
+                "unchanged to avoid session fork",
                 _lock_sid, existing,
             )
             _lock_holder = None  # don't release a lock we don't own
@@ -2623,9 +2624,9 @@ def compress_context(
                 agent._last_compression_lock_warning_sid = _lock_sid
                 try:
                     agent._emit_warning(
-                        "⚠ Skipping concurrent compression — another path "
-                        "is already compressing this session. Will retry "
-                        "after it finishes."
+                        "⚠ Skipping compression — another path is compressing "
+                        "or has already rotated this session. Keeping messages "
+                        "unchanged for this attempt."
                     )
                 except Exception:
                     pass
@@ -3821,7 +3822,10 @@ def compress_context(
         # storing it on _compression_warning lets replay_compression_warning
         # re-deliver it once a late-bound gateway status_callback is wired (#36908).
         _cc = agent.context_compressor.compression_count
-        if _cc >= 2:
+        if _cc >= 2 and not getattr(agent, "_rollover_suggestion_shown", False):
+            # Local patch: once-gate so the suggestion is only emitted on the
+            # first qualifying compaction, not repeated on every subsequent one.
+            agent._rollover_suggestion_shown = True
             _cc_msg = (
                 f"{agent.log_prefix}⚠️  Session compressed {_cc} times — "
                 f"accuracy may degrade. Consider /new to start fresh."
