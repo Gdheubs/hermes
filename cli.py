@@ -11794,7 +11794,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if accepted:
                         _cprint(f"  ⏩ Steer queued — arrives after the next tool call: {payload[:80]}{'...' if len(payload) > 80 else ''}")
                     else:
-                        _cprint("  Steer rejected (empty payload).")
+                        # The turn can seal its terminal result between the UI's
+                        # busy check and steer() acquiring the acceptance lock.
+                        # Preserve that valid non-empty message behind any older
+                        # next-turn work instead of misreporting it as empty.
+                        self._pending_input.put(payload)
+                        _cprint(f"  Turn already completed; queued for the next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
             else:
                 # No active run — treat as a normal next-turn message.
                 self._pending_input.put(payload)
