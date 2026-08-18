@@ -41,6 +41,7 @@ Requires:
 """
 
 import asyncio
+import concurrent.futures
 import errno
 import hashlib
 import hmac
@@ -70,6 +71,19 @@ _PROFILE_REJECTED = object()
 _api_request_profile: ContextVar[Optional[str]] = ContextVar(
     "api_server_request_profile", default=None
 )
+_api_request_browser_control_principal: ContextVar[str] = ContextVar(
+    "api_server_browser_control_principal", default=""
+)
+_api_request_browser_control_transport_family: ContextVar[str] = ContextVar(
+    "api_server_browser_control_transport_family", default=""
+)
+
+#: Browser-extension control protocol version advertised in capabilities and
+#: echoed in registration responses. Strict validation is centralized in the
+#: broker's ``browser_control_protocol_supported`` helper.
+_BROWSER_CONTROL_PROTOCOL_VERSION = 1
+_BROWSER_CONTROL_WS_PROTOCOL = "hermes-browser-control-v1"
+_BROWSER_CONTROL_TICKET_PROTOCOL_PREFIX = "hermes-browser-control-ticket."
 
 def _approval_event_choices(*, smart_denied: bool, allow_permanent: bool) -> list[str]:
     if smart_denied:
@@ -95,6 +109,14 @@ from gateway.platforms.base import (
 from agent.redact import redact_sensitive_text
 from agent.interrupt_compat import request_hard_interrupt
 from gateway.readiness import collect_runtime_readiness
+from gateway.browser_control_broker import (
+    BROWSER_CONTROL_CAPABILITIES,
+    ControllerScope,
+    TicketInvalid,
+    browser_control_protocol_supported,
+    filter_browser_control_capabilities,
+    get_browser_control_broker,
+)
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
@@ -121,6 +143,42 @@ def _get_scoped_secret(name, default=None):
 
 
 logger = logging.getLogger(__name__)
+
+
+def _browser_controller_ws_sender(ws, loop, *, wait_timeout: float = 10.0):
+    """Return a loop-aware broker sender for one aiohttp controller socket.
+
+    A wait timeout means the coroutine is still in flight on a live loop, not
+    that the frame was rejected. Keep the broker command pending and let its
+    own deadline/cancel path decide; a real send exception still propagates.
+    """
+
+    def send(frame: dict) -> None:
+        if ws.closed:
+            raise ConnectionError("browser-control websocket is closed")
+        try:
+            on_loop = asyncio.get_running_loop() is loop
+        except RuntimeError:
+            on_loop = False
+        if on_loop:
+            loop.create_task(ws.send_json(frame))
+            return
+        future = asyncio.run_coroutine_threadsafe(ws.send_json(frame), loop)
+        try:
+            future.result(timeout=wait_timeout)
+        except concurrent.futures.TimeoutError:
+            if future.done():
+                raise
+
+            def observe_late_send(completed):
+                try:
+                    completed.result()
+                except Exception:
+                    logger.exception("browser-controller websocket send failed after wait timeout")
+
+            future.add_done_callback(observe_late_send)
+
+    return send
 
 
 def _hermes_version() -> str:
@@ -1475,6 +1533,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # Shutdown counts this reservation so the request cannot slip through
         # the drain between its first await and _run_agent()/task registration.
         self._pending_agent_requests: int = 0
+        # Browser-control broker core: transport-neutral ticket, controller,
+        # and command lifecycle shared with the dashboard Gateway transport. This adapter only maps HTTP registration and the
+        # controller WebSocket onto the broker; it owns no broker state.
+        self._browser_control_broker = get_browser_control_broker()
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -2044,7 +2106,18 @@ class APIServerAdapter(BasePlatformAdapter):
             token = _api_request_profile.set(profile)
             try:
                 with self._profile_scope(profile):
-                    return await handler(request)
+                    resolved_profile = profile or "default"
+                    principal_token = _api_request_browser_control_principal.set(
+                        self._derive_browser_control_principal(resolved_profile)
+                    )
+                    family_token = _api_request_browser_control_transport_family.set(
+                        self._browser_control_transport_family(request)
+                    )
+                    try:
+                        return await handler(request)
+                    finally:
+                        _api_request_browser_control_transport_family.reset(family_token)
+                        _api_request_browser_control_principal.reset(principal_token)
             finally:
                 _api_request_profile.reset(token)
 
@@ -2063,6 +2136,12 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/v1/models", self._handle_models),
             ("GET", "/api/model/options", self._handle_model_options),
             ("GET", "/v1/capabilities", self._handle_capabilities),
+            # Authenticated browser-control surface: POST registration
+            # mints a short-lived ticket; the controller then opens the WS with
+            # that ticket. Both are gated on browser.extension_control.enabled
+            # and API-key auth (see the handlers for the exact status ladder).
+            ("POST", "/v1/browser-control/register", self._handle_browser_control_register),
+            ("GET", "/v1/browser-control/ws", self._handle_browser_control_ws),
             ("GET", "/v1/skills", self._handle_skills),
             ("GET", "/v1/toolsets", self._handle_toolsets),
             ("GET", "/api/sessions", self._handle_list_sessions),
@@ -3194,6 +3273,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
+                # Browser-extension control is always advertised so clients
+                # can feature-detect it, but remains disabled until
+                # browser.extension_control.enabled is explicitly set.
+                "browser_extension_control": {
+                    "enabled": self._browser_control_enabled(),
+                    "protocol_version": _BROWSER_CONTROL_PROTOCOL_VERSION,
+                    "capabilities": sorted(BROWSER_CONTROL_CAPABILITIES),
+                    "real_browser_actions": True,
+                    "transports": {
+                        "local_vps": "websocket-subprotocol-ticket",
+                        "cloud": "authenticated-gateway-rpc",
+                    },
+                },
             },
             "endpoints": {
                 "health": {"method": "GET", "path": "/health"},
@@ -3220,8 +3312,335 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
                 "session_model_lock": {"method": "POST", "path": "/api/sessions/{session_id}/model"},
+                "browser_control_register": {"method": "POST", "path": "/v1/browser-control/register"},
+                "browser_control_ws": {"method": "GET", "path": "/v1/browser-control/ws"},
             },
         })
+
+    # ------------------------------------------------------------------
+    # Browser-extension control (authenticated local/VPS API)
+    # ------------------------------------------------------------------
+
+    async def _handle_browser_control_register(self, request: "web.Request") -> "web.Response":
+        """POST /v1/browser-control/register — mint a controller ticket.
+
+        The extension controller proves itself with the same Bearer API key
+        every other API-server client uses, then receives a short-lived,
+        single-use ticket to open the controller WebSocket. Identity is NOT
+        taken from the request body: the scope principal is derived
+        server-side from the authenticated key/profile as a non-reversible
+        digest, and the capability set is filtered to the shared browser
+        action allowlist, so a spoofed
+        ``principal_id`` or inflated capability list in the payload is
+        ignored rather than honored. The named session must already exist in
+        the active profile's server-owned SessionDB before a ticket is minted.
+
+        Status ladder: 404 when the feature is disabled, 403 when no API key
+        is configured at all (registration can never be authenticated), 401
+        for a missing/invalid Bearer token, 201 on success.
+        """
+        if not self._browser_control_enabled():
+            return web.json_response(
+                _openai_error(
+                    "Browser control is not enabled on this server.",
+                    code="browser_control_disabled",
+                ),
+                status=404,
+            )
+        if not self._api_key:
+            logger.warning(
+                "browser-control registration rejected: no API key configured; "
+                "set API_SERVER_KEY to enable authenticated browser control."
+            )
+            return web.json_response(
+                _openai_error(
+                    "Browser control registration requires a configured API key.",
+                    err_type="gateway_auth_error",
+                    code="browser_control_auth_required",
+                ),
+                status=403,
+            )
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response(
+                _openai_error("Request body must be valid JSON."), status=400
+            )
+        if not isinstance(payload, dict):
+            return web.json_response(
+                _openai_error("Request body must be a JSON object."), status=400
+            )
+
+        if not browser_control_protocol_supported(payload.get("protocol_version")):
+            return web.json_response(
+                _openai_error(
+                    "Unsupported browser-control protocol version.",
+                    code="browser_control_protocol_unsupported",
+                ),
+                status=400,
+            )
+
+        controller_id = str(payload.get("controller_id") or "").strip()
+        browser_profile_id = str(payload.get("browser_profile_id") or "").strip()
+        session_id = str(payload.get("session_id") or "").strip()
+        if not controller_id or not browser_profile_id or not session_id:
+            return web.json_response(
+                _openai_error(
+                    "controller_id, browser_profile_id, and session_id are required.",
+                    code="browser_control_invalid_registration",
+                ),
+                status=400,
+            )
+
+        db = await self._ensure_session_db_async()
+        if db is None:
+            return web.json_response(
+                _openai_error(
+                    "Session database unavailable.",
+                    code="session_db_unavailable",
+                ),
+                status=503,
+            )
+        session = await asyncio.to_thread(db.get_session, session_id)
+        if not session:
+            return web.json_response(
+                _openai_error(
+                    "Browser control may register only for an existing server session.",
+                    err_type="gateway_auth_error",
+                    code="browser_control_session_forbidden",
+                ),
+                status=403,
+            )
+
+        profile = _api_request_profile.get() or "default"
+        capabilities = filter_browser_control_capabilities(
+            payload.get("capabilities")
+        )
+        if not capabilities:
+            return web.json_response(
+                _openai_error(
+                    "At least one permitted browser-control capability is required.",
+                    code="browser_control_no_capabilities",
+                ),
+                status=400,
+            )
+        scope = ControllerScope(
+            principal_id=self._derive_browser_control_principal(profile),
+            profile_id=profile,
+            session_id=session_id or None,
+            controller_id=controller_id,
+            browser_profile_id=browser_profile_id,
+            transport_family=self._browser_control_transport_family(request),
+            capabilities=capabilities,
+        )
+        ticket = self._browser_control_broker.mint_ticket(scope)
+        ticket_ttl = self._browser_control_broker.ticket_ttl_seconds
+        return web.json_response(
+            {
+                "protocol_version": _BROWSER_CONTROL_PROTOCOL_VERSION,
+                "ticket": ticket.value,
+                "ticket_expires_at": time.time() + ticket_ttl,
+                "ticket_expires_in_seconds": ticket_ttl,
+                "ws_path": "/v1/browser-control/ws",
+                "scope": {
+                    "principal_id": scope.principal_id,
+                    "profile_id": scope.profile_id,
+                    "session_id": scope.session_id,
+                    "controller_id": scope.controller_id,
+                    "browser_profile_id": scope.browser_profile_id,
+                    "transport_family": scope.transport_family,
+                    "capabilities": sorted(scope.capabilities),
+                },
+            },
+            status=201,
+        )
+
+    async def _handle_browser_control_ws(self, request: "web.Request") -> "web.WebSocketResponse":
+        """GET /v1/browser-control/ws — controller WebSocket (one-shot ticket).
+
+        A ticket-bearing ``Sec-WebSocket-Protocol`` token is exchanged exactly
+        once for the identity scope minted at registration; query-string,
+        unknown, already-consumed, or expired tickets are rejected with 401
+        before upgrade. The socket then attaches to the shared broker under
+        that scope, forwards broker command/cancel frames onto the aiohttp loop
+        thread-safely, and accepts controller result/cancel frames. Completion
+        is exact-scope checked, and owner-aware teardown cannot detach a newer
+        replacement controller generation.
+        """
+        # Re-check at upgrade time so disabling the feature immediately closes
+        # the admission gate without consuming still-live one-shot tickets.
+        if not self._browser_control_enabled():
+            raise web.HTTPNotFound()
+
+        # Credentials in the request target are liable to appear in access
+        # logs. Accept the one-shot ticket only as a WebSocket subprotocol;
+        # reject the former query-string shape without consuming it.
+        if request.query.get("ticket"):
+            raise web.HTTPUnauthorized()
+        requested_protocols = [
+            value.strip()
+            for value in request.headers.get("Sec-WebSocket-Protocol", "").split(",")
+            if value.strip()
+        ]
+        ticket_protocols = [
+            value
+            for value in requested_protocols
+            if value.startswith(_BROWSER_CONTROL_TICKET_PROTOCOL_PREFIX)
+        ]
+        if (
+            _BROWSER_CONTROL_WS_PROTOCOL not in requested_protocols
+            or len(ticket_protocols) != 1
+        ):
+            raise web.HTTPUnauthorized()
+        ticket_value = ticket_protocols[0][len(_BROWSER_CONTROL_TICKET_PROTOCOL_PREFIX) :]
+        if not ticket_value:
+            raise web.HTTPUnauthorized()
+        try:
+            scope = self._browser_control_broker.consume_ticket(ticket_value)
+        except TicketInvalid:
+            raise web.HTTPUnauthorized() from None
+        except Exception:
+            logger.exception("browser-control WS ticket consumption failed")
+            raise web.HTTPUnauthorized() from None
+
+        ws = web.WebSocketResponse(
+            heartbeat=30.0,
+            protocols=(_BROWSER_CONTROL_WS_PROTOCOL,),
+        )
+        await ws.prepare(request)
+        loop = asyncio.get_running_loop()
+        _send = _browser_controller_ws_sender(ws, loop)
+
+        self._browser_control_broker.attach(scope, _send, owner=ws)
+        try:
+            async for msg in ws:
+                if msg.type == web.WSMsgType.TEXT:
+                    try:
+                        frame = msg.json()
+                    except Exception:
+                        continue
+                    if isinstance(frame, dict):
+                        reply = self._handle_browser_control_frame(
+                            scope,
+                            frame,
+                            owner=ws,
+                        )
+                        if isinstance(reply, dict):
+                            await ws.send_json(reply)
+                elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                    break
+        finally:
+            self._browser_control_broker.disconnect(
+                scope,
+                owner=ws,
+            )
+        return ws
+
+    def _handle_browser_control_frame(
+        self,
+        scope: "ControllerScope",
+        frame: dict,
+        *,
+        owner: Any = None,
+    ) -> None:
+        """Apply one controller→broker frame with exact-scope checks."""
+        method = frame.get("method")
+        params = frame.get("params")
+        if not isinstance(params, dict):
+            return
+        if owner is None or not self._browser_control_broker.is_owner(scope, owner):
+            return
+        if method == "browser.controller.heartbeat":
+            nonce = str(params.get("nonce") or "").strip()
+            if not nonce or len(nonce) > 128:
+                return
+            # Echo only the caller's opaque nonce on the already authenticated,
+            # exact-scope controller socket. This proves the socket path is live
+            # without granting a new capability or touching broker commands.
+            return {
+                "method": "browser.controller.heartbeat",
+                "params": {"nonce": nonce, "ok": True},
+            }
+        if method == "browser.controller.detach":
+            self._browser_control_broker.detach(
+                scope,
+                owner=owner,
+                notify_controller=False,
+            )
+            return {
+                "method": "browser.controller.detach",
+                "params": {"ok": True},
+            }
+        if method == "browser.controller.result":
+            command_id = params.get("command_id")
+            if isinstance(command_id, str) and command_id:
+                # Broker resolves only the pending command whose scope equals
+                # this socket's scope; a stranger's command id is a no-op.
+                ok = params.get("ok") is True
+                self._browser_control_broker.complete(
+                    command_id,
+                    scope=scope,
+                    ok=ok,
+                    result=params.get("result") if ok else params.get("error"),
+                )
+        elif method == "browser.controller.cancel":
+            tool_call_id = params.get("tool_call_id")
+            if isinstance(tool_call_id, str) and tool_call_id:
+                self._browser_control_broker.cancel(scope, tool_call_id=tool_call_id)
+
+    def _browser_control_enabled(self) -> bool:
+        """Feature flag; False unless explicitly enabled.
+
+        Reads ``browser.extension_control.enabled`` from the global config
+        (defaults to False). Tests monkeypatch this method directly to force
+        the feature on/off without touching config.
+        """
+        try:
+            from gateway.browser_control_broker import browser_control_enabled as _flag
+
+            return _flag()
+        except Exception:
+            return False
+
+    def _derive_browser_control_principal(self, profile: str) -> str:
+        """Server-derived controller principal (non-reversible digest).
+
+        The principal is bound to the credential that authenticated the
+        registration request — the expected API key for the request's
+        profile — so a client cannot impersonate another controller by
+        echoing an id in the registration body.
+        """
+        key = self._expected_api_key() or self._api_key or ""
+        digest = hashlib.sha256(f"{profile}\x00{key}".encode("utf-8")).hexdigest()
+        return f"principal:{profile}:{digest[:32]}"
+
+    def _browser_control_transport_family(self, request: "web.Request") -> str:
+        """Local vs remote API family, decided by the loopback peer.
+
+        A controller speaking to a localhost listener is in the same trust
+        domain as the host and gets the ``local-api`` family; anything else
+        is ``remote-api``. The broker treats the family as part of exact
+        identity, so a remote controller can never satisfy a local-only
+        dispatch (and vice versa).
+        """
+        host = None
+        try:
+            transport = request.transport
+            if transport is not None:
+                peer = transport.get_extra_info("peername")
+                if isinstance(peer, tuple) and peer:
+                    host = peer[0]
+                elif isinstance(peer, str):
+                    host = peer
+        except Exception:
+            host = None
+        if host in ("127.0.0.1", "::1", "localhost"):
+            return "local-api"
+        return "remote-api"
 
     async def _handle_skills(self, request: "web.Request") -> "web.Response":
         """GET /v1/skills — list installed skills visible to the API-server agent.
@@ -6282,6 +6701,8 @@ class APIServerAdapter(BasePlatformAdapter):
         chat_id: str = "",
         session_key: str = "",
         session_id: str = "",
+        browser_control_principal: str = "",
+        browser_control_transport_family: str = "",
     ) -> list:
         """Bind session contextvars for an API-server agent run.
 
@@ -6305,6 +6726,8 @@ class APIServerAdapter(BasePlatformAdapter):
             chat_id=chat_id,
             session_key=session_key,
             session_id=session_id,
+            browser_control_principal=browser_control_principal,
+            browser_control_transport_family=browser_control_transport_family,
             async_delivery=False,
             cron_session="",
         )
@@ -6365,6 +6788,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # run_in_executor threads, so the profile scope must be re-entered
         # inside _run() from this explicit value.
         request_profile = _api_request_profile.get()
+        request_browser_control_principal = (
+            _api_request_browser_control_principal.get()
+        )
+        request_browser_control_transport_family = (
+            _api_request_browser_control_transport_family.get()
+        )
 
         def _run():
             from gateway.session_context import clear_session_vars
@@ -6374,6 +6803,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     chat_id=session_id or "",
                     session_key=gateway_session_key or session_id or "",
                     session_id=session_id or "",
+                    browser_control_principal=request_browser_control_principal,
+                    browser_control_transport_family=(
+                        request_browser_control_transport_family
+                    ),
                 )
                 agent = None
                 try:
@@ -6807,6 +7240,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
         request_profile = _api_request_profile.get()
+        request_browser_control_principal = (
+            _api_request_browser_control_principal.get()
+        )
+        request_browser_control_transport_family = (
+            _api_request_browser_control_transport_family.get()
+        )
 
         async def _run_and_close():
             try:
@@ -6896,6 +7335,12 @@ class APIServerAdapter(BasePlatformAdapter):
                                 chat_id=session_id or "",
                                 session_key=approval_session_key,
                                 session_id=session_id or "",
+                                browser_control_principal=(
+                                    request_browser_control_principal
+                                ),
+                                browser_control_transport_family=(
+                                    request_browser_control_transport_family
+                                ),
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
                             # /v1/runs runs its own agent lifecycle (no
