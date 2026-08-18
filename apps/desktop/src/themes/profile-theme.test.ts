@@ -67,7 +67,7 @@ describe('mode persistence validation', () => {
   beforeEach(() => window.localStorage.clear())
 
   it('still normalizes an unknown stored mode back to the default', () => {
-    modePref.assign('work', 'dusk' as never)
+    window.localStorage.setItem('hermes-desktop-profile-modes-v1', JSON.stringify({ work: 'dusk' }))
 
     expect(modePref.resolve('work')).toBe('light')
   })
