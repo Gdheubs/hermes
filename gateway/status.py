@@ -514,6 +514,21 @@ def looks_like_gateway_runtime_command_line(command: str | None) -> bool:
     state. Keep the public ``looks_like_gateway_command_line()`` strict, and
     use this broader matcher only when validating Hermes-owned runtime records
     or no-supervisor cleanup scans.
+
+    Verified launch shapes (all must keep working):
+    - ``python -m hermes_cli.main gateway run|restart`` (venv shim / CLI)
+    - ``python gateway/run.py ...`` or an absolute path ending in it
+    - ``hermes-gateway[.exe]`` standalone entrypoints
+    - ``--profile``/``-p`` selectors on either side of the subcommand
+        (stripped before matching)
+
+    Deliberately NOT extended with a fallback signal (e.g. "venv exe +
+    ancestor argv contains gateway"): this matcher is also used to validate
+    that a candidate process is Hermes-owned, and widening it risks
+    classifying an unrelated venv process as the gateway. If a future launch
+    shape needs to be recognised, add it to ``_gateway_command_subcommand``
+    and extend the test matrix in
+    ``tests/hermes_cli/test_update_venv_launcher_ancestor_gating.py``.
     """
     return _gateway_command_subcommand(command) in {"run", "restart"}
 

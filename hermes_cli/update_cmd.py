@@ -3513,12 +3513,57 @@ def _venv_launcher_ancestors(pids: list[int]) -> list[int]:
 
     # Never return ourselves or our own ancestry: a CLI ``hermes update``
     # runs from the venv python and would otherwise nominate itself.
+    # Exception (mirrors PR #87608 / #87594): an ancestor that is ITSELF a
+    # running gateway (command line matches ``gateway run``) is a real
+    # venv-holder, not a false positive — when the update was spawned by the
+    # gateway (e.g. /update from a messaging platform), the gateway launcher
+    # sits in this process's ancestry, and skipping it leaves the launcher
+    # locking venv .pyd files so the update still aborts on the venv-holder
+    # guard. Only skip ancestors that are NOT gateways.
     skip: set[int] = {os.getpid()}
+    # Narrow the try to the fragile pieces (import + walking the ancestry)
+    # instead of wrapping the whole loop: per-ancestor cmdline() errors are
+    # already handled by the inner try (anc_cmdline = ""), and a fallback
+    # that re-walks the ancestry would silently duplicate the loop. If the
+    # matcher cannot be imported we degrade to the previous behaviour —
+    # skip everything — and log why.
     try:
-        for anc in psutil.Process().parents():
-            skip.add(int(anc.pid))
-    except Exception:
-        pass
+        from gateway.status import looks_like_gateway_runtime_command_line
+        ancestors = psutil.Process().parents()
+    except Exception as exc:
+        # Fallback to the previous behaviour: skip the whole ancestry.
+        # Log it: without this, an update that trips the venv-holder guard
+        # (silently) never shows *why* — the gateway launcher got hidden by
+        # the very fallback this fix was meant to remove.
+        logger.debug("ancestor gating unavailable (%s); skipping whole ancestry", exc)
+        try:
+            for anc in psutil.Process().parents():
+                skip.add(int(anc.pid))
+        except Exception:
+            pass
+        ancestors = []
+
+    for anc in ancestors:
+        anc_pid = int(anc.pid)
+        try:
+            # Keep quotes when re-serializing: the matcher tokenizes via
+            # shlex, so a path containing spaces (e.g. "C:\Program Files\...")
+            # must stay quoted or it would be split and fail to match.
+            # NOTE: `os.name == "nt"` is unreachable here — the function
+            # already returned [] unless _is_windows(). The branch is
+            # deliberately kept so the re-serialization stays correct if
+            # this helper is ever lifted out of the Windows guard.
+            raw = anc.cmdline() or []
+            anc_cmdline = (
+                subprocess.list2cmdline(raw) if os.name == "nt" else " ".join(raw)
+            )
+        except Exception:
+            anc_cmdline = ""
+        if anc_cmdline and looks_like_gateway_runtime_command_line(anc_cmdline):
+            # A gateway ancestor is the very process we want to pause —
+            # keep it out of the skip set so the launcher is found below.
+            continue
+        skip.add(anc_pid)
 
     found: list[int] = []
     for pid in pids:

@@ -112,3 +112,47 @@ class TestProcFallback:
         # PermissionError swallowed — empty result, no crash
         assert 12345 not in pids
         mock_ps.assert_not_called()  # /proc dir existed, so ps not called
+
+
+# ---------------------------------------------------------------------------
+# Windows wmic branch: ancestor suppression gated on the gateway matcher
+# (#87594 / #87608). The /proc tests above are Linux-only; these run anywhere.
+# (Reuses the _GATEWAY_CMD / _OTHER_CMD constants defined at module top.)
+# ---------------------------------------------------------------------------
+
+
+def _wmic_result(entries: dict):
+    """Return a subprocess.run()-shaped result with WMIC LIST-format output."""
+    out = ""
+    for pid, cmd in entries.items():
+        out += f"CommandLine={cmd}\r\nProcessId={pid}\r\n\r\n"
+    return MagicMock(returncode=0, stdout=out, stderr="")
+
+
+class TestWindowsAncestorSuppression:
+    """_suppressed_as_ancestor: an ancestor that IS a gateway runtime is kept
+    visible (so `hermes update --gateway` can pause it) instead of being
+    dropped by the old blanket ancestor exclusion (#13242 changed by #87594)."""
+
+    def _run_scan(self, monkeypatch, entries: dict, ancestor_pids: set):
+        monkeypatch.setattr(gateway_mod, "is_windows", lambda: True)
+        monkeypatch.setattr(gateway_mod, "is_macos", lambda: False)
+        monkeypatch.setattr(
+            gateway_mod, "_get_ancestor_pids", lambda: set(ancestor_pids)
+        )
+        with (
+            patch("shutil.which", return_value=r"C:\Windows\System32\wbem\wmic.exe"),
+            patch("subprocess.run", return_value=_wmic_result(entries)),
+        ):
+            return gateway_mod._scan_gateway_pids(set(), all_profiles=True)
+
+    def test_gateway_runtime_ancestor_is_kept(self, monkeypatch):
+        """The gateway launcher sits in our ancestry with a ``gateway run``
+        cmdline; it must still be returned (the update pause path needs it)."""
+        entries = {
+            100: _GATEWAY_CMD,   # gateway runtime AND our ancestor
+            200: _GATEWAY_CMD,   # gateway runtime, not an ancestor
+        }
+        pids = self._run_scan(monkeypatch, entries, ancestor_pids={100})
+        assert 100 in pids, "gateway-runtime ancestor must not be suppressed"
+        assert 200 in pids
