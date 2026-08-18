@@ -5504,6 +5504,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                close_session_on_finish=(stored_session_id is None and not bool(gateway_session_key)),
                 **agent_overrides,
                 route=route,
             ))
@@ -5539,6 +5540,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                close_session_on_finish=(stored_session_id is None and not bool(gateway_session_key)),
                 **agent_overrides,
                 route=route,
             )
@@ -6315,6 +6317,7 @@ class APIServerAdapter(BasePlatformAdapter):
         conversation_history: List[Dict[str, str]],
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
+        close_session_on_finish: bool = False,
         stream_delta_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
@@ -6546,6 +6549,15 @@ class APIServerAdapter(BasePlatformAdapter):
                         # shutdown.  pop() is a no-op when _create_agent
                         # succeeded but the turn never reached registration.
                         self._shutdown_interruptible_agents.pop(id(agent), None)
+                    if close_session_on_finish and agent is not None:
+                        try:
+                            agent.close()
+                        except Exception:
+                            logger.debug(
+                                "Failed to close one-off API session %s",
+                                session_id or "",
+                                exc_info=True,
+                            )
                     clear_session_vars(tokens)
 
         self._activate_admitted_request()
@@ -6745,6 +6757,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
         session_id = body.get("session_id") or stored_session_id
+        one_off_session = not bool(session_id)
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
         selection_error = self._request_route_conflict_error(
@@ -6915,6 +6928,15 @@ class APIServerAdapter(BasePlatformAdapter):
                             # run deliberately left running (same race-window
                             # guard as gateway/run.py and _run_agent above).
                             _clear_turn_process_ownership(agent)
+                            if one_off_session:
+                                try:
+                                    agent.close()
+                                except Exception:
+                                    logger.debug(
+                                        "Failed to close one-off API run session %s",
+                                        session_id or "",
+                                        exc_info=True,
+                                    )
                             try:
                                 unregister_gateway_notify(approval_session_key)
                             finally:
