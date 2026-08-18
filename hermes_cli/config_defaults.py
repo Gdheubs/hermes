@@ -232,6 +232,17 @@ DEFAULT_CONFIG = {
         # TUI, desktop — and programmatic callers, off for conversational
         # messaging surfaces). Doc/markdown/skill-only edits never fire it.
         "verify_on_stop": False,
+        # False-stop detection: when the model produces finish_reason=stop
+        # with text indicating intent to continue (e.g., a colon-preamble
+        # that lost its tool_calls, or a narrated continuation) after a
+        # tool round, nudge it to issue the actual tool call instead of
+        # silently ending the turn (#42503). Bounded to 2 retries per turn;
+        # resets on successful tool round or genuine completion. Default is
+        # "auto" — surface-aware: on for interactive coding surfaces (CLI,
+        # TUI, desktop) and programmatic callers, off for conversational
+        # messaging surfaces. Set true to force on everywhere, or false to
+        # disable.
+        "false_stop_detection": "auto",
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.
@@ -328,6 +339,20 @@ DEFAULT_CONFIG = {
         # matches a key in this dict.
         # Edit directly in config.yaml (no CLI support due to dots in keys).
         "reasoning_overrides": {},
+
+        # Per-provider opt-in to preserve assistant ``reasoning_content``
+        # when replaying history.  The built-in echo families (DeepSeek,
+        # Kimi/Moonshot, Xiaomi MiMo) are auto-detected by provider name
+        # and base-URL host.  Custom providers and OpenAI-compatible
+        # gateways that proxy those same models (or other thinking-mode
+        # backends) are not covered by the host-based rules.
+        #
+        # Set ``reasoning_echo: true`` on a ``model:`` entry (primary) or a
+        # ``fallback_providers:`` entry (per-fallback) to preserve
+        # ``reasoning_content`` on replay for that provider only.  Default
+        # ``false`` keeps the historical strict-provider behavior (Mistral,
+        # Groq, Cerebras reject the field with HTTP 400).
+        "reasoning_echo": False,
     },
 
     "terminal": {
@@ -747,6 +772,7 @@ DEFAULT_CONFIG = {
                                       # exceeds this many tokens, the next pass
                                       # re-summarizes the summary itself instead of
                                       # letting it grow without bound.
+        "max_tail_message_floor": 0,  # cap for the tail floor (0 = default 8; set higher to keep more recent messages verbatim)
         "hygiene_hard_message_limit": 5000,  # gateway session-hygiene force-compress threshold by message count
         "hygiene_timeout_seconds": 30,  # max seconds gateway waits for pre-agent hygiene compression
                                       # WITHOUT forward progress. The summary call streams, so
