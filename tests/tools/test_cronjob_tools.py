@@ -246,6 +246,52 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_create_surfaces_scheduler_readiness_warning(self, monkeypatch):
+        warning = (
+            "Gateway is not running — jobs won't fire automatically. "
+            "Start it with `hermes gateway install` "
+            "(`sudo hermes gateway install --system` on Linux servers); "
+            "check with `hermes cron status`."
+        )
+        monkeypatch.setattr(
+            "tools.cronjob_tools._scheduler_readiness_warning",
+            lambda: warning,
+        )
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check server status",
+                schedule="every 1h",
+                name="Server Check",
+                deliver="local",
+            )
+        )
+
+        assert created["success"] is True
+        assert created["scheduler_warning"] == warning
+        assert warning in created["message"]
+
+    def test_create_omits_scheduler_warning_when_ready(self, monkeypatch):
+        monkeypatch.setattr(
+            "tools.cronjob_tools._scheduler_readiness_warning",
+            lambda: None,
+        )
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check server status",
+                schedule="every 1h",
+                name="Server Check",
+                deliver="local",
+            )
+        )
+
+        assert created["success"] is True
+        assert "scheduler_warning" not in created
+        assert "won't fire automatically" not in created["message"]
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 
