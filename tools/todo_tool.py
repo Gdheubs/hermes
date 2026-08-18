@@ -303,9 +303,14 @@ TODO_SCHEMA = {
         "- merge=true: update existing items by id, add any new ones\n\n"
         "Each item: {id: string, content: string, "
         "status: pending|in_progress|completed|cancelled}\n"
-        "List order is priority. Only ONE item in_progress at a time.\n"
-        "Mark items completed immediately when done. If something fails, "
-        "cancel it and add a revised item.\n\n"
+        "List order is priority. Only ONE item in_progress at a time.\n\n"
+        "KEEP THE LIST MOVING (the user sees it live as \"Tasks X/N\"):\n"
+        "- Call this tool with merge=true the moment any item changes state: "
+        "mark a new item in_progress when you start it, mark it completed as "
+        "soon as it is done. Never leave the list untouched across completed "
+        "steps just to update it once at the end — a frozen list looks broken "
+        "to the user, because the panel only moves when this tool is called.\n"
+        "- If something fails, cancel it and add a revised item.\n\n"
         "Always returns the full current list."
     ),
     "parameters": {
