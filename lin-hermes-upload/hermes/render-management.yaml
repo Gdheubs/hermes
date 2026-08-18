@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: lin-hermes-management
+    runtime: python
+    plan: starter
+    buildCommand: uv sync --frozen --extra web && npm ci --workspace web && npm run build --workspace web
+    startCommand: sh lin-hermes-upload/hermes/start_management.sh
+    healthCheckPath: /health
+    envVars:
+      - key: HERMES_HOME
+        value: /var/data/hermes
+      - key: HERMES_DASHBOARD_UPSTREAM
+        value: http://127.0.0.1:9119
+      - key: HERMES_DASHBOARD_INTERNAL_TOKEN
+        sync: false
+    disk:
+      name: hermes-management-data
+      mountPath: /var/data
+      sizeGB: 10
