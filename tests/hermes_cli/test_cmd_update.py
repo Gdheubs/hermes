@@ -1236,3 +1236,31 @@ class TestUpdateNodeDependencies:
         assert cwd_calls, "expected at least one npm call"
         for cwd in cwd_calls:
             assert cwd == tmp_path, f"npm must run from PROJECT_ROOT; got cwd={cwd}"
+
+
+class TestShallowCloneFetch:
+    """A shallow clone's fetch must cross the shallow boundary (#88175)."""
+
+    def test_shallow_clone_uses_unshallow(self, tmp_path):
+        from hermes_cli import update_cmd
+
+        (tmp_path / ".git" / "shallow").mkdir(parents=True)
+        cmd = update_cmd._fetch_command(
+            ["git", "-c", "windows.appendAtomically=false"], "main", tmp_path
+        )
+        assert cmd == [
+            "git",
+            "-c",
+            "windows.appendAtomically=false",
+            "fetch",
+            "--unshallow",
+            "origin",
+            "main",
+        ]
+
+    def test_full_clone_uses_plain_fetch(self, tmp_path):
+        from hermes_cli import update_cmd
+
+        (tmp_path / ".git").mkdir(parents=True)
+        cmd = update_cmd._fetch_command(["git"], "main", tmp_path)
+        assert cmd == ["git", "fetch", "origin", "main"]

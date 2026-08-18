@@ -4207,6 +4207,22 @@ def _resume_windows_gateways_after_update(token: dict | None) -> None:
             f"  ✓ Restarting {unmapped_relaunched} unmapped Windows gateway process(es)"
         )
 
+def _fetch_command(git_cmd: list, branch: str, repo_root) -> list:
+    """Build the git fetch command, unshallowing shallow checkouts (#88175).
+
+    A shallow clone's ``git fetch origin <branch>`` returns success WITHOUT
+    crossing the shallow boundary, so ``origin/<branch>`` stays at a stale
+    commit; ``reset --hard`` then aligns the working tree to that stale
+    commit and the update badge never clears even though the updater
+    reported success. When ``.git/shallow`` is present, fetch with
+    ``--unshallow`` so ``origin/<branch>`` reaches the real remote tip
+    (one-time cost per checkout; afterwards the repo is no longer shallow).
+    """
+    if (Path(repo_root) / ".git" / "shallow").exists():
+        return git_cmd + ["fetch", "--unshallow", "origin", branch]
+    return git_cmd + ["fetch", "origin", branch]
+
+
 def _discard_lockfile_churn(git_cmd, repo_root):
     """Restore tracked ``package-lock.json`` files that npm dirtied locally.
 
@@ -4681,7 +4697,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
+            _fetch_command(git_cmd, branch, _m().PROJECT_ROOT),
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
