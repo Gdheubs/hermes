@@ -100,6 +100,12 @@ _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
 _CLI_TIMEOUT = 30.0
 
+# ``buzz messages send`` accepts at most 65,536 UTF-8 bytes.  Use Buzz's own
+# conservative 60 KiB diff ceiling for message parts, leaving 4 KiB below the
+# hard limit plus a fixed allowance for the visible part label.
+_BUZZ_MESSAGE_MAX_BYTES = 61_440
+_BUZZ_CHUNK_LABEL_RESERVE_BYTES = 64
+
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
 _WS_AUTH_TIMEOUT = 20.0
@@ -110,6 +116,53 @@ _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
 # BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
 _DEFAULT_CREDENTIALS_DIR = Path("~/.config/buzz").expanduser()
+
+
+def _utf8_prefix_length(text: str, byte_limit: int) -> int:
+    """Largest codepoint offset whose UTF-8 encoding fits ``byte_limit``."""
+    low, high = 0, len(text)
+    while low < high:
+        mid = (low + high + 1) // 2
+        if len(text[:mid].encode("utf-8")) <= byte_limit:
+            low = mid
+        else:
+            high = mid - 1
+    return low
+
+
+def _split_buzz_message(content: str) -> List[str]:
+    """Split oversized content without losing Unicode or boundary whitespace."""
+    if len(content.encode("utf-8")) <= _BUZZ_MESSAGE_MAX_BYTES:
+        return [content]
+
+    body_limit = _BUZZ_MESSAGE_MAX_BYTES - _BUZZ_CHUNK_LABEL_RESERVE_BYTES
+    bodies: List[str] = []
+    remaining = content
+    while remaining:
+        codepoint_limit = _utf8_prefix_length(remaining, body_limit)
+        if codepoint_limit >= len(remaining):
+            split_at = len(remaining)
+        else:
+            region = remaining[:codepoint_limit]
+            # Prefer a paragraph boundary in the latter half of the available
+            # region, then a newline, then the exact UTF-8-safe byte boundary.
+            split_at = region.rfind("\n\n")
+            if split_at >= codepoint_limit // 2:
+                split_at += 2
+            else:
+                split_at = region.rfind("\n")
+                if split_at >= codepoint_limit // 2:
+                    split_at += 1
+                else:
+                    split_at = codepoint_limit
+        bodies.append(remaining[:split_at])
+        remaining = remaining[split_at:]
+
+    total = len(bodies)
+    parts = [f"[Part {index}/{total}]\n\n{body}" for index, body in enumerate(bodies, 1)]
+    if any(len(part.encode("utf-8")) > _BUZZ_MESSAGE_MAX_BYTES for part in parts):
+        raise ValueError("Buzz chunk label exceeded reserved byte allowance")
+    return parts
 
 
 def _load_nostr_auth():
@@ -353,6 +406,8 @@ class BuzzAdapter(BasePlatformAdapter):
 
     Instantiated by the adapter_factory passed to register_platform().
     """
+
+    splits_long_messages = True
 
     def __init__(self, config, **kwargs):
         platform = Platform("buzz")
@@ -608,30 +663,95 @@ class BuzzAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if not content:
             return SendResult(success=False, error="Empty message")
-        args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
         reply_target = reply_to or (metadata or {}).get("thread_id")
-        if reply_target:
-            args += ["--reply-to", str(reply_target)]
-        code, out, err = await self._run_cli(args, input_text=content)
-        if code != 0:
-            return SendResult(
-                success=False,
-                error=_cli_error_message(err, code),
-                retryable=code == 2,
+        chunks = _split_buzz_message(content)
+        total = len(chunks)
+        message_ids: List[str] = []
+        delivered_bodies: List[str] = []
+        data: Dict[str, Any] = {}
+
+        for part_number, chunk in enumerate(chunks, 1):
+            args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
+            # Every part stays attached to the original parent. Buzz derives
+            # the thread root from that immediate parent via the relay.
+            if reply_target:
+                args += ["--reply-to", str(reply_target)]
+            code, out, err = await self._run_cli(args, input_text=chunk)
+            if code != 0:
+                error = _cli_error_message(err, code)
+                delivered_prefix = "".join(delivered_bodies)
+                if total > 1:
+                    delivered = part_number - 1
+                    noun = "part" if delivered == 1 else "parts"
+                    error = (
+                        f"Buzz delivery failed at part {part_number}/{total} after "
+                        f"{delivered} {noun} delivered: {error}"
+                    )
+                return SendResult(
+                    success=False,
+                    error=error,
+                    raw_response={
+                        "partial_delivery": part_number > 1,
+                        "delivered_message_ids": message_ids,
+                        "delivered_parts": part_number - 1,
+                        "delivered_prefix": delivered_prefix,
+                        "remaining_content": content[len(delivered_prefix):],
+                        "failed_part": part_number,
+                        "total_parts": total,
+                    },
+                    # Retrying the whole send after any successful part would
+                    # duplicate the already-published prefix.
+                    retryable=code == 2 and part_number == 1,
+                )
+            try:
+                parsed = json.loads(out or "{}")
+                data = parsed if isinstance(parsed, dict) else {}
+            except ValueError:
+                data = {}
+            if data.get("accepted", True) is False:
+                error = str(data.get("message") or data.get("error") or "Buzz rejected message")
+                delivered_prefix = "".join(delivered_bodies)
+                if total > 1:
+                    delivered = part_number - 1
+                    noun = "part" if delivered == 1 else "parts"
+                    error = (
+                        f"Buzz delivery failed at part {part_number}/{total} after "
+                        f"{delivered} {noun} delivered: {error}"
+                    )
+                    data = {
+                        **data,
+                        "partial_delivery": delivered > 0,
+                        "delivered_message_ids": message_ids,
+                        "delivered_parts": delivered,
+                        "delivered_prefix": delivered_prefix,
+                        "remaining_content": content[len(delivered_prefix):],
+                        "failed_part": part_number,
+                        "total_parts": total,
+                    }
+                return SendResult(success=False, error=error, raw_response=data)
+            event_id = data.get("event_id")
+            if event_id:
+                event_id = str(event_id)
+                message_ids.append(event_id)
+                # Belt-and-braces echo suppression: the poll loop already skips
+                # our own pubkey, but marking each id seen makes de-dupe explicit.
+                self._mark_seen(str(chat_id), event_id)
+            delivered_bodies.append(
+                chunk if total == 1 else chunk.split("\n\n", 1)[1]
             )
-        try:
-            data = json.loads(out or "{}")
-        except ValueError:
-            data = {}
-        event_id = data.get("event_id")
-        if event_id:
-            # Belt-and-braces echo suppression: the poll loop already skips
-            # our own pubkey, but marking the id seen makes de-dupe explicit.
-            self._mark_seen(str(chat_id), str(event_id))
+
+        raw_response: Any = data
+        if total > 1:
+            raw_response = {
+                "parts": total,
+                "message_ids": message_ids,
+                "last_response": data,
+            }
         return SendResult(
-            success=bool(data.get("accepted", True)),
-            message_id=str(event_id) if event_id else None,
-            raw_response=data,
+            success=True,
+            message_id=message_ids[-1] if message_ids else None,
+            raw_response=raw_response,
+            continuation_message_ids=tuple(message_ids[:-1]),
         )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
@@ -1385,26 +1505,68 @@ async def _standalone_send(
     if not target:
         return {"error": "Buzz standalone send: no target channel (set BUZZ_HOME_CHANNEL)"}
 
-    args = ["messages", "send", "--channel", target, "--content", "-"]
-    if thread_id:
-        args += ["--reply-to", str(thread_id)]
-    for path in media_files or []:
-        args += ["--file", str(path)]
-    try:
-        code, out, err = await _exec_buzz(
-            cli_path, args, relay_url=relay, private_key=private_key, input_text=message
-        )
-    except asyncio.CancelledError:
-        raise
-    except OSError as e:
-        return {"error": f"Buzz standalone send failed to launch CLI: {e}"}
-    if code != 0:
-        return {"error": f"Buzz standalone send failed: {_cli_error_message(err, code)}"}
-    try:
-        data = json.loads(out or "{}")
-    except ValueError:
-        data = {}
-    return {"success": True, "message_id": str(data.get("event_id") or "")}
+    chunks = _split_buzz_message(message)
+    total = len(chunks)
+    message_ids: List[str] = []
+    for part_number, chunk in enumerate(chunks, 1):
+        args = ["messages", "send", "--channel", target, "--content", "-"]
+        if thread_id:
+            args += ["--reply-to", str(thread_id)]
+        # Files are a single delivery side effect; repeating them on every text
+        # continuation would duplicate attachments.
+        if part_number == 1:
+            for path in media_files or []:
+                args += ["--file", str(path)]
+        try:
+            code, out, err = await _exec_buzz(
+                cli_path,
+                args,
+                relay_url=relay,
+                private_key=private_key,
+                input_text=chunk,
+            )
+        except asyncio.CancelledError:
+            raise
+        except OSError as e:
+            return {
+                "error": f"Buzz standalone send failed to launch CLI: {e}",
+                "partial_delivery": part_number > 1,
+                "delivered_message_ids": message_ids,
+            }
+        if code != 0:
+            return {
+                "error": f"Buzz standalone send failed: {_cli_error_message(err, code)}",
+                "partial_delivery": part_number > 1,
+                "delivered_message_ids": message_ids,
+                "delivered_parts": part_number - 1,
+                "failed_part": part_number,
+                "total_parts": total,
+            }
+        try:
+            data = json.loads(out or "{}")
+        except ValueError:
+            data = {}
+        if data.get("accepted", True) is False:
+            return {
+                "error": str(data.get("message") or data.get("error") or "Buzz rejected message"),
+                "partial_delivery": part_number > 1,
+                "delivered_message_ids": message_ids,
+                "delivered_parts": part_number - 1,
+                "failed_part": part_number,
+                "total_parts": total,
+            }
+        event_id = str(data.get("event_id") or "")
+        if event_id:
+            message_ids.append(event_id)
+
+    if total == 1:
+        return {"success": True, "message_id": message_ids[-1] if message_ids else ""}
+    return {
+        "success": True,
+        "message_id": message_ids[-1] if message_ids else "",
+        "message_ids": message_ids,
+        "parts": total,
+    }
 
 
 def interactive_setup() -> None:

@@ -6,6 +6,8 @@ import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
+from gateway.config import GatewayConfig, Platform
+from gateway.delivery import DeliveryRouter, DeliveryTarget
 from tests.gateway._plugin_adapter_loader import load_plugin_adapter
 
 # Load plugins/platforms/buzz/adapter.py under a unique module name
@@ -24,6 +26,7 @@ validate_config = _buzz_mod.validate_config
 register = _buzz_mod.register
 _env_enablement = _buzz_mod._env_enablement
 _standalone_send = _buzz_mod._standalone_send
+_split_buzz_message = _buzz_mod._split_buzz_message
 
 # Real key pair (Chip's public identity — public information, not a secret)
 SELF_PUBKEY = "9fd5c7ba6d3ef224da78f541e0fcb9c50f72cc63edb19aae76ac6a0474dfa860"
@@ -386,6 +389,26 @@ class TestDmClassification:
 
 class TestBuzzAdapterSend:
 
+    @pytest.mark.parametrize(
+        ("content", "expected_parts"),
+        [
+            ("x" * 61_439, 1),
+            ("x" * 61_440, 1),
+            ("x" * 61_441, 2),
+            ("🎉" * 15_360, 1),
+            ("🎉" * 15_361, 2),
+        ],
+    )
+    def test_split_uses_utf8_byte_threshold(self, content, expected_parts):
+        parts = _split_buzz_message(content)
+
+        assert len(parts) == expected_parts
+        assert all(len(part.encode("utf-8")) <= 61_440 for part in parts)
+        if expected_parts == 1:
+            assert parts == [content]
+        else:
+            assert "".join(part.split("\n\n", 1)[1] for part in parts) == content
+
     @pytest.mark.asyncio
     async def test_send_success_via_stdin(self):
         adapter = _make_adapter()
@@ -406,6 +429,146 @@ class TestBuzzAdapterSend:
         assert stdin_text == "hello **markdown**"
         # Our own event id is marked seen for echo suppression
         assert "evt123" in adapter._channel_state[CHANNEL]["seen"]
+
+    @pytest.mark.asyncio
+    async def test_router_preserves_output_above_gateway_cap(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt124"})
+        adapter._run_cli = cli
+        router = DeliveryRouter(GatewayConfig(), adapters={Platform.BUZZ: adapter})
+        content = "x" * 5_000
+
+        result = await router._deliver_to_platform(
+            DeliveryTarget.parse(f"buzz:{CHANNEL}"),
+            content,
+            metadata={"job_id": "long-buzz"},
+        )
+
+        assert result.success is True
+        assert [stdin_text for _args, stdin_text in cli.calls] == [content]
+
+    @pytest.mark.asyncio
+    async def test_send_splits_utf8_payloads_with_order_and_reply_anchor(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        for event_id in ("evt-a", "evt-b", "evt-c"):
+            cli.script(
+                "messages", "send", {"accepted": True, "event_id": event_id}
+            )
+        adapter._run_cli = cli
+        content = (("paragraph one 🎉\n\n" + ("数据" * 5_000) + "\n\n") * 4)
+
+        result = await adapter.send(CHANNEL, content, reply_to="a" * 64)
+
+        assert result.success is True
+        assert len(cli.calls) > 1
+        payloads = [stdin_text for _args, stdin_text in cli.calls]
+        assert all(len(payload.encode("utf-8")) <= 61_440 for payload in payloads)
+        assert all(
+            args[args.index("--reply-to") + 1] == "a" * 64
+            for args, _stdin_text in cli.calls
+        )
+        bodies = [payload.split("\n\n", 1)[1] for payload in payloads]
+        assert "".join(bodies) == content
+
+    @pytest.mark.asyncio
+    async def test_send_stops_and_reports_partial_chunk_failure(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-a"})
+        cli.script("messages", "send", "", code=2, stderr="relay unavailable")
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-c"})
+        adapter._run_cli = cli
+
+        content = "x" * 130_000
+        result = await adapter.send(CHANNEL, content)
+
+        assert result.success is False
+        assert result.retryable is False
+        assert "part 2/3" in result.error
+        assert "1 part delivered" in result.error
+        assert (
+            result.raw_response["delivered_prefix"]
+            + result.raw_response["remaining_content"]
+            == content
+        )
+        assert len(cli.calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_send_with_retry_does_not_duplicate_partial_delivery(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-a"})
+        cli.script("messages", "send", "", code=2, stderr="network unreachable")
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-c"})
+        adapter._run_cli = cli
+
+        result = await adapter._send_with_retry(
+            CHANNEL,
+            "x" * 130_000,
+            max_retries=1,
+            base_delay=0,
+        )
+
+        assert result.success is False
+        assert result.retryable is False
+        assert result.raw_response["partial_delivery"] is True
+        assert len(cli.calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_send_with_retry_does_not_fallback_after_partial_rejection(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-a"})
+        cli.script("messages", "send", {"accepted": False, "error": "rejected"})
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-c"})
+        adapter._run_cli = cli
+
+        result = await adapter._send_with_retry(CHANNEL, "x" * 130_000)
+
+        assert result.success is False
+        assert result.raw_response["partial_delivery"] is True
+        assert result.raw_response["delivered_message_ids"] == ["evt-a"]
+        assert len(cli.calls) == 2
+
+    @pytest.mark.asyncio
+    async def test_retry_stops_when_later_attempt_partially_delivers(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", "", code=2, stderr="network unreachable")
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-a"})
+        cli.script("messages", "send", "", code=2, stderr="network unreachable")
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-c"})
+        adapter._run_cli = cli
+
+        result = await adapter._send_with_retry(
+            CHANNEL,
+            "x" * 130_000,
+            max_retries=1,
+            base_delay=0,
+        )
+
+        assert result.success is False
+        assert result.raw_response["partial_delivery"] is True
+        assert result.raw_response["delivered_message_ids"] == ["evt-a"]
+        assert len(cli.calls) == 3
+
+    @pytest.mark.asyncio
+    async def test_send_keeps_first_chunk_failure_retryable(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", "", code=2, stderr="relay unavailable")
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "x" * 130_000)
+
+        assert result.success is False
+        assert result.retryable is True
+        assert "part 1/3" in result.error
+        assert "0 parts delivered" in result.error
+        assert len(cli.calls) == 1
 
 
     @pytest.mark.asyncio
@@ -537,4 +700,39 @@ class TestStandaloneSend:
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
 
+    @pytest.mark.asyncio
+    async def test_standalone_send_splits_long_utf8_payload_without_duplicate_files(
+        self, monkeypatch, tmp_path
+    ):
+        from gateway.config import PlatformConfig
 
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1x")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+        calls = []
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, input_text=None, timeout=30.0):
+            calls.append((args, input_text))
+            return 0, json.dumps({"accepted": True, "event_id": f"evt-{len(calls)}"}), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        content = ("report 🎉\n\n" + ("数据" * 8_000)) * 3
+
+        result = await _standalone_send(
+            PlatformConfig(enabled=True, extra={}),
+            CHANNEL,
+            content,
+            thread_id="a" * 64,
+            media_files=["/tmp/report.pdf"],
+        )
+
+        assert result["success"] is True
+        assert result["parts"] == len(calls)
+        assert len(calls) > 1
+        assert all(len(payload.encode("utf-8")) <= 61_440 for _args, payload in calls)
+        assert "--file" in calls[0][0]
+        assert all("--file" not in args for args, _payload in calls[1:])
+        assert all(args[args.index("--reply-to") + 1] == "a" * 64 for args, _ in calls)
+        assert "".join(payload.split("\n\n", 1)[1] for _args, payload in calls) == content

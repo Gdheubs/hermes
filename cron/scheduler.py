@@ -63,6 +63,8 @@ from agent.delegation_context import (
 
 logger = logging.getLogger(__name__)
 
+_LIVE_ADAPTER_SEND_TIMEOUT_SECONDS = 60
+
 
 def _close_late_session_db_result(future: "concurrent.futures.Future") -> None:
     """Done-callback: close a SessionDB whose constructor finished after run_job's timeout.
@@ -2705,6 +2707,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             and getattr(loop, "is_running", lambda: False)()
         )
         delivered = False
+        partial_delivery = False
         target_errors = []
 
         # Continuable cron surface (D1/D2/D6): resolve the delivery surface for
@@ -2895,12 +2898,30 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     # detection when "thread_id"/"message_thread_id" are absent
                     # from metadata, deriving the routing from target.thread_id
                     # or the explicit direct_messages_topic_id above.
-                    future = safe_schedule_threadsafe(
-                        router._deliver_to_platform(
+                    # Coordinate timeout cancellation with coroutine startup.
+                    # concurrent.futures.Future.cancel() may return True even
+                    # after an asyncio task has started, so its return value
+                    # cannot tell us whether a send already produced visible
+                    # side effects.  The lock makes the two safe outcomes
+                    # mutually exclusive: either cron aborts before adapter
+                    # entry and may use standalone fallback, or adapter entry
+                    # wins and timeout must be assume-delivered.
+                    dispatch_lock = threading.Lock()
+                    dispatch_state = {"started": False, "abort": False}
+
+                    async def _deliver_after_dispatch_handshake():
+                        with dispatch_lock:
+                            if dispatch_state["abort"]:
+                                return None
+                            dispatch_state["started"] = True
+                        return await router._deliver_to_platform(
                             route_target,
                             text_to_send,
                             route_metadata,
-                        ),
+                        )
+
+                    future = safe_schedule_threadsafe(
+                        _deliver_after_dispatch_handshake(),
                         loop,
                     )
                     if future is None:
@@ -2910,27 +2931,22 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         send_result = None
                         timeout_handled = False
                         try:
-                            send_result = future.result(timeout=60)
+                            send_result = future.result(
+                                timeout=_LIVE_ADAPTER_SEND_TIMEOUT_SECONDS
+                            )
                         except TimeoutError:
-                            # #38922: a slow confirmation does NOT necessarily
-                            # mean the send failed — but we must distinguish two
-                            # cases via future.cancel()'s return value:
-                            #
-                            #   cancel() == False -> the coroutine was already
-                            #     running on the gateway loop when the timeout
-                            #     fired; the request is in flight on the wire and
-                            #     cannot be un-sent.  Re-sending via standalone
-                            #     would be a guaranteed DUPLICATE, so treat it as
-                            #     delivered (assume-delivered).
-                            #
-                            #   cancel() == True -> the scheduled callback never
-                            #     started executing (loop wedged/backlogged for
-                            #     the full 60s), so nothing was sent.  We MUST
-                            #     fall through to the standalone path or the
-                            #     message is silently dropped (worse than a
-                            #     duplicate).
-                            cancelled = future.cancel()
-                            if cancelled:
+                            # #38922: a slow confirmation does not prove failure.
+                            # Atomically stop a not-yet-started coroutine before
+                            # allowing standalone fallback.  If adapter execution
+                            # already began, it may have published one or more
+                            # Buzz chunks, so any full resend could duplicate the
+                            # visible prefix regardless of cancel()'s return value.
+                            with dispatch_lock:
+                                already_started = dispatch_state["started"]
+                                if not already_started:
+                                    dispatch_state["abort"] = True
+                            future.cancel()
+                            if not already_started:
                                 msg = (
                                     f"live adapter send to {platform_name}:{chat_id} "
                                     "timed out before the coroutine was dispatched"
@@ -2947,10 +2963,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 timeout_handled = True
                                 logger.warning(
                                     "Job '%s': live adapter send to %s:%s timed out "
-                                    "after 60s; already dispatched (in flight), "
+                                    "after %ss; already dispatched (in flight), "
                                     "assuming delivered (skipping standalone fallback "
                                     "to avoid duplicate)",
                                     job["id"], platform_name, chat_id,
+                                    _LIVE_ADAPTER_SEND_TIMEOUT_SECONDS,
                                 )
                         except Exception as ex:
                             # A real send error (not a slow confirmation) — fall
@@ -3088,18 +3105,29 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
                     )
             except Exception as e:
+                partial_delivery = getattr(e, "partial_delivery", False) is True
                 err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)
                 if transport is not None and transport.is_relay:
                     logger.warning("Job '%s': %s", job["id"], err_msg)
                 else:
-                    logger.warning(
-                        "Job '%s': %s, falling back to standalone",
-                        job["id"], err_msg,
-                    )
+                    if partial_delivery:
+                        logger.warning(
+                            "Job '%s': %s; visible partial delivery prevents "
+                            "standalone fallback",
+                            job["id"], err_msg,
+                        )
+                    else:
+                        logger.warning(
+                            "Job '%s': %s, falling back to standalone",
+                            job["id"], err_msg,
+                        )
 
         if not delivered:
+            if partial_delivery:
+                delivery_errors.extend(target_errors)
+                continue
             if transport is not None and transport.is_relay:
                 # Relay owns the logical destination and its connector owns the
                 # platform credential. A native retry could duplicate delivery

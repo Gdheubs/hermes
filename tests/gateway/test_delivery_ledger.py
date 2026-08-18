@@ -111,6 +111,17 @@ class TestSweep:
         _record()  # owner = this (live) process
         assert dl.sweep_recoverable() == []
 
+    def test_partial_row_claims_only_unsent_tail(self):
+        _record(content="visible prefix plus unsent tail")
+        dl.mark_partial("ob-1", "unsent tail", "part 2 failed")
+        _orphan("ob-1")
+
+        claimed = dl.sweep_recoverable()
+
+        assert len(claimed) == 1
+        assert claimed[0]["content"] == "unsent tail"
+        assert claimed[0]["needs_marker"] is True
+
     def test_dead_owner_pending_claimed_without_marker(self):
         _record()
         _orphan("ob-1")
@@ -198,6 +209,46 @@ class TestGatewayRedeliverySweep:
         sent = adapter.send.call_args.kwargs
         assert sent["content"].startswith(dl.RECOVERED_MARKER)
         assert sent["content"].endswith("the final answer")
+
+    @pytest.mark.asyncio
+    async def test_partial_redelivery_sends_only_unsent_tail(self):
+        _record(content="visible prefix plus unsent tail")
+        dl.mark_partial("ob-1", "unsent tail", "part 2 failed")
+        _orphan("ob-1")
+        adapter = self._adapter()
+        runner = self._runner(adapter)
+
+        await runner._redeliver_pending_obligations()
+
+        sent = adapter.send.call_args.kwargs["content"]
+        assert sent == dl.RECOVERED_MARKER + "unsent tail"
+        assert "visible prefix" not in sent
+        assert _row("ob-1")["state"] == "delivered"
+
+    @pytest.mark.asyncio
+    async def test_repeated_partial_redelivery_advances_unsent_tail(self):
+        from gateway.platforms.base import SendResult
+
+        _record(content="first tail then second tail")
+        dl.mark_partial("ob-1", "first tail then second tail", "part 2 failed")
+        _orphan("ob-1")
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=SendResult(
+                success=False,
+                error="recovery part failed",
+                raw_response={
+                    "partial_delivery": True,
+                    "remaining_content": "second tail",
+                },
+            )
+        )
+        runner = self._runner(adapter)
+
+        await runner._redeliver_pending_obligations()
+
+        assert _row("ob-1")["state"] == "failed"
+        assert _row("ob-1")["content"] == "second tail"
 
     @pytest.mark.parametrize(
         ("send_success", "ledger_method"),

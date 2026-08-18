@@ -14,7 +14,8 @@ bounded retention). The gateway writes three checkpoints around the send:
     record_obligation()   state='pending'     before any send attempt
     mark_attempting()     state='attempting'  immediately before the await
     mark_delivered() /    state='delivered'   only on SendResult.success
-    mark_failed()         state='failed'      on a definitive rejection
+    mark_failed() /       state='failed'      on a definitive rejection
+    mark_partial()        content=unsent tail when a visible prefix landed
 
 On startup, ``sweep_recoverable()`` claims rows whose owning process is
 dead and hands them to the gateway for redelivery. Crash semantics are
@@ -237,6 +238,26 @@ def mark_delivered(obligation_id: str) -> None:
 
 def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
+
+
+def mark_partial(
+    obligation_id: str,
+    remaining_content: str,
+    error: str = "",
+) -> None:
+    """Persist only the unsent tail so recovery cannot replay a visible prefix."""
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET state='failed', content=?, updated_at=?, last_error=?
+               WHERE obligation_id=?""",
+            (
+                remaining_content,
+                time.time(),
+                error[:500] if error else None,
+                obligation_id,
+            ),
+        )
 
 
 def _update_state(obligation_id: str, state: str, error: str = "") -> None:

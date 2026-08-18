@@ -1,10 +1,12 @@
 """Tests for cron/scheduler.py — origin resolution, delivery routing, and error logging."""
 
+import asyncio
 import contextlib
 import itertools
 import json
 import logging
 import os
+import threading
 from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
@@ -1920,20 +1922,15 @@ class TestParallelTick:
 
 
 class TestDeliverResultTimeoutCancelsFuture:
-    """When future.result(timeout=60) raises TimeoutError in the live adapter
-    delivery path, the outcome depends on whether the coroutine was already
-    running.  future.cancel() returning False means it is in flight on the wire
-    (cannot be un-sent) → treat as DELIVERED and skip the standalone fallback to
-    avoid a duplicate (#38922).  future.cancel() returning True means it never
-    started (wedged loop) → nothing was sent, so fall through to standalone or
-    the message is silently dropped.  Regression for #38922.
+    """Timeout fallback depends on an atomic adapter-entry handshake.
+
+    ``run_coroutine_threadsafe`` futures can report successful cancellation
+    after their asyncio task has started.  Cancellation status therefore cannot
+    safely decide whether standalone delivery would duplicate visible effects.
     """
 
-    def test_live_adapter_timeout_assumes_delivered_no_duplicate(self):
-        """End-to-end: live adapter confirmation times out past the 60s budget.
-        The fix (#38922) treats the send as already-dispatched/delivered and
-        does NOT run the standalone fallback — otherwise the message is sent
-        twice."""
+    def test_never_started_coroutine_uses_standalone_fallback(self):
+        """A coroutine aborted before adapter entry has no visible effects."""
         from gateway.config import Platform
         from concurrent.futures import Future
 
@@ -1949,11 +1946,9 @@ class TestDeliverResultTimeoutCancelsFuture:
         loop = MagicMock()
         loop.is_running.return_value = True
 
-        # A real concurrent.futures.Future, but we override .result() to raise
-        # TimeoutError exactly like the 60s wait firing in production.  We make
-        # .cancel() return False to simulate the coroutine being ALREADY RUNNING
-        # on the gateway loop (in flight on the wire) — the case where the send
-        # cannot be un-sent and a standalone resend would be a duplicate.
+        # The scheduled wrapper is closed without running, so its atomic
+        # dispatch state remains "not started". cancel() deliberately returns
+        # False to prove cancellation status is not the delivery oracle.
         captured_future = Future()
         cancel_calls = []
 
@@ -1987,12 +1982,80 @@ class TestDeliverResultTimeoutCancelsFuture:
                 loop=loop,
             )
 
-        # 1. cancel() was attempted (returned False = in flight).
+        # 1. Cancellation is still attempted to clean up the future.
         assert cancel_calls == [True], "future.cancel() should be attempted on TimeoutError"
-        # 2. Delivery is reported successful (no error string returned).
+        # 2. Standalone delivery succeeds, so the target succeeds overall.
         assert result is None, f"expected successful delivery, got error: {result!r}"
-        # 3. The standalone fallback must NOT run — that is the #38922 fix:
-        #    an in-flight confirmation timeout is assume-delivered, not a resend.
+        # 3. Adapter entry never occurred, so standalone fallback is safe.
+        standalone_send.assert_awaited_once()
+
+    def test_running_coroutine_cancel_true_does_not_resend_visible_prefix(
+        self, monkeypatch
+    ):
+        """A real loop may cancel a running send and return True.
+
+        Model the dangerous Buzz sequence: an adapter makes its first chunk
+        visible, stalls on a later chunk, and is cancelled by cron's timeout.
+        The original payload must not be handed to standalone delivery.
+        """
+        from gateway.config import Platform
+
+        buzz = Platform("buzz")
+        first_chunk_visible = threading.Event()
+        task_cancelled = threading.Event()
+
+        class StalledAfterVisibleChunkAdapter:
+            async def send(self, _target, _content, metadata=None):
+                first_chunk_visible.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    task_cancelled.set()
+                    raise
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {buzz: pconfig}
+        adapter = StalledAfterVisibleChunkAdapter()
+        standalone_send = AsyncMock(return_value={"success": True})
+        loop = asyncio.new_event_loop()
+        loop_thread = threading.Thread(target=loop.run_forever)
+        loop_thread.start()
+
+        job = {
+            "id": "buzz-timeout-after-visible-chunk",
+            "deliver": "origin",
+            "origin": {"platform": "buzz", "chat_id": "123"},
+        }
+
+        monkeypatch.setattr(
+            "cron.scheduler._LIVE_ADAPTER_SEND_TIMEOUT_SECONDS", 0.05
+        )
+        try:
+            with patch(
+                "gateway.config.load_gateway_config", return_value=mock_cfg
+            ), patch(
+                "cron.scheduler.load_config",
+                return_value={"cron": {"wrap_response": False}},
+            ), patch(
+                "tools.send_message_tool._send_to_platform", new=standalone_send
+            ):
+                result = _deliver_result(
+                    job,
+                    "x" * 70_000,
+                    adapters={buzz: adapter},
+                    loop=loop,
+                )
+                cancel_observed = task_cancelled.wait(timeout=1)
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join(timeout=2)
+            loop.close()
+
+        assert first_chunk_visible.is_set()
+        assert cancel_observed
+        assert result is None
         standalone_send.assert_not_awaited()
 
 
@@ -2057,6 +2120,67 @@ class TestDeliverResultLiveAdapterUnconfirmed:
         result, standalone_send = self._run(None)
         assert result is None, f"standalone should have delivered, got: {result!r}"
         standalone_send.assert_awaited_once()
+
+
+class TestDeliverResultPartialDelivery:
+    def test_partial_live_delivery_does_not_fall_back_to_standalone(self):
+        from concurrent.futures import Future
+
+        from gateway.config import Platform
+        from gateway.platforms.base import SendResult
+
+        adapter = AsyncMock()
+        adapter.send.return_value = SendResult(
+            success=False,
+            error="part 2/2 failed after 1 part delivered",
+            raw_response={
+                "partial_delivery": True,
+                "delivered_parts": 1,
+                "failed_part": 2,
+            },
+        )
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        buzz_platform = Platform("buzz")
+        mock_cfg.platforms = {buzz_platform: pconfig}
+
+        loop = MagicMock()
+        loop.is_running.return_value = True
+
+        def fake_run_coro(coro, _loop):
+            import asyncio as _asyncio
+
+            future = Future()
+            try:
+                future.set_result(_asyncio.run(coro))
+            except BaseException as exc:  # noqa: BLE001
+                future.set_exception(exc)
+            return future
+
+        job = {
+            "id": "partial-buzz-job",
+            "deliver": "origin",
+            "origin": {"platform": "buzz", "chat_id": "channel-1"},
+        }
+        standalone_send = AsyncMock(return_value={"success": True})
+
+        with (
+            patch("gateway.config.load_gateway_config", return_value=mock_cfg),
+            patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}),
+            patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro),
+            patch("tools.send_message_tool._send_to_platform", new=standalone_send),
+        ):
+            result = _deliver_result(
+                job,
+                "x" * 70_000,
+                adapters={buzz_platform: adapter},
+                loop=loop,
+            )
+
+        assert "part 2/2 failed after 1 part delivered" in result
+        standalone_send.assert_not_awaited()
 
 
 class TestDeliverOriginUnresolvableIsLocal:

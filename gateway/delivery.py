@@ -28,6 +28,16 @@ logger = logging.getLogger(__name__)
 # preserved.
 MAX_PLATFORM_OUTPUT = 4000
 
+
+class PartialDeliveryError(RuntimeError):
+    """A failed delivery that already produced visible, non-reversible output."""
+
+    partial_delivery = True
+
+    def __init__(self, message: str, result: Any):
+        super().__init__(message)
+        self.result = result
+
 # Matches strings that are *only* a "silence" narration with optional markdown
 # wrappers. Covers: *(silent)*, _silent_, `silent`, ~silent~, (silent), silent,
 # 🔇, a bare ".", "…", and the whitespace/marker-padded variants seen in the
@@ -169,6 +179,17 @@ def _send_result_error(result: Any) -> Optional[str]:
     else:
         error = getattr(result, "error", None)
     return str(error) if error else None
+
+
+def _send_result_is_partial(result: Any) -> bool:
+    if isinstance(result, dict):
+        raw_response = result.get("raw_response")
+    else:
+        raw_response = getattr(result, "raw_response", None)
+    return (
+        isinstance(raw_response, dict)
+        and raw_response.get("partial_delivery") is True
+    )
 
 
 def _is_thread_not_found_delivery_error(result: Any) -> bool:
@@ -638,9 +659,11 @@ class DeliveryRouter:
                     metadata=send_metadata or None,
                 )
             if _send_result_failed(result):
-                raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
+                error = _send_result_error(result) or f"{target.platform.value} delivery failed"
+                if _send_result_is_partial(result):
+                    raise PartialDeliveryError(error, result)
+                raise RuntimeError(error)
         return result
-
 
 
 

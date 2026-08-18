@@ -2475,7 +2475,10 @@ class SendResult:
     # raw_response["partial_overflow"] with delivered_chunks, total_chunks,
     # last_message_id, delivered_prefix, and continuation_message_ids so the
     # stream consumer can send the missing tail instead of marking a clipped
-    # response complete.
+    # response complete.  Chunking adapters may also set
+    # raw_response["partial_delivery"] when a failed send has already produced
+    # visible side effects; _send_with_retry() must then return the failure
+    # unchanged instead of retrying or sending a plain-text fallback.
     retryable: bool = False  # True for transient connection errors — base will retry automatically
     # Server-requested retry delay in seconds (e.g. Telegram FloodWait retry_after).
     # When present, _send_with_retry() honors this instead of its default backoff.
@@ -5416,6 +5419,15 @@ class BasePlatformAdapter(ABC):
         lowered = error.lower()
         return "timed out" in lowered or "readtimeout" in lowered or "writetimeout" in lowered
 
+    @staticmethod
+    def _is_partial_delivery_result(result: "SendResult") -> bool:
+        """Whether retry or fallback would duplicate an already-visible effect."""
+        raw_response = result.raw_response
+        return (
+            isinstance(raw_response, dict)
+            and raw_response.get("partial_delivery") is True
+        )
+
     def _unwrap_ephemeral(self, response: Any) -> Tuple[Optional[str], int]:
         """Unwrap a handler response into (text, ttl_seconds).
 
@@ -5494,6 +5506,15 @@ class BasePlatformAdapter(ABC):
         if result.success:
             return result
 
+        if self._is_partial_delivery_result(result):
+            logger.error(
+                "[%s] Partial delivery already produced visible messages; "
+                "automatic retry and fallback are unsafe: %s",
+                self.name,
+                result.error or "unknown send failure",
+            )
+            return result
+
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
 
@@ -5526,6 +5547,14 @@ class BasePlatformAdapter(ABC):
                 )
                 if result.success:
                     logger.info("[%s] Send succeeded on retry %d", self.name, attempt)
+                    return result
+                if self._is_partial_delivery_result(result):
+                    logger.error(
+                        "[%s] Retry partially delivered visible messages; "
+                        "further retry and fallback are unsafe: %s",
+                        self.name,
+                        result.error or "unknown send failure",
+                    )
                     return result
                 error_str = result.error or ""
                 if result.retry_after is not None:
@@ -6558,10 +6587,28 @@ class BasePlatformAdapter(ABC):
                             from gateway.delivery_ledger import (
                                 mark_delivered,
                                 mark_failed,
+                                mark_partial,
                             )
 
                             if getattr(result, "success", False):
                                 await asyncio.to_thread(mark_delivered, _obligation_id)
+                            elif self._is_partial_delivery_result(result):
+                                remaining_content = result.raw_response.get(
+                                    "remaining_content"
+                                )
+                                if isinstance(remaining_content, str):
+                                    await asyncio.to_thread(
+                                        mark_partial,
+                                        _obligation_id,
+                                        remaining_content,
+                                        str(getattr(result, "error", "") or ""),
+                                    )
+                                else:
+                                    await asyncio.to_thread(
+                                        mark_failed,
+                                        _obligation_id,
+                                        str(getattr(result, "error", "") or ""),
+                                    )
                             else:
                                 await asyncio.to_thread(
                                     mark_failed,

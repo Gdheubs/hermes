@@ -122,6 +122,72 @@ class TestProducerHook:
         assert len(rows) == 1
         assert rows[0][1] == "failed"
 
+    @pytest.mark.asyncio
+    async def test_partial_send_persists_only_unsent_tail(self):
+        adapter = _Adapter()
+        adapter.send = AsyncMock(
+            return_value=SendResult(
+                success=False,
+                error="part 2 failed after part 1 delivered",
+                raw_response={
+                    "partial_delivery": True,
+                    "delivered_prefix": "final ",
+                    "remaining_content": "answer",
+                },
+            )
+        )
+
+        await _run(adapter, _event())
+
+        rows = _rows()
+        assert len(rows) == 1
+        assert rows[0][1] == "failed"
+        assert rows[0][2] == "answer"
+
+    @pytest.mark.asyncio
+    async def test_partial_send_recovers_only_unsent_tail_after_restart(self):
+        from gateway.run import GatewayRunner
+
+        adapter = _Adapter()
+        adapter.send = AsyncMock(
+            return_value=SendResult(
+                success=False,
+                error="part 2 failed after part 1 delivered",
+                raw_response={
+                    "partial_delivery": True,
+                    "delivered_prefix": "final ",
+                    "remaining_content": "answer",
+                },
+            )
+        )
+        await _run(adapter, _event())
+
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET owner_pid=999999999, "
+                "owner_started_at=1"
+            )
+
+        recovery_adapter = MagicMock()
+        recovery_adapter.send = AsyncMock(
+            return_value=SendResult(success=True, message_id="recovered-1")
+        )
+        runner = object.__new__(GatewayRunner)
+        runner.adapters = {Platform.SLACK: recovery_adapter}
+        store = MagicMock()
+        store.clear_resume_pending = AsyncMock()
+        store._store = None
+        runner.session_store = None
+        runner._async_session_store = store
+
+        recovered = await runner._redeliver_pending_obligations()
+
+        assert recovered == 1
+        resent = recovery_adapter.send.call_args.kwargs["content"]
+        assert resent == dl.RECOVERED_MARKER + "answer"
+        assert "final answer" not in resent
+        assert _rows()[0][1] == "delivered"
+
 
     @pytest.mark.asyncio
     async def test_slow_ledger_record_does_not_block_event_loop(self):

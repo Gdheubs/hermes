@@ -11797,6 +11797,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ledger_enabled,
                 mark_delivered,
                 mark_failed,
+                mark_partial,
                 sweep_recoverable,
             )
 
@@ -11861,11 +11862,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         row["obligation_id"], row["attempts"],
                     )
                 else:
-                    await asyncio.to_thread(
-                        mark_failed,
-                        row["obligation_id"],
-                        str(getattr(result, "error", "") or "send failed"),
+                    raw_response = getattr(result, "raw_response", None)
+                    remaining_content = (
+                        raw_response.get("remaining_content")
+                        if isinstance(raw_response, dict)
+                        and raw_response.get("partial_delivery") is True
+                        else None
                     )
+                    if isinstance(remaining_content, str):
+                        await asyncio.to_thread(
+                            mark_partial,
+                            row["obligation_id"],
+                            remaining_content,
+                            str(getattr(result, "error", "") or "send failed"),
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            mark_failed,
+                            row["obligation_id"],
+                            str(getattr(result, "error", "") or "send failed"),
+                        )
             except Exception:
                 logger.debug("delivery ledger update failed", exc_info=True)
 
