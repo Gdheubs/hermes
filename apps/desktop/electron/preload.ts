@@ -17,6 +17,11 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   openSessionInTerminal: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openInTerminal', sessionId, opts),
   openWindow: () => ipcRenderer.invoke('hermes:window:openInstance'),
   claimAmbientCue: key => ipcRenderer.invoke('hermes:ambient:claim', key),
+  // Close-button behavior ('tray' = hide to system tray, 'quit' = close quits).
+  closeBehavior: {
+    get: () => ipcRenderer.invoke('hermes:close-behavior:get'),
+    set: mode => ipcRenderer.invoke('hermes:close-behavior:set', mode)
+  },
   wakeIndicator: {
     getState: () => ipcRenderer.invoke('hermes:wake-indicator:get'),
     setState: state => ipcRenderer.send('hermes:wake-indicator:set', state),
