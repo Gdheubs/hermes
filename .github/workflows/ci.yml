@@ -246,15 +246,21 @@ jobs:
           print(f'needs-json={json.dumps(compact)}')
           with open('$GITHUB_OUTPUT', 'a') as f:
               f.write(f'needs-json={json.dumps(compact)}\n')
-          failed = [name for name, info in needs.items() if info['result'] == 'failure']
+          # Only an explicit success or an intentional skip (a job gated by a
+          # classifier output, e.g. `if: needs.detect.outputs.python`) counts
+          # as passing. A `failure` OR a `cancelled` job is a real problem —
+          # a cancelled run means a job died or was interrupted, never a clean
+          # pass (#84254). Nothing else is acceptable.
+          bad = [name for name, info in needs.items()
+                 if info['result'] not in ('success', 'skipped')]
           for name, info in sorted(needs.items()):
               result = info['result']
               icon = '✅' if result in ('success', 'skipped') else '❌'
               print(f'{icon} {name}: {result}')
-          if failed:
-              print(f'::error::{len(failed)} job(s) failed: {\", \".join(failed)}')
+          if bad:
+              print(f'::error::{len(bad)} job(s) did not pass: {\", \".join(bad)}')
               sys.exit(1)
-          print('All checks passed (or were skipped)')
+          print('All checks passed (or were intentionally skipped)')
           "
 
   # ─────────────────────────────────────────────────────────────────────
