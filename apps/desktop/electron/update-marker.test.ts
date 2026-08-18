@@ -40,6 +40,13 @@ function writeMarker(home, pid, startedAtSec) {
 
 const ALIVE: typeof process.kill = () => true // injected kill that "succeeds" => pid alive
 
+function foreignPid(preferred) {
+  return preferred === process.pid ? preferred + 1 : preferred
+}
+
+const LIVE_OWNER_PID = foreignPid(4242)
+const CONFLICT_OWNER_PID = foreignPid(1010)
+
 const DEAD: typeof process.kill = () => {
   const err = new Error('no such process')
 
@@ -55,10 +62,10 @@ test('absent marker => no live update', () => {
 test('live pid within age ceiling => live update reported', () => {
   const home = tmpHome('live')
   const now = 1_000_000_000_000
-  writeMarker(home, 4242, Math.floor(now / 1000) - 5) // 5s old
+  writeMarker(home, LIVE_OWNER_PID, Math.floor(now / 1000) - 5) // 5s old
   const res = readLiveUpdateMarker(home, { kill: ALIVE, now: () => now })
   assert.ok(res, 'a fresh, alive marker is a live update')
-  assert.equal(res.pid, 4242)
+  assert.equal(res.pid, LIVE_OWNER_PID)
   assert.ok(res.ageMs >= 0 && res.ageMs < 10_000)
   assert.ok(fs.existsSync(markerPath(home)), 'a live marker is NOT deleted')
 })
@@ -70,10 +77,18 @@ test('dead pid => no live update and marker is pruned', () => {
   assert.ok(!fs.existsSync(markerPath(home)), 'a dead-pid marker self-heals (deleted)')
 })
 
+test('marker whose pid was reused by this desktop => no live update and marker is pruned', () => {
+  const home = tmpHome('self-pid')
+  writeMarker(home, process.pid, Math.floor(Date.now() / 1000))
+
+  assert.equal(readLiveUpdateMarker(home), null)
+  assert.ok(!fs.existsSync(markerPath(home)), 'a marker cannot be owned by the desktop reading it')
+})
+
 test('expired marker (past age ceiling) => no live update and pruned', () => {
   const home = tmpHome('expired')
   const now = 1_000_000_000_000
-  writeMarker(home, 4242, Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000))
+  writeMarker(home, LIVE_OWNER_PID, Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000))
   // Even though the pid is "alive", the marker is too old to trust.
   assert.equal(readLiveUpdateMarker(home, { kill: ALIVE, now: () => now }), null)
   assert.ok(!fs.existsSync(markerPath(home)), 'an expired marker self-heals (deleted)')
@@ -107,11 +122,11 @@ test('isPidAlive: EPERM counts as alive (process owned by another user)', () => 
 test('writeUpdateMarker writes a marker that readLiveUpdateMarker accepts', () => {
   const home = tmpHome('write')
   const now = 1_000_000_000_000
-  writeUpdateMarker(home, 4242, { now: () => now })
+  writeUpdateMarker(home, LIVE_OWNER_PID, { now: () => now })
   // The marker should be readable and report the same pid.
   const res = readLiveUpdateMarker(home, { kill: ALIVE, now: () => now })
   assert.ok(res, 'marker written by writeUpdateMarker should be detected as live')
-  assert.equal(res.pid, 4242)
+  assert.equal(res.pid, LIVE_OWNER_PID)
   assert.ok(fs.existsSync(markerPath(home)), 'marker file should exist after write')
 })
 
@@ -147,12 +162,12 @@ test('no marker => hand-off is not blocked', () => {
 test('a different live updater already owns the marker => hand-off is blocked', () => {
   const home = tmpHome('conflict-live')
   const now = 1_000_000_000_000
-  writeMarker(home, 1010, Math.floor(now / 1000) - 6) // 6s old
+  writeMarker(home, CONFLICT_OWNER_PID, Math.floor(now / 1000) - 6) // 6s old
   const conflict = updateHandoffConflict(home, { kill: ALIVE, now: () => now })
   assert.ok(conflict, 'a live foreign updater must block a new hand-off')
-  assert.equal(conflict.pid, 1010)
+  assert.equal(conflict.pid, CONFLICT_OWNER_PID)
   assert.match(conflict.message, /already running/)
-  assert.match(conflict.message, /PID 1010/)
+  assert.ok(conflict.message.includes(`PID ${CONFLICT_OWNER_PID}`))
   assert.match(conflict.message, /6s/)
 })
 
@@ -165,14 +180,14 @@ test('a dead-pid marker does not block a hand-off (self-heals)', () => {
 test('an expired marker does not block a hand-off (self-heals)', () => {
   const home = tmpHome('conflict-expired')
   const now = 1_000_000_000_000
-  writeMarker(home, 1010, Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000))
+  writeMarker(home, CONFLICT_OWNER_PID, Math.floor((now - UPDATE_MARKER_MAX_AGE_MS - 60_000) / 1000))
   assert.equal(updateHandoffConflict(home, { kill: ALIVE, now: () => now }), null)
 })
 
 test('minutes-scale elapsed time is formatted as "Nm Ss"', () => {
   const home = tmpHome('conflict-minutes')
   const now = 1_000_000_000_000
-  writeMarker(home, 1010, Math.floor(now / 1000) - 125) // 2m 5s old
+  writeMarker(home, CONFLICT_OWNER_PID, Math.floor(now / 1000) - 125) // 2m 5s old
   const conflict = updateHandoffConflict(home, { kill: ALIVE, now: () => now })
   assert.ok(conflict)
   assert.match(conflict.message, /2m 5s/)

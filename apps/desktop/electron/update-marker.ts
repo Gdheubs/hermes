@@ -68,11 +68,13 @@ export function readLiveUpdateMarker(
   {
     kill,
     now = Date.now,
-    maxAgeMs = UPDATE_MARKER_MAX_AGE_MS
+    maxAgeMs = UPDATE_MARKER_MAX_AGE_MS,
+    ownPid = process.pid
   }: {
     now?: () => number
     maxAgeMs?: number
     kill?: typeof process.kill
+    ownPid?: number
   } = {}
 ) {
   const file = markerPath(hermesHome)
@@ -88,7 +90,11 @@ export function readLiveUpdateMarker(
   const pid = Number.parseInt((pidLine || '').trim(), 10)
   const startedAt = Number.parseInt((startedLine || '').trim(), 10)
   const ageMs = Number.isFinite(startedAt) ? now() - startedAt * 1000 : Infinity
-  const alive = Number.isInteger(pid) && isPidAlive(pid, kill)
+  // This module runs in the Desktop process, but every legitimate marker is
+  // owned by a separate updater process. Windows can reuse a crashed updater's
+  // pid for the newly relaunched Desktop; an existence-only probe would then
+  // mistake the Desktop for its updater and make it wait on itself.
+  const alive = Number.isInteger(pid) && pid !== ownPid && isPidAlive(pid, kill)
 
   if (!alive || ageMs > maxAgeMs) {
     try {
