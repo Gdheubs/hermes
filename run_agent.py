@@ -174,6 +174,7 @@ from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock
 )
 from agent.process_bootstrap import _get_proxy_from_env  # noqa: F401
 from agent.message_sanitization import (  # noqa: F401
+    INTERRUPTED_TOOL_TAIL_KEY,
     _SURROGATE_RE,
     _sanitize_surrogates,
     _sanitize_structure_surrogates,
@@ -251,6 +252,11 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     # drive the bounded retry. Persisting them would replay the internal
     # retry instruction as user-authored context on resume.
     "_dropped_toolcall_nudge",
+    # false-stop nudge: the synthetic "issue the actual tool call now"
+    # user nudge drives the false-stop retry loop. The assistant candidate
+    # is NOT synthetic — it persists with finish_reason="false_stop_retry"
+    # and is emitted as an interim message. Only the user nudge is stripped.
+    "_false_stop_synthetic",
 )
 
 
@@ -980,6 +986,33 @@ class AIAgent:
                 self.status_callback("lifecycle", message)
             except Exception:
                 logger.debug("status_callback error in _emit_status", exc_info=True)
+
+    def _emit_tool_call_status(self, assistant_msg: Dict[str, Any]) -> None:
+        """Emit a synthetic status line for empty-content tool-call messages.
+
+        When the model issues tool calls without any accompanying narration
+        text, the user sees raw tool output with no explanation of what the
+        agent is doing.  This synthesizes a short status line from the tool
+        call metadata (names only — arguments may contain secrets) and routes
+        it through ``_emit_status`` (the status channel), NOT
+        ``interim_assistant_callback`` (the commentary channel), to keep
+        dedup records clean and avoid polluting the permanent message stream.
+
+        Local patch — not submitted upstream.
+        """
+        tool_calls = assistant_msg.get("tool_calls") or []
+        if not tool_calls:
+            return
+        names: List[str] = []
+        for tc in tool_calls:
+            if isinstance(tc, dict):
+                fn = tc.get("function", {})
+                names.append(fn.get("name", "unknown"))
+            elif hasattr(tc, "function"):
+                fn = tc.function
+                names.append(getattr(fn, "name", "unknown"))
+        if names:
+            self._emit_status(f"→ {', '.join(names)}")
 
     def _emit_warning(self, message: str) -> None:
         """Emit a user-visible warning through the same status plumbing.
@@ -1882,8 +1915,9 @@ class AIAgent:
         that synthetic text leak into persisted transcripts or resumed session
         history. When an override is configured for the active turn, mutate the
         in-memory messages list in place so both persistence and returned
-        history stay clean.  A paired timestamp override preserves the platform
-        event time as message metadata, rather than embedding it in content.
+        history stay clean. Paired source metadata preserves platform event
+        identity/time on the canonical message rather than embedding either in
+        content; the common API-copy boundary strips it before provider calls.
         """
         idx = getattr(self, "_persist_user_message_idx", None)
         override = getattr(self, "_persist_user_message_override", None)
@@ -2071,8 +2105,9 @@ class AIAgent:
         # silently dropped it. Instead, resolve the override here and apply it
         # ONLY to the value written to the DB (see the write loop below); the
         # live dict is never mutated, so every caller (early persist, mid-loop
-        # flush, /resume, /branch) is protected uniformly. Timestamp override is
-        # metadata and is likewise applied only to the written row.
+        # flush, /resume, /branch) is protected uniformly. The timestamp may
+        # already exist on the canonical message; this override also guarantees
+        # the written row retains it when a call path supplies it separately.
         _ov_idx = getattr(self, "_persist_user_message_idx", None)
         _ov_content = getattr(self, "_persist_user_message_override", None)
         _ov_timestamp = getattr(self, "_persist_user_message_timestamp", None)
@@ -2083,9 +2118,10 @@ class AIAgent:
             # Positional flushing used to slice at
             # max(len(conversation_history), _last_flushed_db_idx). That
             # assumes the live `messages` list is the original history plus a
-            # new tail. repair_message_sequence can shrink/merge the history
-            # copy before the final flush, making len(conversation_history)
-            # larger than len(messages); the slice is then empty and delivered
+            # new tail. repair_message_sequence can shrink the history copy by
+            # merging assistant turns or dropping orphaned tools before the
+            # final flush, making len(conversation_history) larger than
+            # len(messages); the slice is then empty and delivered
             # assistant responses never reach state.db (#46053).
             #
             # Track persistence with an intrinsic per-message marker rather than
@@ -2156,6 +2192,17 @@ class AIAgent:
                 if _is_ephemeral_scaffolding(msg):
                     continue
                 if msg.get(_DB_PERSISTED_MARKER):
+                    # Already-durable tool rows marked interrupted at finalize
+                    # time still need the durable provenance column stamped —
+                    # they were batch-flushed before the marker existed.
+                    if (
+                        msg.get("role") == "tool"
+                        and msg.get(INTERRUPTED_TOOL_TAIL_KEY) is True
+                    ):
+                        self._session_db.mark_tool_tail_interrupted(
+                            self.session_id,
+                            msg.get("tool_call_id"),
+                        )
                     continue
                 # Already-durable messages: either carried over from the loaded
                 # history copy, or seeded by a caller. Stamp them so future
@@ -2272,10 +2319,15 @@ class AIAgent:
                     "reasoning_details": msg.get("reasoning_details"),
                     "codex_reasoning_items": msg.get("codex_reasoning_items"),
                     "codex_message_items": msg.get("codex_message_items"),
+                    "platform_message_id": (
+                        msg.get("platform_message_id")
+                        or msg.get("message_id")
+                        or msg.get("_source_message_id")
+                    ),
                     "timestamp": _row_timestamp,
                     "api_content": _row_api_content,
                     # Standalone reference handoffs are always hidden, even
-                    # when the summarized transcript contained a user turn —
+                    # when the summarized transcript contained a user turn—
                     # otherwise they occupy the active user slot in
                     # retry/undo/session dispatch (#80622). Merge-into-tail
                     # carriers keep prior visibility rules so preserved tail
@@ -4037,6 +4089,54 @@ class AIAgent:
         except Exception:
             # Never let durable cleanup I/O break turn teardown.
             pass
+
+    def _finalize_activity_after_turn(self) -> None:
+        """Terminal activity stamp — called from the turn ``finally`` block.
+
+        Ensures ``last_activity_at`` is durably persisted even when all
+        intermediate heartbeats were rate-limited or dropped under lock
+        contention. This fixes the "stuck timestamp" bug where the Desktop
+        UI stops refreshing messages because ``last_activity_at`` never
+        advances past the last successful heartbeat.
+
+        Key design decisions (tri-model review 3/3 convergence):
+
+        1. **Does NOT call ``_touch_activity``** — that method runs the
+           kanban bridge (``inject_new_comments_from_env``) which can
+           trigger a spurious continuation turn on a finished turn.
+        2. **Does NOT bump in-memory ``_last_activity_ts``** — the gateway
+           stall-watchdog relies on this value being preserved across
+           interrupt-recursive turns (#15654). Bumping it at every nested
+           finally would reset the accumulated-idle clock.
+        3. **Uses elevated write patience** (``_ACTIVITY_FINALIZE_PATIENCE_S``
+           = 2.0s) — the turn is already over, so there is no
+           response-critical path to protect. The 0.5s mid-turn budget
+           does not apply here.
+        4. **Atomic UPDATE** — stamps ts AND clears labels in one write,
+           avoiding a transient "turn completed" label flash and halving
+           teardown writes vs. touch-then-clear.
+        """
+        session_id = getattr(self, "session_id", None)
+        session_db = getattr(self, "_session_db", None)
+        ts = getattr(self, "_last_activity_ts", None)
+        if not session_id or session_db is None:
+            return
+        finalize = getattr(session_db, "finalize_session_activity", None)
+        if not callable(finalize):
+            return
+        try:
+            finalize(session_id, ts)
+        except Exception:
+            logger.debug(
+                "turn-end activity finalize write failed (ignored)",
+                exc_info=True,
+            )
+        # Clear in-memory labels (mirrors _reset_activity_labels_after_turn).
+        # The DB write already clears them atomically; this ensures the
+        # in-memory snapshot is consistent for any reader that checks
+        # get_activity_summary() before the next _touch_activity.
+        self._last_activity_desc = ""
+        self._last_activity_provenance = ActivityProvenance.UNKNOWN
 
     def _capture_rate_limits(self, http_response: Any) -> None:
         """Parse x-ratelimit-* headers from an HTTP response and cache the state.
@@ -6676,7 +6776,7 @@ class AIAgent:
             logger.debug("interim_assistant_callback error", exc_info=True)
 
     def _emit_interim_assistant_message(
-        self, assistant_msg: Dict[str, Any]
+        self, assistant_msg: Dict[str, Any], *, force_display: bool = False
     ) -> None:
         """Surface a real mid-turn assistant commentary message to the UI layer.
 
@@ -6687,6 +6787,15 @@ class AIAgent:
         suppress a *different* final summary (e.g. from ``_handle_max_iterations``)
         when the only streamed text was unrelated mid-turn commentary. (#65919
         review: response-loss blocker)
+
+        When ``force_display`` is True, bypass the dedup gate
+        (``_interim_text_was_delivered``) and force ``already_streamed=False``
+        so the gateway calls ``on_commentary()`` (standalone permanent bubble)
+        instead of ``on_segment_break()`` (paragraph separator that can be
+        overwritten by subsequent messages). This is needed for the
+        verify-on-stop and pre_verify paths where the response MUST survive
+        as a permanent UI element, even if similar text was previously
+        streamed or delivered.
         """
         if not isinstance(assistant_msg, dict):
             return
@@ -6698,7 +6807,7 @@ class AIAgent:
             if (
                 not key
                 or key in pending_keys
-                or self._interim_text_was_delivered(part)
+                or (not force_display and self._interim_text_was_delivered(part))
             ):
                 continue
             pending_keys.add(key)
@@ -6711,10 +6820,10 @@ class AIAgent:
         if (
             not visible
             or visible == "(empty)"
-            or self._interim_text_was_delivered(visible)
+            or (not force_display and self._interim_text_was_delivered(visible))
         ):
             return
-        already_streamed = self._interim_content_was_streamed(visible)
+        already_streamed = False if force_display else self._interim_content_was_streamed(visible)
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
@@ -7758,9 +7867,35 @@ class AIAgent:
             self._needs_deepseek_tool_reasoning()
             or self._needs_kimi_tool_reasoning()
             or self._needs_mimo_tool_reasoning()
+            or self._reasoning_echo_opt_in()
         )
         self._thinking_pad_cache = (key, result)
         return result
+
+    def _reasoning_echo_opt_in(self) -> bool:
+        """Return True when the user has opted in to ``reasoning_content``
+        echo-back for the *current* provider via config.
+
+        This covers custom providers and OpenAI-compatible gateways that
+        proxy thinking-mode models (e.g. a reverse proxy fronting Kimi K3
+        or GLM-5.2) but are not matched by the built-in host-based
+        ``_REASONING_ECHO_RULES`` (DeepSeek / Kimi / MiMo).
+
+        The flag is per-active-provider:
+
+        * **Primary** — read from ``model.reasoning_echo`` in config.yaml
+          at agent init and on ``switch_model()``.
+        * **Fallback** — set by ``try_activate_fallback()`` from the
+          fallback entry's ``reasoning_echo`` field.
+        * **Restore** — ``restore_primary_runtime()`` copies the snapshot
+          saved by ``switch_model()``.
+
+        Unlike a global toggle, this flag travels with the active
+        provider, so falling back to a strict provider (Mistral, Groq,
+        Cerebras) correctly strips ``reasoning_content`` even when the
+        primary had the flag enabled.
+        """
+        return bool(getattr(self, "_reasoning_echo_flag", False))
 
     def _needs_kimi_tool_reasoning(self) -> bool:
         """Return True when the current provider is Kimi / Moonshot thinking mode.
@@ -8346,6 +8481,7 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        persist_user_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -8710,6 +8846,7 @@ class AIAgent:
                         persist_user_timestamp=persist_user_timestamp,
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
+                        persist_user_message_id=persist_user_message_id,
                         moa_config=moa_config,
                     )
                 finally:
@@ -8792,10 +8929,16 @@ class AIAgent:
                         ):
                             self._active_session_turn_lease_holder = None
                             self._active_session_turn_lease_ttl_seconds = None
-                    # Always clear mid-turn labels when the turn exits — including
-                    # interrupted early returns that skip finalize_turn. Keep ts.
+                    # Terminal activity stamp: persist ``last_activity_at``
+                    # and clear mid-turn labels in one atomic write. This
+                    # ensures the timestamp is durably stamped even when all
+                    # intermediate heartbeats were throttled or dropped.
+                    # ``_finalize_activity_after_turn`` does NOT call
+                    # ``_touch_activity`` (avoids kanban bridge side-effect)
+                    # and does NOT bump in-memory ``_last_activity_ts``
+                    # (preserves #15654 watchdog continuity).
                     try:
-                        self._reset_activity_labels_after_turn()
+                        self._finalize_activity_after_turn()
                     except Exception:
                         pass
                     if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
