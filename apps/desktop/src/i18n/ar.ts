@@ -1748,6 +1748,7 @@ export const ar = defineLocale({
     stopShort: 'إيقاف',
     endConversation: 'إنهاء المحادثة',
     endShort: 'إنهاء',
+    cancelDictation: 'إلغاء الإملاء',
     stopDictation: 'إيقاف الإملاء',
     transcribingDictation: 'جار تفريغ الإملاء',
     voiceDictation: 'إملاء صوتي',

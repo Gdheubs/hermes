@@ -2376,6 +2376,7 @@ export const zh: Translations = {
     stopShort: '停止',
     endConversation: '结束语音对话',
     endShort: '结束',
+    cancelDictation: '取消听写',
     stopDictation: '停止听写',
     transcribingDictation: '正在转写听写',
     voiceDictation: '语音听写',
