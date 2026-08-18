@@ -2213,7 +2213,11 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
             f"  \033[33m⚠\033[0m MESSAGING_CWD={messaging_cwd} found in .env — "
             f"this is deprecated."
         )
-    if terminal_cwd_env and not config_has_explicit_cwd:
+    # Kanban workers deliberately pin TERMINAL_CWD to the task workspace so
+    # file tools anchor there (kanban_db worker spawn); that is a runtime
+    # bridge, not a stale .env entry — don't warn about it.
+    _is_kanban_worker = os.environ.get("HERMES_SESSION_SOURCE") == "kanban"
+    if terminal_cwd_env and not config_has_explicit_cwd and not _is_kanban_worker:
         # TERMINAL_CWD in env but not from config bridge — likely from .env
         lines.append(
             f"  \033[33m⚠\033[0m TERMINAL_CWD={terminal_cwd_env} found in .env — "
