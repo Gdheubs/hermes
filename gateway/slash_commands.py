@@ -864,8 +864,35 @@ class GatewaySlashCommandsMixin:
             try:
                 from agent.model_metadata import get_model_context_length
 
+                # Inactive-agent fallback: resolve the configured route
+                # identity + compatible custom_providers so per-model
+                # context_length overrides (custom_providers[].models.<id>)
+                # are honored — passing only model_name falls through to
+                # generic metadata for custom endpoints (#15779).
+                _provider = ""
+                _custom_providers = None
+                try:
+                    from hermes_cli.config import (
+                        get_compatible_custom_providers,
+                        load_config_readonly,
+                    )
+
+                    _cfg = load_config_readonly() or {}
+                    _model_cfg = _cfg.get("model")
+                    if isinstance(_model_cfg, dict):
+                        _provider = str(_model_cfg.get("provider") or "").strip()
+                    _custom_providers = get_compatible_custom_providers(_cfg)
+                except Exception:
+                    _provider = ""
+                    _custom_providers = None
+
                 context_length = _int_value(
-                    await asyncio.to_thread(get_model_context_length, model_name)
+                    await asyncio.to_thread(
+                        get_model_context_length,
+                        model_name,
+                        provider=_provider,
+                        custom_providers=_custom_providers,
+                    )
                 )
             except Exception:
                 context_length = 0

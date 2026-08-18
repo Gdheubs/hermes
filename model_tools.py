@@ -720,12 +720,29 @@ def _resolve_active_context_length() -> int:
                     return cached_ctx
             except Exception:
                 pass
+        # Per-model context_length overrides from custom_providers config
+        # (custom_providers[].models.<id>.context_length) must be honored by
+        # the tool-search gate too — otherwise the gate sizes against generic
+        # metadata for custom endpoints (#15779). Best-effort load: config
+        # failure degrades to None so resolution falls through to probing.
+        custom_providers = None
+        try:
+            from hermes_cli.config import (
+                get_compatible_custom_providers,
+                load_config_readonly,
+            )
+            custom_providers = get_compatible_custom_providers(
+                load_config_readonly()
+            )
+        except Exception:
+            custom_providers = None
         return int(get_model_context_length(
             model_id,
             base_url=base_url,
             api_key=api_key,
             config_context_length=config_ctx,
             provider=provider,
+            custom_providers=custom_providers,
         ) or 0)
     except Exception as e:
         logger.debug("Could not resolve active context length: %s", e)
