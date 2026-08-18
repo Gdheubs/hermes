@@ -2090,6 +2090,13 @@ export const zhHant = defineLocale({
     pidLabel: pid => `PID ${pid}`,
     technicalDetails: '技術詳細資料',
     notNow: '暫不',
+    changeLogNew: '新增功能',
+    changeLogFixed: '修復',
+    changeLogFaster: '更快',
+    changeLogImproved: '改進',
+    changeLogOther: '其他改進',
+    changeLogFallbackLabel: '本次更新',
+    changeLogFallbackItem: '改進與修復',
     applyStatus: {
       preparing: '正在更新後端…',
       pulling: '後端更新中…',

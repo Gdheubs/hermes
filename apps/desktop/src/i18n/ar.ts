@@ -1953,6 +1953,13 @@ export const ar = defineLocale({
     pidLabel: pid => `معرّف العملية ${pid}`,
     technicalDetails: 'التفاصيل التقنية',
     notNow: 'ليس الآن',
+    changeLogNew: 'جديد',
+    changeLogFixed: 'إصلاحات',
+    changeLogFaster: 'أسرع',
+    changeLogImproved: 'تحسينات',
+    changeLogOther: 'تحسينات أخرى',
+    changeLogFallbackLabel: 'في هذا التحديث',
+    changeLogFallbackItem: 'تحسينات وإصلاحات',
     applyStatus: {
       preparing: 'جار تحديث الواجهة الخلفية...',
       pulling: 'جار تحديث الواجهة الخلفية...',

@@ -2629,6 +2629,13 @@ export const zh: Translations = {
     pidLabel: pid => `PID ${pid}`,
     technicalDetails: '技术详情',
     notNow: '暂不',
+    changeLogNew: '新增',
+    changeLogFixed: '修复',
+    changeLogFaster: '更快',
+    changeLogImproved: '改进',
+    changeLogOther: '其他改进',
+    changeLogFallbackLabel: '本次更新',
+    changeLogFallbackItem: '改进与修复',
     applyStatus: {
       preparing: '正在更新后端…',
       pulling: '后端更新中…',

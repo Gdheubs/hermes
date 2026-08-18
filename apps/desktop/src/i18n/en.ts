@@ -2451,6 +2451,13 @@ export const en: Translations = {
     pidLabel: pid => `PID ${pid}`,
     technicalDetails: 'Technical details',
     notNow: 'Not now',
+    changeLogNew: "What's new",
+    changeLogFixed: 'Fixed',
+    changeLogFaster: 'Faster',
+    changeLogImproved: 'Improved',
+    changeLogOther: 'Other improvements',
+    changeLogFallbackLabel: 'In this update',
+    changeLogFallbackItem: 'Improvements and fixes',
     applyStatus: {
       preparing: 'Updating backend…',
       pulling: 'Backend updating…',

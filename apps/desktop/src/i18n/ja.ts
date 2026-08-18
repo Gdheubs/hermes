@@ -2159,6 +2159,13 @@ export const ja = defineLocale({
     pidLabel: pid => `PID ${pid}`,
     technicalDetails: '技術的な詳細',
     notNow: '今は後で',
+    changeLogNew: '新機能',
+    changeLogFixed: '修正',
+    changeLogFaster: '高速化',
+    changeLogImproved: '改善',
+    changeLogOther: 'その他の改善',
+    changeLogFallbackLabel: '今回の更新',
+    changeLogFallbackItem: '改善と修正',
     applyStatus: {
       preparing: 'バックエンドを更新しています…',
       pulling: 'バックエンドを更新中…',

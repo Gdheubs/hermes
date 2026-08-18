@@ -80,6 +80,41 @@ describe('buildCommitChangelog', () => {
     expect(groups).toEqual([{ id: 'other', items: ['Improvements and fixes'], label: 'In this update' }])
   })
 
+  it('resolves group labels from the provided options', () => {
+    const groups = buildCommitChangelog(
+      [
+        { summary: 'feat: a' },
+        { summary: 'fix: b' },
+        { summary: 'perf: c' }
+      ],
+      { labels: { new: 'Nouveau', fixed: 'Corrigé', faster: 'Plus rapide' } }
+    )
+
+    expect(groups.map(g => g.label)).toEqual(['Nouveau', 'Corrigé', 'Plus rapide'])
+  })
+
+  it('keeps English defaults for groups missing from a partial labels map', () => {
+    const groups = buildCommitChangelog(
+      [
+        { summary: 'feat: a' },
+        { summary: 'fix: b' },
+        { summary: 'perf: c' },
+        { summary: 'refactor: d' }
+      ],
+      { labels: { new: 'Nouveau' }, maxGroups: 4 }
+    )
+
+    expect(groups.map(g => g.label)).toEqual(['Nouveau', 'Fixed', 'Faster', 'Improved'])
+  })
+
+  it('uses the provided fallback label and item for the empty state', () => {
+    const groups = buildCommitChangelog([{ summary: 'chore: x' }], {
+      fallback: { label: 'Dans cette mise à jour', item: 'Améliorations et correctifs' }
+    })
+
+    expect(groups).toEqual([{ id: 'other', items: ['Améliorations et correctifs'], label: 'Dans cette mise à jour' }])
+  })
+
   it('dedupes identical subjects and caps the items per group', () => {
     const groups = buildCommitChangelog(
       [
