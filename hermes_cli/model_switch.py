@@ -373,6 +373,58 @@ class DirectAlias(NamedTuple):
 # Built-in direct aliases (can be extended via config.yaml model_aliases:)
 _BUILTIN_DIRECT_ALIASES: dict[str, DirectAlias] = {}
 
+def _freemaxxing_health_ok(base_url: str) -> bool:
+    """Return True when ``base_url``/healthz responds 200 (a live Freemaxxing
+    proxy). Kept as a module-level helper so the alias/route path can verify the
+    endpoint belongs to the proxy before resolving a route to it, and so tests
+    can patch it without spinning up a real server."""
+    from urllib import request
+
+    health_url = base_url.rstrip("/") + "/healthz"
+    req = request.Request(
+        health_url,
+        headers={"User-Agent": "hermes-cli"},
+        method="GET",
+    )
+    try:
+        with request.urlopen(req, timeout=3.0) as resp:
+            return resp.status == 200
+    except Exception:
+        return False
+
+
+def _ensure_freemaxxing_proxy() -> str:
+    """Start the bundled loopback endpoint without selecting a vendor model.
+
+    Provider discovery installs the bundled plugin under the stable module name
+    ``plugins.model_providers.freemaxxing``. The plugin owns process lifecycle;
+    this helper merely ensures its local endpoint is listening before picker or
+    model validation probes ``/v1/models``.
+
+    Returns the loopback base URL only after the endpoint is confirmed to be a
+    healthy Freemaxxing proxy (``/healthz`` reachable). If the proxy cannot be
+    started or the port is owned by an unrelated process, this raises so the
+    caller never resolves a route that points at a foreign or dead endpoint.
+    """
+    from importlib import import_module
+
+    from providers import get_provider_profile
+
+    if get_provider_profile("freemaxxing") is None:
+        raise RuntimeError("Freemaxxing provider plugin is not available")
+    plugin = import_module("plugins.model_providers.freemaxxing")
+    base_url = plugin.ensure_proxy()
+
+    # Verify the endpoint actually belongs to a healthy Freemaxxing proxy
+    # before we hand a route to it. A concurrent process that grabbed the same
+    # loopback port would otherwise make us resolve a foreign endpoint.
+    if not _freemaxxing_health_ok(base_url):
+        raise RuntimeError(
+            f"Freemaxxing proxy at {base_url}/healthz did not respond 200"
+        )
+    return base_url
+
+
 # Merged dict (builtins + user config); populated by _load_direct_aliases()
 DIRECT_ALIASES: dict[str, DirectAlias] = {}
 
@@ -973,6 +1025,15 @@ def resolve_alias(
     direct = DIRECT_ALIASES.get(key)
     if direct is not None:
         return (direct.provider, direct.model, key)
+
+    # Freemaxxing remains opaque inside Hermes core. Starting the local
+    # loopback endpoint is lifecycle setup only; concrete backend/model
+    # selection belongs exclusively to that proxy. If the proxy cannot be
+    # started or verified healthy, do NOT resolve a successful route — a
+    # foreign process owning the port must never receive our requests.
+    if key in {"freemaxxing", "fm", "freemaxxing-auto"}:
+        _ensure_freemaxxing_proxy()
+        return ("freemaxxing", "freemaxxing", key)
 
     # Reverse lookup: match by model ID so full names (e.g. "kimi-k2.5",
     # "glm-4.7") route through direct aliases instead of falling through
@@ -3583,6 +3644,23 @@ def _prepend_moa_picker_provider(providers: List[dict], current_provider: str = 
         return providers
 
 
+def _prepend_freemaxxing_picker_provider(providers: List[dict], current_provider: str = "") -> List[dict]:
+    """Add the virtual freemaxxing provider row used by interactive model pickers.
+
+    Freemaxxing is a dynamic alias that resolves to the best free model.
+    Added here so gateway pickers (Telegram/Discord) see it alongside MOA.
+    """
+    try:
+        from hermes_cli.inventory import _freemaxxing_provider_row
+
+        freemaxxing_row = _freemaxxing_provider_row(current_provider)
+        if freemaxxing_row is None:
+            return providers
+        return [freemaxxing_row] + [p for p in providers if str(p.get("slug", "")).lower() != "freemaxxing"]
+    except Exception:
+        return providers
+
+
 def list_picker_providers(
     current_provider: str = "",
     current_base_url: str = "",
@@ -3626,6 +3704,7 @@ def list_picker_providers(
     )
     if include_moa:
         providers = _prepend_moa_picker_provider(providers, current_provider=current_provider)
+    providers = _prepend_freemaxxing_picker_provider(providers, current_provider=current_provider)
 
     filtered: List[dict] = []
     for p in providers:
@@ -3642,7 +3721,8 @@ def list_picker_providers(
 
         has_models = bool(p.get("models"))
         is_custom_endpoint = bool(p.get("is_user_defined")) and bool(p.get("api_url"))
-        if not has_models and not is_custom_endpoint:
+        is_virtual_provider = p.get("auth_type") == "virtual"
+        if not has_models and not is_custom_endpoint and not is_virtual_provider:
             continue
         filtered.append(p)
 
