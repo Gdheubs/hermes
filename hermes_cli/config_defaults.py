@@ -2929,13 +2929,14 @@ DEFAULT_CONFIG = {
         # operator allowlist — useful for ``pandoc -o /tmp/report.pdf`` or
         # PDFs the agent writes into a working directory. System paths
         # (/etc, /proc, ~/.ssh, ~/.aws, etc.) remain blocked regardless.
-        # Disable to fall back to pure-allowlist mode. Bridged to
-        # HERMES_MEDIA_TRUST_RECENT_FILES. Only consulted when ``strict``
-        # is true; in default mode the denylist alone gates delivery.
-        "trust_recent_files": True,
+        # F6 (P3): OFF BY DEFAULT. mtime is writable metadata, not evidence
+        # that Hermes produced a file — a pre-existing personal file at the
+        # home root must not become deliverable because someone ``touch``ed
+        # it. This is an explicit operator opt-in convenience, not a
+        # provenance signal. Bridged to HERMES_MEDIA_TRUST_RECENT_FILES.
+        "trust_recent_files": False,
         # Recency window in seconds. 600 (10 min) comfortably covers a
         # multi-tool agent turn. Bridged to HERMES_MEDIA_TRUST_RECENT_SECONDS.
-        # Only consulted when ``strict`` is true.
         "trust_recent_files_seconds": 600,
 
         # OpenAI-compatible API server platform

@@ -1357,8 +1357,14 @@ def _media_delivery_recency_seconds() -> float:
     """Return the recency window for trusting freshly-produced files.
 
     0 disables recency-based trust entirely (pure-allowlist mode).
+
+    F6 (P3): recency is now OFF BY DEFAULT — mtime is writable metadata,
+    not evidence that Hermes produced a file, so a pre-existing personal
+    file at the home root must not be deliverable merely because someone
+    ``touch``ed it. Operators who want the convenience opt in explicitly
+    (``HERMES_MEDIA_TRUST_RECENT_FILES=1`` / ``trust_recent_files: true``).
     """
-    raw = os.environ.get(MEDIA_DELIVERY_TRUST_RECENT_ENV, "1").strip().lower()
+    raw = os.environ.get(MEDIA_DELIVERY_TRUST_RECENT_ENV, "0").strip().lower()
     if raw in ("0", "false", "no", "off", ""):
         return 0.0
     try:

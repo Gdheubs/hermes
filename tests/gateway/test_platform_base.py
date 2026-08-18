@@ -585,6 +585,13 @@ class TestMediaDeliveryDefaultMode:
         # strict path live in TestMediaDeliveryPathValidation.
         monkeypatch.delenv("HERMES_MEDIA_DELIVERY_STRICT", raising=False)
         monkeypatch.delenv("HERMES_MEDIA_ALLOW_DIRS", raising=False)
+        # Pin the recency default OFF (F6/P3). The pytest process inherits
+        # the running gateway's env (which may have bridged the OLD
+        # recency-on default or an operator's explicit opt-in), so the
+        # default must be made deterministic here; tests that exercise the
+        # opt-in set the vars explicitly themselves.
+        monkeypatch.delenv("HERMES_MEDIA_TRUST_RECENT_FILES", raising=False)
+        monkeypatch.delenv("HERMES_MEDIA_TRUST_RECENT_SECONDS", raising=False)
 
     def test_accepts_stale_file_outside_allowlist(self, tmp_path, monkeypatch):
         """The motivating case — agent says ``MEDIA:/home/user/notes.md``
@@ -659,11 +666,37 @@ class TestMediaDeliveryDefaultMode:
 
         assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
 
-    def test_default_mode_accepts_fresh_home_root_deliverable(self, tmp_path, monkeypatch):
-        """F6/P2 control: a file the agent freshly produced at the home root
-        (cwd=$HOME workflow, e.g. ``pandoc -o ~/report.pdf``) is a
-        deliverable, not pre-existing personal data."""
+    def test_default_mode_denies_fresh_home_root_files(self, tmp_path, monkeypatch):
+        """F6/P3: mtime is writable metadata, not provenance. A home-root
+        file is denied EVEN when freshly written (or freshly ``touch``ed by
+        an attacker) unless the operator explicitly opts into recency trust —
+        a pre-existing personal file made 'recent' with os.utime must not
+        become deliverable."""
         self._patch_roots(monkeypatch)
+        fake_home = self._pin_home(tmp_path, monkeypatch)
+        # Recency trust is NOT enabled in this test (the new default).
+
+        doc = fake_home / "report.pdf"
+        doc.write_bytes(b"%PDF-1.4")  # mtime = now
+        # Fresh mtime alone is NOT evidence of agent production.
+        assert BasePlatformAdapter.validate_media_delivery_path(str(doc)) is None
+
+        # A pre-existing personal file whose mtime was just touched must also
+        # stay denied (the reviewer's spoofed-mtime case).
+        secret = fake_home / "tax-return.pdf"
+        secret.write_bytes(b"%PDF-1.4")
+        os.utime(secret, (time.time() - 1, time.time() - 1))
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
+
+    def test_default_mode_fresh_home_root_allowed_with_explicit_opt_in(
+        self, tmp_path, monkeypatch
+    ):
+        """F6 control: the recency convenience remains available to operators
+        who explicitly opt in (``HERMES_MEDIA_TRUST_RECENT_FILES=1``) — a
+        fresh ``pandoc -o ~/report.pdf`` deliverable passes again."""
+        self._patch_roots(monkeypatch)
+        monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "1")
+        monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_SECONDS", "600")
         fake_home = self._pin_home(tmp_path, monkeypatch)
 
         doc = fake_home / "report.pdf"
