@@ -682,6 +682,33 @@ memory:
 
 With `memory.write_approval: true`, memory writes need your approval before they land: interactive CLI turns prompt inline; messaging sessions and the background self-improvement review stage the write for `/memory pending` → `/memory approve <id>` / `/memory reject <id>` review. Toggle at runtime with `/memory approval on|off`. See [Controlling memory writes](/user-guide/features/memory#controlling-memory-writes-write_approval).
 
+## Session Storage Backend
+
+Sessions, messages, and agent state live in a single SQLite file
+(`~/.hermes/state.db`) by default. Point them at an external PostgreSQL server
+instead by setting two keys:
+
+```yaml
+sessions:
+  state_backend: sqlite   # "sqlite" (default) or "postgres"
+  postgres_dsn: ""        # DSN, consulted only when state_backend is "postgres"
+```
+
+The DSN is passed to the driver unchanged, so `sslmode`, host, port, and
+credentials all come from that value. Because it carries credentials, prefer
+supplying it via environment variable — `HERMES_STATE_DATABASE_URL` (or its
+alias `HERMES_STATE_POSTGRES_DSN`) in `~/.hermes/.env`. `HERMES_STATE_BACKEND`
+overrides `state_backend` the same way. All three environment variables take
+precedence over the `config.yaml` keys.
+
+The PostgreSQL path is opt-in: installs that leave `state_backend` at `sqlite`
+never load the driver. Enabling it requires the `postgres` extra
+(`pip install 'hermes-agent[postgres]'`), which Hermes will also try to install
+on first use.
+
+See [PostgreSQL State Backend](/user-guide/features/postgres-backend) for
+requirements, the SQLite → PostgreSQL migration script, and behavioral notes.
+
 ## Context File Truncation
 
 Controls how much content Hermes loads from each automatic context file before applying head/tail truncation. This applies to files injected into the system prompt such as `SOUL.md`, `.hermes.md`, `AGENTS.md`, `CLAUDE.md`, and `.cursorrules`. It does **not** affect the `read_file` tool.
