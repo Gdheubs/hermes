@@ -615,10 +615,10 @@ def _compute_tool_definitions(
         logger.warning("Schema sanitization skipped: %s", e)
 
     # ── Tool Search (progressive disclosure) ────────────────────────────
-    # Conditionally replace MCP + plugin (non-core) tools with three bridge
-    # tools (tool_search / tool_describe / tool_call) when the deferrable
-    # surface exceeds the configured threshold (default 10% of context
-    # window). Core Hermes tools (toolsets._HERMES_CORE_TOOLS) are NEVER
+    # Replace MCP + plugin (non-core) tools with three byte-stable bridge tools
+    # (tool_search / tool_describe / tool_call). The bridge is present even for
+    # an empty catalog so MCP edits never mutate the model-facing ``tools=``
+    # prefix. Core Hermes tools (toolsets._HERMES_CORE_TOOLS) are NEVER
     # deferred. See tools/tool_search.py for full design notes.
     #
     # This is deliberately the last step before returning — sanitization
@@ -628,110 +628,21 @@ def _compute_tool_definitions(
         from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
         ts_cfg = _load_ts_config()
         if not skip_tool_search_assembly and ts_cfg.enabled != "off":
-            context_length = _resolve_active_context_length()
             assembly = assemble_tool_defs(
                 filtered_tools,
-                context_length=context_length,
                 config=ts_cfg,
             )
             if assembly.activated and not quiet_mode:
-                _forms = {"full": "catalog listing embedded",
-                          "names": "names-only listing embedded",
-                          "mixed": "listing embedded (oversized servers summarized)",
-                          "groups": "server summary embedded (search-only discovery)",
-                          "none": "no listing (search-only)"}
                 print(
-                    f"🔎 Tool Search (tier {assembly.tier}): {assembly.deferred_count} "
+                    f"🔎 Tool Search: {assembly.deferred_count} "
                     f"MCP/plugin tools deferred (~{assembly.deferred_tokens} tokens) behind "
-                    f"tool_search/describe/call — {_forms.get(assembly.listing_form, assembly.listing_form)}."
+                    "a stable tool_search/describe/call bridge."
                 )
             filtered_tools = assembly.tool_defs
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
 
     return filtered_tools
-
-
-def _resolve_active_context_length() -> int:
-    """Look up the active model's context length for the tool-search gate.
-
-    Returns 0 when the model can't be resolved — ``should_activate`` falls
-    back to a fixed token cutoff in that case.
-    """
-    try:
-        from hermes_cli.config import load_config as _load
-        cfg = _load() or {}
-        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
-        if not isinstance(model_cfg, dict):
-            model_cfg = {}
-        _raw_model_id = model_cfg.get("model") or model_cfg.get("default") or ""
-        if isinstance(_raw_model_id, dict):
-            from hermes_cli.config import split_model_config_default
-            _raw_model_id, _ = split_model_config_default(_raw_model_id)
-        model_id = str(_raw_model_id).strip()
-        if not model_id:
-            return 0
-        from agent.model_metadata import get_model_context_length
-        # Honor explicit `model.context_length` in config.yaml — short-circuits
-        # the OpenRouter /models probe at get_model_context_length step 0, so
-        # non-OpenRouter providers don't pay the ~2-3s OpenRouter fetch at every
-        # CLI startup.  See issue #46620.
-        raw_ctx = model_cfg.get("context_length")
-        config_ctx = raw_ctx if isinstance(raw_ctx, int) and raw_ctx > 0 else None
-        # Provider-aware resolution: providers like Codex OAuth enforce a
-        # different (lower) window than the direct API for the same slug, and
-        # their resolvers key off provider/base_url/api_key. Without these,
-        # the gate sizes against generic metadata (e.g. 1.05M for gpt-5.5
-        # instead of Codex's enforced 272K). Credential resolution failing
-        # (offline, no keys) degrades to a provider+base_url-only lookup so
-        # the static provider-aware fallbacks still apply.
-        provider = str(model_cfg.get("provider") or "").strip()
-        base_url = str(model_cfg.get("base_url") or "").strip()
-        api_key = ""
-        if provider:
-            try:
-                from hermes_cli.runtime_provider import resolve_runtime_provider
-                rt = resolve_runtime_provider(
-                    requested=provider, target_model=model_id
-                ) or {}
-                base_url = str(rt.get("base_url") or base_url or "").strip()
-                api_key = str(rt.get("api_key") or "").strip()
-            except Exception as rt_exc:
-                logger.debug(
-                    "Runtime credential resolution failed for tool-search "
-                    "context gate (provider=%s): %s — using config values only",
-                    provider, rt_exc,
-                )
-        # Fast path: a previously discovered on-disk cache entry is plenty
-        # for SIZING the tool-search gate — unlike compression budgeting, a
-        # slightly stale window can't corrupt anything (should_activate only
-        # picks a disclosure tier). The full resolver below deliberately
-        # bypasses the persistent cache for some providers (Nous portal,
-        # Codex OAuth) so IT can reconcile against the authoritative live
-        # /models endpoint — correct for compression sizing, but it costs a
-        # ~200ms network probe on EVERY CLI startup. When any prior session
-        # already learned the window, use it for the gate and let the full
-        # resolver (called later on the compression path) do reconciliation.
-        if config_ctx is None and base_url:
-            try:
-                from agent.model_metadata import get_cached_context_length
-                cached_ctx = get_cached_context_length(model_id, base_url)
-                if isinstance(cached_ctx, int) and cached_ctx > 0:
-                    return cached_ctx
-            except Exception:
-                pass
-        return int(get_model_context_length(
-            model_id,
-            base_url=base_url,
-            api_key=api_key,
-            config_context_length=config_ctx,
-            provider=provider,
-        ) or 0)
-    except Exception as e:
-        logger.debug("Could not resolve active context length: %s", e)
-        return 0
-
-
 # =============================================================================
 # handle_function_call  (the main dispatcher)
 # =============================================================================
