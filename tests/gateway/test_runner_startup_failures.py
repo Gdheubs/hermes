@@ -413,3 +413,81 @@ async def test_start_gateway_propagates_fatal_config_exit_code(monkeypatch, tmp_
     assert exc_info.value.code == GATEWAY_FATAL_CONFIG_EXIT_CODE
 
 
+class _StubRunner:
+    """Minimal GatewayRunner stand-in for the duplicate-instance guard tests:
+    the guard fires before runner.start(), so only the attributes the
+    planned-stop watcher thread reads are needed."""
+
+    def __init__(self, config):
+        self.config = config
+        self.should_exit_cleanly = False
+        self.exit_reason = None
+        self.exit_code = None
+        self.adapters = {}
+        self._running = False
+        self._draining = False
+
+    async def start(self):
+        raise AssertionError("start() must not be reached")
+
+    async def stop(self):
+        return None
+
+
+def _patch_guard_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
+    monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
+    monkeypatch.setattr("hermes_logging._add_rotating_handler", lambda *args, **kwargs: None)
+    monkeypatch.setattr("gateway.run.GatewayRunner", _StubRunner)
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_raises_when_another_instance_running(monkeypatch, tmp_path):
+    """A plain (non-replace) start while another gateway's PID file is live
+    must raise GatewayAlreadyRunningError — a benign double-run, not a crash —
+    so the CLI wrappers map it to a clean exit 0 instead of the generic
+    failure exit 1 that auto-restart supervisors restart-loop forever."""
+    _patch_guard_env(monkeypatch, tmp_path)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 42)
+    monkeypatch.setattr("gateway.run.os.getpid", lambda: 100)
+
+    from gateway.run import start_gateway, GatewayAlreadyRunningError
+
+    with pytest.raises(GatewayAlreadyRunningError):
+        await start_gateway(config=GatewayConfig(), replace=False, verbosity=None)
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_raises_when_runtime_lock_held(monkeypatch, tmp_path):
+    """start_gateway must raise GatewayAlreadyRunningError (not return False)
+    when the cross-process runtime lock is held by another instance."""
+    _patch_guard_env(monkeypatch, tmp_path)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr("gateway.status.acquire_gateway_runtime_lock", lambda: False)
+
+    from gateway.run import start_gateway, GatewayAlreadyRunningError
+
+    with pytest.raises(GatewayAlreadyRunningError):
+        await start_gateway(config=GatewayConfig(), replace=False, verbosity=None)
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_raises_on_pidfile_race_loss(monkeypatch, tmp_path):
+    """start_gateway must raise GatewayAlreadyRunningError (not return False)
+    when the PID-file O_CREAT|O_EXCL race is lost to another instance."""
+    _patch_guard_env(monkeypatch, tmp_path)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr("gateway.status.acquire_gateway_runtime_lock", lambda: True)
+
+    def _race_pidfile(*args, **kwargs):
+        raise FileExistsError()
+
+    monkeypatch.setattr("gateway.status.write_pid_file", _race_pidfile)
+
+    from gateway.run import start_gateway, GatewayAlreadyRunningError
+
+    with pytest.raises(GatewayAlreadyRunningError):
+        await start_gateway(config=GatewayConfig(), replace=False, verbosity=None)
+
+

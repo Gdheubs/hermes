@@ -19873,9 +19873,14 @@ def main(
     # Handle gateway mode (messaging + cron)
     if gateway:
         import asyncio
-        from gateway.run import start_gateway
+        from gateway.run import start_gateway, GatewayAlreadyRunningError
         print("Starting Hermes Gateway (messaging platforms)...")
-        asyncio.run(start_gateway())
+        try:
+            asyncio.run(start_gateway())
+        except GatewayAlreadyRunningError:
+            # Another gateway instance already owns the runtime lock: nothing
+            # to do. Exit cleanly (code 0) — this is not a crash.
+            print("Gateway is already running in another process. Exiting.")
         return
 
     # Skip worktree for list commands (they exit immediately)

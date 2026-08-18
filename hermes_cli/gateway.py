@@ -5612,7 +5612,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         except Exception:
             pass  # best-effort; don't block gateway startup
 
-    from gateway.run import start_gateway
+    from gateway.run import start_gateway, GatewayAlreadyRunningError
 
     print("┌─────────────────────────────────────────────────────────┐")
     print("│           ⚕ Hermes Gateway Starting...                 │")
@@ -5753,6 +5753,14 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     try:
         success = asyncio.run(start_gateway(replace=replace, verbosity=verbosity))
         _exit_diag("asyncio.run.returned", success=success)
+    except GatewayAlreadyRunningError:
+        # Another instance already owns the gateway (benign double-run): exit
+        # cleanly so auto-restart supervisors (Windows wrapper loops, Task
+        # Scheduler retry, systemd) do not mistake it for a crash and
+        # restart-loop a second instance forever.
+        _exit_diag("gateway.already_running")
+        _hard_exit_after_gateway_teardown(0)
+        return
     except KeyboardInterrupt:
         # On Windows-detached runs this shouldn't fire (we absorb SIGINT above),
         # but keep the handler for console runs.

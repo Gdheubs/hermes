@@ -29870,6 +29870,19 @@ def _gateway_stderr_formatter() -> logging.Formatter:
     return RedactingFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
+class GatewayAlreadyRunningError(RuntimeError):
+    """Raised by start_gateway() when another gateway instance already owns the
+    runtime lock / PID file (a benign double-run).
+
+    The CLI wrappers map this to a clean exit code 0 ("nothing to do") instead
+    of the generic failure code 1, so supervisors — systemd ``Restart=
+    on-failure``, s6 finish scripts, Windows wrapper loops, Task Scheduler
+    retry policies — do NOT mistake a second instance for a crashed one and
+    restart-loop it forever (observed: 52k+ respawns on a Windows box from
+    escaped auto-restart wrappers each re-spawning a lock-losing gateway).
+    """
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -30060,7 +30073,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 f"   or 'hermes gateway stop' to kill it first.\n"
                 f"   Or use 'hermes gateway run --replace' to auto-replace.\n"
             )
-            return False
+            raise GatewayAlreadyRunningError(
+                f"Gateway already running (PID {existing_pid})"
+            )
 
     # Sync bundled skills on gateway start (fast -- skips unchanged)
     try:
@@ -30284,12 +30299,16 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             "Another gateway instance (PID %d) started during our startup. "
             "Exiting to avoid double-running.", _current_pid
         )
-        return False
+        raise GatewayAlreadyRunningError(
+            f"Another gateway instance (PID {_current_pid}) is already running"
+        )
     if not acquire_gateway_runtime_lock():
         logger.error(
             "Gateway runtime lock is already held by another instance. Exiting."
         )
-        return False
+        raise GatewayAlreadyRunningError(
+            "Gateway runtime lock is already held by another instance"
+        )
     try:
         write_pid_file()
     except FileExistsError:
@@ -30297,7 +30316,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         logger.error(
             "PID file race lost to another gateway instance. Exiting."
         )
-        return False
+        raise GatewayAlreadyRunningError(
+            "PID file race lost to another gateway instance"
+        )
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
 
@@ -30622,6 +30643,11 @@ def main():
     try:
         success = asyncio.run(start_gateway(config))
         exit_code = 0 if success else 1
+    except GatewayAlreadyRunningError:
+        # Another instance owns the gateway (benign double-run): exit cleanly
+        # so supervisors (systemd Restart=on-failure, s6, Windows wrapper
+        # loops) do not treat this as a crash and restart-loop forever.
+        exit_code = 0
     except SystemExit as e:
         # e.code may be None (→ 0), an int, or a str (→ 1, like CPython).
         if e.code is None:
