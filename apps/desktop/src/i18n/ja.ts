@@ -2596,7 +2596,13 @@ export const ja = defineLocale({
       loadFailedConsole: (code, message) => `読み込みに失敗しました${code ? ` (${code})` : ''}: ${message}`,
       unreachableDescription: 'プレビューページに到達できませんでした。',
       openTarget: url => `${url} を開く`,
-      fallbackTitle: 'プレビュー'
+      fallbackTitle: 'プレビュー',
+      goBack: '戻る',
+      goForward: '進む',
+      reload: 'プレビューを再読み込み',
+      address: 'プレビュー URL',
+      navigate: 'プレビューをナビゲート',
+      go: 'このアドレスへ移動'
     }
   },
 

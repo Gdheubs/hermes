@@ -110,6 +110,118 @@ describe('PreviewPane console state', () => {
     forgetPreviewStripTools(tabId)
   })
 
+  it('shows the URL toolbar on the live embedded preview tile', async () => {
+    const tabId = 'url:http://localhost:5174'
+
+    forgetPreviewStripTools(tabId)
+
+    let rendered!: ReturnType<typeof render>
+    await act(async () => {
+      rendered = render(
+        <PreviewPane
+          embedded
+          tabId={tabId}
+          target={{
+            kind: 'url',
+            label: 'Preview',
+            source: 'http://localhost:5174',
+            url: 'http://localhost:5174'
+          }}
+        />
+      )
+    })
+
+    expect(rendered.getByRole('textbox', { name: 'Preview URL' })).toBeTruthy()
+    expect(rendered.getByRole('button', { name: 'Go back' })).toBeTruthy()
+    expect(rendered.container.querySelector('webview')).toBeInstanceOf(HTMLElement)
+
+    forgetPreviewStripTools(tabId)
+  })
+
+  it('keeps the address field while a page-in navigation happens', async () => {
+    const tabId = 'url:http://localhost:5174'
+
+    forgetPreviewStripTools(tabId)
+
+    let rendered!: ReturnType<typeof render>
+    await act(async () => {
+      rendered = render(
+        <PreviewPane
+          tabId={tabId}
+          target={{
+            kind: 'url',
+            label: 'Preview',
+            source: 'http://localhost:5174',
+            url: 'http://localhost:5174'
+          }}
+        />
+      )
+    })
+
+    const input = rendered.getByRole('textbox', { name: 'Preview URL' }) as HTMLInputElement
+    const webview = rendered.container.querySelector('webview')
+
+    expect(webview).toBeInstanceOf(HTMLElement)
+
+    await act(async () => {
+      fireEvent.focus(input)
+      fireEvent.change(input, { target: { value: 'https://example.com/typed' } })
+    })
+
+    expect(input.value).toBe('https://example.com/typed')
+
+    act(() => {
+      webview?.dispatchEvent(
+        Object.assign(new Event('did-navigate-in-page'), {
+          url: 'http://localhost:5174/pushed'
+        })
+      )
+    })
+
+    expect(input.value).toBe('https://example.com/typed')
+
+    forgetPreviewStripTools(tabId)
+  })
+
+  it('syncs back/forward on both navigate events', async () => {
+    const tabId = 'url:http://localhost:5174'
+
+    forgetPreviewStripTools(tabId)
+
+    let rendered!: ReturnType<typeof render>
+    await act(async () => {
+      rendered = render(
+        <PreviewPane
+          tabId={tabId}
+          target={{
+            kind: 'url',
+            label: 'Preview',
+            source: 'http://localhost:5174',
+            url: 'http://localhost:5174'
+          }}
+        />
+      )
+    })
+
+    const webview = rendered.container.querySelector('webview') as HTMLElement & {
+      canGoBack?: () => boolean
+      canGoForward?: () => boolean
+    }
+
+    expect(webview).toBeInstanceOf(HTMLElement)
+    webview.canGoBack = () => true
+    webview.canGoForward = () => false
+
+    act(() => {
+      webview.dispatchEvent(Object.assign(new Event('did-navigate-in-page'), { url: 'http://localhost:5174/next' }))
+    })
+
+    expect((rendered.getByRole('button', { name: 'Go back' }) as HTMLButtonElement).disabled).toBe(false)
+    expect((rendered.getByRole('button', { name: 'Go forward' }) as HTMLButtonElement).disabled).toBe(true)
+
+    forgetPreviewStripTools(tabId)
+  })
+
   it('renders authenticated remote HTML safely and honors source mode', async () => {
     const dataUrl = `data:text/html;base64,${btoa('<h1>remote</h1>')}`
 

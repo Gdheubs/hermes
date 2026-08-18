@@ -24,13 +24,19 @@ import { type ConsoleEntry } from './preview-console-state'
 import { LocalFilePreview, PreviewEmptyState } from './preview-file'
 import { registerPreviewPageReader } from './preview-reader'
 import { previewConsoleState, registerPreviewDevTools } from './preview-strip-tools'
+import { isHttpUrl, PreviewToolbar } from './preview-toolbar'
 
 type PreviewWebview = HTMLElement & {
+  canGoBack?: () => boolean
+  canGoForward?: () => boolean
   closeDevTools?: () => void
   executeJavaScript?: (code: string) => Promise<unknown>
   getTitle?: () => string
   getURL?: () => string
+  goBack?: () => void
+  goForward?: () => void
   isDevToolsOpened?: () => boolean
+  loadURL?: (url: string) => Promise<void> | void
   openDevTools?: () => void
   reload?: () => void
   reloadIgnoringCache?: () => void
@@ -146,6 +152,11 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<PreviewLoadErrorState | null>(null)
   const [localReloadKey, setLocalReloadKey] = useState(0)
+  const [address, setAddress] = useState(target.url)
+  const [canGoBack, setCanGoBack] = useState(false)
+  const [canGoForward, setCanGoForward] = useState(false)
+  const addressFocusedRef = useRef(false)
+  const submittedAddressRef = useRef(false)
 
   // Artifacts have no URL to load — they render from the registry, never in a
   // webview.
@@ -153,20 +164,21 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     target.kind !== 'artifact' &&
     (target.kind === 'url' || (target.previewKind === 'html' && target.renderMode !== 'source'))
 
-  const isRemoteHtmlTarget =
-    target.kind === 'file' && target.previewKind === 'html' && Boolean(target.dataUrl || target.transient)
-
-  const isRemoteHtml = isRemoteHtmlTarget && target.renderMode !== 'source' && Boolean(target.dataUrl)
+  // `isRemoteHtml` keeps its original definition — fully rendered HTML in an
+  // iframe (skips the webview path). The toolbar is for actual webview tabs.
+  const isRemoteHtml =
+    target.kind === 'file' && target.previewKind === 'html' && target.renderMode !== 'source' && Boolean(target.dataUrl)
 
   const remoteHtmlDocument = useMemo(
     () => (isRemoteHtml ? remoteHtmlPreviewDocument(target.dataUrl!) : null),
     [isRemoteHtml, target.dataUrl]
   )
 
-  const currentLabel = compactUrl(currentUrl)
-
-  const previewLabel =
-    target.label && target.label.replace(/\/$/, '') !== currentLabel.replace(/\/$/, '') ? target.label : currentLabel
+  // Source-mode preview (HTML rendered as text, no webview/iframe): the URL
+  // label stays as an "open in default browser" affordance. The href/target
+  // are gated on this so the link is purely visual until the user clicks.
+  const isSourcePreviewTarget =
+    target.kind === 'file' && target.previewKind === 'html' && Boolean(target.dataUrl || target.transient)
 
   const restartingServer =
     previewServerRestart?.status === 'running' &&
@@ -245,6 +257,84 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       webviewRef.current?.reload?.()
     }
   }, [isWebPreview])
+
+  const syncNavigationState = useCallback(() => {
+    const webview = webviewRef.current
+
+    setCanGoBack(Boolean(webview?.canGoBack?.()))
+    setCanGoForward(Boolean(webview?.canGoForward?.()))
+  }, [])
+
+  const goBack = useCallback(() => {
+    const webview = webviewRef.current
+
+    if (!webview?.canGoBack?.() || !webview.goBack) {
+      return
+    }
+
+    webview.goBack()
+    syncNavigationState()
+  }, [syncNavigationState])
+
+  const goForward = useCallback(() => {
+    const webview = webviewRef.current
+
+    if (!webview?.canGoForward?.() || !webview.goForward) {
+      return
+    }
+
+    webview.goForward()
+    syncNavigationState()
+  }, [syncNavigationState])
+
+  const submitAddress = useCallback(
+    (next: string) => {
+      const webview = webviewRef.current
+      const url = next.trim()
+
+      if (!isHttpUrl(url)) {
+        return
+      }
+
+      setLoadError(null)
+      setCurrentUrl(url)
+      setAddress(url)
+      submittedAddressRef.current = true
+
+      if (webview?.loadURL) {
+        void Promise.resolve(webview.loadURL(url)).catch(error => {
+          setLoadError({
+            description: error instanceof Error ? error.message : copy.unreachableDescription,
+            url
+          })
+          setLoading(false)
+        })
+      } else {
+        webview?.setAttribute('src', url)
+      }
+    },
+    [copy.unreachableDescription]
+  )
+
+  const handleAddressBlur = useCallback(() => {
+    addressFocusedRef.current = false
+
+    // Don't snap back if the user just submitted — mousedown on Go fires
+    // submit, then blur. getURL() is still the previous page until did-navigate.
+    if (submittedAddressRef.current) {
+      submittedAddressRef.current = false
+
+      return
+    }
+
+    // Sync the address to the webview's actual current URL after the user is
+    // done typing — keeps the input truthful without clobbering mid-typing.
+    const live = webviewRef.current?.getURL?.() || currentUrl
+
+    if (live) {
+      setAddress(live)
+    }
+  }, [currentUrl])
 
   const appendConsoleEntry = useCallback(
     (entry: Omit<ConsoleEntry, 'id'>) => {
@@ -543,6 +633,9 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     host.replaceChildren()
     webviewRef.current = null
     setCurrentUrl(target.url)
+    setAddress(target.url)
+    setCanGoBack(false)
+    setCanGoForward(false)
     setDevtoolsOpen(false)
     setLoadError(null)
     consoleState.reset()
@@ -592,7 +685,18 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       if (detail.url) {
         setLoadError(null)
         setCurrentUrl(detail.url)
+
+        // Don't clobber the user's in-progress typing. The webview is the
+        // source of truth on blur — see `handleAddressBlur`.
+        if (!addressFocusedRef.current) {
+          setAddress(detail.url)
+        }
       }
+
+      // Both `did-navigate` and `did-navigate-in-page` can change the webview's
+      // history. Reading the back/forward state on either keeps the toolbar
+      // buttons truthful for SPA pushState navigation too.
+      syncNavigationState()
     }
 
     const onFail = (event: Event) => {
@@ -621,7 +725,12 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
     }
 
     const onStart = () => setLoading(true)
-    const onStop = () => setLoading(false)
+
+    const onStop = () => {
+      setLoading(false)
+      syncNavigationState()
+    }
+
     // The WEBVIEW is the source of truth for DevTools, not our click handler:
     // closing the DevTools window itself fires devtools-closed with no click,
     // and the glyph was left stuck "on" when we tracked it locally.
@@ -650,34 +759,52 @@ export function PreviewPane({ embedded = false, onRestartServer, reloadRequest =
       webview.removeEventListener('did-stop-loading', onStop)
       webview.remove()
     }
-  }, [appendConsoleEntry, consoleState, copy, isRemoteHtml, isWebPreview, target.url])
+  }, [appendConsoleEntry, consoleState, copy, isRemoteHtml, isWebPreview, syncNavigationState, target.url])
 
   return (
     <aside className="relative flex h-full w-full min-w-0 flex-col overflow-hidden bg-transparent text-muted-foreground">
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-        {!embedded && (
+        {isWebPreview && !isRemoteHtml && (
+          <PreviewToolbar
+            address={address}
+            addressValid={isHttpUrl(address)}
+            canGoBack={canGoBack}
+            canGoForward={canGoForward}
+            loading={loading}
+            onAddressBlur={handleAddressBlur}
+            onAddressChange={setAddress}
+            onAddressFocus={() => {
+              addressFocusedRef.current = true
+            }}
+            onBack={goBack}
+            onForward={goForward}
+            onReload={reloadPreview}
+            onSubmit={submitAddress}
+            placeholder={currentUrl || copy.fallbackTitle}
+          />
+        )}
+        {!embedded && !isWebPreview && target.kind === 'file' && target.previewKind === 'html' && (
           <div className="pointer-events-none flex min-h-(--titlebar-height) items-center gap-1.5 border-b border-border/60 bg-background px-2 py-1">
             <div className="min-w-0 flex-1">
               <Tip label={copy.openTarget(currentUrl)}>
                 <a
                   className="pointer-events-auto inline max-w-full truncate text-left text-xs font-medium text-foreground underline-offset-4 decoration-current/20 transition-colors hover:text-primary hover:underline"
-                  href={isRemoteHtmlTarget ? undefined : currentUrl}
+                  href={isSourcePreviewTarget ? undefined : currentUrl}
                   onClick={event => {
-                    if (isRemoteHtmlTarget) {
+                    if (isSourcePreviewTarget) {
                       event.preventDefault()
                       void openPreviewTargetInBrowser(target).catch(error => notifyError(error, t.preview.unavailable))
                     }
                   }}
                   rel="noreferrer"
-                  target={isRemoteHtmlTarget ? undefined : '_blank'}
+                  target={isSourcePreviewTarget ? undefined : '_blank'}
                 >
-                  {previewLabel || copy.fallbackTitle}
+                  {copy.openTarget(currentUrl)}
                 </a>
               </Tip>
             </div>
           </div>
         )}
-
         <div
           className="pointer-events-auto relative min-h-0 flex-1 overflow-hidden bg-transparent"
           ref={previewContentRef}

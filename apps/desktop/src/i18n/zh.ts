@@ -3063,7 +3063,13 @@ export const zh: Translations = {
       loadFailedConsole: (code, message) => `加载失败${code ? ` (${code})` : ''}: ${message}`,
       unreachableDescription: '无法访问预览页面。',
       openTarget: url => `打开 ${url}`,
-      fallbackTitle: '预览'
+      fallbackTitle: '预览',
+      goBack: '后退',
+      goForward: '前进',
+      reload: '重新加载预览',
+      address: '预览网址',
+      navigate: '浏览预览',
+      go: '转到地址'
     }
   },
 
