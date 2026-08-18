@@ -5040,3 +5040,64 @@ class TestFts5SanitizerCharacterClass:
         # text; keep % intact there (pre-existing contract).
         sanitized = self._sanitize("完成50%")
         assert "%" in sanitized
+
+
+def test_startup_removes_orphan_fts_triggers_but_preserves_other_triggers(tmp_path):
+    """Startup cleanup must be limited to duplicate FTS triggers."""
+    from hermes_state import SessionDB
+    import hermes_state_common
+    
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    
+    # Create base schema
+    conn.executescript(hermes_state_common.SCHEMA_SQL)
+    
+    # Create canonical FTS trigger (should be preserved)
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS messages_fts_insert "
+        "AFTER INSERT ON messages BEGIN "
+        "INSERT INTO messages_fts(rowid, content) VALUES(NEW.id, NEW.content); END"
+    )
+    
+    # Create orphan FTS trigger (should be removed - references messages_fts)
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS messages_ai "
+        "AFTER INSERT ON messages BEGIN "
+        "INSERT INTO messages_fts(rowid, content) VALUES(NEW.id, NEW.content); END"
+    )
+    
+    # Create legitimate non-FTS trigger (should be preserved - doesn't reference FTS tables)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS audit_log (event TEXT)"
+    )
+    conn.execute(
+        "CREATE TRIGGER IF NOT EXISTS messages_audit "
+        "AFTER INSERT ON messages BEGIN "
+        "INSERT INTO audit_log(event) VALUES('message_created'); END"
+    )
+    conn.commit()
+    conn.close()
+    
+    # Open SessionDB - triggers startup cleanup
+    db = SessionDB(db_path)
+    
+    # Verify: orphan FTS trigger removed
+    orphan = db._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND name='messages_ai'"
+    ).fetchone()
+    assert orphan is None, "Orphan FTS trigger should be removed"
+    
+    # Verify: canonical trigger preserved
+    canonical = db._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND name='messages_fts_insert'"
+    ).fetchone()
+    assert canonical is not None, "Canonical FTS trigger should be preserved"
+    
+    # Verify: legitimate non-FTS trigger preserved
+    audit = db._conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='trigger' AND name='messages_audit'"
+    ).fetchone()
+    assert audit is not None, "Non-FTS trigger should be preserved"
+    
+    db.close()

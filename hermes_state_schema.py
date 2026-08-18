@@ -155,6 +155,55 @@ class SessionSchemaMixin:
         ).fetchone()
         return int(row[0] if not isinstance(row, sqlite3.Row) else row[0])
 
+    @staticmethod
+    def _drop_orphan_fts_triggers(cursor: sqlite3.Cursor) -> bool:
+        """Drop non-canonical triggers that write to a Hermes FTS table.
+
+        Legacy code paths or manual DDL may have created duplicate triggers
+        under alternate names (e.g. messages_ai, messages_ad) that write to
+        the same FTS virtual table as the canonical triggers. Two triggers
+        writing to the same FTS5 table on every INSERT causes constraint
+        failures that roll back the entire transaction, making message
+        persistence silently fail.
+
+        Only triggers whose SQL references one of Hermes' FTS virtual tables
+        are eligible for removal; unrelated application triggers on messages
+        must survive startup cleanup.
+
+        Returns True if any orphan FTS triggers were found and dropped (caller
+        should rebuild FTS indexes since data may have been silently lost).
+        """
+        known = set(_FTS_TRIGGERS) | set(_FTS_CJK_TRIGGERS)
+        rows = cursor.execute(
+            "SELECT name, sql FROM sqlite_master "
+            "WHERE type = 'trigger' AND tbl_name = 'messages'"
+        ).fetchall()
+
+        orphan_rows = []
+        for row in rows:
+            name = row["name"] if isinstance(row, sqlite3.Row) else row[0]
+            sql = row["sql"] if isinstance(row, sqlite3.Row) else row[1]
+            sql_lower = (sql or "").lower()
+            if (
+                name not in known
+                and ("messages_fts" in sql_lower
+                     or "messages_fts_trigram" in sql_lower
+                     or "messages_fts_cjk" in sql_lower)
+            ):
+                orphan_rows.append(name)
+
+        for name in orphan_rows:
+            try:
+                quoted_name = '"' + name.replace('"', '""') + '"'
+                cursor.execute(f"DROP TRIGGER IF EXISTS {quoted_name}")
+                logger.warning(
+                    "Dropped orphan FTS trigger on messages table: %s", name
+                )
+            except sqlite3.OperationalError:
+                pass
+
+        return bool(orphan_rows)
+
 
     @staticmethod
     def _fts_update_trigger_needs_narrowing(sql: Optional[str]) -> bool:
@@ -1243,8 +1292,10 @@ class SessionSchemaMixin:
                     self._trigram_available = False
                     self._fts_cjk_available = False
             elif legacy_fts:
+                had_orphans = self._drop_orphan_fts_triggers(cursor)
                 triggers_need_repair = (
-                    self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+                    had_orphans
+                    or self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
                 )
                 self._fts_enabled = self._ensure_fts_schema(
                     cursor, "messages_fts", LEGACY_FTS_SQL
@@ -1259,8 +1310,10 @@ class SessionSchemaMixin:
                             cursor, include_trigram=trigram_enabled
                         )
             else:
+                had_orphans = self._drop_orphan_fts_triggers(cursor)
                 triggers_need_repair = (
-                    self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
+                    had_orphans
+                    or self._fts_trigger_count(cursor) < len(_FTS_TRIGGERS)
                 )
                 self._fts_enabled = self._ensure_fts_schema(
                     cursor, "messages_fts", FTS_SQL
