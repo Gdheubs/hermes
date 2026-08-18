@@ -6,6 +6,7 @@ All probes are mocked at the HTTP/client layer; no real network calls are made.
 from __future__ import annotations
 
 import argparse
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -49,6 +50,8 @@ class TestLiveFlagGating:
         assert args.live is False
         args = parser.parse_args(["doctor", "--live"])
         assert args.live is True
+        args = parser.parse_args(["doctor", "--deep"])
+        assert args.deep is True
 
     def test_no_live_flag_means_zero_probes(self, monkeypatch):
         called = []
@@ -230,6 +233,44 @@ class TestBrowserAvailableNpxRung:
         monkeypatch.setattr(bt, "_requires_real_termux_browser_install", lambda cmd: True)
 
         assert _real_browser_available() is False
+
+
+class TestBrowserProbeBackendContract:
+    def test_probe_uses_agent_browser_cli_without_python_playwright(self, monkeypatch):
+        calls = []
+        fake_browser_tool = SimpleNamespace(
+            _run_browser_command=lambda task_id, command, args, timeout: (
+                calls.append(("run", task_id, command, args, timeout))
+                or {"success": True, "data": {}}
+            ),
+            cleanup_browser=lambda task_id: calls.append(("cleanup", task_id)),
+        )
+        # The runtime backend is agent-browser; Python Playwright is not a
+        # Hermes dependency and must not be required by the doctor probe.
+        monkeypatch.setitem(sys.modules, "tools.browser_tool", fake_browser_tool)
+        monkeypatch.setitem(sys.modules, "playwright", None)
+
+        ok, detail = doctor_live._launch_browser_probe(1.0)
+
+        assert ok is True
+        assert "agent-browser" in detail
+        assert calls[0][0] == "run"
+        assert calls[0][2:] == ("open", ["about:blank"], 1.0)
+        assert calls[-1][0] == "cleanup"
+
+    def test_probe_reports_cleanup_failure_instead_of_claiming_closed(self, monkeypatch):
+        fake_browser_tool = SimpleNamespace(
+            _run_browser_command=lambda *args, **kwargs: {"success": True, "data": {}},
+            cleanup_browser=lambda _task_id: (_ for _ in ()).throw(RuntimeError("cleanup stuck")),
+        )
+        monkeypatch.setitem(sys.modules, "tools.browser_tool", fake_browser_tool)
+
+        ok, detail = doctor_live._launch_browser_probe(1.0)
+
+        assert ok is False
+        assert "cleanup failed" in detail
+        assert "cleanup stuck" in detail
+        assert "closed" not in detail
 
 
 class TestFailureIsolation:

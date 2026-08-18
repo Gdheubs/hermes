@@ -32,6 +32,14 @@ def build_doctor_parser(subparsers, *, cmd_doctor: Callable) -> None:
         ),
     )
     doctor_parser.add_argument(
+        "--deep",
+        action="store_true",
+        help=(
+            "Run the bounded full state.db PRAGMA integrity_check; omitted "
+            "by default so large databases get only the quick FTS/schema probe."
+        ),
+    )
+    doctor_parser.add_argument(
         "--ack",
         metavar="ADVISORY_ID",
         default=None,

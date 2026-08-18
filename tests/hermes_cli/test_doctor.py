@@ -16,6 +16,32 @@ from hermes_cli import doctor as doctor_mod
 from hermes_cli.doctor import _has_provider_env_config
 
 
+def test_state_db_probe_timeout_is_not_corruption_evidence():
+    assert doctor_mod._is_state_db_probe_timeout(
+        "quick state.db health probe timed out after 5s"
+    )
+    assert doctor_mod._is_state_db_probe_timeout(
+        "deep state.db health probe timed out after 300s"
+    )
+    assert not doctor_mod._is_state_db_probe_timeout(
+        "fts5 read probe failed on messages_fts: database disk image is malformed"
+    )
+
+
+class TestDoctorOutputObservability:
+    def test_check_helpers_flush_non_tty_output(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            "builtins.print",
+            lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
+
+        doctor_mod.check_info("state.db probe started")
+
+        assert calls
+        assert calls[-1][1]["flush"] is True
+
+
 class TestDoctorPlatformHints:
     def test_termux_package_hint(self, monkeypatch):
         monkeypatch.setenv("TERMUX_VERSION", "0.118.3")

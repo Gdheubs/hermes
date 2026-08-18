@@ -337,21 +337,29 @@ def _has_healthy_oauth_fallback_for_apikey_provider(provider_label: str) -> bool
 
 
 def check_ok(text: str, detail: str = ""):
-    print(f"  {color('✓', Colors.GREEN)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
+    print(f"  {color('✓', Colors.GREEN)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""), flush=True)
 
 def check_warn(text: str, detail: str = ""):
-    print(f"  {color('⚠', Colors.YELLOW)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
+    print(f"  {color('⚠', Colors.YELLOW)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""), flush=True)
 
 def check_fail(text: str, detail: str = ""):
-    print(f"  {color('✗', Colors.RED)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""))
+    print(f"  {color('✗', Colors.RED)} {text}" + (f" {color(detail, Colors.DIM)}" if detail else ""), flush=True)
 
 def check_info(text: str):
-    print(f"    {color('→', Colors.CYAN)} {text}")
+    print(f"    {color('→', Colors.CYAN)} {text}", flush=True)
 
 
 # ── state.db health/stats thresholds (advisory only — module constants,
 # deliberately NOT config: doctor warnings are guidance, not policy) ──
 STATE_DB_SIZE_WARN_BYTES = 1 * 1024 * 1024 * 1024   # 1 GiB logical size
+
+
+def _is_state_db_probe_timeout(reason: object) -> bool:
+    """Timeout is an inconclusive diagnostic, never corruption evidence."""
+    return isinstance(reason, str) and reason.startswith((
+        "quick state.db health probe timed out after ",
+        "deep state.db health probe timed out after ",
+    ))
 
 
 # Shared byte formatter, aliased to the name this module's three rendering
@@ -441,8 +449,8 @@ def _render_state_db_stats(stats: dict, holders=None) -> list:
 
 def _section(title: str) -> None:
     """Print a doctor section banner: blank line + bold cyan ◆ title."""
-    print()
-    print(color(f"◆ {title}", Colors.CYAN, Colors.BOLD))
+    print(flush=True)
+    print(color(f"◆ {title}", Colors.CYAN, Colors.BOLD), flush=True)
 
 
 def _fail_and_issue(text: str, detail: str, fix: str, issues: list[str]) -> None:
@@ -931,6 +939,7 @@ def managed_scope_check() -> None:
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
+    deep_db_check = bool(getattr(args, 'deep', False))
     ack_target = getattr(args, 'ack', None)
 
     # Doctor runs from the interactive CLI, so CLI-gated tool availability
@@ -1733,13 +1742,49 @@ def run_doctor(args):
 
             # FTS write-health probe (#50502): `SELECT COUNT(*)` above succeeds
             # even when the FTS index is corrupt and every message write fails
-            # through the triggers. `_db_opens_cleanly` now drives a rolled-back
+            # through the triggers. `_db_opens_cleanly` drives a rolled-back
             # write so this otherwise-silent corruption class is surfaced (and
-            # repaired in place with --fix).
+            # repaired in place with --fix). The full integrity scan is opt-in:
+            # it is expensive on multi-GB databases and is selected by
+            # `hermes doctor --deep`.
             from hermes_state import _db_opens_cleanly, repair_state_db_schema
 
-            _write_reason = _db_opens_cleanly(state_db_path)
-            if _write_reason is not None:
+            from hermes_state import (
+                DEFAULT_DEEP_DB_PROBE_TIMEOUT,
+                DEFAULT_QUICK_DB_PROBE_TIMEOUT,
+            )
+
+            if deep_db_check:
+                check_info(
+                    f"state.db deep health probe started (full integrity_check; "
+                    f"bounded to {DEFAULT_DEEP_DB_PROBE_TIMEOUT:g}s)"
+                )
+            else:
+                check_info(
+                    f"state.db quick health probe started (bounded to "
+                    f"{DEFAULT_QUICK_DB_PROBE_TIMEOUT:g}s; full integrity_check "
+                    "skipped — use 'hermes doctor --deep' for the complete scan)"
+                )
+
+            def _state_db_probe_progress(message: str) -> None:
+                check_info(f"state.db probe: {message}")
+
+            _write_reason = _db_opens_cleanly(
+                state_db_path,
+                deep=deep_db_check,
+                progress_callback=_state_db_probe_progress,
+            )
+            if _is_state_db_probe_timeout(_write_reason):
+                check_warn(
+                    f"{_DHH}/state.db health probe was inconclusive",
+                    f"({_write_reason})",
+                )
+                manual_issues.append(
+                    "state.db health probe timed out — retry without competing "
+                    "database work; use 'hermes doctor --deep' only when a full "
+                    "offline integrity scan is required"
+                )
+            elif _write_reason is not None:
                 check_warn(
                     f"{_DHH}/state.db fails a write-health probe (FTS index may be corrupt)",
                     f"({_write_reason})",

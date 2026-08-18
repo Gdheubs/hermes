@@ -810,12 +810,14 @@ Subscriptions persist to `~/.hermes/webhook_subscriptions.json` and are hot-relo
 ## `hermes doctor`
 
 ```bash
-hermes doctor [--fix]
+hermes doctor [--fix] [--live] [--deep]
 ```
 
 | Option | Description |
 |--------|-------------|
 | `--fix` | Attempt automatic repairs where possible. |
+| `--live` | Opt in to bounded real-call probes for configured backends after the static checks. |
+| `--deep` | Run the bounded full `state.db` `PRAGMA integrity_check`. Ordinary doctor runs use a quick schema/FTS read/write probe and skip this table-wide scan, which can be slow on large databases. |
 
 ## `hermes dump`
 

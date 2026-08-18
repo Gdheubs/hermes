@@ -94,6 +94,13 @@ logger = logging.getLogger(__name__)
 MAX_SAFE_RESUME_MESSAGES = 20_000
 MAX_SAFE_EXPORT_MESSAGES = 20_000
 
+# A routine doctor run must not spend minutes scanning a multi-gigabyte state
+# database.  Keep the full scan available to explicit diagnostic callers, but
+# give both modes a wall-clock boundary and a SQLite VM progress interrupt.
+DEFAULT_QUICK_DB_PROBE_TIMEOUT = 5.0
+DEFAULT_DEEP_DB_PROBE_TIMEOUT = 300.0
+_DB_PROBE_PROGRESS_OPS = 1_000
+
 
 def _configured_transcript_limit(key: str, fallback: int) -> int:
     """Resolve a transcript safety limit from config at call time.
@@ -2136,32 +2143,105 @@ def preflight_db_writability(
             _ensure_writable(p)
 
 
-def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+def _db_opens_cleanly(
+    db_path: Path,
+    *,
+    deep: bool = True,
+    timeout: Optional[float] = None,
+    progress_callback: Optional[Callable[[str], None]] = None,
+) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
-    Runs the same first-statement (``PRAGMA journal_mode``) that trips the
-    malformed-schema parse, then ``PRAGMA integrity_check`` and a canonical
-    ``sessions`` read, and finally a rolled-back ``messages`` write so that
-    FTS5 index corruption — which leaves base-table reads and
-    ``integrity_check`` passing while every ``INSERT INTO messages`` fails
-    through the FTS triggers — is reported as unhealthy rather than slipping
-    past as a false "ok" (#50502).
+    ``deep=True`` preserves the historical API used by repair/check-only
+    callers: it includes the complete ``PRAGMA integrity_check``. The doctor
+    command passes ``deep=False`` for its routine probe, which still checks the
+    first schema statement, canonical reads, FTS reads, and the rolled-back FTS
+    write path, but deliberately skips the table-wide integrity scan.
+
+    Both modes have a wall-clock deadline. SQLite's progress handler interrupts
+    long VM statements (including integrity_check), while the connection
+    timeout bounds lock acquisition. ``progress_callback`` is intentionally a
+    tiny diagnostic seam: doctor uses it to flush phase updates before a slow
+    operation starts, and other callers may omit it.
     """
-    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    default_timeout = (
+        DEFAULT_DEEP_DB_PROBE_TIMEOUT if deep else DEFAULT_QUICK_DB_PROBE_TIMEOUT
+    )
     try:
+        probe_timeout = float(default_timeout if timeout is None else timeout)
+    except (TypeError, ValueError):
+        probe_timeout = default_timeout
+    if probe_timeout <= 0:
+        probe_timeout = default_timeout
+
+    deadline = time.monotonic() + probe_timeout
+    timed_out = False
+    conn = None
+
+    def notify(message: str) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(message)
+        except Exception:  # diagnostics must not change DB-health semantics
+            logger.debug("state.db probe progress callback failed", exc_info=True)
+
+    def progress_handler() -> int:
+        nonlocal timed_out
+        if time.monotonic() >= deadline:
+            timed_out = True
+            return 1
+        return 0
+
+    def timeout_reason() -> str:
+        mode = "deep" if deep else "quick"
+        return f"{mode} state.db health probe timed out after {probe_timeout:g}s"
+
+    def deadline_expired() -> bool:
+        return timed_out or time.monotonic() >= deadline
+
+    try:
+        notify("opening fresh SQLite connection")
+        conn = sqlite3.connect(
+            str(db_path), timeout=probe_timeout, isolation_level=None
+        )
+        # A progress handler is the only reliable wall-clock escape hatch for
+        # a long-running SQLite VM statement. The busy timeout above handles
+        # lock waits; this handles scans of large/corrupt databases.
+        conn.set_progress_handler(progress_handler, _DB_PROBE_PROGRESS_OPS)
+
         # Best-effort tokenizer load: a DB carrying the messages_fts_cjk
         # index needs the cjk_unicode61 extension before any statement can
         # touch that table — including the trigger-driven write probe below.
         # Without it, this probe sees the DB exactly as a tokenizer-less
         # SessionDB open would (which drops the cjk triggers to keep writes
         # working), so tokenizer absence must never classify as corruption.
+        notify("checking schema and journal mode")
         load_fts5_cjk_extension(conn)
         conn.execute("PRAGMA journal_mode").fetchone()
-        rows = conn.execute("PRAGMA integrity_check").fetchall()
-        problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
-        if problems:
-            return "; ".join(problems[:3])
+        if deadline_expired():
+            return timeout_reason()
+
+        if deep:
+            notify(
+                "running full PRAGMA integrity_check "
+                f"(deadline {probe_timeout:g}s)"
+            )
+            rows = conn.execute("PRAGMA integrity_check").fetchall()
+            if deadline_expired():
+                return timeout_reason()
+            problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
+            if problems:
+                return "; ".join(problems[:3])
+        else:
+            notify(
+                "skipping full PRAGMA integrity_check in quick mode "
+                "(use hermes doctor --deep for the complete scan)"
+            )
+
         conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
+        if deadline_expired():
+            return timeout_reason()
 
         # FTS5 read probe: run a representative MATCH query against the
         # messages_fts* virtual tables. The FTS *write* probe below catches
@@ -2174,6 +2254,7 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         # and any feature relying on FTS5 discovery then break silently
         # because the official repair tool's check-only path reports the
         # DB as healthy. #66724.
+        notify("checking FTS read paths")
         # Catch the full sqlite3 exception hierarchy (not just
         # OperationalError) so the malformed-shadow-table class is reported
         # rather than letting it crash the caller.
@@ -2190,7 +2271,11 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                 conn.execute(
                     f"SELECT 1 FROM {fts_table} WHERE {fts_table} MATCH '\"\"' LIMIT 1"
                 ).fetchone()
+                if deadline_expired():
+                    return timeout_reason()
             except sqlite3.OperationalError as exc:
+                if deadline_expired():
+                    return timeout_reason()
                 # Use the canonical capability classifier instead of a
                 # hand-rolled substring check. On SQLite builds without the
                 # fts5 module, the legacy messages_fts table may exist on
@@ -2198,12 +2283,7 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                 # against it raise OperationalError("no such module: fts5");
                 # the substring check below would misclassify that as
                 # corruption and send the DB into the repair path, whose
-                # final fallback deletes the messages_fts% schema
-                # (hermes_state.py:645-723). The supported degraded-runtime
-                # path (SessionDB._is_fts5_unavailable_error + the
-                # regression suite in tests/test_hermes_state.py:600-632)
-                # treats both "no such module: fts5" and
-                # "no such tokenizer: trigram" as the capability error.
+                # final fallback deletes the messages_fts% schema.
                 if SessionDB._is_fts5_unavailable_error(exc):
                     # Degraded runtime — not the corruption class we probe.
                     continue
@@ -2214,6 +2294,8 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                     continue
                 return f"fts5 read probe failed on {fts_table}: {exc}"
             except sqlite3.DatabaseError as exc:
+                if deadline_expired():
+                    return timeout_reason()
                 # This is the corruption class #66724 actually wants caught:
                 # partial shadow-table damage where MATCH / snippet / rank
                 # queries raise DatabaseError("database disk image is malformed")
@@ -2226,6 +2308,7 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         # best-effort — if the messages/sessions tables don't exist yet (brand
         # new file mid-init) the OperationalError is treated as "not yet a
         # populated DB", not corruption.
+        notify("checking FTS write path with a rolled-back probe")
         probe_session_id = f"_hermes_fts_health_probe_{time.time_ns()}"
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -2239,7 +2322,11 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                 (probe_session_id, "user", "_fts_health_probe", time.time()),
             )
             conn.execute("ROLLBACK")
+            if deadline_expired():
+                return timeout_reason()
         except sqlite3.OperationalError as exc:
+            if deadline_expired():
+                return timeout_reason()
             # Missing tables / FTS disabled — not the corruption class we probe.
             try:
                 conn.execute("ROLLBACK")
@@ -2255,11 +2342,23 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                 # a tokenizer-less one self-heals by dropping the triggers.
                 return None
             return str(exc)
+        notify("health probe completed")
         return None
+    except sqlite3.OperationalError as exc:
+        if deadline_expired():
+            return timeout_reason()
+        return str(exc)
     except sqlite3.DatabaseError as exc:
+        if deadline_expired():
+            return timeout_reason()
         return str(exc)
     finally:
-        conn.close()
+        if conn is not None:
+            try:
+                conn.set_progress_handler(None, 0)
+            except Exception:
+                pass
+            conn.close()
 
 
 def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:

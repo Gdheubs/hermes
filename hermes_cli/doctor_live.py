@@ -18,7 +18,9 @@ Design invariants:
 
 from __future__ import annotations
 
+import logging
 import os
+import uuid
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
@@ -29,6 +31,8 @@ from hermes_cli.doctor import (
     check_ok,
     check_warn,
 )
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_PROBE_TIMEOUT = 10.0
 
@@ -75,27 +79,6 @@ def _http_get(url: str, headers: Optional[dict] = None,
 
 def _browser_available() -> bool:
     """Is the local browser automation backend (agent-browser) installed?"""
-    import shutil
-
-    if shutil.which("agent-browser"):
-        return True
-    try:
-        from hermes_cli.doctor import HERMES_HOME, PROJECT_ROOT
-
-        if (PROJECT_ROOT / "node_modules" / "agent-browser").exists():
-            return True
-        for candidate in (HERMES_HOME / "node" / "bin",
-                          HERMES_HOME / "node",
-                          HERMES_HOME / "node_modules" / ".bin"):
-            if shutil.which("agent-browser", path=str(candidate)):
-                return True
-    except Exception:
-        pass
-    # agent-browser resolves lazily via npx on the default install (#43564),
-    # invisible to the PATH/node_modules probes above. Mirror the rung
-    # hermes_cli.doctor uses so this probe can't diverge from it, including
-    # the Termux carve-out (bare npx is too fragile to advertise as ready
-    # there — see check_browser_requirements).
     try:
         from tools.browser_tool import (
             _find_agent_browser,
@@ -106,30 +89,55 @@ def _browser_available() -> bool:
     except Exception:
         return False
     if not _is_npx_agent_browser_sentinel(browser_cmd):
-        return False
+        # A concrete executable path is the same backend that the browser
+        # tools invoke. Do not substitute a Python Playwright import check.
+        return True
     return not _requires_real_termux_browser_install(browser_cmd)
 
 
 def _launch_browser_probe(timeout: float) -> tuple:
     """Launch a browser, open about:blank, close. Returns (ok, detail).
 
-    Uses Playwright directly (what agent-browser drives underneath) so the
-    probe owns the full lifecycle and always cleans up.
+    Reuses the exact ``agent-browser`` command/session machinery used by the
+    browser tools. Python Playwright is an implementation detail of that CLI,
+    not a Hermes runtime dependency; importing it here caused false negatives
+    whenever ``npx agent-browser`` was available without a Python Playwright
+    package. The helper owns cleanup even when the open command fails.
     """
+    task_id = f"_hermes_doctor_browser_probe_{uuid.uuid4().hex[:12]}"
     try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return (False, "playwright not installed")
+        from tools.browser_tool import _run_browser_command, cleanup_browser
+    except Exception as exc:
+        return (False, f"agent-browser backend unavailable: {exc}")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True,
-                                    timeout=timeout * 1000)
+    probe_error = None
+    cleanup_error = None
+    try:
+        result = _run_browser_command(
+            task_id,
+            "open",
+            ["about:blank"],
+            timeout=timeout,
+        )
+        if not isinstance(result, dict) or not result.get("success"):
+            detail = result.get("error") if isinstance(result, dict) else repr(result)
+            probe_error = f"agent-browser open failed: {detail}"
+    except Exception as exc:
+        probe_error = f"agent-browser probe failed: {exc}"
+    finally:
         try:
-            page = browser.new_page()
-            page.goto("about:blank", timeout=timeout * 1000)
-        finally:
-            browser.close()
-    return (True, "launched + about:blank + closed")
+            cleanup_browser(task_id)
+        except Exception as exc:
+            cleanup_error = str(exc)
+            logger.debug("doctor browser probe cleanup failed", exc_info=exc)
+
+    if probe_error is not None:
+        if cleanup_error is not None:
+            probe_error += f"; cleanup also failed: {cleanup_error}"
+        return (False, probe_error)
+    if cleanup_error is not None:
+        return (False, f"agent-browser launched about:blank but cleanup failed: {cleanup_error}")
+    return (True, "agent-browser launched + about:blank + closed")
 
 
 def _probe_mcp_server(name: str, config: dict, timeout: float):
