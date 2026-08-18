@@ -100,6 +100,29 @@ def _exact_pins(specs):
     return pins
 
 
+def _all_pin_versions(specs):
+    """Map canonical package -> set of every exact-pinned version seen.
+
+    Like :func:`_exact_pins` but marker-aware: a single extra may pin the
+    same package to different versions per platform (e.g. the ``wake`` extra
+    pins ``onnxruntime==1.23.2`` on Intel macOS where 1.27.0 ships no
+    x86_64 wheel, and ``==1.27.0`` everywhere else — #81577). The drift test
+    must compare the *full* version set against LAZY_DEPS, not just the
+    last spec seen, or marker-scoped pins report a false conflict.
+    """
+    versions: dict[str, set[str]] = {}
+    if isinstance(specs, str):
+        specs = (specs,)
+    for spec in specs:
+        requirement = spec.split(";", 1)[0].strip()
+        if "==" not in requirement:
+            continue
+        package, version = requirement.split("==", 1)
+        package = package.split("[", 1)[0].lower().replace("_", "-")
+        versions.setdefault(package, set()).add(version)
+    return versions
+
+
 
 
 def test_pyproject_pins_match_lazy_deps_pins():
@@ -118,21 +141,21 @@ def test_pyproject_pins_match_lazy_deps_pins():
 
     optional_dependencies = _load_optional_dependencies()
 
-    # package -> version, as pinned across all pyproject extras. If an
-    # extra pins a package at a different version than another extra, that
-    # is itself a bug (caught below); here we just collect the set.
+    # package -> version set, as pinned across all pyproject extras. If an
+    # extra pins a package at different versions under the same marker, that
+    # is itself a bug (caught elsewhere); here we collect the full set per
+    # package so marker-scoped platform pins (onnxruntime 1.23.2 on Intel
+    # macOS vs 1.27.0 elsewhere — #81577) are compared in their entirety.
     pyproject_pins: dict[str, set[str]] = {}
     for specs in optional_dependencies.values():
-        for package, version in _exact_pins(specs).items():
-            pyproject_pins.setdefault(package, set()).add(version)
+        for package, versions in _all_pin_versions(specs).items():
+            pyproject_pins.setdefault(package, set()).update(versions)
 
-    # package -> version, as pinned across all LAZY_DEPS entries.
+    # package -> version set, as pinned across all LAZY_DEPS entries.
     lazy_pins: dict[str, set[str]] = {}
     for specs in LAZY_DEPS.values():
-        if isinstance(specs, str):
-            specs = (specs,)
-        for package, version in _exact_pins(specs).items():
-            lazy_pins.setdefault(package, set()).add(version)
+        for package, versions in _all_pin_versions(specs).items():
+            lazy_pins.setdefault(package, set()).update(versions)
 
     shared = sorted(set(pyproject_pins) & set(lazy_pins))
     assert shared, "expected at least one package pinned in both pyproject and LAZY_DEPS"

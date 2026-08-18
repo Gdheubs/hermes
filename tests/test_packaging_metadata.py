@@ -182,13 +182,24 @@ def _canonical(name: str) -> str:
 
 
 def _pins_from_specs(specs):
-    """Map canonical package name -> set of exact-pinned versions seen."""
-    pins: dict[str, set[str]] = {}
+    """Map (canonical package, marker) -> set of exact-pinned versions seen.
+
+    The marker (empty string for an un-marker'd spec) is part of the key so
+    that two platform-specific pins of the same package count as separate,
+    non-conflicting groups rather than a same-environment conflict — e.g.
+    ``onnxruntime==1.23.2; platform_machine == 'x86_64' ...`` vs
+    ``onnxruntime==1.27.0; ...`` (#81577). Within ONE marker group a package
+    must still agree on a single version, so a genuine conflict pinned under
+    the same marker is still caught.
+    """
+    pins: dict[tuple[str, str], set[str]] = {}
     for spec in specs:
-        m = _PIN_RE.match(spec)
+        req, _sep, marker = spec.partition(";")
+        m = _PIN_RE.match(req)
         if not m:
             continue
-        pins.setdefault(_canonical(m.group(1)), set()).add(m.group(2))
+        key = (_canonical(m.group(1)), marker.strip())
+        pins.setdefault(key, set()).add(m.group(2))
     return pins
 
 
@@ -235,16 +246,25 @@ def _lazy_deps_pinned_specs():
 
 
 def test_pyproject_pins_are_internally_consistent():
-    """No package may be exact-pinned to two different versions in pyproject.
+    """No package may be exact-pinned to two different versions in pyproject
+    under the SAME platform marker.
 
     A package legitimately appearing in several extras (e.g. aiohttp in
     messaging/slack/homeassistant/sms) must use the SAME version everywhere.
+    Distinct per-platform pins are legal (e.g. ``onnxruntime==1.23.2`` on
+    Intel macOS vs ``==1.27.0`` elsewhere — #81577), so versions are compared
+    within a (package, marker) group, never across markers.
     """
     pins = _pins_from_specs(_pyproject_pinned_specs())
-    conflicts = {name: sorted(v) for name, v in pins.items() if len(v) > 1}
+    conflicts = {
+        f"{name}{' [' + marker + ']' if marker else ''}": sorted(v)
+        for (name, marker), v in pins.items()
+        if len(v) > 1
+    }
     assert not conflicts, (
         "pyproject.toml exact-pins the same package to different versions "
-        "across [project.dependencies] / extras: " + str(conflicts)
+        "within one environment marker (a same-environment conflict): "
+        + str(conflicts)
     )
 
 
@@ -356,7 +376,19 @@ def test_security_pins_present_in_mirrored_lazy_features():
     problems = []
     for pkg, features in _REQUIRED_SECURITY_PINS.items():
         canon = _canonical(pkg)
-        expected = py.get(canon)
+
+        def _all_versions(pins):
+            # Aggregate a package's versions across every marker group. A
+            # security pin must hold regardless of platform, so all groups
+            # must carry the same patched floor.
+            return {
+                ver
+                for (name, _marker), vers in pins.items()
+                if name == canon
+                for ver in vers
+            }
+
+        expected = _all_versions(py)
         assert expected, (
             f"{pkg} is listed in _REQUIRED_SECURITY_PINS but is not exact-pinned "
             f"in pyproject.toml — update the map or the pin."
@@ -367,7 +399,7 @@ def test_security_pins_present_in_mirrored_lazy_features():
                 f"lazy feature {feature!r} named in _REQUIRED_SECURITY_PINS no "
                 f"longer exists in LAZY_DEPS — update the map."
             )
-            got = _pins_from_specs(specs).get(canon)
+            got = _all_versions(_pins_from_specs(specs))
             if got != expected:
                 problems.append(
                     f"{feature}: {pkg}="

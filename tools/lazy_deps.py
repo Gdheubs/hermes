@@ -162,12 +162,32 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # It lives in its own feature because lazy-dep specs cannot carry PEP 508
     # environment markers (_spec_is_safe rejects ";"), so the platform gate is
     # applied by the caller instead.
+    #
+    # ``wake.openwakeword.slim`` is the Intel-macOS variant of the default
+    # stack, pinning ``onnxruntime==1.23.2`` — the last release with a Darwin
+    # x86_64 wheel (1.27.0 ships none). The [wake] extra pins the same version
+    # via a platform marker; lazy-dep specs cannot carry PEP 508 markers
+    # (_spec_is_safe rejects ";"), so ``wake.openwakeword`` hard-pins 1.27.0
+    # and its version match would fail against the marker-pinned 1.23.2
+    # install. Slim exists so the Intel-macOS lazy channel pins 1.23.2
+    # (matching the extra) instead of 1.27.0. Callers gate on the platform:
+    # Intel macOS ensures the slim feature — which now carries its own
+    # onnxruntime==1.23.2 so a pure lazy install (no [wake] extra ever
+    # installed) actually fetches the runtime instead of surfacing a missing
+    # ImportError (#81560, #81577) — every other platform ensures the default
+    # feature (#81560, #81577).
     "wake.openwakeword.tflite": (
         "ai-edge-litert==2.1.6",
     ),
     "wake.openwakeword": (
         "openwakeword==0.6.0",
         "onnxruntime==1.27.0",
+        "sounddevice==0.5.5",
+        "numpy==2.4.3",
+    ),
+    "wake.openwakeword.slim": (
+        "openwakeword==0.6.0",
+        "onnxruntime==1.23.2",
         "sounddevice==0.5.5",
         "numpy==2.4.3",
     ),

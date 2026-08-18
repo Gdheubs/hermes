@@ -211,6 +211,12 @@ def _install_fake_openwakeword(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "openwakeword", oww)
     monkeypatch.setitem(sys.modules, "openwakeword.model", model_mod)
+    # The engine's onnxruntime preflight (slim / missing-runtime guard) must
+    # not depend on the test venv's installed packages; the runtime is faked
+    # here and the missing-runtime path is exercised by its own test.
+    monkeypatch.setitem(
+        sys.modules, "onnxruntime", types.SimpleNamespace(__name__="onnxruntime")
+    )
     monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **k: None)
     return calls
 
@@ -269,6 +275,28 @@ def test_macos_arm64_prefers_tflite_on_this_host():
     ) == "tflite"
 
 
+def test_default_framework_is_onnx_on_macos_intel(monkeypatch):
+    # Intel macOS uses the ONNX backend with the platform-pinned
+    # onnxruntime==1.23.2 wheel (the last release with a Darwin x86_64
+    # wheel). The tflite route was abandoned in #81577: ai-edge-litert
+    # also ships no x86_64 macOS wheel.
+    monkeypatch.setattr(ww.sys, "platform", "darwin")
+    monkeypatch.setattr("platform.machine", lambda: "x86_64")
+    assert ww._is_macos_intel() is True
+    assert ww.default_inference_framework() == "onnx"
+
+
+def test_explicit_onnx_kept_on_macos_intel(monkeypatch):
+    monkeypatch.setattr(ww.sys, "platform", "darwin")
+    monkeypatch.setattr("platform.machine", lambda: "x86_64")
+    assert (
+        ww.resolve_inference_framework(
+            {"openwakeword": {"inference_framework": "onnx"}}
+        )
+        == "onnx"
+    )
+
+
 def test_explicit_framework_kept_where_onnx_works(monkeypatch):
     # An operator who pins a backend keeps it everywhere ONNX actually works.
     calls = _install_fake_openwakeword(monkeypatch)
@@ -278,6 +306,145 @@ def test_explicit_framework_kept_where_onnx_works(monkeypatch):
     )
     (downloaded,) = calls["download"]
     assert downloaded == [ww._bundled_wakeword_path("onnx")]
+
+
+def test_intel_macos_engine_ensures_slim_stack(monkeypatch):
+    # Intel macOS: the [wake] extra installs onnxruntime==1.23.2 (the last
+    # Darwin x86_64 wheel) via pyproject's platform marker, but lazy_deps
+    # specs cannot carry markers — `wake.openwakeword` hard-pins 1.27.0 and
+    # its version match would fail against a 1.23.2 install, re-raising the
+    # #81560 lazy-install failure at engine construction. The engine must
+    # ensure the slim feature on Intel macOS, which pins onnxruntime==1.23.2
+    # itself so a pure lazy install (no [wake] extra) fetches the runtime
+    # (#81560, #81577 follow-up).
+    _install_fake_openwakeword(monkeypatch)
+    ensured = []
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure", lambda feature, prompt=False: ensured.append(feature)
+    )
+    monkeypatch.setattr(ww, "ensure_tflite_runtime", lambda: True)
+    monkeypatch.setattr(ww.sys, "platform", "darwin")
+    monkeypatch.setattr("platform.machine", lambda: "x86_64")
+    ww._OpenWakeWordEngine(
+        {"provider": "openwakeword", "openwakeword": {"inference_framework": "onnx"}}
+    )
+    assert "wake.openwakeword.slim" in ensured
+    assert "wake.openwakeword" not in ensured
+    assert "wake.openwakeword.tflite" not in ensured
+
+
+def test_intel_macos_slim_lazy_request_pins_onnxruntime_1_23_2(monkeypatch):
+    # The pure-lazy path (a fresh env, no [wake] extra ever installed) must
+    # install onnxruntime itself at the platform-correct version. The engine
+    # ensures `wake.openwakeword.slim` on Intel macOS; its spec must carry
+    # onnxruntime==1.23.2 (the last Darwin x86_64 wheel) — NOT the 1.27.0
+    # pin of the shared default feature, which has no x86_64 macOS wheel
+    # (#81560, #81577).
+    from tools import lazy_deps
+
+    slim_specs = lazy_deps.feature_specs("wake.openwakeword.slim")
+    assert "onnxruntime==1.23.2" in slim_specs
+    assert "onnxruntime==1.27.0" not in slim_specs
+
+    default_specs = lazy_deps.feature_specs("wake.openwakeword")
+    assert "onnxruntime==1.27.0" in default_specs
+
+    # When onnxruntime is missing (fresh install), the lazy installer's
+    # feature_missing() must report 1.23.2 as the spec to fetch on Intel
+    # macOS — the request the engine's ensure() would pass to pip.
+    original = lazy_deps.feature_missing
+    monkeypatch.setattr(
+        "tools.lazy_deps._is_satisfied",
+        lambda spec: "onnxruntime" not in spec,
+    )
+    missing = original("wake.openwakeword.slim")
+    assert "onnxruntime==1.23.2" in missing
+    assert not any(s.startswith("onnxruntime==") and "1.23.2" not in s for s in missing)
+
+
+def test_intel_macos_engine_reports_missing_onnxruntime(monkeypatch):
+    # The engine's lazy ensure() installs onnxruntime (slim → 1.23.2 on
+    # Intel macOS), but a user who manually pip-installed only the slim
+    # stack with lazy installs disabled would otherwise hit openwakeword's
+    # bare ModuleNotFoundError at engine construction. The engine must
+    # surface an actionable hint instead of the raw "No module named
+    # 'onnxruntime'".
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "onnxruntime":
+            raise ImportError("No module named 'onnxruntime'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure", lambda feature, prompt=False: None
+    )
+    monkeypatch.setattr(ww, "ensure_tflite_runtime", lambda: True)
+    monkeypatch.setattr(ww.sys, "platform", "darwin")
+    monkeypatch.setattr("platform.machine", lambda: "x86_64")
+    with pytest.raises(ImportError) as err:
+        ww._OpenWakeWordEngine(
+            {"provider": "openwakeword", "openwakeword": {"inference_framework": "onnx"}}
+        )
+    msg = str(err.value)
+    assert "onnxruntime" in msg
+    assert "hermes tools" in msg
+    assert "No module named 'onnxruntime'" not in msg
+
+
+def test_non_intel_macos_engine_ensures_default_stack(monkeypatch):
+    # Everywhere else the default feature (with onnxruntime==1.27.0) is
+    # correct — the platform-correct wheel is installable there.
+    _install_fake_openwakeword(monkeypatch)
+    ensured = []
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure", lambda feature, prompt=False: ensured.append(feature)
+    )
+    monkeypatch.setattr(ww, "ensure_tflite_runtime", lambda: True)
+    monkeypatch.setattr(ww.sys, "platform", "darwin")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    ww._OpenWakeWordEngine(
+        {"provider": "openwakeword", "openwakeword": {"inference_framework": "onnx"}}
+    )
+    assert "wake.openwakeword" in ensured
+    assert "wake.openwakeword.slim" not in ensured
+    assert "wake.openwakeword.tflite" not in ensured
+
+
+def test_tflite_framework_skips_onnxruntime_preflight(monkeypatch):
+    # Regression (#81560): the effective framework on macOS ARM64 is tflite,
+    # which runs on ai-edge-litert (bridged by ensure_tflite_runtime), NOT
+    # onnxruntime. A user who manually installed only the tflite runtime —
+    # a previously-working setup — must not be hard-blocked by the engine's
+    # onnxruntime preflight (which #81577 made unconditional).
+    _install_fake_openwakeword(monkeypatch)
+    # Make onnxruntime genuinely un-importable: if the preflight ran for the
+    # tflite path, construction would raise the "needs onnxruntime" ImportError.
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "onnxruntime":
+            raise ImportError("No module named 'onnxruntime'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.delitem(sys.modules, "onnxruntime", raising=False)
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure", lambda feature, prompt=False: None
+    )
+    monkeypatch.setattr(ww, "ensure_tflite_runtime", lambda: True)
+    monkeypatch.setattr(ww.sys, "platform", "darwin")
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    # Explicit "onnx" is coerced to tflite on macOS ARM64; the engine must
+    # build on the tflite runtime alone, with no onnxruntime anywhere.
+    ww._OpenWakeWordEngine(
+        {"provider": "openwakeword", "openwakeword": {"inference_framework": "onnx"}}
+    )
 
 
 def test_empty_framework_falls_back_to_platform_default(monkeypatch):
