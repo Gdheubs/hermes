@@ -530,7 +530,13 @@ def get_external_skills_dirs() -> List[Path]:
     called once per skill during banner / tool-registry scans, and YAML
     parsing a non-trivial config dominates ``hermes`` cold-start time
     when the cache is absent.
+
+    When HERMES_SKILL_PATH is set (per-agent skill_path), returns empty
+    so the agent only sees skills from its own skill_path.
     """
+    # Per-agent skill_path override — restrict to only that directory
+    if os.environ.get("HERMES_SKILL_PATH", "").strip():
+        return []
     config_path = get_config_path()
     if not config_path.exists():
         return []

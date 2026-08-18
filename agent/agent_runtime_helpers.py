@@ -3050,6 +3050,43 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     if not isinstance(function_args, dict):
         function_args = {}
 
+    # ── PLAN mode gate ────────────────────────────────────────────────
+    # Block write/execute tools when in PLAN mode. Read-only tools are
+    # allowed so the agent can gather context without fabricating answers.
+    _PLAN_READ_ONLY_TOOLS = frozenset({
+        "read_file", "search_files", "session_search",
+        "skill_view", "skills_list",
+        "clarify", "browser_snapshot", "browser_get_images",
+        "memory",
+    })
+    if getattr(agent, "interaction_mode", "build") == "plan" and function_name not in _PLAN_READ_ONLY_TOOLS:
+        result = json.dumps(
+            {
+                "error": "Tool execution is disabled in PLAN mode. "
+                "Switch to BUILD mode to run tools."
+            },
+            ensure_ascii=False,
+        )
+        try:
+            from model_tools import _emit_post_tool_call_hook
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                task_id=effective_task_id or "",
+                session_id=getattr(agent, "session_id", "") or "",
+                tool_call_id=tool_call_id or "",
+                turn_id=getattr(agent, "_current_turn_id", "") or "",
+                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                status="blocked",
+                error_type="plan_mode",
+                error_message="Tool execution is disabled in PLAN mode. "
+                "Switch to BUILD mode to run tools.",
+            )
+        except Exception:
+            pass
+        return result
+
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
     try:
         from hermes_cli.middleware import apply_tool_request_middleware

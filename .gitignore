@@ -12,6 +12,8 @@ act/
 .venv
 .vscode/
 .env
+.ares/
+.agents/
 .op.env
 .env.local
 .env.development.local

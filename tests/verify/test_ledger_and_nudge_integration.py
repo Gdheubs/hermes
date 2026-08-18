@@ -167,13 +167,14 @@ def test_nudge_mentions_hermes_verify_when_manifest_exists(hermes_home):
 
 
 def test_nudge_keeps_plain_wording_without_recipe_start(hermes_home):
-    # Verify commands but no start script and no manifest: today's wording.
+    # Verify commands but no start script and no manifest: stricter guidance
+    # still names the cheapest useful check and evidence expectations.
     project = _workspace(hermes_home, scripts={"test": "vitest"})
     changed = str(project / "src" / "app.ts")
     mark_workspace_edited(session_id="s1", cwd=project, paths=[changed])
     nudge = build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed])
     assert nudge is not None
-    assert "hermes verify" not in nudge
+    assert "cheapest useful check" in nudge
 
 
 def test_nudge_recipe_detection_failure_is_silent(hermes_home, monkeypatch):
@@ -189,7 +190,7 @@ def test_nudge_recipe_detection_failure_is_silent(hermes_home, monkeypatch):
     mark_workspace_edited(session_id="s1", cwd=project, paths=[changed])
     nudge = build_verify_on_stop_nudge(session_id="s1", changed_paths=[changed])
     assert nudge is not None
-    assert "hermes verify" not in nudge
+    assert "verification evidence" in nudge
 
 
 # ---------------------------------------------------------------------------

@@ -518,21 +518,6 @@ def _get_cdp_override_raw() -> str:
     Precedence is:
     1. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
     2. ``browser.cdp_url`` in config.yaml (persistent config)
-
-    This is the availability-check variant: callers that only need to know
-    *whether* a CDP override is configured (tool ``check_fn`` gates,
-    ``_is_local_mode`` / ``_is_local_backend`` routing decisions,
-    ``hermes doctor``) MUST use this instead of :func:`_get_cdp_override`.
-
-    Rationale: ``_get_cdp_override`` resolves the endpoint over HTTP
-    (``/json/version`` discovery, 10s timeout). Tool-schema assembly runs at
-    every CLI/Desktop startup and probes several browser-family check_fns;
-    when a *stale* ``browser.cdp_url`` points at a dead endpoint (the debug
-    Chrome it referenced is long gone), each check blocked on a failing
-    socket connect and startup stalled for 10+ seconds before the banner —
-    with no error, just mystery slowness. Same principle as the existing
-    "do not execute ``agent-browser --version`` here" rule in
-    ``check_browser_requirements``: no side effects during schema build.
     """
     env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
     if env_override:
@@ -551,23 +536,43 @@ def _get_cdp_override_raw() -> str:
     return ""
 
 
+def _detect_live_local_cdp() -> str:
+    """Check if a local browser is actively listening on port 9222."""
+    try:
+        from hermes_cli.config import read_raw_config
+        cfg = read_raw_config()
+        browser_cfg = cfg.get("browser", {})
+        if isinstance(browser_cfg, dict):
+            # Check if user explicitly disabled auto CDP
+            if browser_cfg.get("auto_connect_cdp") is False:
+                return ""
+    except Exception:
+        pass
+
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.05)
+        result = s.connect_ex(("127.0.0.1", 9222))
+        s.close()
+        if result == 0:
+            return "http://127.0.0.1:9222"
+    except Exception:
+        pass
+    return ""
+
+
 def _get_cdp_override() -> str:
     """Return a normalized CDP URL override, or empty string.
 
     Precedence is:
     1. ``BROWSER_CDP_URL`` env var (live override from ``/browser connect``)
     2. ``browser.cdp_url`` in config.yaml (persistent config)
-
-    When either is set, we skip both Browserbase and the local headless
-    launcher and connect directly to the supplied Chrome DevTools Protocol
-    endpoint.
-
-    NOTE: resolution may perform an HTTP ``/json/version`` discovery request.
-    Only call this on paths that are about to *connect* (session creation,
-    supervisor attach). Pure is-it-configured gates must use
-    :func:`_get_cdp_override_raw`.
+    3. Auto-detected live local CDP on port 9222 (if active)
     """
     raw = _get_cdp_override_raw()
+    if not raw:
+        raw = _detect_live_local_cdp()
     if not raw:
         return ""
     return _resolve_cdp_override(raw)
@@ -1465,10 +1470,10 @@ def _navigation_session_key(task_id: str, url: str) -> str:
     path spawns a local Chromium sidecar while the cloud session (if any)
     continues to serve public URLs.
     """
+    if _get_cdp_override_raw():
+        return "cdp_global_session"
     if task_id is None:
         task_id = "default"
-    if _get_cdp_override_raw():
-        return task_id
     if _is_camofox_mode():
         return task_id
     if _get_cloud_provider() is None:
@@ -1480,8 +1485,10 @@ def _navigation_session_key(task_id: str, url: str) -> str:
     return f"{task_id}{_LOCAL_SUFFIX}"
 
 
-def _is_local_sidecar_key(session_key: str) -> bool:
+def _is_local_sidecar_key(session_key: str | None) -> bool:
     """Return True when ``session_key`` is a hybrid-routing local sidecar."""
+    if not session_key:
+        return False
     return session_key.endswith(_LOCAL_SUFFIX)
 
 
@@ -1519,6 +1526,10 @@ def _last_session_key(task_id: str) -> str:
     dropping the stale binding instead of silently recreating or mutating the
     wrong browser.
     """
+def _resolve_session_key_for_task(task_id: Optional[str]) -> str:
+    """Resolve the session key to use for a non-navigation browser tool call."""
+    if _get_cdp_override_raw():
+        return "cdp_global_session"
     if task_id is None:
         task_id = "default"
     recorded_key = _last_active_session_key.get(task_id)
@@ -2316,9 +2327,9 @@ def _create_local_session(task_id: str) -> Dict[str, str]:
 
 def _create_cdp_session(task_id: str, cdp_url: str) -> Dict[str, str]:
     """Create a session that connects to a user-supplied CDP endpoint."""
-    import uuid
-    session_name = f"cdp_{uuid.uuid4().hex[:10]}"
-    logger.info("Created CDP browser session %s → %s for task %s",
+    # Use deterministic session name for global CDP to avoid spawning multiple agent-browser daemons
+    session_name = "cdp_local_9222" if "9222" in cdp_url else f"cdp_{task_id.replace(':', '_')}"
+    logger.info("Using CDP browser session %s → %s for task %s",
                 session_name, _sanitize_url_for_logs(cdp_url), task_id)
     return {
         "session_name": session_name,

@@ -107,6 +107,7 @@ def _(rid, params: dict) -> dict:
             "slash_worker": None,
             "tool_progress_mode": _load_tool_progress_mode(),
             "tool_started_at": {},
+            "interaction_mode": _resolve_default_interaction_mode(),
             "transport": current_transport() or _stdio_transport,
         }
         _register_session_cwd(_sessions[sid])
@@ -155,6 +156,7 @@ def _(rid, params: dict) -> dict:
                 "lazy": True,
                 "desktop_contract": DESKTOP_BACKEND_CONTRACT,
                 "profile_name": _response_profile_name(profile),
+                "interaction_mode": "build",
             },
         },
     )

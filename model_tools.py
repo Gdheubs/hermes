@@ -1347,6 +1347,39 @@ def handle_function_call(
             )
 
     _tool_original_args = dict(function_args)
+
+    # ── PLAN mode gate (defense-in-depth) ─────────────────────────────
+    # The primary gate is in ``invoke_tool`` (agent_runtime_helpers.py)
+    # and ``_run_agent_tool_execution_middleware`` (tool_executor.py).
+    # This duplicate catches any direct ``handle_function_call`` callers
+    # that bypass both paths.
+    try:
+        from tui_gateway import server as _gw_server
+        _im_session = _gw_server._sessions.get(session_id or "")
+        if _im_session and str(_im_session.get("interaction_mode") or "build") == "plan":
+            result = tool_error(
+                "Tool execution is disabled in PLAN mode. "
+                "Switch to BUILD mode to run tools."
+            )
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                status="blocked",
+                error_type="plan_mode",
+                error_message="Tool execution is disabled in PLAN mode. "
+                "Switch to BUILD mode to run tools.",
+                middleware_trace=list(_tool_middleware_trace),
+            )
+            return result
+    except Exception:
+        pass
+
     if not skip_tool_request_middleware:
         try:
             from hermes_cli.middleware import apply_tool_request_middleware

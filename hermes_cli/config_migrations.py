@@ -815,6 +815,55 @@ def _migrate_to_37(results: Dict[str, Any], quiet: bool) -> None:
             )
 
 
+def _migrate_to_38(results: Dict[str, Any], quiet: bool) -> None:
+    # ── Version 37 → 38: add interaction_mode defaults ──
+    _c = _cfg()
+    read_raw_config = _c.read_raw_config
+    _persist_migration = _c._persist_migration
+
+    config = read_raw_config()
+    agent = config.get("agent")
+    changed = False
+    if not isinstance(agent, dict):
+        agent = {}
+    if "interaction_mode" not in agent:
+        agent["interaction_mode"] = "build"
+        changed = True
+    if "interaction_mode_key" not in agent:
+        agent["interaction_mode_key"] = "s-tab"
+        changed = True
+    if changed:
+        config["agent"] = agent
+        _persist_migration(config)
+        results["config_added"].append("agent.interaction_mode=build, agent.interaction_mode_key=s-tab")
+        if not quiet:
+            print(
+                "  ✓ Added agent.interaction_mode (build/plan) and "
+                "agent.interaction_mode_key (Shift+Tab). "
+                "Press Shift+Tab in TUI to toggle. Change key with: "
+                "hermes config set agent.interaction_mode_key c-p"
+            )
+
+
+def _migrate_to_39(results: Dict[str, Any], quiet: bool) -> None:
+    # ── Version 38 → 39: add delegate section for agent definitions ──
+    _c = _cfg()
+    read_raw_config = _c.read_raw_config
+    _persist_migration = _c._persist_migration
+
+    config = read_raw_config()
+    if "delegate" not in config:
+        config["delegate"] = {}
+        _persist_migration(config)
+        results["config_added"].append("delegate={} (agent definitions)")
+        if not quiet:
+            print(
+                "  ✓ Added 'delegate' section for agent definitions. "
+                "Define agents in .hermes/agents/*.md and reference them: "
+                "delegate.agent_name: ~/.hermes/agents/agent.md"
+            )
+
+
 #: Registry of (target_version, migration_fn), strictly ascending. The driver
 #: applies every entry whose target version is greater than the on-disk
 #: observe earlier steps' writes via read_raw_config() (filesystem state).
@@ -839,6 +888,8 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (35, _migrate_to_35),
     (36, _migrate_to_36),
     (37, _migrate_to_37),
+    (38, _migrate_to_38),
+    (39, _migrate_to_39),
 )
 
 

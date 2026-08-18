@@ -247,6 +247,54 @@ def _build_server() -> Any:
         exposed_count,
         len(EXPOSED_TOOLS),
     )
+
+    # ── Agent tools ───────────────────────────────────────────────────
+    # Register agent_<name> tools for each defined agent.
+    try:
+        from agent.mcp_agent_tools import get_agent_tools, handle_agent_tool
+        import inspect
+
+        agent_tools = get_agent_tools()
+        agent_count = 0
+
+        for tool_def in agent_tools:
+            tool_name = tool_def["name"]
+            description = tool_def["description"]
+            params_schema = tool_def.get("inputSchema") or {"type": "object", "properties": {}}
+
+            def _make_handler(_name: str, _schema: dict | None):
+                sig, annots = _signature_from_schema(_schema)
+
+                def _dispatch(**kwargs: Any) -> str:
+                    try:
+                        args = {k: v for k, v in kwargs.items() if v is not None}
+                        return handle_agent_tool(_name, args or {})
+                    except Exception as exc:
+                        logger.exception("agent tool %s raised", _name)
+                        return json.dumps({"error": str(exc), "tool": _name})
+
+                _dispatch.__name__ = _name
+                _dispatch.__doc__ = description
+                _dispatch.__signature__ = sig
+                _dispatch.__annotations__ = {**annots, "return": str}
+                return _dispatch
+
+            try:
+                mcp.add_tool(
+                    _make_handler(tool_name, params_schema),
+                    name=tool_name,
+                    description=description,
+                )
+            except TypeError:
+                handler = _make_handler(tool_name, params_schema)
+                handler = mcp.tool(name=tool_name, description=description)(handler)
+
+            agent_count += 1
+
+        logger.info("hermes-tools MCP server registered %d agent tools", agent_count)
+    except Exception as exc:
+        logger.warning("Failed to register agent tools: %s", exc)
+
     return mcp
 
 

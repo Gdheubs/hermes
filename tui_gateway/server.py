@@ -2376,6 +2376,9 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     if (tier := current.get("create_service_tier_override")) is not None:
                         kw["service_tier_override"] = tier
                 agent = _make_agent(sid, key, **kw)
+                agent.interaction_mode = str(
+                    current.get("interaction_mode") or "build"
+                )
             finally:
                 _clear_session_context(tokens)
 
@@ -5509,6 +5512,16 @@ def _project_info_for_cwd(cwd: str) -> dict | None:
         return None
 
 
+def _resolve_default_interaction_mode() -> str:
+    """Read agent.interaction_mode from config, default 'build'."""
+    try:
+        cfg = _load_cfg()
+        raw = str((cfg or {}).get("agent", {}).get("interaction_mode", "build")).strip().lower()
+        return raw if raw in ("build", "plan") else "build"
+    except Exception:
+        return "build"
+
+
 def _session_info(agent, session: dict | None = None) -> dict:
     if session is None:
         for candidate in _sessions.values():
@@ -5578,6 +5591,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "service_tier": service_tier,
         "fast": service_tier == "priority",
         "yolo": yolo,
+        "interaction_mode": str((session or {}).get("interaction_mode") or "build"),
         "approval_mode": approval_mode,
         "tools": dict(mirror.get("tools") or {}) if isinstance(mirror.get("tools"), dict) else {},
         "skills": dict(mirror.get("skills") or {}) if isinstance(mirror.get("skills"), dict) else {},
@@ -6677,6 +6691,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     finally:
         _clear_session_context(tokens)
     session["agent"] = new_agent
+    new_agent.interaction_mode = str(session.get("interaction_mode") or "build")
     session["config_model_seen"] = _config_model_target()
     session["attached_images"] = []
     session["queued_prompt"] = None
@@ -8372,6 +8387,7 @@ def _lazy_resume_info(
         "lazy": True,
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
         "profile_name": _response_profile_name(profile),
+        "interaction_mode": "build",
     }
     if provider:
         info["provider"] = provider
@@ -8648,6 +8664,7 @@ def _fallback_session_info(session: dict) -> dict:
         # a current backend is falsely flagged "out of date" (#68392). The sibling
         # session.create shape (_lazy_resume_info) already carries it (#36112).
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+        "interaction_mode": str((session or {}).get("interaction_mode") or "build"),
     }
 
 
@@ -10764,6 +10781,32 @@ def _run_prompt_submit(
             # state, so it cannot live in the (byte-stable) system prompt.
             run_message = _prepend_note(run_message, _hud_surface_note(session))
 
+            # Interaction mode (PLAN/BUILD) — tell the model what it can do.
+            _imode = str(session.get("interaction_mode") or "build")
+            if _imode == "plan":
+                _mode_text = (
+                    "[System: Current interaction mode: PLAN.\n"
+                    "Plan mode is active for safe exploring, research, analysis, and architecture design. "
+                    "Modifying tools (write_file, patch, terminal commands that alter state) are disabled in this mode. "
+                    "Read-only tools (read_file, search_files, session_search, skill_view, skills_list) remain available.\n\n"
+                    "PLAN mode guidelines:\n"
+                    "- Answer user questions with critical analysis and concrete recommendations\n"
+                    "- Explore and understand the codebase before formulating plans\n"
+                    "- Research and design architecture, workflows, and task roadmaps\n"
+                    "- Do not attempt to write code, edit files, or execute mutating actions directly]"
+                )
+            else:
+                _mode_text = (
+                    "[System: Current interaction mode: BUILD.\n"
+                    "Full tool execution is enabled for implementing changes.\n\n"
+                    "BUILD mode guidelines:\n"
+                    "- Explore first: read code, locate exact symbols/functions before editing\n"
+                    "- Implement minimal, robust changes matching project conventions\n"
+                    "- Run tests and verify changes before reporting completion\n"
+                    "- Use delegate_task to orchestrate subagent workstreams when appropriate]"
+                )
+            run_message = _prepend_note(run_message, _mode_text)
+
             def _stream(delta):
                 with session["history_lock"]:
                     _append_inflight_delta(session, delta)
@@ -12103,6 +12146,35 @@ def _(rid, params: dict) -> dict:
             return _ok(rid, {"key": key, "value": nv, "scope": "session"})
         except Exception as e:
             return _err(rid, 5001, str(e))
+
+    if key == "interaction_mode":
+        # Session-scoped PLAN/BUILD mode toggle.  No global config write.
+        raw = str(value or "").strip().lower()
+        if raw in {"build", "plan"}:
+            target = raw
+        elif raw == "toggle" or not raw:
+            current = str((session or {}).get("interaction_mode") or "build")
+            target = "plan" if current == "build" else "build"
+        else:
+            return _err(
+                rid,
+                4002,
+                f"unknown interaction mode: {value}; use build, plan, or toggle",
+            )
+        if session:
+            session["interaction_mode"] = target
+            agent_im = session.get("agent")
+            if agent_im is not None:
+                try:
+                    agent_im.interaction_mode = target
+                except Exception:
+                    pass
+            _emit(
+                "session.info",
+                params.get("session_id", ""),
+                _session_info(agent_im, session),
+            )
+        return _ok(rid, {"key": key, "value": target})
 
     if key == "reasoning":
         try:

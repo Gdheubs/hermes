@@ -743,8 +743,8 @@ class TestConfigSupportFloor:
     }
     _V20_EXPECTED = {
         "_config_version": 33,
-        # v31 writes verify_on_stop=False, but False now equals the schema
-        # default (opt-in) so the write invariant strips it from disk.
+        # v31 writes verify_on_stop=False, which now equals the schema default,
+        # so the write invariant strips it from disk.
         "agent": {},
         "model": {"default": "anthropic/claude-fable-5", "provider": "nous"},
         "model_catalog": {"ttl_hours": 1},
@@ -1226,8 +1226,8 @@ feishu:
 
         assert raw["platforms"]["feishu"]["extra"]["app_id"] == "cli_xxx"
         assert raw["feishu"]["require_mention"] is True
-        # verify_on_stop=False now equals the schema default (opt-in), so
-        # strip_defaults removes it from disk; deep-merge supplies it at read.
+        # verify_on_stop=False is the schema default, so _persist_migration
+        # strips it from disk and load_config supplies the default.
         assert "verify_on_stop" not in raw.get("agent", {})
         assert merged["agent"]["verify_on_stop"] is False
 
@@ -1257,9 +1257,8 @@ platforms:
             raw = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
 
         assert raw["platforms"]["feishu"]["extra"]["app_id"] == "cli_xxx"
-        # The migration-write invariant strips schema-default values, and
-        # verify_on_stop=False now IS the default — so it must NOT be
-        # materialised to disk by _persist_migration.
+        # verify_on_stop=False is the schema default, so _persist_migration
+        # strips it from disk.
         assert "verify_on_stop" not in raw.get("agent", {})
         assert raw["agent"]["max_turns"] == 60
         assert raw["_config_version"] == 32

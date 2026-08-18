@@ -662,25 +662,25 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       })
     }
 
-    // shift-tab flips yolo without spending a turn (claude-code parity)
+    // shift-tab flips interaction_mode (PLAN/BUILD) without spending a turn
     if (key.shift && key.tab && !cState.completions.length) {
       if (!live.sid) {
-        return void actions.sys('yolo needs an active session')
+        return void actions.sys('interaction mode needs an active session')
       }
 
       // gateway.rpc swallows errors with its own sys() message and resolves to null,
       // so we only speak when it came back with a real shape. null = rpc already spoke.
-      return void gateway.rpc<ConfigSetResponse>('config.set', { key: 'yolo', session_id: live.sid }).then(r => {
-        if (r?.value === '1') {
-          return actions.sys('yolo on')
+      return void gateway.rpc<ConfigSetResponse>('config.set', { key: 'interaction_mode', value: 'toggle', session_id: live.sid }).then(r => {
+        if (r?.value === 'plan') {
+          return actions.sys('plan mode on — tools disabled')
         }
 
-        if (r?.value === '0') {
-          return actions.sys('yolo off')
+        if (r?.value === 'build') {
+          return actions.sys('build mode on — tools enabled')
         }
 
         if (r) {
-          actions.sys('failed to toggle yolo')
+          actions.sys('failed to toggle interaction mode')
         }
       })
     }

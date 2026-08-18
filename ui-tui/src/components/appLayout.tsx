@@ -495,6 +495,7 @@ const StatusRulePane = memo(function StatusRulePane({
         cwdLabel={status.cwdLabel}
         focusView={ui.focusView}
         indicatorStyle={ui.indicatorStyle}
+        interactionMode={ui.interactionMode}
         lastTurnEndedAt={status.lastTurnEndedAt}
         liveSessionCount={ui.liveSessionCount}
         model={ui.info?.model ?? ''}

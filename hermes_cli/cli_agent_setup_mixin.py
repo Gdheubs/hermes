@@ -541,6 +541,8 @@ class CLIAgentSetupMixin:
                 notice_clear_callback=self._on_notice_clear,
                 reaction_callback=self._on_reaction,
             )
+            # Propagate CLI session interaction mode to the new agent.
+            self.agent.interaction_mode = getattr(self, '_interaction_mode', 'build')
             # Store reference for atexit memory provider shutdown.
             # NOTE: this MUST write to the ``cli`` module's global, not a
             # local module global. ``_run_cleanup`` (in cli.py) reads

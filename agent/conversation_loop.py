@@ -7955,7 +7955,11 @@ def run_conversation(
                         verify_on_stop_enabled,
                     )
 
-                    if verify_on_stop_enabled():
+                    # Skip verification nudges in PLAN mode — tools are blocked,
+                    # so asking the agent to verify is a pointless loop.
+                    if getattr(agent, "interaction_mode", "build") == "plan":
+                        _verify_nudge = None
+                    elif verify_on_stop_enabled():
                         _verify_nudge = build_verify_on_stop_nudge(
                             session_id=getattr(agent, "session_id", None),
                             changed_paths=getattr(agent, "_turn_file_mutation_paths", set()),

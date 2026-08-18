@@ -19,6 +19,7 @@ const buildUiState = (): UiState => ({
   detailsModeCommandOverride: false,
   focusView: false,
   indicatorStyle: DEFAULT_INDICATOR_STYLE,
+  interactionMode: 'build',
   info: null,
   liveSessionCount: 0,
   inlineDiffs: true,

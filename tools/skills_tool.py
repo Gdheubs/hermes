@@ -152,7 +152,13 @@ def _skills_dir() -> Path:
     set HERMES_HOME. Keep the legacy SKILLS_DIR module attribute for tests and
     external patchers, but when it has not been patched, resolve from the live
     profile-scoped HERMES_HOME on every call.
+
+    If HERMES_SKILL_PATH is set (per-agent skill_path), use that instead.
     """
+    # Per-agent skill_path override (set by delegate_task)
+    agent_skill_path = os.environ.get("HERMES_SKILL_PATH", "").strip()
+    if agent_skill_path:
+        return Path(agent_skill_path)
     configured = Path(SKILLS_DIR)
     if configured != _SKILLS_DIR_AT_IMPORT:
         return configured
@@ -621,37 +627,26 @@ def _parse_tags(tags_value) -> List[str]:
 
 
 def _get_disabled_skill_names() -> Set[str]:
-    """Load disabled skill names from config.
-
-    Delegates to ``agent.skill_utils.get_disabled_skill_names`` — kept here
-    as a public re-export so existing callers don't need updating.
-    """
+    """Load disabled skill names from config."""
     from agent.skill_utils import get_disabled_skill_names
-    return get_disabled_skill_names()
-
-
-def _get_session_platform() -> str:
-    """Resolve the current platform from gateway session context.
-
-    Mirrors the platform-resolution logic in
-    ``agent.skill_utils.get_disabled_skill_names`` so that
-    ``_is_skill_disabled`` respects ``HERMES_SESSION_PLATFORM``.
-    """
-    try:
-        from gateway.session_context import get_session_env
-        return get_session_env("HERMES_SESSION_PLATFORM") or ""
-    except Exception:
-        return ""
+    disabled = set(get_disabled_skill_names())
+    return disabled
 
 
 def _is_skill_disabled(name: str, platform: str = None) -> bool:
-    """Check if a skill is disabled in config.
+    """Check if a skill is disabled in config or excluded by subagent skill whitelist.
 
     Resolves the active platform from (in order of precedence):
     1. Explicit ``platform`` argument
     2. ``HERMES_PLATFORM`` environment variable
     3. ``HERMES_SESSION_PLATFORM`` from gateway session context
     """
+    allowed_env = os.environ.get("HERMES_ALLOWED_SKILLS", "").strip()
+    if allowed_env:
+        allowed_skills = {s.strip() for s in allowed_env.split(",") if s.strip()}
+        bare_name = name.split(":")[-1].split("/")[-1]
+        if name not in allowed_skills and bare_name not in allowed_skills:
+            return True
     try:
         from hermes_cli.config import load_config
         config = load_config()
@@ -661,9 +656,6 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         if resolved_platform:
             platform_disabled = cfg_get(skills_cfg, "platform_disabled", resolved_platform)
             if platform_disabled is not None:
-                # A globally-disabled skill stays disabled on every platform;
-                # the platform list adds to it rather than replacing it. Keep
-                # in sync with agent.skill_utils.get_disabled_skill_names.
                 return name in platform_disabled or name in global_disabled
         return name in global_disabled
     except Exception:
@@ -698,6 +690,10 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # disabling a skill is a config change with no filesystem mtime bump.
     disabled = set() if skip_disabled else _get_disabled_skill_names()
 
+    # Subagent skill scope whitelist (HERMES_ALLOWED_SKILLS)
+    allowed_env = os.environ.get("HERMES_ALLOWED_SKILLS", "").strip()
+    allowed_skills = {s.strip() for s in allowed_env.split(",") if s.strip()} if allowed_env else None
+
     # Collect directories to scan — same resolution as the scan loop below
     # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
     # SKILLS_DIR can be stale in long-lived runtimes). Trusted project-local
@@ -710,7 +706,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
         dirs_to_scan.append(active_skills_dir)
     dirs_to_scan.extend(get_external_skills_dirs())
 
-    signature = _skills_scan_signature(dirs_to_scan, disabled)
+    signature = _skills_scan_signature(dirs_to_scan, disabled) + (allowed_env,)
     now = time.monotonic()
 
     cached = _SKILLS_CACHE.get(cache_key)
@@ -757,6 +753,8 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
                 if name in seen_names:
                     continue
                 if name in disabled:
+                    continue
+                if allowed_skills is not None and name not in allowed_skills and skill_dir.name not in allowed_skills:
                     continue
 
                 description = frontmatter.get("description", "")
@@ -1105,6 +1103,21 @@ def skill_view(
                 },
                 ensure_ascii=False,
             )
+
+        # Check subagent skill scope whitelist
+        allowed_env = os.environ.get("HERMES_ALLOWED_SKILLS", "").strip()
+        if allowed_env:
+            allowed_skills = {s.strip() for s in allowed_env.split(",") if s.strip()}
+            bare_name = name.split(":")[-1].split("/")[-1]
+            if name not in allowed_skills and bare_name not in allowed_skills:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"Skill '{name}' is not in this agent's allowed skills list: {list(allowed_skills)}.",
+                        "hint": "This agent has restricted skill access defined in its agent definition.",
+                    },
+                    ensure_ascii=False,
+                )
 
         local_category_name: str | None = None
         # ── Qualified name dispatch (plugin skills) ──────────────────
@@ -2136,6 +2149,20 @@ def _skill_view_with_bump(args, **kw):
     # so a post-compression re-view returns full content again.
     stub = _check_skill_view_dedup(task_id, name, args.get("file_path"))
     if stub is not None:
+        # If allowed skills whitelist is in effect, ensure dedup doesn't bypass it
+        allowed_env = os.environ.get("HERMES_ALLOWED_SKILLS", "").strip()
+        if allowed_env:
+            allowed_skills = {s.strip() for s in allowed_env.split(",") if s.strip()}
+            bare_name = name.split(":")[-1].split("/")[-1]
+            if name not in allowed_skills and bare_name not in allowed_skills:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"Skill '{name}' is not in this agent's allowed skills list ({', '.join(sorted(allowed_skills))}).",
+                        "hint": "This agent has restricted skill access defined in its agent definition.",
+                    },
+                    ensure_ascii=False,
+                )
         return stub
     result = skill_view(
         name, file_path=args.get("file_path"), task_id=task_id

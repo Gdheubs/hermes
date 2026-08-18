@@ -4,7 +4,7 @@ import { type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } 
 import unicodeSpinners from 'unicode-animations'
 
 import { $delegationState } from '../app/delegationStore.js'
-import type { BatteryInfo, IndicatorStyle, Notice } from '../app/interfaces.js'
+import type { BatteryInfo, IndicatorStyle, InteractionMode, Notice } from '../app/interfaces.js'
 import { $isStatusRuleOccluded } from '../app/overlayStore.js'
 import { useTurnSelector } from '../app/turnStore.js'
 import { DEV_CREDITS_MODE } from '../config/env.js'
@@ -466,6 +466,7 @@ export function GoodVibesHeart({ tick, t }: { tick: number; t: Theme }) {
 export function StatusRule({
   battery,
   focusView,
+  interactionMode = 'build',
   cwdLabel,
   cols,
   busy,
@@ -609,6 +610,10 @@ export function StatusRule({
   // seeing it, so it must not drop off a narrow terminal.
   const showFocus = !!focusView
 
+  // PLAN mode badge. Always visible when active — safety-critical indicator
+  // that must not be hidden by terminal width constraints.
+  const showPlan = interactionMode === 'plan'
+
   const handleSessionCountClick = (event: { stopImmediatePropagation?: () => void }) => {
     event.stopImmediatePropagation?.()
     onSessionCountClick?.()
@@ -679,6 +684,17 @@ export function StatusRule({
             <Text color={t.color.warn}>◉ focus</Text>
           </Box>
         ) : null}
+        {showPlan ? (
+          <Box flexDirection="row" flexShrink={0}>
+            <Text color={t.color.muted}>{' │ '}</Text>
+            <Text color={t.color.error} bold>◉ PLAN</Text>
+          </Box>
+        ) : (
+          <Box flexDirection="row" flexShrink={0}>
+            <Text color={t.color.muted}>{' │ '}</Text>
+            <Text color={t.color.ok}>◉ BUILD</Text>
+          </Box>
+        )}
         {showBar ? (
           <Text color={t.color.muted} wrap="truncate-end">
             {' │ '}
@@ -858,6 +874,7 @@ interface StatusRuleProps {
   battery?: BatteryInfo | null
   // Focus view (/focus) badge — display-only reduced-output indicator.
   focusView?: boolean
+  interactionMode?: InteractionMode
   bgCount: number
   lastTurnEndedAt?: null | number
   liveSessionCount: number

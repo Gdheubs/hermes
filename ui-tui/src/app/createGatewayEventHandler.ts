@@ -773,6 +773,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         patchUiState(state => ({
           ...state,
           info,
+          interactionMode: (info?.interaction_mode as string) === 'plan' ? 'plan' : 'build',
           status: state.status === 'starting agent…' ? 'ready' : state.status,
           usage: info.usage ? mergeUsageStable(state.usage, info.usage) : state.usage
         }))

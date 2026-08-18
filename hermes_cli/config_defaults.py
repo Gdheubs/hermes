@@ -218,7 +218,7 @@ DEFAULT_CONFIG = {
         "verify_guidance": True,
         # Upper bound on consecutive `pre_verify` "continue" nudges in a single
         # turn, so a user/plugin hook can never trap the loop.
-        "max_verify_nudges": 3,
+        "max_verify_nudges": 2,
         # Verification closure: after the agent edits files in a code workspace,
         # do not accept a final answer until fresh verification evidence exists
         # or the agent explains why it cannot run checks. The loop is bounded
@@ -232,6 +232,12 @@ DEFAULT_CONFIG = {
         # TUI, desktop — and programmatic callers, off for conversational
         # messaging surfaces). Doc/markdown/skill-only edits never fire it.
         "verify_on_stop": False,
+        # Session interaction mode: "build" (default, tools enabled) or
+        # "plan" (read-only, tools blocked). Shift+Tab toggles per-session.
+        "interaction_mode": "build",
+        # Keybinding to toggle PLAN/BUILD mode. Any prompt_toolkit key name
+        # works: "s-tab" (default), "c-p", "f2", "escape,p", etc.
+        "interaction_mode_key": "s-tab",
         # Staged inactivity warning: send a warning to the user at this
         # threshold before escalating to a full timeout.  The warning fires
         # once per run and does not interrupt the agent.  0 = disable warning.
@@ -3547,8 +3553,13 @@ DEFAULT_CONFIG = {
         "region": "global",
     },
 
+    # Agent definitions - maps agent names to .md files with config + persona.
+    # Each .md file has YAML frontmatter (model, reasoning, temperature, tools,
+    # skills) and a body (system prompt). Used by delegate_task with agent param.
+    "delegate": {},
+
     # Config schema version - bump this when adding new required fields
-    "_config_version": 37,
+    "_config_version": 39,
 }
 
 # Optional environment variables that enhance functionality

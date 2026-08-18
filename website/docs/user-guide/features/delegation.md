@@ -31,6 +31,47 @@ delegate_task(tasks=[
 ])
 ```
 
+## Subagent Persona & Agent Definitions
+
+You can define specialized subagent personas using Markdown definition files under `~/.hermes/agents/` (global) or `.agents/` (per-project). When the `agent` parameter is provided to `delegate_task()`, the subagent automatically inherits the persona, specialized toolset, model/provider settings, temperature, and skill-scoping rules configured in that file.
+
+```python
+# Spawn specialized coder agent
+delegate_task(
+    agent="coder",
+    goal="Implement user authentication module with JWT",
+    context="Use FastAPI and SQLite."
+)
+
+# Batch spawn multiple specialized agents in parallel
+delegate_task(tasks=[
+    {"agent": "coder", "goal": "Implement the backend API endpoints", "context": "FastAPI route /items"},
+    {"agent": "designer", "goal": "Build frontend preview", "context": "Save HTML/CSS to .ares/preview/items.html"}
+])
+```
+
+### Per-Agent Session Continuity
+
+Subagents spawned with an `agent` parameter enjoy **session continuity** for the lifetime of the parent conversation. Repeated calls to `delegate_task(agent="coder")` within the same orchestrator session will resume the subagent's persistent session context, retaining memory of previous commands and code iterations without starting from scratch. When context grows, the subagent leverages the built-in auxiliary context compressor (`compression_threshold` & `compression_target_ratio`).
+
+### Agent Definition Format (`~/.hermes/agents/<name>.md`)
+
+```yaml
+---
+name: coder
+model:                  # empty = inherit from parent/delegation config
+provider:               # empty = inherit from parent/delegation config
+reasoning: medium
+temperature: 0.2
+top_p: 0.8
+max_tokens: 8192
+tools: [read_file, search_files, patch, write_file, terminal]
+skills: [cavpon, test-driven-development] # scoped whitelist of accessible skills
+skill_path:             # custom skills directory, or empty for ~/.hermes/skills
+---
+You are a senior full-stack software engineer...
+```
+
 ## How Subagent Context Works
 
 :::warning Critical: Subagents Know Nothing

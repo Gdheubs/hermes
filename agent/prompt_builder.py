@@ -1846,6 +1846,7 @@ def _build_skills_system_prompt_inner(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        os.environ.get("HERMES_ALLOWED_SKILLS", ""),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1865,11 +1866,15 @@ def _build_skills_system_prompt_inner(
 
     if snapshot is not None:
         # Fast path: use pre-parsed metadata from disk
+        _allowed_env = os.environ.get("HERMES_ALLOWED_SKILLS", "").strip()
+        _allowed_set = {s.strip() for s in _allowed_env.split(",") if s.strip()} if _allowed_env else None
         for entry in snapshot.get("skills", []):
             if not isinstance(entry, dict):
                 continue
             skill_name = entry.get("skill_name") or ""
             frontmatter_name = entry.get("frontmatter_name") or skill_name
+            if _allowed_set is not None and frontmatter_name not in _allowed_set and skill_name not in _allowed_set:
+                continue
             platforms = entry.get("platforms") or []
             if not skill_matches_platform_list(platforms):
                 continue
@@ -1888,6 +1893,8 @@ def _build_skills_system_prompt_inner(
         }
     else:
         # Cold path: full filesystem scan + write snapshot for next time
+        _allowed_env = os.environ.get("HERMES_ALLOWED_SKILLS", "").strip()
+        _allowed_set = {s.strip() for s in _allowed_env.split(",") if s.strip()} if _allowed_env else None
         for skill_file in iter_skill_index_files(skills_dir, "SKILL.md"):
             is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
             entry = _build_snapshot_entry(skill_file, skills_dir, frontmatter, desc)
@@ -1896,6 +1903,8 @@ def _build_skills_system_prompt_inner(
                 continue
             skill_name = entry["skill_name"]
             if entry["frontmatter_name"] in disabled or skill_name in disabled:
+                continue
+            if _allowed_set is not None and entry["frontmatter_name"] not in _allowed_set and skill_name not in _allowed_set:
                 continue
             if not _skill_should_show(
                 extract_skill_conditions(frontmatter),
@@ -2026,6 +2035,8 @@ def _build_skills_system_prompt_inner(
                 if frontmatter_name in seen_skill_names:
                     continue
                 if frontmatter_name in disabled or skill_name in disabled:
+                    continue
+                if _allowed_set is not None and frontmatter_name not in _allowed_set and skill_name not in _allowed_set:
                     continue
                 if not _skill_should_show(
                     extract_skill_conditions(frontmatter),

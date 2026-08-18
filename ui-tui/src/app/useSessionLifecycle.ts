@@ -148,7 +148,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     turnController.fullReset()
     setVoiceRecording(false)
     setVoiceProcessing(false)
-    patchUiState({ bgTasks: new Set(), info: null, sid: null, usage: ZERO })
+    patchUiState({ bgTasks: new Set(), info: null, interactionMode: 'build', sid: null, usage: ZERO })
     setHistoryItems([])
     setLastUserMsg('')
     setStickyPrompt('')
@@ -178,7 +178,11 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       setLastUserMsg('')
       composerActions.setComposerTokens([])
       patchTurnState({ activity: [] })
-      patchUiState({ info, usage: usageFrom(info) })
+      patchUiState({
+        info,
+        interactionMode: info?.interaction_mode === 'plan' ? 'plan' : 'build',
+        usage: usageFrom(info)
+      })
     },
     [composerActions, setHistoryItems, setLastUserMsg, setStickyPrompt]
   )
@@ -217,6 +221,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
       writeActiveSessionFile(r.session_id)
       patchUiState({
         info,
+        interactionMode: info?.interaction_mode === 'plan' ? 'plan' : 'build',
         sid: r.session_id,
         status: info?.version ? 'ready' : 'starting agent…',
         usage: usageFrom(info)
@@ -310,6 +315,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
           patchUiState({
             busy: running,
             info,
+            interactionMode: info?.interaction_mode === 'plan' ? 'plan' : 'build',
             sid: r.session_id,
             status: statusFromLiveSession(r.status, running),
             usage: usageFrom(info)
@@ -364,6 +370,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             patchUiState({
               busy: running,
               info,
+              interactionMode: info?.interaction_mode === 'plan' ? 'plan' : 'build',
               sid: r.session_id,
               status: statusFromLiveSession(r.status, running),
               usage: usageFrom(info)

@@ -8229,15 +8229,14 @@ class AIAgent:
         #     synchronous: the orchestrator needs its workers' results within
         #     its own turn to compose a summary, and a subagent doesn't own the
         #     gateway session the async result would route back to.
-        # The schema-level `background` param is intentionally ignored here.
-        _is_subagent = getattr(self, "_delegate_depth", 0) > 0
+        # Background is always True — delegations run async.
         return _delegate_task(
+            agent=function_args.get("agent"),
             goal=function_args.get("goal"),
             context=function_args.get("context"),
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
-            background=(not _is_subagent),
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),

@@ -51,6 +51,8 @@ export interface BatteryInfo {
 
 export type BusyInputMode = 'interrupt' | 'queue' | 'steer'
 
+export type InteractionMode = 'build' | 'plan'
+
 export type NoticeLevel = 'error' | 'info' | 'success' | 'warn'
 
 // Credits/usage notice surfaced in the status bar. Shape is snake_case to
@@ -331,6 +333,7 @@ export interface UiState {
   info: null | SessionInfo
   liveSessionCount: number
   inlineDiffs: boolean
+  interactionMode: InteractionMode
   mouseTracking: MouseTrackingMode
   notice: Notice | null
   pasteCollapseLines: number

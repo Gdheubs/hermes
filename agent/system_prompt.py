@@ -309,7 +309,9 @@ def _agent_home(agent: Any) -> Optional[Path]:
 
 
 def _agent_skills_dir(agent: Any) -> Optional[Path]:
-    """The agent's own ``<home>/skills`` dir, or None to use ambient home."""
+    """The agent's own skills dir, or None to use ambient home."""
+    if hasattr(agent, "_agent_skill_path") and agent._agent_skill_path:
+        return Path(agent._agent_skill_path)
     home = _agent_home(agent)
     return (home / "skills") if home is not None else None
 

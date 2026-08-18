@@ -552,6 +552,40 @@ def _run_agent_tool_execution_middleware(
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
+    # ── PLAN mode gate ─────────────────────────────────────────────
+    # Block write/execute tools before any side-effecting middleware,
+    # plugin hook, or dispatch runs.  Read-only tools are allowed so the
+    # agent can gather context without fabricating answers.
+    _PLAN_READ_ONLY_TOOLS = frozenset({
+        "read_file", "search_files", "session_search",
+        "skill_view", "skills_list",
+        "clarify", "browser_snapshot", "browser_get_images",
+        "memory",
+    })
+    if getattr(agent, "interaction_mode", "build") == "plan" and function_name not in _PLAN_READ_ONLY_TOOLS:
+        block_msg = (
+            "Tool execution is disabled in PLAN mode. "
+            "Switch to BUILD mode to run tools."
+        )
+        _emit_terminal_post_tool_call(
+            agent,
+            function_name=function_name,
+            function_args=function_args,
+            result=json.dumps({"error": block_msg}, ensure_ascii=False),
+            effective_task_id=effective_task_id,
+            tool_call_id=tool_call_id,
+            status="blocked",
+            error_type="plan_mode_block",
+            error_message=block_msg,
+            middleware_trace=list(middleware_trace or []),
+        )
+        return _ManagedToolResult(
+            result=json.dumps({"error": block_msg}, ensure_ascii=False),
+            args=function_args,
+            middleware_trace=list(middleware_trace or []),
+            blocked=True,
+            dispatched=False,
+        )
     from agent import relay_tools
     from hermes_cli.middleware import (
         apply_tool_request_middleware,

@@ -11408,7 +11408,7 @@ def _build_provider_choices() -> list[str]:
 # to parse.
 _BUILTIN_SUBCOMMANDS = frozenset(
     {
-        "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
+        "acp", "agent", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
         "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "import-agent", "insights",
@@ -12642,6 +12642,13 @@ def main():
     # plugins command  (parser built in hermes_cli/subcommands/plugins.py)
     # =========================================================================
     build_plugins_parser(subparsers, cmd_plugins=cmd_plugins)
+
+    # =========================================================================
+    # agent command — agent definition management
+    # =========================================================================
+    from hermes_cli.agent_cmd import build_agent_parser, cmd_agent
+
+    build_agent_parser(subparsers, cmd_agent=cmd_agent)
 
     # =========================================================================
     # Plugin CLI commands — dynamically registered by memory/general plugins.
