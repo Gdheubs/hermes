@@ -323,6 +323,12 @@ def _(rid, params: dict) -> dict:
     # in turn: a stale "hud" would tell the model the user is still floating
     # over another app when they are back in Hermes.
     session["client_surface"] = "hud" if params.get("surface") == "hud" else ""
+    # Same reasoning for the Desktop connection mode (#82140): the user can
+    # switch the active connection or profile between turns, and an extension
+    # that acts on a stale "local" hands them a link to a file that lives on the
+    # gateway machine. The client re-announces on every submit; an omitted
+    # ``connection_mode`` (older client) leaves the stored value alone.
+    _remember_connection_mode(session, params)
     has_truncation = (
         truncate_user_ordinal is not None
         or params.get("truncate_before_row_id") is not None
@@ -1214,7 +1220,14 @@ def _(rid, params: dict) -> dict:
     task_id = f"bg_{uuid.uuid4().hex[:6]}"
 
     def run():
-        session_tokens = _set_session_context(task_id, cwd=_session_cwd(session))
+        # task_id is ephemeral (not in _sessions), so the context bind cannot
+        # derive the Desktop connection mode by lookup — inherit the parent
+        # session's resolved mode explicitly (#82140).
+        session_tokens = _set_session_context(
+            task_id,
+            cwd=_session_cwd(session),
+            connection_mode=_session_connection_mode(session),
+        )
         try:
             from run_agent import AIAgent
 
@@ -1327,7 +1340,13 @@ def _(rid, params: dict) -> dict:
     def run():
         # Pin the validated preview cwd, else the parent workspace — never an
         # invalid client path, which would silently fall back to the launch dir.
-        session_tokens = _set_session_context(task_id, cwd=(preview_cwd or _session_cwd(session)))
+        # Ephemeral preview task: inherit the parent's Desktop connection mode
+        # explicitly, same as prompt.background (#82140).
+        session_tokens = _set_session_context(
+            task_id,
+            cwd=(preview_cwd or _session_cwd(session)),
+            connection_mode=_session_connection_mode(session),
+        )
         try:
             from run_agent import AIAgent
             from tools.terminal_tool import register_task_env_overrides

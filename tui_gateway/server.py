@@ -1786,6 +1786,11 @@ def _compute_host_turn_frame(
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session),
+        # Resolved Desktop connection mode (#82140). The compute-host child
+        # rebuilds the session from this frame, so without it an isolated turn
+        # would bind None and skills/MCP would lose the mode the Desktop
+        # announced to the parent.
+        "connection_mode": _session_connection_mode(session),
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
     }
@@ -2882,6 +2887,63 @@ def _session_source(session: dict | None) -> str:
     return _resolve_session_platform()
 
 
+def _session_connection_mode(session: dict | None) -> str | None:
+    """The Desktop connection mode this session's client announced, if any.
+
+    Gated on ``source == 'desktop'``: the mode describes the Desktop shell's
+    relationship to this backend, so it is meaningless coming from the TUI, a
+    messaging platform, or a plugin-opened session — and a stray
+    ``connection_mode`` param from one of those must not be honored. Every
+    non-Desktop surface therefore reports ``None``, which is what
+    ``desktop_connection_mode()`` promises them. See #82140.
+    """
+    if not session or _session_source(session) != "desktop":
+        return None
+    try:
+        from gateway.session_context import normalize_desktop_connection_mode
+
+        return normalize_desktop_connection_mode(session.get("connection_mode"))
+    except Exception:
+        return None
+
+
+def _normalize_connection_mode_param(params: dict | None) -> str | None:
+    """Read ``connection_mode`` out of RPC *params* for a brand-new session."""
+    try:
+        from gateway.session_context import normalize_desktop_connection_mode
+
+        return normalize_desktop_connection_mode((params or {}).get("connection_mode"))
+    except Exception:
+        return None
+
+
+def _remember_connection_mode(session: dict | None, params: dict | None) -> None:
+    """Refresh a session's announced Desktop connection mode from RPC *params*.
+
+    The Desktop re-announces on every session.create/resume and every
+    prompt.submit, so switching the active connection or profile mid-session is
+    reflected on the very next turn rather than being pinned to whatever was
+    true when the chat was opened.
+
+    An OMITTED ``connection_mode`` leaves the stored value alone — an older
+    Desktop build (or an internal caller that reuses these handlers) must not
+    silently erase a mode a newer client already announced. An explicitly
+    unrecognized value stores ``None`` ("mode unknown"), which is the safe
+    answer: extensions fall back to treating the location as unknown instead of
+    assuming local.
+    """
+    if session is None or not params or "connection_mode" not in params:
+        return
+    try:
+        from gateway.session_context import normalize_desktop_connection_mode
+
+        session["connection_mode"] = normalize_desktop_connection_mode(
+            params.get("connection_mode")
+        )
+    except Exception:
+        pass
+
+
 def _register_session_cwd(session: dict | None) -> None:
     if not session:
         return
@@ -3403,11 +3465,18 @@ def _cwd_for_session_key(session_key: str) -> str:
     return ""
 
 
+# Sentinel for _set_session_context: "caller did not supply a mode, derive it
+# from the live session map". Distinct from None, which is a real answer
+# ("no Desktop mode") that must not be second-guessed by the lookup.
+_DERIVE_CONNECTION_MODE = object()
+
+
 def _set_session_context(
     session_key: str,
     cwd: str | None = None,
     *,
     ui_session_id: str = "",
+    connection_mode: object = _DERIVE_CONNECTION_MODE,
 ) -> list:
     try:
         from gateway.session_context import set_session_vars
@@ -3428,6 +3497,11 @@ def _set_session_context(
         # fall back to the session_key (matching the id derivation used at
         # session-finalize), so an identified session is never left blank.
         session_id = session_key
+        # Ephemeral task IDs (background, preview) aren't in `_sessions` either,
+        # so the loop below can't find a mode for them. Callers that hold the
+        # parent session pass its resolved mode explicitly (#82140); the
+        # session-map derivation only runs when nothing was supplied.
+        mode = None if connection_mode is _DERIVE_CONNECTION_MODE else connection_mode
         with _sessions_lock:
             for sess in list(_sessions.values()):
                 if sess.get("session_key") == session_key:
@@ -3435,6 +3509,8 @@ def _set_session_context(
                     session_id = (
                         getattr(sess.get("agent"), "session_id", None) or session_key
                     )
+                    if connection_mode is _DERIVE_CONNECTION_MODE:
+                        mode = _session_connection_mode(sess)
                     break
         return set_session_vars(
             session_key=session_key,
@@ -3443,6 +3519,7 @@ def _set_session_context(
             cwd=resolved,
             ui_session_id=ui_session_id,
             cron_session="",
+            desktop_connection_mode=mode,
         )
     except Exception:
         return []
@@ -7031,6 +7108,7 @@ def _init_session(
     session_db=None,
     source: str | None = None,
     profile_home: str | None = None,
+    connection_mode: str | None = None,
 ):
     now = time.time()
     with _sessions_lock:
@@ -7051,6 +7129,10 @@ def _init_session(
             "slash_worker": None,
             "show_reasoning": _load_show_reasoning(),
             "source": _resolve_session_source(source),
+            # Desktop shell's resolved 'local'/'remote' connection mode (#82140);
+            # None for every non-Desktop client. Refreshed per turn from
+            # prompt.submit so a connection/profile switch lands immediately.
+            "connection_mode": connection_mode,
             "tool_progress_mode": _load_tool_progress_mode(),
             "edit_snapshots": {},
             "tool_started_at": {},
@@ -8392,6 +8474,7 @@ def _deferred_session_record(
     lazy: bool = False,
     model_override=None,
     resume_runtime_overrides: dict | None = None,
+    connection_mode: str | None = None,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
@@ -8404,6 +8487,9 @@ def _deferred_session_record(
         "close_on_disconnect": close_on_disconnect,
         "active_session_lease": lease,
         "cols": cols,
+        # Desktop shell's resolved 'local'/'remote' connection mode (#82140);
+        # None for every non-Desktop client.
+        "connection_mode": connection_mode,
         "created_at": now,
         "cwd": cwd,
         "display_history_prefix": display_history_prefix or [],

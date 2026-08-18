@@ -781,6 +781,7 @@ const sidebars: SidebarsConfig = {
                 'developer-guide/plugin-llm-access',
                 'developer-guide/subagent-lifecycle-api',
                 'developer-guide/desktop-plugin-sdk',
+                'developer-guide/desktop-connection-mode',
                 'developer-guide/memory-provider-plugin',
                 'developer-guide/context-engine-plugin',
                 'developer-guide/secret-source-plugin',

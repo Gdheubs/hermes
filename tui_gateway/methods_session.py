@@ -83,6 +83,11 @@ def _(rid, params: dict) -> dict:
             "close_on_disconnect": is_truthy_value(params.get("close_on_disconnect", False)),
             "active_session_lease": lease,
             "cols": cols,
+            # The Desktop shell's resolved 'local'/'remote' connection mode for
+            # THIS backend (#82140). Refreshed on every resume/prompt so a
+            # connection or profile switch lands on the next turn. None for
+            # every non-Desktop client.
+            "connection_mode": _normalize_connection_mode_param(params),
             "created_at": now,
             "edit_snapshots": {},
             "explicit_cwd": explicit_cwd,
@@ -449,6 +454,11 @@ def _(rid, params: dict) -> dict:
         with _session_resume_lock:
             live = _find_live_session_by_key(target)
             if live is not None:
+                # Reopening a live chat is also a re-announcement: the client may
+                # have switched connection/profile since this session was
+                # registered (#82140). prompt.submit refreshes it again before
+                # any turn runs, so this only tightens the window.
+                _remember_connection_mode(live[1], params)
                 return _ok(rid, _reuse_live_payload(*live))
 
         # Lazy/watch resume: register the live session WITHOUT building an agent.
@@ -488,6 +498,7 @@ def _(rid, params: dict) -> dict:
                 close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
                 profile_home=profile_home,
                 lazy=True,
+                connection_mode=_normalize_connection_mode_param(params),
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _ok(rid, _reuse_live_payload(*live))
@@ -652,6 +663,7 @@ def _(rid, params: dict) -> dict:
                 profile_home=profile_home,
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
+                connection_mode=_normalize_connection_mode_param(params),
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _ok(rid, _reuse_live_payload(*live))
@@ -796,6 +808,7 @@ def _(rid, params: dict) -> dict:
                         cwd=profile_resume_cwd,
                         session_db=db,
                         source=source,
+                        connection_mode=_normalize_connection_mode_param(params),
                     )
                     # Ownership TRANSFER — the registered session's agent now
                     # holds this handle for its whole life, and _init_session
@@ -3088,6 +3101,9 @@ def _(rid, params: dict) -> dict:
                 session_db=branch_db,
                 source=source,
                 profile_home=parent_home,
+                # A branch inherits the parent chat's connection mode: it is the
+                # same Desktop client talking to the same backend.
+                connection_mode=_session_connection_mode(session),
             )
             # Ownership TRANSFER — the branched session's agent holds this
             # handle for its whole life and closes it on teardown. Drop is

@@ -3,6 +3,7 @@ import { useStore } from '@nanostores/react'
 import { useCallback, useEffect, useRef } from 'react'
 
 import type { HermesGateway } from '@/hermes'
+import { announceConnectionMode } from '@/lib/connection-mode'
 import { $gateway, ensureActiveGatewayOpen, isActivePrimary } from '@/store/gateway'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $gatewayState, setConnection } from '@/store/session'
@@ -104,15 +105,22 @@ export function useGatewayRequest() {
   }, [])
 
   const requestGateway = useCallback(
-    async <T>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number, signal?: AbortSignal) => {
+    async <T>(method: string, rawParams: Record<string, unknown> = {}, timeoutMs?: number, signal?: AbortSignal) => {
       const gateway = gatewayRef.current
 
       if (!gateway) {
         throw new Error('Hermes gateway unavailable')
       }
 
+      // Announce the live connection mode on session/prompt RPCs (#82140).
+      // Resolved per attempt, not per call: $connection is published in the
+      // same synchronous frame as a profile switch (ensureGatewayProfile) and
+      // is rewritten by the reconnect below, so re-reading on the retry sends
+      // the mode of the connection the retry actually lands on.
+      const announce = () => announceConnectionMode(method, rawParams)
+
       try {
-        return await gateway.request<T>(method, params, timeoutMs, signal)
+        return await gateway.request<T>(method, announce(), timeoutMs, signal)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
 
@@ -138,7 +146,7 @@ export function useGatewayRequest() {
           throw error
         }
 
-        return recovered.request<T>(method, params, timeoutMs, signal)
+        return recovered.request<T>(method, announce(), timeoutMs, signal)
       }
     },
     [ensureGatewayOpen]

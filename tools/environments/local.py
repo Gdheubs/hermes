@@ -450,6 +450,8 @@ def _inject_session_context_env(env: dict) -> None:
         from gateway.session_context import (
             _UNSET,
             _VAR_MAP,
+            DESKTOP_CONNECTION_MODE_ENV,
+            desktop_connection_mode,
             session_context_engaged,
         )
     except Exception:
@@ -465,6 +467,24 @@ def _inject_session_context_env(env: dict) -> None:
             # Unset for THIS task while a concurrent host is engaged: drop any
             # inherited global so a sibling session's value can't leak in.
             env.pop(var_name, None)
+
+    # The Desktop connection mode (#82140) is the skill-facing read path for
+    # "is the gateway's filesystem the machine the user is looking at?" —
+    # skills and their helper scripts branch on it to decide whether a file has
+    # to be transferred before it can be presented for local viewing/editing.
+    #
+    # STRICTLY WRITE-ONLY, unconditionally: stamped when a mode is bound and
+    # POPPED otherwise, on every spawn. That is deliberate and is what keeps the
+    # value from becoming a user-configurable env var — an inherited
+    # HERMES_DESKTOP_CONNECTION_MODE from the user's shell (or a stale one from
+    # a previous turn) is removed rather than passed through, so a child can
+    # only ever see what the live session actually resolved. Nothing in Hermes
+    # reads this name back; the source of truth is the contextvar.
+    mode = desktop_connection_mode()
+    if mode:
+        env[DESKTOP_CONNECTION_MODE_ENV] = mode
+    else:
+        env.pop(DESKTOP_CONNECTION_MODE_ENV, None)
 
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:

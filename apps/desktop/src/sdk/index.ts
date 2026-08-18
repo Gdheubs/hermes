@@ -34,6 +34,7 @@ import {
 import { onGatewayEvent } from '@/contrib/events'
 import { registry } from '@/contrib/registry'
 import { deleteProfile, getLogs, getStatus, type HermesGateway } from '@/hermes'
+import { announceConnectionMode } from '@/lib/connection-mode'
 import {
   $gateway,
   activeGatewayConnectionId,
@@ -108,6 +109,58 @@ export interface PluginProfileRoute {
   profile: string
   /** Backend Hermes profile served by that route. */
   targetProfile: string
+}
+
+// One announcing view per real gateway, so repeated `getGateway()` calls hand
+// back a stable reference — SDK components take this as a React prop, and a
+// fresh wrapper per render would churn every memo and effect dependency on it.
+const announcingGateways = new WeakMap<HermesGateway, HermesGateway>()
+
+/** A gateway whose `request` announces the connection mode, like `host.request`.
+ *
+ *  A Proxy rather than a spread copy or a subclass: `HermesGateway` is the live
+ *  socket wrapper, so its methods close over connection state that only exists
+ *  on the real instance. Every member except `request` passes straight through,
+ *  bound to the target — calling a delegated method with the proxy as `this`
+ *  would break any private-field access inside it.
+ */
+const announcingGateway = (gateway: HermesGateway): HermesGateway => {
+  const cached = announcingGateways.get(gateway)
+
+  if (cached) {
+    return cached
+  }
+
+  const wrapped = new Proxy(gateway, {
+    get(target, prop) {
+      if (prop === 'request') {
+        // Mirror the FULL HermesGateway.request signature. A two-argument
+        // wrapper silently swallows `timeoutMs` and `signal`, so any SDK
+        // caller passing them lost its custom deadline and its ability to
+        // abort - a wrapper must not narrow the contract it stands in for.
+        //
+        // The tail is forwarded as a REST spread rather than as two named
+        // parameters so the delegated call carries exactly the arguments the
+        // caller made. Naming them re-materializes omitted arguments as
+        // explicit `undefined`, which is invisible to a defaulted parameter
+        // but not to anything reading `arguments.length` - and it makes every
+        // pass-through call site un-assertable on its real shape.
+        return <T>(
+          method: string,
+          params: Record<string, unknown> = {},
+          ...rest: [timeoutMs?: number, signal?: AbortSignal]
+        ): Promise<T> => target.request<T>(method, announceConnectionMode(method, params), ...rest)
+      }
+
+      const value = Reflect.get(target, prop)
+
+      return typeof value === 'function' ? value.bind(target) : value
+    }
+  })
+
+  announcingGateways.set(gateway, wrapped)
+
+  return wrapped
 }
 
 /** Window geometry + the app's responsive posture, one readonly rect. */
@@ -515,7 +568,10 @@ export const host = {
   ): Promise<T> => requestPluginProfile<T>(route, method, params),
 
   /** Gateway JSON-RPC — sessions, config, skills, cron, kanban, everything
-   *  the app itself uses. Lazy: resolves the LIVE socket per call. */
+   *  the app itself uses. Lazy: resolves the LIVE socket per call. Session and
+   *  prompt RPCs announce the live Desktop connection mode through the same
+   *  helper `useGatewayRequest` uses, so a plugin-driven session's skills/MCP
+   *  context sees the mode a hook-driven one would (#82140). */
   request: async <T>(method: string, params: Record<string, unknown> = {}): Promise<T> => {
     const gateway = $gateway.get()
 
@@ -523,15 +579,23 @@ export const host = {
       throw new Error('Hermes gateway unavailable')
     }
 
-    return gateway.request<T>(method, params)
+    return gateway.request<T>(method, announceConnectionMode(method, params))
   },
 
   /** The LIVE gateway instance for the active profile (null before the first
    *  socket opens). Most plugins want `host.request`; this exists for SDK
    *  components that take a `HermesGateway` prop directly (e.g. `McpTab`),
    *  which need the instance, not just a JSON-RPC door. Re-read per use — the
-   *  active instance changes on a profile swap. */
-  getGateway: (): HermesGateway | null => $gateway.get()
+   *  active instance changes on a profile swap.
+   *
+   *  Announcing, like `host.request`: this is the SDK's other request door, and
+   *  a door that skips the announcement lets a plugin drive a Desktop session
+   *  whose skills/MCP context never learns the mode (#82140). */
+  getGateway: (): HermesGateway | null => {
+    const gateway = $gateway.get()
+
+    return gateway ? announcingGateway(gateway) : gateway
+  }
 }
 
 // -- react bridge -------------------------------------------------------------
@@ -643,7 +707,9 @@ export { Textarea } from '@/components/ui/textarea'
 export { Tip, Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 export type { GatewayEventListener } from '@/contrib/events'
 export type {
+  HermesConnectionMode,
   HermesPlugin,
+  PluginConnection,
   PluginContext,
   PluginContribution,
   PluginNativeNotificationInput,

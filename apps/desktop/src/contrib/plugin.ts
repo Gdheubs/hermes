@@ -14,13 +14,16 @@
 
 import { pluginRest, type PluginRestOptions, pluginSocket } from '@/hermes'
 import { createPluginI18n, type PluginI18n } from '@/i18n'
+import { type HermesConnectionMode, resolveConnectionMode } from '@/lib/connection-mode'
 import { readKey, writeKey } from '@/lib/storage'
 import { dispatchPluginNativeNotification, type PluginNativeNotificationInput } from '@/store/native-notifications'
+import { $connection } from '@/store/session'
 
 import { registry } from './registry'
 import type { Contribution } from './types'
 
 export type { PluginRestOptions } from '@/hermes'
+export type { HermesConnectionMode } from '@/lib/connection-mode'
 export type { PluginNativeNotificationInput } from '@/store/native-notifications'
 
 /** A contribution as a plugin author writes it — provenance + id scoping are
@@ -56,6 +59,25 @@ export interface PluginOs {
   writeClipboard: (text: string) => Promise<boolean>
 }
 
+/** The supported read of the resolved backend connection — the connection's
+ *  *shape*, never its credentials. `mode` is `'local'` when this Desktop drives
+ *  its own local backend (a path the agent reports is already openable here),
+ *  `'remote'` when it drives an SSH/URL/cloud backend (a gateway-side path must
+ *  be transferred first), and `null` when it isn't resolved yet.
+ *
+ *  Base URL, host, tokens, SSH keys, and auth mode stay behind the Electron
+ *  bridge on purpose; a plugin that needs to move a file should ask the backend
+ *  to do it, not dial the backend itself. See #82140. */
+export interface PluginConnection {
+  /** The live mode, read at call time. */
+  mode: () => HermesConnectionMode | null
+  /** Subscribe to mode changes (connection switch, profile switch, reconnect).
+   *  Fires immediately with the current value. Returns an unsubscribe; it is
+   *  also registered with `onDispose`, so a plugin that ignores the return
+   *  value still stops listening when it unloads. */
+  onModeChange: (listener: (mode: HermesConnectionMode | null) => void) => () => void
+}
+
 export interface PluginContext {
   /** The resolved plugin source tag, e.g. `'plugin:cost-meter'`. */
   readonly source: string
@@ -81,6 +103,9 @@ export interface PluginContext {
    *  manager, clipboard — attributed to this plugin, result-shaped (never
    *  throws for a missing capability). */
   os: PluginOs
+  /** Is the backend's filesystem the machine the user is looking at? The
+   *  supported answer to that question — mode only, no credentials. */
+  connection: PluginConnection
   /** Plugin-scoped persistence. */
   storage: PluginStorage
   /** Plugin-scoped i18n: ship + register locale bundles under this plugin,
@@ -156,6 +181,49 @@ function createPluginOs(pluginId: string): PluginOs {
   }
 }
 
+// Reads the resolved mode off the live connection atom rather than calling the
+// Electron bridge: the atom is what stays in lockstep with the ACTIVE profile
+// (published atomically with a profile switch), so a plugin sees the same mode the session
+// RPCs announce. A raw bridge.getConnection() would describe the primary window
+// backend, which is the wrong answer whenever a background profile is active.
+function createPluginConnection(pluginId: string, track: (dispose: () => void) => () => void): PluginConnection {
+  // Isolate every listener call: the subscription below runs inside core
+  // connection updates (setConnection during boot, reconnect, and profile
+  // switches), so a plugin throw escaping here would abort profile
+  // synchronization/reconnect code — one bad plugin destabilizing the
+  // renderer. Same containment contract as gateway event listeners.
+  const invoke = (listener: (mode: HermesConnectionMode | null) => void, mode: HermesConnectionMode | null) => {
+    try {
+      listener(mode)
+    } catch (error) {
+      console.error(`[plugins] ${pluginId}: connection mode listener failed`, error)
+    }
+  }
+
+  return {
+    mode: () => resolveConnectionMode($connection.get()),
+    onModeChange: listener => {
+      let previous = resolveConnectionMode($connection.get())
+
+      invoke(listener, previous)
+
+      // $connection changes on every reconnect and descriptor refresh, most of
+      // which don't move the mode. Only forward real transitions so a plugin
+      // can put its transfer/cleanup work straight in the listener.
+      return track(
+        $connection.subscribe(connection => {
+          const next = resolveConnectionMode(connection)
+
+          if (next !== previous) {
+            previous = next
+            invoke(listener, next)
+          }
+        })
+      )
+    }
+  }
+}
+
 /** Build the scoped context handed to a plugin's `register`. `onDispose`
  *  receives every registration's disposer (the loader's unload/reload hook). */
 export function createPluginContext(pluginId: string, onDispose?: (dispose: () => void) => void): PluginContext {
@@ -176,6 +244,7 @@ export function createPluginContext(pluginId: string, onDispose?: (dispose: () =
     rest: <T>(path: string, opts?: PluginRestOptions) => pluginRest<T>(pluginId, path, opts),
     socket: (path, onMessage) => track(pluginSocket(pluginId, path, onMessage)),
     os: createPluginOs(pluginId),
+    connection: createPluginConnection(pluginId, track),
     storage: createPluginStorage(pluginId),
     i18n: createPluginI18n(pluginId, track)
   }

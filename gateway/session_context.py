@@ -135,6 +135,35 @@ _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_P
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
 
+# The env var name used for the write-only subprocess stamp (see
+# tools/environments/local.py). Never read back as configuration.
+DESKTOP_CONNECTION_MODE_ENV = "HERMES_DESKTOP_CONNECTION_MODE"
+
+# The resolved Desktop connection mode for this turn: 'local' when the Desktop
+# app drives its own local backend, 'remote' when it drives an SSH/URL/cloud
+# backend on another machine. ``None`` for every non-Desktop surface (CLI, TUI,
+# messaging, cron, API server) and for a Desktop client too old to announce it.
+#
+# Deliberately NOT a member of ``_VAR_MAP``: mapped vars are readable through
+# ``get_session_env``, which falls back to ``os.environ``. That fallback is what
+# makes a var user-configurable, and this value must be authoritative — a user
+# who exports HERMES_DESKTOP_CONNECTION_MODE=local must not be able to convince
+# a skill that a gateway-side file is sitting on their Desktop machine. The only
+# writer is :func:`set_desktop_connection_mode`, driven by the connection
+# descriptor the Desktop shell already resolves (``getConnection().mode``).
+#
+# Read it with :func:`desktop_connection_mode`. The subprocess bridge in
+# ``tools/environments/local.py`` stamps it onto child environments write-only
+# (always overwritten, stripped when unset) so skills and their helper scripts
+# can branch on it without it ever becoming an input.
+_DESKTOP_CONNECTION_MODE: ContextVar = ContextVar(DESKTOP_CONNECTION_MODE_ENV, default=_UNSET)
+
+# Saved-config connection modes that resolve to a backend on another machine.
+# The Desktop descriptor already collapses these to 'remote', but the RPC edge
+# accepts them so a client that forwards its raw saved mode still lands on a
+# correct answer rather than an unavailable one.
+_REMOTE_LIKE_CONNECTION_MODES = frozenset({"cloud", "remote", "ssh", "url"})
+
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
     "HERMES_SESSION_SOURCE": _SESSION_SOURCE,
@@ -156,6 +185,56 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
 }
+
+
+def normalize_desktop_connection_mode(value: Any) -> str | None:
+    """Coerce a client-announced connection mode to ``'local'``/``'remote'``/``None``.
+
+    ``'local'`` stays local; every remote-shaped saved mode (``remote``,
+    ``cloud``, ``ssh``, ``url``) resolves to ``'remote'``. Anything else —
+    empty, ``None``, a typo, a hostile string — resolves to ``None`` (mode
+    unknown), because a wrong answer here is worse than no answer: an extension
+    that believes a gateway-side path is Desktop-local will hand the user a link
+    to a file that isn't on their machine.
+    """
+    text = str(value or "").strip().lower()
+    if text == "local":
+        return "local"
+    if text in _REMOTE_LIKE_CONNECTION_MODES:
+        return "remote"
+    return None
+
+
+def set_desktop_connection_mode(value: Any) -> None:
+    """Bind the resolved Desktop connection mode for this task.
+
+    Called by the Desktop-facing RPC edge with the mode the Desktop shell
+    resolved via ``window.hermesDesktop.getConnection()``. Non-Desktop surfaces
+    never call this, so :func:`desktop_connection_mode` keeps returning ``None``
+    for them.
+    """
+    _DESKTOP_CONNECTION_MODE.set(normalize_desktop_connection_mode(value))
+
+
+def desktop_connection_mode() -> str | None:
+    """The resolved Desktop connection mode, or ``None`` when not applicable.
+
+    ``'local'``  — the Desktop app is driving its own local backend, so a
+                   gateway-side path is already a path on the user's machine.
+    ``'remote'`` — the Desktop app is driving an SSH/URL/cloud backend, so a
+                   gateway-side path must be transferred before the Desktop can
+                   open it.
+    ``None``     — not a Desktop session (CLI, TUI, messaging, cron, API
+                   server), or a Desktop client that didn't announce a mode.
+
+    This is the only supported read path on the Python side. It reports the
+    connection *shape* and nothing else — no base URL, host, token, SSH key, or
+    auth mode ever passes through here.
+    """
+    value = _DESKTOP_CONNECTION_MODE.get()
+    if value is _UNSET:
+        return None
+    return value
 
 
 def set_current_session_id(session_id: str) -> None:
@@ -232,6 +311,7 @@ def set_session_vars(
     async_delivery: bool = True,
     ui_session_id: str = "",
     cron_session: Any = _UNSET,
+    desktop_connection_mode: Any = None,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -251,6 +331,11 @@ def set_session_vars(
     ``cron_session`` is tri-state: ``_UNSET`` preserves legacy
     ``os.environ["HERMES_CRON_SESSION"]`` fallback, ``"1"`` marks a cron job,
     and ``""`` explicitly marks a non-cron session while masking leaked env.
+
+    ``desktop_connection_mode`` is the Desktop shell's resolved connection mode
+    (see :func:`desktop_connection_mode`). Every caller that isn't the
+    Desktop-facing RPC edge leaves it ``None``, which is exactly the "not a
+    Desktop session" answer non-Desktop surfaces should report.
     """
     # Mark the session-context machinery engaged for this process. The
     # subprocess-env bridge uses this to switch from "os.environ fallback" to
@@ -275,6 +360,7 @@ def set_session_vars(
         _SESSION_PROFILE.set(profile),
         _CRON_SESSION.set(cron_session),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        _DESKTOP_CONNECTION_MODE.set(normalize_desktop_connection_mode(desktop_connection_mode)),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -320,6 +406,11 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    # A finished handler is no longer a Desktop turn. Setting None (rather than
+    # _UNSET) is the same "explicitly cleared" posture the mapped vars take —
+    # both read as "no Desktop connection", and there is no os.environ fallback
+    # behind this var for the distinction to matter.
+    _DESKTOP_CONNECTION_MODE.set(None)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -368,6 +459,11 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    # Same leak concern, sharper consequence: a task spawned from a context where
+    # a concurrent Desktop turn had bound 'local' would otherwise inherit it, and
+    # a skill running for a *remote* Desktop client (or for the CLI) would be told
+    # its gateway-side files are already on the user's machine.
+    _DESKTOP_CONNECTION_MODE.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 

@@ -542,6 +542,11 @@ class ComputeHost:
                 session["profile_home"] = str(frame.get("profile_home"))
             if isinstance(frame.get("attached_images"), list):
                 session["attached_images"] = list(frame.get("attached_images") or [])
+            if "connection_mode" in frame:
+                # Refresh so a mid-session Desktop connection switch lands on
+                # the very next isolated turn (#82140). An OMITTED key (older
+                # parent) must not erase a mode a newer frame already carried.
+                session["connection_mode"] = frame.get("connection_mode")
             return session
 
         history = frame.get("history") if isinstance(frame.get("history"), list) else []
@@ -604,6 +609,7 @@ class ComputeHost:
                     cwd=str(frame.get("cwd") or "") or None,
                     session_db=session_db,
                     source=frame.get("source"),
+                    connection_mode=frame.get("connection_mode"),
                 )
             finally:
                 reset_transport(token)
@@ -631,7 +637,12 @@ class ComputeHost:
                 "edit_snapshots": {},
                 "tool_started_at": {},
                 "model_override": frame.get("model_override"),
-                "source": server._sanitize_client_source(frame.get("source")),
+                # _resolve_session_source, same as _init_session: the previous
+                # _sanitize_client_source reference never existed on the server
+                # module, so this fallback died with AttributeError instead of
+                # keeping a minimal host-owned session.
+                "source": server._resolve_session_source(frame.get("source")),
+                "connection_mode": frame.get("connection_mode"),
                 "transport": self._transport,
             }
         session = server._sessions[sid]

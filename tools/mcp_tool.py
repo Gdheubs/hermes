@@ -99,6 +99,7 @@ import contextvars
 import concurrent.futures
 import errno
 import fnmatch
+import functools
 import inspect
 import json
 import logging
@@ -665,6 +666,52 @@ def _context_var_value(ref: str) -> Optional[str]:
     if ref in ("pathSeparator", "/"):
         return os.sep
     return None
+
+
+# ---------------------------------------------------------------------------
+# Per-call request metadata
+# ---------------------------------------------------------------------------
+
+# The `_meta` key carrying the resolved Desktop connection mode to MCP servers
+# (#82140). MCP reserves the `modelcontextprotocol.io/` prefix for the spec, so
+# this uses the documented third-party form: a domain we own plus a path.
+MCP_DESKTOP_CONNECTION_MODE_META_KEY = "hermes-agent.nousresearch.com/desktop-connection-mode"
+
+
+@functools.lru_cache(maxsize=1)
+def _call_tool_supports_meta() -> bool:
+    """Whether the installed MCP SDK's ``call_tool`` accepts per-call ``meta``.
+
+    Per-call metadata landed after the transport API stabilized, so probe rather
+    than pin behavior to a version: on an SDK without it we simply omit the
+    field and MCP servers see exactly today's request shape.
+    """
+    try:
+        from mcp import ClientSession
+
+        return "meta" in inspect.signature(ClientSession.call_tool).parameters
+    except Exception:
+        return False
+
+
+def _call_tool_meta() -> Optional[dict]:
+    """Per-call ``_meta`` for the current turn, or ``None`` when there's nothing to say.
+
+    Carries the resolved Desktop connection mode so an MCP server can tell
+    whether a path it returns will be openable on the machine the user is
+    looking at. Deliberately narrow: the mode and nothing else — no base URL,
+    host, token, SSH key, or auth mode. Non-Desktop sessions (CLI, TUI,
+    messaging, cron) contribute no key at all, so their requests are unchanged.
+    """
+    try:
+        from gateway.session_context import desktop_connection_mode
+
+        mode = desktop_connection_mode()
+    except Exception:
+        return None
+    if not mode:
+        return None
+    return {MCP_DESKTOP_CONNECTION_MODE_META_KEY: mode}
 
 
 # ---------------------------------------------------------------------------
@@ -5791,8 +5838,19 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # task, which doesn't inherit our contextvars) can replay
                 # it and detect the gateway platform / session for routing.
                 server._pending_call_context = contextvars.copy_context()
+                # Per-call `_meta` rides the request so a server can see the
+                # resolved Desktop connection mode (#82140). Read here, inside
+                # the agent's context, and only sent when the SDK supports it
+                # and there is a mode to report — otherwise the request shape
+                # is byte-identical to before.
+                call_meta = _call_tool_meta() if _call_tool_supports_meta() else None
                 try:
-                    result = await server.session.call_tool(tool_name, arguments=args)
+                    if call_meta:
+                        result = await server.session.call_tool(
+                            tool_name, arguments=args, meta=call_meta
+                        )
+                    else:
+                        result = await server.session.call_tool(tool_name, arguments=args)
                 finally:
                     server._pending_call_context = None
             # The RPC round-trip completed — the session is demonstrably
