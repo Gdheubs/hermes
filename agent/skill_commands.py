@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -24,6 +25,12 @@ logger = logging.getLogger(__name__)
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
 _skill_commands_home: Optional[str] = None
+# Guards the atomic publish/snapshot of the shared command map and its platform
+# tag. The scan itself runs unlocked (it walks the skills dir and can be slow);
+# only the final swap of the fully-built map — and the paired read-back in
+# ``get_skill_commands`` / ``reload_skills`` — take the lock. This is what lets
+# overlapping scans publish whole maps instead of interleaving their writes.
+_skill_commands_lock = threading.Lock()
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -419,13 +426,29 @@ def _build_skill_message(
 def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     """Scan ~/.hermes/skills/ and return a mapping of /command -> skill info.
 
+    Builds into a local dict and publishes it to ``_skill_commands`` in one
+    atomic swap under ``_skill_commands_lock``. Building locally (instead of
+    mutating the shared global in place) means overlapping scans — several
+    session boots landing in the same gateway ``serve`` process at once — can
+    no longer interleave their writes and log a bogus "already claimed by
+    itself" warning per skill (#74574).
+
     Returns:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
     global _skill_commands, _skill_commands_platform, _skill_commands_home
-    _skill_commands_platform = _resolve_skill_commands_platform()
-    _skill_commands_home = _resolve_skill_commands_home()
-    _skill_commands = {}
+
+    # Resolve the platform scope once, up front. It feeds the disabled-skill
+    # filter and is published alongside the map so ``get_skill_commands`` can
+    # detect a platform change without a second lookup.
+    platform = _resolve_skill_commands_platform()
+    home = _resolve_skill_commands_home()
+
+    # Build the full command map into a LOCAL dict. Every dedup check below
+    # runs against local state (``seen_names`` for raw names, ``local_commands``
+    # for normalized slugs) — never the shared global — so a concurrent scan's
+    # publish can't corrupt this scan's dedup.
+    local_commands: Dict[str, Dict[str, Any]] = {}
     try:
         from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
         from agent.skill_utils import (
@@ -505,14 +528,14 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     # slug (e.g. "git_helper" vs "git-helper"). First-wins
                     # preserves local-before-external precedence.
                     cmd_key = f"/{cmd_name}"
-                    if cmd_key in _skill_commands:
+                    if cmd_key in local_commands:
                         logger.warning(
                             "Skill %r maps to slash command %s already claimed "
                             "by %r; keeping the first and skipping this one.",
-                            name, cmd_key, _skill_commands[cmd_key]["name"],
+                            name, cmd_key, local_commands[cmd_key]["name"],
                         )
                         continue
-                    _skill_commands[cmd_key] = {
+                    local_commands[cmd_key] = {
                         "name": name,
                         "description": description or f"Invoke the {name} skill",
                         "skill_md_path": str(skill_md),
@@ -522,7 +545,15 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     continue
     except Exception:
         pass
-    return _skill_commands
+
+    # Publish atomically: swap the fully-built map (and its platform tag) into
+    # the globals in one locked step. Readers only ever observe a complete map.
+    with _skill_commands_lock:
+        _skill_commands = local_commands
+        _skill_commands_platform = platform
+        _skill_commands_home = home
+
+    return local_commands
 
 
 def get_skill_commands() -> Dict[str, Dict[str, Any]]:
@@ -533,14 +564,22 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     sees its own ``skills.platform_disabled`` view (#14536), and when the
     active profile's Hermes home changes (e.g. Desktop switching profiles
     mid-session) so each profile sees its own ``skills.external_dirs`` (#88023).
+
+    The map and its platform tag are snapshotted together under the publish
+    lock so a concurrent scan's swap can't leave us comparing a fresh map
+    against a stale platform tag.
     """
+    with _skill_commands_lock:
+        commands = _skill_commands
+        commands_platform = _skill_commands_platform
+        commands_home = _skill_commands_home
     if (
-        not _skill_commands
-        or _skill_commands_platform != _resolve_skill_commands_platform()
-        or _skill_commands_home != _resolve_skill_commands_home()
+        not commands
+        or commands_platform != _resolve_skill_commands_platform()
+        or commands_home != _resolve_skill_commands_home()
     ):
-        scan_skill_commands()
-    return _skill_commands
+        return scan_skill_commands()
+    return commands
 
 
 def reload_skills() -> Dict[str, Any]:
@@ -582,10 +621,11 @@ def reload_skills() -> Dict[str, Any]:
             out[bare] = (info or {}).get("description") or ""
         return out
 
-    before = _snapshot(_skill_commands)
+    with _skill_commands_lock:
+        before = _snapshot(_skill_commands)
 
-    # Rescan the skills dir. ``scan_skill_commands`` resets
-    # ``_skill_commands = {}`` internally and repopulates it.
+    # Rescan the skills dir. ``scan_skill_commands`` builds into a local map
+    # and publishes it atomically; the return value is that newly-built map.
     new_commands = scan_skill_commands()
 
     after = _snapshot(new_commands)

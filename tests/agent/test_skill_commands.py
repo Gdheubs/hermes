@@ -349,6 +349,81 @@ class TestScanSkillCommands:
         assert any("already claimed" in r.message for r in caplog.records)
 
 
+class TestScanSkillCommandsConcurrency:
+    """Concurrent scans must not log self-claim warnings (#74574).
+
+    ``scan_skill_commands`` used to build the shared ``_skill_commands``
+    global in place, so two overlapping scans — several session boots landing
+    in one gateway ``serve`` process at the same time — interleaved their
+    resets and dedup checks and logged a bogus "already claimed by itself"
+    warning per skill. The fix builds locally and publishes atomically, so
+    concurrent scans must emit zero such warnings and leave a complete map.
+    """
+
+    def test_concurrent_scans_produce_no_self_claim_warnings(
+        self, tmp_path, caplog
+    ):
+        import logging as _logging
+        import threading as _threading
+
+        import agent.skill_commands as sc_mod
+
+        # A generous skill set widens the file-I/O window so the scans
+        # genuinely overlap instead of running back-to-back.
+        names = [f"skill-{i:02d}" for i in range(40)]
+
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch(
+                "tools.skills_tool._get_disabled_skill_names",
+                return_value=set(),
+            ),
+            patch.object(sc_mod, "_skill_commands", {}),
+            patch.object(sc_mod, "_skill_commands_platform", None),
+        ):
+            for name in names:
+                _make_skill(tmp_path, name)
+
+            results = []
+            barrier = _threading.Barrier(6)  # 5 workers + this main thread
+
+            def worker():
+                barrier.wait()
+                results.append(dict(scan_skill_commands()))
+
+            threads = [
+                _threading.Thread(target=worker, name=f"scan-{i}")
+                for i in range(5)
+            ]
+            with caplog.at_level(
+                _logging.WARNING, logger="agent.skill_commands"
+            ):
+                for t in threads:
+                    t.start()
+                barrier.wait()  # release all workers simultaneously
+                for t in threads:
+                    t.join()
+
+            final_global = dict(sc_mod._skill_commands)
+
+        # Zero self-claim warnings — the regression this fix targets.
+        self_claim = [
+            r for r in caplog.records if "already claimed" in r.message
+        ]
+        assert self_claim == [], [r.message for r in self_claim]
+
+        # Every worker observed the same complete, correct map.
+        expected_keys = {f"/{name}" for name in names}
+        assert len(results) == 5
+        for result in results:
+            assert set(result) == expected_keys
+            for name in names:
+                assert result[f"/{name}"]["name"] == name
+
+        # The published global is also complete and correct.
+        assert set(final_global) == expected_keys
+
+
 class TestResolveSkillCommandKey:
     """Telegram bot-command names disallow hyphens, so the menu registers
     skills with hyphens swapped for underscores. When Telegram autocomplete
