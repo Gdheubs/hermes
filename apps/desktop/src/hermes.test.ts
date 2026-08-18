@@ -24,6 +24,7 @@ import {
   listSidebarSessions,
   pluginSocket,
   resetSidebarBatchCapability,
+  searchSessions,
   setApiRequestProfile,
   speakText,
   transcribeAudio,
@@ -77,6 +78,17 @@ describe('Hermes REST helpers', () => {
         timeoutMs: 60_000
       })
     )
+  })
+
+  it('routes a session search to the selected profile backend', async () => {
+    api.mockResolvedValue({ results: [] })
+
+    await searchSessions('attendance audit', 'sabby')
+
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/sessions/search?q=attendance+audit&profile=sabby',
+      profile: 'sabby'
+    })
   })
 
   it('batches the sidebar slices into a single request with per-slice limits + excludes', async () => {
