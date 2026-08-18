@@ -742,6 +742,7 @@ def _resolve_active_context_length() -> int:
 # so if something slips through, the LLM sees a sensible message.
 _AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
+_TARGET_SELECTOR_TOOLS = {"terminal", "write_file", "patch", "execute_code"}
 
 
 # =========================================================================
@@ -1366,6 +1367,19 @@ def handle_function_call(
         except Exception as _mw_err:
             logger.debug("tool_request middleware error: %s", _mw_err)
 
+    # Enforce the canonical execution-routing API before pre-tool hooks,
+    # ACP edit approval, guardrails, progress, checkpoints, or dispatch.
+    try:
+        from tools.execution_targets import (
+            ExecutionTargetError,
+            validate_execution_target_args,
+            validate_execution_target_dispatch_args,
+        )
+
+        validate_execution_target_args(function_name, function_args)
+    except ExecutionTargetError as exc:
+        return tool_error(str(exc))
+
     try:
         if function_name in _AGENT_LOOP_TOOLS:
             return tool_error(f"{function_name} must be handled by the agent loop")
@@ -1464,9 +1478,21 @@ def handle_function_call(
         if function_name not in _READ_SEARCH_TOOLS:
             try:
                 from tools.file_tools import notify_other_tool_call
-                notify_other_tool_call(task_id or "default")
+                notify_other_tool_call(
+                    task_id or "default",
+                    (
+                        function_args.get("execution_target")
+                        if function_name in _TARGET_SELECTOR_TOOLS
+                        else None
+                    ),
+                )
             except Exception:
                 pass  # file_tools may not be loaded yet
+
+        # Pin the arguments that hooks and approvals evaluated. Execution
+        # middleware may rewrite ordinary arguments, but changing the routing
+        # selector here would retarget the call after authorization.
+        _authorized_function_args = dict(function_args)
 
         # Measure tool dispatch latency so post_tool_call and
         # transform_tool_result hooks can observe per-tool duration.
@@ -1494,7 +1520,7 @@ def handle_function_call(
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
-                def _dispatch(next_args: Dict[str, Any]) -> Any:
+                def _registry_dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
@@ -1502,13 +1528,20 @@ def handle_function_call(
                         enabled_tools=sandbox_enabled,
                     )
             else:
-                def _dispatch(next_args: Dict[str, Any]) -> Any:
+                def _registry_dispatch(next_args: Dict[str, Any]) -> Any:
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
                     )
+
+            def _dispatch(next_args: Dict[str, Any]) -> Any:
+                validate_execution_target_dispatch_args(
+                    function_name, _authorized_function_args, next_args,
+                )
+                return _registry_dispatch(next_args)
+
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)
             else:

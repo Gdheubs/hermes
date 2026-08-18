@@ -2562,12 +2562,12 @@ def _run_single_child(
         # the parent once readers flip to the record store).
         try:
             from tools.terminal_tool import (
-                get_session_cwd,
-                record_session_cwd,
+                inherit_session_cwds,
                 register_container_alias,
             )
 
-            record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
+            if parent_task_id:
+                inherit_session_cwds(parent_task_id, child_task_id)
             # Per-session container isolation (docker + container_persistent:
             # false) keys containers by session task_id. The child must share
             # the PARENT's container — register the alias so the child's
