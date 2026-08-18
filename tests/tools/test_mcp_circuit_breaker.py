@@ -569,3 +569,129 @@ def test_initial_connect_budget_parks_instead_of_exiting_then_revives(monkeypatc
             run_task.cancel()
 
     asyncio.run(_scenario())
+
+
+def _app_error_result(text: str):
+    """A CallToolResult carrying an application-level error (isError)."""
+    result = MagicMock()
+    result.is_error = True
+    block = MagicMock()
+    block.text = text
+    result.content = [block]
+    result.structured_content = None
+    return result
+
+
+def test_tool_level_error_does_not_arm_breaker(monkeypatch, tmp_path):
+    """A reachable server that rejects the *arguments* is not a down server.
+
+    The breaker measures transport reachability. An isError payload proves the
+    round-trip completed, so it must never count toward "unreachable" — a
+    model that sends the same bad argument a few times in a row (trivially
+    possible within one parallel tool-call batch) would otherwise black out a
+    perfectly healthy server for the whole cooldown.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    call_count = {"n": 0}
+
+    async def _call_tool_app_error(*a, **kw):
+        call_count["n"] += 1
+        return _app_error_result(
+            "groupby must not be empty (use search_count for an unfiltered total)"
+        )
+
+    _install_stub_server(mcp_tool, "srv", _call_tool_app_error)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = _make_tool_handler("srv", "tool1", 10.0)
+        attempts = mcp_tool._CIRCUIT_BREAKER_THRESHOLD + 2
+
+        for i in range(attempts):
+            parsed = json.loads(handler({}))
+            # The server's own message must survive, not be replaced by a
+            # bogus availability diagnostic.
+            assert "groupby" in parsed.get("error", ""), parsed
+            assert "unreachable" not in parsed.get("error", "").lower(), (
+                f"call {i + 1}: healthy server reported as unreachable"
+            )
+
+        assert call_count["n"] == attempts, (
+            "every call must reach the session; none should be short-circuited"
+        )
+        assert mcp_tool._server_error_counts.get("srv", 0) == 0
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
+def test_transport_exception_still_arms_breaker(monkeypatch, tmp_path):
+    """Non-regression: a real transport failure must still trip the breaker."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    call_count = {"n": 0}
+
+    async def _call_tool_transport_dead(*a, **kw):
+        call_count["n"] += 1
+        raise RuntimeError("transport is gone")
+
+    _install_stub_server(mcp_tool, "srv", _call_tool_transport_dead)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = _make_tool_handler("srv", "tool1", 10.0)
+
+        for _ in range(mcp_tool._CIRCUIT_BREAKER_THRESHOLD):
+            json.loads(handler({}))
+
+        assert (
+            mcp_tool._server_error_counts.get("srv", 0)
+            >= mcp_tool._CIRCUIT_BREAKER_THRESHOLD
+        )
+
+        calls_before = call_count["n"]
+        parsed = json.loads(handler({}))
+        assert "unreachable" in parsed.get("error", "").lower(), parsed
+        assert call_count["n"] == calls_before, (
+            "an open breaker must short-circuit instead of probing"
+        )
+    finally:
+        _cleanup(mcp_tool, "srv")
+
+
+def test_answered_call_closes_breaker_even_when_tool_errored(monkeypatch, tmp_path):
+    """An answer — any answer — is proof of reachability, so it resets.
+
+    This is the recovery half: after transient transport trouble, the first
+    server reply must close the breaker even when that reply is an isError,
+    rather than leaving the count one strike away from tripping.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools.mcp_tool import _make_tool_handler
+
+    async def _call_tool_app_error(*a, **kw):
+        return _app_error_result("unknown field 'nope'")
+
+    _install_stub_server(mcp_tool, "srv", _call_tool_app_error)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        mcp_tool._server_error_counts["srv"] = mcp_tool._CIRCUIT_BREAKER_THRESHOLD - 1
+
+        handler = _make_tool_handler("srv", "tool1", 10.0)
+        parsed = json.loads(handler({}))
+        assert "nope" in parsed.get("error", ""), parsed
+
+        assert mcp_tool._server_error_counts.get("srv", 0) == 0, (
+            "a completed round-trip must clear accumulated transport strikes"
+        )
+    finally:
+        _cleanup(mcp_tool, "srv")
