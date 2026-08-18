@@ -1,6 +1,7 @@
 """xAI image generation backend.
 
-Exposes xAI's ``grok-imagine-image`` model as an
+Exposes xAI's Grok Imagine image models (``grok-imagine-image``,
+``grok-imagine-image-quality``, ``grok-imagine-image-2.0``) as an
 :class:`ImageGenProvider` implementation.
 
 Features:
@@ -54,15 +55,29 @@ _MODELS: Dict[str, Dict[str, Any]] = {
         "display": "Grok Imagine Image",
         "speed": "~5-10s",
         "strengths": "Fast, high-quality",
+        "supports_edit": False,
     },
     "grok-imagine-image-quality": {
         "display": "Grok Imagine Image (Quality)",
         "speed": "~10-20s",
         "strengths": "Higher fidelity / detail; slower than the standard model.",
+        "supports_edit": True,
+    },
+    "grok-imagine-image-2.0": {
+        "display": "Grok Imagine Image 2.0",
+        "speed": "~10-20s",
+        "strengths": (
+            "Strongest instruction following, typography and layout; "
+            "generation and editing with up to 3 source images."
+        ),
+        "supports_edit": True,
     },
 }
 
 DEFAULT_MODEL = "grok-imagine-image"
+
+# Editing model used when the resolved model cannot edit (``grok-imagine-image``).
+DEFAULT_EDIT_MODEL = "grok-imagine-image-quality"
 
 # xAI aspect ratios (more options than FAL/OpenAI)
 _XAI_ASPECT_RATIOS = {
@@ -224,9 +239,10 @@ class XAIImageGenProvider(ImageGenProvider):
 
         Routing: when ``image_url`` is provided, POST to ``/v1/images/edits``
         with the source image; otherwise POST to ``/v1/images/generations``.
-        Per xAI docs, editing uses the ``grok-imagine-image-quality`` model and
-        a JSON body (the OpenAI SDK's multipart ``images.edit()`` is NOT
-        supported by xAI).
+        Editing uses the resolved model when it supports editing
+        (``grok-imagine-image-quality``, ``grok-imagine-image-2.0``) and
+        otherwise falls back to :data:`DEFAULT_EDIT_MODEL`, with a JSON body
+        (the OpenAI SDK's multipart ``images.edit()`` is NOT supported by xAI).
         """
         creds = resolve_xai_http_credentials()
         api_key = str(creds.get("api_key") or "").strip()
@@ -240,6 +256,9 @@ class XAIImageGenProvider(ImageGenProvider):
             )
 
         model_id, meta = _resolve_model()
+        # Resolved up-front so error envelopes report the model the request
+        # would actually have used.
+        edit_model = model_id if meta.get("supports_edit") else DEFAULT_EDIT_MODEL
         aspect = resolve_aspect_ratio(aspect_ratio)
         xai_ar = _XAI_ASPECT_RATIOS.get(aspect, "1:1")
         resolution = _resolve_resolution()
@@ -256,7 +275,7 @@ class XAIImageGenProvider(ImageGenProvider):
                 error="xAI image editing supports at most 3 source images",
                 error_type="too_many_references",
                 provider=provider_name,
-                model="grok-imagine-image-quality",
+                model=edit_model,
                 prompt=prompt,
                 aspect_ratio=aspect,
             )
@@ -273,7 +292,7 @@ class XAIImageGenProvider(ImageGenProvider):
                         ),
                         error_type="invalid_image_url",
                         provider=provider_name,
-                        model="grok-imagine-image-quality",
+                        model=edit_model,
                         prompt=prompt,
                         aspect_ratio=aspect,
                     )
@@ -296,10 +315,11 @@ class XAIImageGenProvider(ImageGenProvider):
         storage_cfg = read_xai_imagine_storage_config("image_gen")
 
         if is_edit:
-            # Editing requires the quality model per xAI docs. The source
-            # image may be a public URL or a base64 data URI; local file paths
-            # are converted to a data URI here.
-            edit_model = "grok-imagine-image-quality"
+            # ``edit_model`` was resolved above: a user-selected edit-capable
+            # model (Quality, 2.0) is preserved, and ``grok-imagine-image``
+            # (generation-only) falls back to the documented editing model.
+            # The source image may be a public URL or a base64 data URI; local
+            # file paths are converted to a data URI here.
             try:
                 image_fields = [_xai_image_field(source) for source in source_images]
             except Exception as exc:

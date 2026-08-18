@@ -117,7 +117,7 @@ Two inputs drive the edit:
 |---|---|---|---|
 | **FAL.ai** (edit-capable models below) | ✓ | up to 9 | routes to the model's `/edit` endpoint |
 | **OpenAI** (`gpt-image-2`) | ✓ | up to 16 | `images.edit()` |
-| **xAI** (Grok Imagine) | ✓ | 1 | `/v1/images/edits` (`grok-imagine-image-quality`) |
+| **xAI** (Grok Imagine) | ✓ | 1 | `/v1/images/edits` (`grok-imagine-image-2.0` or `grok-imagine-image-quality`; the generation-only `grok-imagine-image` falls back to `grok-imagine-image-quality`) |
 | **Krea** (`Krea 2`) | ✓ | up to 10 | reference-guided generation (`image_style_references`) |
 | **OpenAI (Codex auth)** | ✓ | up to 16 | Codex Responses `image_generation` tool with `input_image` content parts |
 

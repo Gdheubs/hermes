@@ -63,6 +63,32 @@ class TestXAIImageGenProvider:
         assert len(models) >= 1
         assert models[0]["id"] == "grok-imagine-image"
 
+    def test_list_models_includes_imagine_image_2(self):
+        """Imagine Image 2.0 is GA in the Imagine API and must be selectable.
+
+        Source: https://docs.x.ai/developers/model-capabilities/imagine
+        """
+        from plugins.image_gen.xai import XAIImageGenProvider
+
+        ids = {m["id"] for m in XAIImageGenProvider().list_models()}
+        assert "grok-imagine-image-2.0" in ids
+
+    def test_every_model_declares_edit_support(self):
+        """``supports_edit`` drives edit routing, so it must never be absent.
+
+        A missing key would silently read as False and downgrade the request
+        to the fallback edit model.
+        """
+        from plugins.image_gen.xai import _MODELS
+
+        for model_id, meta in _MODELS.items():
+            assert isinstance(meta.get("supports_edit"), bool), model_id
+
+    def test_default_edit_model_is_edit_capable(self):
+        from plugins.image_gen.xai import DEFAULT_EDIT_MODEL, _MODELS
+
+        assert _MODELS[DEFAULT_EDIT_MODEL]["supports_edit"] is True
+
     def test_default_model(self):
         from plugins.image_gen.xai import XAIImageGenProvider
 
@@ -104,6 +130,21 @@ class TestConfig:
 
         model_id, _ = _resolve_model()
         assert model_id == "grok-imagine-image"
+
+    def test_resolve_imagine_image_2(self, monkeypatch):
+        monkeypatch.setenv("XAI_IMAGE_MODEL", "grok-imagine-image-2.0")
+        from plugins.image_gen.xai import _resolve_model
+
+        model_id, meta = _resolve_model()
+        assert model_id == "grok-imagine-image-2.0"
+        assert meta["supports_edit"] is True
+
+    def test_unknown_model_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv("XAI_IMAGE_MODEL", "grok-imagine-image-9.9")
+        from plugins.image_gen.xai import DEFAULT_MODEL, _resolve_model
+
+        model_id, _ = _resolve_model()
+        assert model_id == DEFAULT_MODEL
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +213,88 @@ class TestGenerate:
             "Cache failure must not turn into a tool error — gateway gets a chance to retry"
         )
         assert result["image"] == "https://imgen.x.ai/xai-tmp-imgen-already-404.jpeg"
+
+    def test_generation_uses_selected_imagine_image_2(self, monkeypatch):
+        monkeypatch.setenv("XAI_IMAGE_MODEL", "grok-imagine-image-2.0")
+        from plugins.image_gen.xai import XAIImageGenProvider
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"data": [{"b64_json": "dGVzdC1pbWFnZS1kYXRh"}]}
+
+        with patch("plugins.image_gen.xai.requests.post", return_value=mock_resp) as post, \
+             patch("plugins.image_gen.xai.save_b64_image", return_value="/tmp/test.png"):
+            result = XAIImageGenProvider().generate(prompt="A concert poster")
+
+        assert result["success"] is True
+        assert post.call_args.kwargs["json"]["model"] == "grok-imagine-image-2.0"
+        assert post.call_args.args[0].endswith("/images/generations")
+        assert result["model"] == "grok-imagine-image-2.0"
+
+    def test_edit_preserves_selected_edit_capable_model(self, monkeypatch):
+        """Editing with Image 2.0 selected must NOT downgrade to the fallback.
+
+        Regression guard: the edit model used to be hardcoded, so selecting
+        2.0 and passing a source image silently produced a Quality-model edit.
+        """
+        monkeypatch.setenv("XAI_IMAGE_MODEL", "grok-imagine-image-2.0")
+        from plugins.image_gen.xai import XAIImageGenProvider
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"data": [{"b64_json": "dGVzdC1pbWFnZS1kYXRh"}]}
+
+        with patch("plugins.image_gen.xai.requests.post", return_value=mock_resp) as post, \
+             patch("plugins.image_gen.xai.save_b64_image", return_value="/tmp/test.png"):
+            result = XAIImageGenProvider().generate(
+                prompt="Render as a pencil sketch",
+                image_url="https://example.com/source.png",
+            )
+
+        assert result["success"] is True
+        assert post.call_args.kwargs["json"]["model"] == "grok-imagine-image-2.0"
+        assert post.call_args.args[0].endswith("/images/edits")
+
+    def test_edit_falls_back_when_selected_model_cannot_edit(self, monkeypatch):
+        """``grok-imagine-image`` is generation-only, so edits must fall back."""
+        monkeypatch.setenv("XAI_IMAGE_MODEL", "grok-imagine-image")
+        from plugins.image_gen.xai import DEFAULT_EDIT_MODEL, XAIImageGenProvider
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status = MagicMock()
+        mock_resp.json.return_value = {"data": [{"b64_json": "dGVzdC1pbWFnZS1kYXRh"}]}
+
+        with patch("plugins.image_gen.xai.requests.post", return_value=mock_resp) as post, \
+             patch("plugins.image_gen.xai.save_b64_image", return_value="/tmp/test.png"):
+            result = XAIImageGenProvider().generate(
+                prompt="Render as a pencil sketch",
+                image_url="https://example.com/source.png",
+            )
+
+        assert result["success"] is True
+        assert post.call_args.kwargs["json"]["model"] == DEFAULT_EDIT_MODEL
+        assert post.call_args.args[0].endswith("/images/edits")
+
+    def test_too_many_sources_error_reports_selected_edit_model(self, monkeypatch):
+        monkeypatch.setenv("XAI_IMAGE_MODEL", "grok-imagine-image-2.0")
+        from plugins.image_gen.xai import XAIImageGenProvider
+
+        result = XAIImageGenProvider().generate(
+            prompt="combine these",
+            image_url="https://example.com/a.png",
+            reference_image_urls=[
+                "https://example.com/b.png",
+                "https://example.com/c.png",
+                "https://example.com/d.png",
+            ],
+        )
+
+        assert result["success"] is False
+        assert result["error_type"] == "too_many_references"
+        assert result["model"] == "grok-imagine-image-2.0"
 
     def test_api_error(self):
         import requests as req_lib
