@@ -170,6 +170,7 @@ import {
 import { WorktreeDialog } from './projects/worktree-dialog'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
 import { buildSessionByAnyId, resolvePinnedSessions } from './session-index'
+import { selectVisibleSessions } from './session-scope'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 
@@ -473,8 +474,8 @@ export function ChatSidebar({
   const scopedSessions = useMemo(() => {
     const pool = showArchived ? archivedSessions : sessions
 
-    return showAllProfiles ? pool : pool.filter(s => normalizeProfileKey(s.profile) === profileScope)
-  }, [sessions, archivedSessions, showArchived, showAllProfiles, profileScope])
+    return selectVisibleSessions(pool, profileScope)
+  }, [sessions, archivedSessions, showArchived, profileScope])
 
   // One predicate for the status/project filters, so the flat list and the
   // project lanes narrow by the same rule. A project lane holds rows the loaded
