@@ -18888,6 +18888,14 @@ def start_server(
                 # No SPA, and the JSON-RPC/WS endpoints are auth-gated — don't
                 # advertise a paste-and-connect URL, just announce the bind.
                 print(f"  Hermes backend listening on {host}:{actual_port}")
+                # `serve` looks like a working dashboard start (it prints a
+                # ready sentinel and even serves the auth login page), but the
+                # browser UI is never mounted here — see mount_spa(). Without
+                # this, users burn hours logging in and finding no chat UI
+                # (#84865). Say it up front instead of only on 404.
+                print("  This is a headless backend (no browser UI). Use "
+                      "`hermes dashboard` to open the web dashboard.")
+                print("  The JSON-RPC/WS API is still available for scripted clients.")
             else:
                 print(f"  Hermes Web UI → http://{host}:{actual_port}")
             _maybe_open_browser(host, actual_port, open_browser, initial_profile)

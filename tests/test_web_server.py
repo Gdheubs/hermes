@@ -123,6 +123,21 @@ def test_start_server_accepts_base64_desktop_attachments_above_preview_limit(mon
     assert captured["ws_max_size"] > base64_bytes
 
 
+def test_start_server_headless_prints_dashboard_hint(monkeypatch, capsys):
+    """`hermes serve` (headless=True) must tell the user up front that there
+    is no browser UI here — otherwise a user logs into the auth page it does
+    serve and burns time looking for a chat UI that only `hermes dashboard`
+    mounts (#84865)."""
+    _stub_uvicorn(monkeypatch)
+
+    web_server.start_server(host="127.0.0.1", port=0, open_browser=False, headless=True)
+
+    out = capsys.readouterr().out
+    assert "hermes dashboard" in out
+    assert "headless backend" in out
+    assert "JSON-RPC/WS API is still available" in out
+
+
 def test_start_server_enables_ws_ping_for_half_open_detection(monkeypatch):
     """Non-loopback (public) binds MUST keep the ws ping enabled so half-open
     connections (reverse-proxy 524, dropped Cloudflare Tunnel) raise
