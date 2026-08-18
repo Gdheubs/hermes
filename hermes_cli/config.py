@@ -2192,15 +2192,21 @@ def warn_deprecated_cwd_env_vars(config: Optional[Dict[str, Any]] = None) -> Non
 
     These env vars are deprecated — the canonical setting is terminal.cwd
     in config.yaml.  Prints a migration hint to stderr.
-    """
-    messaging_cwd = os.environ.get("MESSAGING_CWD")
-    terminal_cwd_env = os.environ.get("TERMINAL_CWD")
 
+    Reads the .env FILE (via ``load_env()``), NOT ``os.environ``: Hermes
+    bridges ``terminal.cwd`` into ``TERMINAL_CWD`` in the process environment
+    at startup, so an ``os.environ`` read would false-positive on Hermes's own
+    bridge output even when the user never wrote the deprecated var to .env.
+    """
     if config is None:
         try:
             config = load_config()
         except Exception:
             return
+
+    env_vars = load_env()
+    messaging_cwd = env_vars.get("MESSAGING_CWD")
+    terminal_cwd_env = env_vars.get("TERMINAL_CWD")
 
     terminal_cfg = config.get("terminal", {})
     config_cwd = terminal_cfg.get("cwd", ".") if isinstance(terminal_cfg, dict) else "."
