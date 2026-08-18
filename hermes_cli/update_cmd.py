@@ -1131,7 +1131,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
 
     node_failures = _update_node_dependencies()
     _m()._build_web_ui(_m().PROJECT_ROOT / "web")
-    _rebuild_desktop_after_update(
+    desktop_rebuilt = _rebuild_desktop_after_update(
         _m().PROJECT_ROOT / "apps" / "desktop",
         had_desktop_app_before_update=had_desktop_app_before_update,
     )
@@ -1246,6 +1246,12 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False):
         print("  be in a mixed state until the Node deps are rebuilt.")
     else:
         _print_update_completion(_update_complete_message(pre_update_version))
+    if not desktop_rebuilt:
+        # A failed desktop pack is non-fatal, but the success banner above
+        # must not imply the Electron app shipped with this update — it is
+        # still running the previous build (#88251).
+        print("⚠ The Desktop app was NOT rebuilt — it is still running the")
+        print("  previous build. Run `hermes desktop` to retry the build.")
     try:
         _print_curator_first_run_notice()
     except Exception as e:
@@ -4371,8 +4377,16 @@ def _desktop_app_present(desktop_dir: Path) -> bool:
 
 def _rebuild_desktop_after_update(
     desktop_dir: Path, *, had_desktop_app_before_update: bool
-) -> None:
-    """Rebuild an installed Desktop app when its source or artifact changed."""
+) -> bool:
+    """Rebuild an installed Desktop app when its source or artifact changed.
+
+    Returns ``False`` only when a rebuild was attempted and failed, so the
+    caller can flag in the final summary that the Desktop app is still
+    running the previous build — an update that prints only ``✓ Update
+    complete!`` over a failed desktop pack silently leaves the app stale
+    (#88251). Every other outcome (nothing to rebuild, up to date, build
+    succeeded, Desktop never installed) returns ``True``.
+    """
     # The release tree is ignored by git and can disappear during an update.
     # Its pre-update presence is enough to restore it; do not make people who
     # have never used Desktop pay for an Electron build.
@@ -4382,7 +4396,7 @@ def _rebuild_desktop_after_update(
         and _m()._resolve_node_runtime_npm()
         and has_desktop_app
     ):
-        return
+        return True
 
     print("→ Checking if desktop app needs rebuilding...")
     # Consult the content-hash stamp IN-PROCESS first. The spawned
@@ -4401,7 +4415,7 @@ def _rebuild_desktop_after_update(
         skip_desktop_build = False
     if skip_desktop_build:
         print("  ✓ Desktop app up to date")
-        return
+        return True
 
     desktop_build_cmd = [sys.executable, "-m", "hermes_cli.main", "desktop", "--build-only"]
     # Capture the (very loud) Electron/vite build output into update.log
@@ -4433,8 +4447,9 @@ def _rebuild_desktop_after_update(
         from hermes_constants import display_hermes_home as _dhh
 
         print(f"  Full build log: {_dhh()}/logs/update.log")
-    else:
-        print("  ✓ Desktop app up to date")
+        return False
+    print("  ✓ Desktop app up to date")
+    return True
 
 
 def _cmd_update_impl(args, gateway_mode: bool):
@@ -5239,13 +5254,19 @@ def _cmd_update_impl(args, gateway_mode: bool):
         node_failures = _update_node_dependencies()
         _m()._build_web_ui(_m().PROJECT_ROOT / "web")
 
-        _rebuild_desktop_after_update(
+        desktop_rebuilt = _rebuild_desktop_after_update(
             desktop_dir,
             had_desktop_app_before_update=had_desktop_app_before_update,
         )
 
         print()
         print("✓ Code updated!")
+        if not desktop_rebuilt:
+            # Non-fatal, but the user must not walk away thinking the
+            # Electron app updated with the code — it is still running the
+            # previous build (#88251).
+            print("⚠ The Desktop app was NOT rebuilt — it is still running the")
+            print("  previous build. Run `hermes desktop` to retry the build.")
 
         # ── Post-update state.db integrity guard (#68474) ─────────────────
         # Verify that state.db survived the update intact.  If the live file
