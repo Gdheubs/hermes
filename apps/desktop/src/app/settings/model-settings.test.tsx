@@ -29,7 +29,7 @@ let profileSwitchHandler: (() => void) | null = null
 
 vi.mock('@/hermes', () => ({
   getGlobalModelInfo: () => getGlobalModelInfo(),
-  getGlobalModelOptions: () => getGlobalModelOptions(),
+  getGlobalModelOptions: (opts?: unknown) => getGlobalModelOptions(opts),
   getAuxiliaryModels: () => getAuxiliaryModels(),
   getApiRequestProfile: () => 'default',
   getMoaModels: () => getMoaModels(),
@@ -214,7 +214,7 @@ describe('ModelSettings', () => {
   })
 
   it('preserves a user-defined provider endpoint when applying the main model', async () => {
-    getGlobalModelOptions.mockResolvedValueOnce({
+    getGlobalModelOptions.mockResolvedValue({
       providers: [
         {
           name: 'Nous',
@@ -259,6 +259,192 @@ describe('ModelSettings', () => {
         base_url: 'http://localhost:11434/v1'
       })
     )
+  })
+
+  it('refreshes a selected custom provider without carrying over the previous model', async () => {
+    getGlobalModelInfo.mockResolvedValueOnce({ provider: 'openai-codex', model: 'gpt-5.6-luna' })
+    getGlobalModelOptions
+      .mockResolvedValueOnce({
+        providers: [
+          {
+            name: 'OpenAI Codex',
+            slug: 'openai-codex',
+            models: ['gpt-5.6-luna'],
+            authenticated: true
+          },
+          {
+            name: 'Alibaba Personal Token Plan',
+            slug: 'alibaba-token-plan',
+            models: ['qwen3.8-max-preview'],
+            authenticated: true,
+            is_user_defined: true
+          }
+        ]
+      })
+      .mockResolvedValueOnce({
+        providers: [
+          {
+            name: 'OpenAI Codex',
+            slug: 'openai-codex',
+            models: ['gpt-5.6-luna'],
+            authenticated: true
+          },
+          {
+            name: 'Alibaba Personal Token Plan',
+            slug: 'alibaba-token-plan',
+            models: ['qwen3.8-max', 'qwen3.7-max'],
+            authenticated: true,
+            is_user_defined: true
+          }
+        ]
+      })
+
+    await renderModelSettings()
+
+    const providerSelect = (await screen.findAllByRole('combobox'))[0]
+    fireEvent.click(providerSelect)
+    fireEvent.click(await screen.findByRole('option', { name: 'Alibaba Personal Token Plan' }))
+
+    await waitFor(() => expect(getGlobalModelOptions).toHaveBeenLastCalledWith({ refresh: true }))
+
+    const modelSelect = (await screen.findAllByRole('combobox'))[1]
+    expect(modelSelect.textContent).not.toContain('gpt-5.6-luna')
+    fireEvent.click(modelSelect)
+    expect(await screen.findByRole('option', { name: 'qwen3.8-max' })).toBeTruthy()
+    expect(screen.queryByRole('option', { name: 'gpt-5.6-luna' })).toBeNull()
+  })
+
+  it('clears the previous model on a built-in provider switch without refreshing discovery', async () => {
+    getGlobalModelOptions.mockResolvedValueOnce({
+      providers: [
+        {
+          name: 'Nous',
+          slug: 'nous',
+          models: ['hermes-4'],
+          authenticated: true
+        },
+        {
+          name: 'OpenAI Codex',
+          slug: 'openai-codex',
+          models: ['gpt-5.6-luna'],
+          authenticated: true
+        }
+      ]
+    })
+
+    await renderModelSettings()
+
+    const providerSelect = (await screen.findAllByRole('combobox'))[0]
+    fireEvent.click(providerSelect)
+    fireEvent.click(await screen.findByRole('option', { name: 'OpenAI Codex' }))
+
+    const modelSelect = (await screen.findAllByRole('combobox'))[1]
+    expect(modelSelect.textContent).not.toContain('hermes-4')
+    expect(getGlobalModelOptions).toHaveBeenCalledTimes(1)
+  })
+
+  it('discards a stale custom-provider refresh after a newer provider selection', async () => {
+    let resolveFirstRefresh!: (value: { providers: Array<Record<string, unknown>> }) => void
+
+    const firstRefresh = new Promise<{ providers: Array<Record<string, unknown>> }>(resolve => {
+      resolveFirstRefresh = resolve
+    })
+
+    getGlobalModelOptions
+      .mockResolvedValueOnce({
+        providers: [
+          { name: 'Nous', slug: 'nous', models: ['hermes-4'], authenticated: true },
+          { name: 'Custom A', slug: 'custom-a', models: ['a-old'], authenticated: true, is_user_defined: true },
+          { name: 'Custom B', slug: 'custom-b', models: ['b-old'], authenticated: true, is_user_defined: true }
+        ]
+      })
+      .mockReturnValueOnce(firstRefresh)
+      .mockResolvedValueOnce({
+        providers: [
+          { name: 'Nous', slug: 'nous', models: ['hermes-4'], authenticated: true },
+          { name: 'Custom A', slug: 'custom-a', models: ['a-old'], authenticated: true, is_user_defined: true },
+          { name: 'Custom B', slug: 'custom-b', models: ['b-fresh'], authenticated: true, is_user_defined: true }
+        ]
+      })
+
+    await renderModelSettings()
+
+    const providerSelect = (await screen.findAllByRole('combobox'))[0]
+    fireEvent.click(providerSelect)
+    fireEvent.click(await screen.findByRole('option', { name: 'Custom A' }))
+    await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalledTimes(2))
+
+    fireEvent.click(providerSelect)
+    fireEvent.click(await screen.findByRole('option', { name: 'Custom B' }))
+    await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalledTimes(3))
+
+    const modelSelect = (await screen.findAllByRole('combobox'))[1]
+    fireEvent.click(modelSelect)
+    expect(await screen.findByRole('option', { name: 'b-fresh' })).toBeTruthy()
+
+    await act(async () => {
+      resolveFirstRefresh({
+        providers: [
+          { name: 'Nous', slug: 'nous', models: ['hermes-4'], authenticated: true },
+          { name: 'Custom A', slug: 'custom-a', models: ['a-stale'], authenticated: true, is_user_defined: true },
+          { name: 'Custom B', slug: 'custom-b', models: ['b-old'], authenticated: true, is_user_defined: true }
+        ]
+      })
+      await firstRefresh
+    })
+
+    expect(screen.queryByRole('option', { name: 'a-stale' })).toBeNull()
+    expect(screen.getByRole('option', { name: 'b-fresh' })).toBeTruthy()
+  })
+
+  it('discards a custom-provider refresh after the active profile changes', async () => {
+    let resolveOldProfileRefresh!: (value: { providers: Array<Record<string, unknown>> }) => void
+
+    const oldProfileRefresh = new Promise<{ providers: Array<Record<string, unknown>> }>(resolve => {
+      resolveOldProfileRefresh = resolve
+    })
+
+    getGlobalModelInfo
+      .mockResolvedValueOnce({ provider: 'nous', model: 'hermes-4' })
+      .mockResolvedValueOnce({ provider: 'openai-codex', model: 'gpt-5.6-luna' })
+    getGlobalModelOptions
+      .mockResolvedValueOnce({
+        providers: [
+          { name: 'Nous', slug: 'nous', models: ['hermes-4'], authenticated: true },
+          { name: 'Custom A', slug: 'custom-a', models: ['a-old'], authenticated: true, is_user_defined: true }
+        ]
+      })
+      .mockReturnValueOnce(oldProfileRefresh)
+      .mockResolvedValueOnce({
+        providers: [
+          { name: 'OpenAI Codex', slug: 'openai-codex', models: ['gpt-5.6-luna'], authenticated: true }
+        ]
+      })
+
+    await renderModelSettings()
+
+    const providerSelect = (await screen.findAllByRole('combobox'))[0]
+    fireEvent.click(providerSelect)
+    fireEvent.click(await screen.findByRole('option', { name: 'Custom A' }))
+    await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalledTimes(2))
+
+    await act(async () => {
+      profileSwitchHandler?.()
+    })
+    await waitFor(() => expect(providerSelect.textContent).toContain('OpenAI Codex'))
+
+    await act(async () => {
+      resolveOldProfileRefresh({
+        providers: [
+          { name: 'Nous', slug: 'nous', models: ['hermes-4'], authenticated: true },
+          { name: 'Custom A', slug: 'custom-a', models: ['a-stale'], authenticated: true, is_user_defined: true }
+        ]
+      })
+      await oldProfileRefresh
+    })
+
+    expect(providerSelect.textContent).toContain('OpenAI Codex')
+    expect(providerSelect.textContent).not.toContain('Custom A')
   })
 
   it('writes the profile default speed (service_tier) when the fast switch is toggled', async () => {

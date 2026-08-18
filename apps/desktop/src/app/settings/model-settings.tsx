@@ -226,6 +226,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile = null }: Model
   // so a request in flight when the user switches profiles can't paint profile
   // A's models/providers into profile B (or fire onMainModelChanged for A).
   const profileEpoch = useRef(0)
+  const providerRefreshGeneration = useRef(0)
 
   const refresh = useCallback(
     async ({ replaceSelection = false }: { replaceSelection?: boolean } = {}) => {
@@ -320,6 +321,44 @@ export function ModelSettings({ onMainModelChanged, scopeProfile = null }: Model
   )
 
   const selectedProviderModels = selectedProviderRow?.models ?? []
+
+  const selectMainProvider = useCallback(
+    async (provider: string) => {
+      const epoch = profileEpoch.current
+      const generation = providerRefreshGeneration.current + 1
+      providerRefreshGeneration.current = generation
+
+      setSelectedProvider(provider)
+      // A model is scoped to its provider. Clear it before the new provider's
+      // inventory is rendered so withActive-style fallback behavior cannot
+      // surface an impossible provider/model pair.
+      setSelectedModel('')
+
+      const row = providers.find(entry => entry.slug === provider)
+
+      // Normal Settings loads avoid probing every saved custom endpoint. An
+      // explicit user selection is the right time to refresh that endpoint's
+      // discovered catalog.
+      if (!row?.is_user_defined) {
+        return
+      }
+
+      try {
+        const options = await getGlobalModelOptions({ refresh: true })
+
+        if (profileEpoch.current !== epoch || providerRefreshGeneration.current !== generation) {
+          return
+        }
+
+        setProviders(options.providers || [])
+      } catch (err) {
+        if (profileEpoch.current === epoch && providerRefreshGeneration.current === generation) {
+          setError(err instanceof Error ? err.message : String(err))
+        }
+      }
+    },
+    [providers]
+  )
 
   // An unconfigured provider was picked: no credentials yet, so there are no
   // models to choose. `api_key` providers can be activated inline (paste key);
@@ -789,7 +828,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile = null }: Model
       <section>
         <p className="mb-3 text-xs text-muted-foreground">{m.appliesDesc}</p>
         <div className="flex flex-wrap items-center gap-2">
-          <Select onValueChange={setSelectedProvider} value={selectedProvider}>
+          <Select onValueChange={value => void selectMainProvider(value)} value={selectedProvider}>
             <SelectTrigger className={cn('min-w-40', CONTROL_TEXT)}>
               <SelectValue placeholder={m.provider} />
             </SelectTrigger>
@@ -838,7 +877,7 @@ export function ModelSettings({ onMainModelChanged, scopeProfile = null }: Model
                   <SelectValue placeholder={m.model} />
                 </SelectTrigger>
                 <SelectContent>
-                  {withActive(selectedProviderModels, selectedModel).map(model => (
+                  {selectedProviderModels.map(model => (
                     <SelectItem key={model} value={model}>
                       {model}
                     </SelectItem>
