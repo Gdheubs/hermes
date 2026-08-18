@@ -550,6 +550,15 @@ class MemoryManager:
         if provider.name == "builtin":
             return provider.prefetch(query, session_id=session_id)
 
+        # The existing per-provider thread skip (below) prevents sending a
+        # second query to a provider whose prefetch is still in flight. When
+        # that thread times out, the sensitive query has ALREADY been sent to
+        # the external provider and cannot be revoked (the daemon thread is
+        # not cancellable) — see #84263. We surface that exposure explicitly
+        # in the timeout path so the operator knows the context may be held by
+        # a provider we could not recall, while still allowing the provider to
+        # recover on later turns once its stuck call completes.
+
         result_box: Dict[str, str] = {}
         error_box: Dict[str, Exception] = {}
 
@@ -584,9 +593,15 @@ class MemoryManager:
 
         thread.join(self._external_prefetch_timeout)
         if thread.is_alive():
+            # The query has already been sent to the external provider and the
+            # daemon thread cannot be aborted — the sensitive context may be
+            # held by a provider we could not recall (#84263). Surface this
+            # exposure explicitly; the provider is allowed to recover once its
+            # stuck call returns.
             logger.warning(
-                "Memory provider '%s' prefetch timed out after %.1fs; skipping it until "
-                "the stuck call returns",
+                "Memory provider '%s' prefetch timed out after %.1fs; its "
+                "thread remains running and the query context it received "
+                "cannot be revoked (non-cancellable external provider, #84263)",
                 provider.name,
                 self._external_prefetch_timeout,
             )
