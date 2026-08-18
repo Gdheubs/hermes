@@ -39,6 +39,10 @@ describe('settings helpers', () => {
     expect(enumOptionsFor('memory.provider', 'honcho', {})).toBeUndefined()
   })
 
+  it('does not shadow discovery-driven terminal backend options', () => {
+    expect(enumOptionsFor('terminal.backend', 'coder', {})).toBeUndefined()
+  })
+
   describe('isExternalMemoryProvider', () => {
     it('treats only real plugin names as external providers', () => {
       expect(isExternalMemoryProvider('honcho')).toBe(true)
@@ -122,12 +126,24 @@ describe('settings helpers', () => {
     })
   })
 
-  it('reads and writes nested config paths', () => {
-    const config: HermesConfigRecord = { display: { theme: 'mono' } }
-    const next = setNested(config, 'display.theme', 'slate')
+  it('reads and writes nested config paths without dropping unknown plugin config', () => {
+    const config: HermesConfigRecord = {
+      display: { theme: 'mono' },
+      terminal: {
+        backend: 'coder',
+        backends: {
+          coder: { workspace: 'development', token: 'keep-me' },
+          another_plugin: { future_option: true }
+        }
+      }
+    }
 
-    expect(getNested(next, 'display.theme')).toBe('slate')
-    expect(getNested(config, 'display.theme')).toBe('mono')
+    const next = setNested(config, 'terminal.backends.coder.workspace', 'production')
+
+    expect(getNested(next, 'terminal.backends.coder.workspace')).toBe('production')
+    expect(getNested(next, 'terminal.backends.coder.token')).toBe('keep-me')
+    expect(getNested(next, 'terminal.backends.another_plugin.future_option')).toBe(true)
+    expect(getNested(config, 'terminal.backends.coder.workspace')).toBe('development')
   })
 
   it('rejects prototype-polluting config paths', () => {
@@ -203,11 +219,6 @@ describe('settings helpers', () => {
       expect(enumOptionsFor('stt.openai.model', 'whisper-1', config)).toContain('gpt-4o-transcribe')
       expect(enumOptionsFor('tts.openai.model', 'gpt-4o-mini-tts', config)).toContain('tts-1-hd')
       expect(enumOptionsFor('tts.neutts.device', 'cpu', config)).toEqual(['cpu', 'cuda', 'mps'])
-    })
-
-    it('renders a dropdown for the terminal execution backend', () => {
-      const opts = enumOptionsFor('terminal.backend', 'local', config)
-      expect(opts).toEqual(['local', 'docker', 'singularity', 'modal', 'daytona', 'ssh'])
     })
 
     it('narrows OpenAI TTS voice suggestions to what the selected model supports', () => {
@@ -331,6 +342,30 @@ describe('settings helpers', () => {
   })
 
   describe('sectionFieldEntries', () => {
+    it('shows config fields declared by the selected terminal backend', () => {
+      const schema = {
+        'terminal.backend': { type: 'select' as const, options: ['local', 'coder', 'modal'] },
+        'terminal.backends.coder.workspace': {
+          type: 'string' as const,
+          terminal_backend: 'coder'
+        },
+        'terminal.modal_mode': {
+          type: 'select' as const,
+          options: ['auto', 'direct', 'managed'],
+          terminal_backend: 'modal'
+        }
+      }
+
+      const config: HermesConfigRecord = {
+        terminal: { backend: 'coder', backends: { coder: { workspace: 'development' } } }
+      }
+
+      const advancedKeys = (sectionFieldEntries(schema, config).get('advanced') ?? []).map(([key]) => key)
+
+      expect(advancedKeys).toContain('terminal.backends.coder.workspace')
+      expect(advancedKeys).not.toContain('terminal.modal_mode')
+    })
+
     it('renders memory.provider from config even when the backend schema omits it', () => {
       const schema = { 'memory.memory_enabled': { type: 'boolean' as const } }
       const config: HermesConfigRecord = { memory: { memory_enabled: true, provider: '' } }

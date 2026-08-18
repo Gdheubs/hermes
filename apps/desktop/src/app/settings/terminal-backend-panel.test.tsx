@@ -5,6 +5,7 @@ import type { TerminalBackendsResponse } from '@/types/hermes'
 
 const getTerminalBackends = vi.fn()
 const selectTerminalBackend = vi.fn()
+const setHermesConfigCache = vi.fn()
 
 vi.mock('@/hermes', () => ({
   getTerminalBackends: () => getTerminalBackends(),
@@ -14,6 +15,10 @@ vi.mock('@/hermes', () => ({
 vi.mock('@/store/notifications', () => ({
   notify: vi.fn(),
   notifyError: vi.fn()
+}))
+
+vi.mock('../hooks/use-config-record', () => ({
+  setHermesConfigCache: (next: unknown) => setHermesConfigCache(next)
 }))
 
 function backends(overrides: Partial<TerminalBackendsResponse> = {}): TerminalBackendsResponse {
@@ -98,6 +103,13 @@ describe('TerminalBackendPanel', () => {
 
     await waitFor(() => expect(selectTerminalBackend).toHaveBeenCalledWith('ssh'))
     await waitFor(() => expect(onConfiguredChange).toHaveBeenCalled())
+    expect(setHermesConfigCache).toHaveBeenCalledTimes(1)
+
+    const updateCache = setHermesConfigCache.mock.calls[0][0] as (
+      current: Record<string, unknown> | undefined
+    ) => Record<string, unknown> | undefined
+
+    expect(updateCache({ terminal: { backend: 'local' } })).toEqual({ terminal: { backend: 'ssh' } })
     // Active highlight moves without a refetch.
     const ssh = screen.getByRole('button', { name: /SSH/ })
     expect(ssh.getAttribute('aria-pressed')).toBe('true')
@@ -113,6 +125,27 @@ describe('TerminalBackendPanel', () => {
     await waitFor(() => expect(selectTerminalBackend).toHaveBeenCalledWith('docker'))
     // The guidance detail stays visible on the now-active row.
     expect(screen.getByText(/Docker daemon not reachable/)).toBeTruthy()
+  })
+
+  it('defensively renders malformed picker text from an external response', async () => {
+    getTerminalBackends.mockResolvedValue({
+      active: 'coder',
+      backends: [
+        {
+          name: 'coder',
+          label: { malformed: true },
+          description: ['malformed'],
+          active: true,
+          status: 'needs_setup',
+          detail: { malformed: true }
+        }
+      ]
+    } as unknown as TerminalBackendsResponse)
+    const { TerminalBackendPanel } = await import('./terminal-backend-panel')
+
+    render(<TerminalBackendPanel onConfiguredChange={vi.fn()} />)
+
+    expect(await screen.findByText('coder')).toBeTruthy()
   })
 
   it('does not re-select the already active backend', async () => {

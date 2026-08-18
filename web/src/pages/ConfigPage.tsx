@@ -38,6 +38,7 @@ import {
 } from "lucide-react";
 import { api } from "@/lib/api";
 import { getNestedValue, setNestedValue } from "@/lib/nested";
+import { useProfileScope } from "@/contexts/useProfileScope";
 import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { Toast } from "@nous-research/ui/ui/components/toast";
 import { AutoField } from "@/components/AutoField";
@@ -102,31 +103,44 @@ function CategoryIcon({
 /* ------------------------------------------------------------------ */
 
 export default function ConfigPage() {
+  const { profile } = useProfileScope();
   const [config, setConfig] = useState<Record<string, unknown> | null>(null);
+  const [configLoadedProfile, setConfigLoadedProfile] = useState<string | null>(null);
   const [schema, setSchema] = useState<Record<
     string,
     Record<string, unknown>
   > | null>(null);
+  const [schemaLoadedProfile, setSchemaLoadedProfile] = useState<string | null>(null);
   const [categoryOrder, setCategoryOrder] = useState<string[]>([]);
   const [defaults, setDefaults] = useState<Record<string, unknown> | null>(
     null,
   );
+  const [defaultsLoadedProfile, setDefaultsLoadedProfile] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [yamlMode, setYamlMode] = useState(false);
   const [yamlText, setYamlText] = useState("");
   const [yamlLoading, setYamlLoading] = useState(false);
+  const [yamlLoadedProfile, setYamlLoadedProfile] = useState<string | null>(null);
   const [yamlSaving, setYamlSaving] = useState(false);
   const [configPath, setConfigPath] = useState<string | null>(null);
+  const [configPathProfile, setConfigPathProfile] = useState<string | null>(null);
   const [activeCategory, setActiveCategory] = useState<string>("");
   const [confirmReset, setConfirmReset] = useState(false);
   const { toast, showToast } = useToast();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const profileGenerationRef = useRef(0);
+  const ownsForm =
+    configLoadedProfile === profile && schemaLoadedProfile === profile;
   const { t } = useI18n();
   const { setEnd } = usePageHeader();
 
   useLayoutEffect(() => {
-    if (!config || !schema) {
+    profileGenerationRef.current += 1;
+  }, [profile]);
+
+  useLayoutEffect(() => {
+    if (!ownsForm || !config || !schema) {
       setEnd(null);
       return;
     }
@@ -153,7 +167,7 @@ export default function ConfigPage() {
       </div>,
     );
     return () => setEnd(null);
-  }, [config, schema, searchQuery, setEnd, t.common.clear, t.common.search]);
+  }, [config, ownsForm, schema, searchQuery, setEnd, t.common.clear, t.common.search]);
 
   function prettyCategoryName(cat: string): string {
     const key = cat as keyof typeof t.config.categories;
@@ -162,13 +176,38 @@ export default function ConfigPage() {
   }
 
   useEffect(() => {
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) return;
+      setConfig(null);
+      setConfigLoadedProfile(null);
+      setSchema(null);
+      setSchemaLoadedProfile(null);
+      setDefaults(null);
+      setDefaultsLoadedProfile(null);
+      setCategoryOrder([]);
+      setActiveCategory("");
+      setConfigPath(null);
+      setConfigPathProfile(null);
+      setYamlText("");
+      setYamlLoadedProfile(null);
+      setSaving(false);
+      setYamlSaving(false);
+      setConfirmReset(false);
+    });
     api
       .getConfig()
-      .then(setConfig)
+      .then((value) => {
+        if (!cancelled) {
+          setConfig(value);
+          setConfigLoadedProfile(profile);
+        }
+      })
       .catch(() => {});
     api
       .getSchema()
       .then((resp) => {
+        if (cancelled) return;
         // memory.provider has a dedicated management UI on the Plugins page
         // (provider cards + guided setup/switch flow). Hide it from the
         // generic config form so the two surfaces don't fight; the schema
@@ -179,12 +218,18 @@ export default function ConfigPage() {
         >;
         delete fields["memory.provider"];
         setSchema(fields);
+        setSchemaLoadedProfile(profile);
         setCategoryOrder(resp.category_order ?? []);
       })
       .catch(() => {});
     api
       .getDefaults()
-      .then(setDefaults)
+      .then((value) => {
+        if (!cancelled) {
+          setDefaults(value);
+          setDefaultsLoadedProfile(profile);
+        }
+      })
       .catch(() => {});
     // getConfigRaw is profile-scoped (fetchJSON appends ?profile=), so its
     // `path` reflects the switched profile's config.yaml. /api/status's
@@ -193,14 +238,25 @@ export default function ConfigPage() {
     api
       .getConfigRaw()
       .then((resp) => {
-        if (resp.path) setConfigPath(resp.path);
+        if (!cancelled && resp.path) {
+          setConfigPath(resp.path);
+          setConfigPathProfile(profile);
+        }
       })
       .catch(() => {});
     api
       .getStatus()
-      .then((resp) => setConfigPath((prev) => prev ?? resp.config_path))
+      .then((resp) => {
+        if (!cancelled) {
+          setConfigPath((prev) => prev ?? resp.config_path);
+          setConfigPathProfile((prev) => prev ?? profile);
+        }
+      })
       .catch(() => {});
-  }, []);
+    return () => {
+      cancelled = true;
+    };
+  }, [profile]);
 
   // Set active category when categories load
   useEffect(() => {
@@ -211,15 +267,29 @@ export default function ConfigPage() {
 
   // Load YAML when switching to YAML mode
   useEffect(() => {
+    let cancelled = false;
     if (yamlMode) {
+      setYamlLoadedProfile(null);
       setYamlLoading(true);
       api
         .getConfigRaw()
-        .then((resp) => setYamlText(resp.yaml))
-        .catch(() => showToast(t.config.failedToLoadRaw, "error"))
-        .finally(() => setYamlLoading(false));
+        .then((resp) => {
+          if (!cancelled) {
+            setYamlText(resp.yaml);
+            setYamlLoadedProfile(profile);
+          }
+        })
+        .catch(() => {
+          if (!cancelled) showToast(t.config.failedToLoadRaw, "error");
+        })
+        .finally(() => {
+          if (!cancelled) setYamlLoading(false);
+        });
     }
-  }, [yamlMode]);
+    return () => {
+      cancelled = true;
+    };
+  }, [profile, showToast, t.config.failedToLoadRaw, yamlMode]);
 
   /* ---- Categories ---- */
   const categories = useMemo(() => {
@@ -277,36 +347,48 @@ export default function ConfigPage() {
 
   /* ---- Handlers ---- */
   const handleSave = async () => {
-    if (!config) return;
+    if (!config || !ownsForm) return;
+    const generation = profileGenerationRef.current;
     setSaving(true);
     try {
       await api.saveConfig(config);
-      showToast(t.config.configSaved, "success");
+      if (profileGenerationRef.current === generation) {
+        showToast(t.config.configSaved, "success");
+      }
     } catch (e) {
-      showToast(`${t.config.failedToSave}: ${e}`, "error");
+      if (profileGenerationRef.current === generation) {
+        showToast(`${t.config.failedToSave}: ${e}`, "error");
+      }
     } finally {
-      setSaving(false);
+      if (profileGenerationRef.current === generation) setSaving(false);
     }
   };
 
   const handleYamlSave = async () => {
+    if (yamlLoading || yamlLoadedProfile !== profile) return;
+    const generation = profileGenerationRef.current;
     setYamlSaving(true);
     try {
       await api.saveConfigRaw(yamlText);
+      if (profileGenerationRef.current !== generation) return;
       showToast(t.config.yamlConfigSaved, "success");
-      api
-        .getConfig()
-        .then(setConfig)
-        .catch(() => {});
+      const refreshed = await api.getConfig();
+      if (profileGenerationRef.current === generation) {
+        setConfig(refreshed);
+        setConfigLoadedProfile(profile);
+      }
     } catch (e) {
-      showToast(`${t.config.failedToSaveYaml}: ${e}`, "error");
+      if (profileGenerationRef.current === generation) {
+        showToast(`${t.config.failedToSaveYaml}: ${e}`, "error");
+      }
     } finally {
-      setYamlSaving(false);
+      if (profileGenerationRef.current === generation) setYamlSaving(false);
     }
   };
 
   const handleReset = () => {
-    if (!defaults || !config) return;
+    if (!defaults || !config || !ownsForm || defaultsLoadedProfile !== profile)
+      return;
     // Scope the reset to what the user is currently looking at:
     //   - search mode → the matched fields
     //   - form mode   → the active category's fields
@@ -319,7 +401,8 @@ export default function ConfigPage() {
   };
 
   const executeReset = () => {
-    if (!defaults || !config) return;
+    if (!defaults || !config || !ownsForm || defaultsLoadedProfile !== profile)
+      return;
     setConfirmReset(false);
     const scopedFields = isSearching ? searchMatchedFields : activeFields;
     if (scopedFields.length === 0) return;
@@ -338,7 +421,7 @@ export default function ConfigPage() {
   };
 
   const handleExport = () => {
-    if (!config) return;
+    if (!config || configLoadedProfile !== profile) return;
     const blob = new Blob([JSON.stringify(config, null, 2)], {
       type: "application/json",
     });
@@ -351,13 +434,17 @@ export default function ConfigPage() {
   };
 
   const handleImport = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (!ownsForm) return;
     const file = e.target.files?.[0];
     if (!file) return;
+    const generation = profileGenerationRef.current;
     const reader = new FileReader();
     reader.onload = () => {
+      if (profileGenerationRef.current !== generation) return;
       try {
         const imported = JSON.parse(reader.result as string);
         setConfig(imported);
+        setConfigLoadedProfile(profile);
         showToast(t.config.configImported, "success");
       } catch {
         showToast(t.config.invalidJson, "error");
@@ -367,7 +454,7 @@ export default function ConfigPage() {
   };
 
   /* ---- Loading ---- */
-  if (!config || !schema) {
+  if (!config || !schema || !ownsForm) {
     return (
       <div className="flex items-center justify-center py-24">
         <Spinner className="text-2xl text-primary" />
@@ -439,7 +526,8 @@ export default function ConfigPage() {
         <div className="flex min-w-0 items-center gap-2 sm:flex-1">
           <Settings2 className="h-4 w-4 shrink-0 text-muted-foreground" />
           <code className="min-w-0 flex-1 break-words text-xs text-muted-foreground bg-muted/50 px-2 py-0.5">
-            {configPath ?? t.config.configPath}
+            {(configPathProfile === profile ? configPath : null) ??
+              t.config.configPath}
           </code>
         </div>
         <div className="flex flex-wrap items-center gap-1.5 sm:shrink-0">
@@ -506,7 +594,9 @@ export default function ConfigPage() {
               size="sm"
               className="uppercase"
               onClick={handleYamlSave}
-              disabled={yamlSaving}
+              disabled={
+                yamlSaving || yamlLoading || yamlLoadedProfile !== profile
+              }
             >
               {yamlSaving ? t.common.saving : t.common.save}
             </Button>
@@ -515,7 +605,7 @@ export default function ConfigPage() {
               size="sm"
               className="uppercase"
               onClick={handleSave}
-              disabled={saving}
+              disabled={saving || !ownsForm}
             >
               {saving ? t.common.saving : t.common.save}
             </Button>
@@ -532,7 +622,7 @@ export default function ConfigPage() {
             </CardTitle>
           </CardHeader>
           <CardContent className="p-0">
-            {yamlLoading ? (
+            {yamlLoading || yamlLoadedProfile !== profile ? (
               <div className="flex items-center justify-center py-12">
                 <Spinner className="text-xl text-primary" />
               </div>

@@ -114,7 +114,9 @@ export function AutoField({
   }
 
   if (schema.type === "select") {
-    const options = (schema.options as string[]) ?? [];
+    const options = Array.isArray(schema.options)
+      ? schema.options.filter((option): option is string => typeof option === "string")
+      : [];
     return (
       <div className="grid gap-1.5">
         <Label className="text-sm">{label}</Label>

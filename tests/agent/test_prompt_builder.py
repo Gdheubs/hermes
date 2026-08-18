@@ -817,7 +817,18 @@ class TestEnvironmentHints:
         _pb._clear_backend_probe_cache()
         assert f"Current working directory: {tmp_path}" in _pb.build_environment_hints()
 
-
+    def test_build_environment_hints_uses_live_probe_when_available(self, monkeypatch):
+        """When the probe succeeds, its output must appear in the hint block."""
+        import agent.prompt_builder as _pb
+        monkeypatch.setattr(_pb, "is_wsl", lambda: False)
+        monkeypatch.setenv("TERMINAL_ENV", "modal")
+        fake_probe_output = "  OS: Linux 6.8.0\n  User: root\n  Home: /root\n  Working directory: /workspace"
+        monkeypatch.setattr(_pb, "_probe_remote_backend", lambda _t: fake_probe_output)
+        _pb._clear_backend_probe_cache()
+        result = _pb.build_environment_hints()
+        assert "Terminal backend: modal" in result
+        assert "Linux 6.8.0" in result
+        assert "/workspace" in result
     def test_probe_remote_backend_imports_real_factory(self, monkeypatch):
         """Regression for #53667: the probe imported a nonexistent
         ``get_environment`` from ``tools.environments`` and always died with
@@ -842,18 +853,32 @@ class TestEnvironmentHints:
                 }
 
         created = {}
+        backend_config = {"workspace_name": "prompt-probe-workspace"}
 
         def _fake_create_environment(*, env_type, **kwargs):
             created["env_type"] = env_type
+            created["backend_config"] = kwargs.get("backend_config")
             return _FakeEnv()
 
         # Patch the REAL factory in tools.terminal_tool — the probe imports it
         # locally, so the import itself must succeed (the bug was here).
         import tools.terminal_tool as _tt
         monkeypatch.setattr(_tt, "_create_environment", _fake_create_environment)
+        monkeypatch.setattr(
+            _tt,
+            "_get_env_config",
+            lambda: {
+                "env_type": "docker",
+                "cwd": "/workspace",
+                "timeout": 180,
+                "host_cwd": None,
+                "backend_config": backend_config,
+            },
+        )
 
         line = _pb._probe_remote_backend("docker")
         assert created.get("env_type") == "docker"
+        assert created.get("backend_config") == backend_config
         assert line is not None
         assert "Linux 6.8.0" in line
         assert "root" in line
@@ -873,14 +898,12 @@ class TestEnvironmentHints:
 
 
 
-    def test_remote_backend_list_covers_known_sandboxes(self):
-        """Regression guard: if someone adds a remote backend, they must list it here."""
+    def test_registered_capabilities_cover_known_sandboxes(self):
+        """Built-in remote capabilities suppress misleading host information."""
         import agent.prompt_builder as _pb
         for backend in ("docker", "singularity", "modal", "daytona", "ssh", "vercel_sandbox"):
-            assert backend in _pb._REMOTE_TERMINAL_BACKENDS, (
-                f"{backend!r} must be in _REMOTE_TERMINAL_BACKENDS so its host "
-                f"info is suppressed in the system prompt"
-            )
+            assert _pb._is_remote_terminal_backend(backend) is True
+        assert _pb._is_remote_terminal_backend("local") is False
 
 
 # =========================================================================
