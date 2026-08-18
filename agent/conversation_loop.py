@@ -83,6 +83,9 @@ from agent.prompt_caching import (
 )
 from agent.retry_utils import (
     adaptive_rate_limit_backoff,
+    capacity_overload_backoff,
+    capacity_overload_retry_ceiling,
+    is_capacity_overload_error,
     is_zai_coding_overload_error,
     jittered_backoff,
     zai_coding_overload_retry_ceiling,
@@ -5220,9 +5223,22 @@ def run_conversation(
                 )
                 if _is_zai_coding_overload:
                     max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
+                # #68771: generic 503/529 "upstream capacity limits" overloads
+                # get the same shape of treatment as Z.AI overloads — a
+                # bounded long-backoff window on the PRIMARY before the
+                # fallback chain activates. Capacity outages often clear in
+                # seconds-to-minutes; falling back (or giving up when no
+                # fallback chain exists) after one ~2s retry is too eager.
+                _is_capacity_overload = is_capacity_overload_error(api_error)
+                if _is_capacity_overload:
+                    max_retries = max(max_retries, capacity_overload_retry_ceiling())
                 _should_fallback = (
                     is_rate_limited
-                    or (_is_transport_failure and retry_count >= 2)
+                    or (
+                        _is_transport_failure
+                        and retry_count >= 2
+                        and not _is_capacity_overload
+                    )
                 )
                 if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
                     # Don't eagerly fallback if credential pool rotation may
@@ -6343,7 +6359,7 @@ def run_conversation(
                                 pass
                 wait_time = _retry_after if _retry_after else jittered_backoff(retry_count, base_delay=2.0, max_delay=60.0)
                 _backoff_policy = None
-                if (is_rate_limited or _is_zai_coding_overload) and not _retry_after:
+                if (is_rate_limited or _is_zai_coding_overload or _is_capacity_overload) and not _retry_after:
                     wait_time, _backoff_policy = adaptive_rate_limit_backoff(
                         retry_count,
                         base_url=str(_base),
@@ -6351,18 +6367,28 @@ def run_conversation(
                         error=api_error,
                         default_wait=wait_time,
                     )
-                if is_rate_limited or _is_zai_coding_overload:
+                    if _is_capacity_overload and _backoff_policy is None:
+                        # adaptive_rate_limit_backoff only fires for Z.AI
+                        # overloads; apply the generic capacity schedule.
+                        wait_time, _backoff_policy = capacity_overload_backoff(
+                            retry_count, wait_time
+                        )
+                if is_rate_limited or _is_zai_coding_overload or _is_capacity_overload:
                     _policy_note = ""
                     if _backoff_policy == "zai_coding_overload_long":
                         _policy_note = " (Z.AI Coding overload adaptive long backoff)"
                     elif _backoff_policy == "zai_coding_overload_short":
                         _policy_note = " (Z.AI Coding overload short retry)"
-                    _wait_reason = "Provider overloaded" if _is_zai_coding_overload and not is_rate_limited else "Rate limited"
+                    elif _backoff_policy == "capacity_overload_long":
+                        _policy_note = " (upstream capacity overload — waiting for the model to come back)"
+                    elif _backoff_policy == "capacity_overload_short":
+                        _policy_note = " (upstream capacity overload short retry)"
+                    _wait_reason = "Provider overloaded" if (_is_zai_coding_overload or _is_capacity_overload) and not is_rate_limited else "Rate limited"
                     _rate_limit_status = f"⏱️ {_wait_reason}. Waiting {wait_time:.1f}s (attempt {retry_count + 1}/{max_retries}){_policy_note}..."
                     # Normal retries are buffered to avoid noisy transient chatter. Long
-                    # Z.AI Coding waits are different: they can last minutes, so surface
-                    # progress immediately instead of making the TUI look frozen.
-                    if _backoff_policy == "zai_coding_overload_long":
+                    # Z.AI Coding / capacity waits are different: they can last minutes, so
+                    # surface progress immediately instead of making the TUI look frozen.
+                    if _backoff_policy in ("zai_coding_overload_long", "capacity_overload_long"):
                         agent._emit_status(_rate_limit_status)
                     else:
                         agent._buffer_status(_rate_limit_status)

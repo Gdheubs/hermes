@@ -34,6 +34,20 @@ _ZAI_CODING_OVERLOAD_LONG_BACKOFF = (30.0, 60.0, 90.0, 120.0)
 # the two from silently desyncing if the short-retry count is ever tuned.
 _ZAI_CODING_OVERLOAD_SHORT_ATTEMPTS = 3
 
+# #68771: generic provider 503/529 "upstream capacity limits" overloads.
+# Capacity outages typically last tens of seconds to a few minutes, so a
+# single ~2s retry followed by eager fallback (or give-up when no fallback
+# chain exists) is too aggressive. Keep the first retry on the normal short
+# schedule, then walk a longer backoff table so the primary gets a few
+# retries over ~75s before the fallback chain activates.
+_CAPACITY_OVERLOAD_LONG_BACKOFF = (5.0, 10.0, 20.0, 40.0)
+
+# Number of initial short retries before the capacity long-backoff tier
+# kicks in. Shared by ``capacity_overload_backoff`` and
+# ``capacity_overload_retry_ceiling`` for the same desync-prevention reason
+# as the Z.AI constants above.
+_CAPACITY_OVERLOAD_SHORT_ATTEMPTS = 1
+
 
 def parse_retry_after_seconds(value_or_headers: Any) -> Optional[float]:
     """Parse a ``Retry-After`` value into non-negative seconds.
@@ -206,3 +220,50 @@ def zai_coding_overload_retry_ceiling(short_attempts: int = _ZAI_CODING_OVERLOAD
     value for Z.AI Coding overload 429s so the 30/60/90/120s waits run.
     """
     return short_attempts + len(_ZAI_CODING_OVERLOAD_LONG_BACKOFF) + 1
+
+
+def is_capacity_overload_error(error: Any) -> bool:
+    """True when ``error`` is a provider 503/529 overload.
+
+    Status-code based — the reliable signal; message wording varies wildly
+    across providers (Anthropic/OpenRouter: "temporarily unavailable due to
+    upstream capacity limits"; Cloudflare 529: origin overload). 503 Service
+    Unavailable and Cloudflare 529 both mean the model cannot serve right now
+    but may recover in seconds-to-minutes.
+    """
+    return getattr(error, "status_code", None) in {503, 529}
+
+
+def capacity_overload_backoff(attempt: int, default_wait: float) -> tuple[float, str | None]:
+    """Adaptive 503/529 overload backoff.
+
+    The first retry keeps the caller's default wait (normal short schedule);
+    subsequent attempts walk ``_CAPACITY_OVERLOAD_LONG_BACKOFF`` (5/10/20/40s)
+    with light jitter, so a capacity outage gets a few retries over roughly a
+    minute instead of one quick retry then fallback.
+
+    ``attempt`` is 1-based, matching the retry loop's logged attempt number.
+    Returns ``(wait_seconds, policy_label)``.
+    """
+    if attempt <= _CAPACITY_OVERLOAD_SHORT_ATTEMPTS:
+        return default_wait, "capacity_overload_short"
+    idx = min(
+        attempt - _CAPACITY_OVERLOAD_SHORT_ATTEMPTS - 1,
+        len(_CAPACITY_OVERLOAD_LONG_BACKOFF) - 1,
+    )
+    base_delay = _CAPACITY_OVERLOAD_LONG_BACKOFF[idx]
+    return (
+        jittered_backoff(1, base_delay=base_delay, max_delay=base_delay, jitter_ratio=0.2),
+        "capacity_overload_long",
+    )
+
+
+def capacity_overload_retry_ceiling(short_attempts: int = _CAPACITY_OVERLOAD_SHORT_ATTEMPTS) -> int:
+    """Retry-loop ceiling needed for the full capacity backoff schedule.
+
+    Same rationale as ``zai_coding_overload_retry_ceiling``: the retry loop
+    gives up as soon as ``retry_count >= ceiling`` and that check runs before
+    the attempt's backoff is computed, so the ceiling must sit one past the
+    final long-backoff entry for every long tier to execute.
+    """
+    return short_attempts + len(_CAPACITY_OVERLOAD_LONG_BACKOFF) + 1
