@@ -165,6 +165,34 @@ class TestAppendMessagesBatch:
         with pytest.raises(CompressionSessionClosedError):
             db.append_messages_batch("sess-batch", _turn_messages())
 
+    def test_reset_closed_session_rejected(self, db):
+        """``/new`` ends the parent as session_reset, not compression.
+
+        maclab 2026-08-13: a stale TUI ``--resume`` on that parent kept
+        flushing the full in-memory transcript (25k → 126k rows) because
+        the write guard only blocked ``end_reason='compression'``.
+        """
+        db._conn.execute(
+            "UPDATE sessions SET ended_at = 1.0, end_reason = 'session_reset' "
+            "WHERE id = ?",
+            ("sess-batch",),
+        )
+        db._conn.commit()
+        with pytest.raises(CompressionSessionClosedError):
+            db.append_messages_batch("sess-batch", _turn_messages())
+
+    def test_user_exit_session_still_writable(self, db):
+        """Hygiene / user_exit is not a lineage boundary — fixtures and
+        post-close bookkeeping may still append. Only /new + compression
+        (and the other reset reasons) must reject."""
+        db._conn.execute(
+            "UPDATE sessions SET ended_at = 1.0, end_reason = 'user_exit' "
+            "WHERE id = ?",
+            ("sess-batch",),
+        )
+        db._conn.commit()
+        assert db.append_messages_batch("sess-batch", _turn_messages()) == 4
+
     def test_multimodal_content_encoded(self, db):
         msgs = [
             {

@@ -44,6 +44,27 @@ def test_find_live_compression_child_fails_closed_when_ambiguous(db: SessionDB) 
     assert db.find_live_compression_child("parent") is None
 
 
+def test_find_live_child_adopts_session_reset_parent(db: SessionDB) -> None:
+    """``/new`` parents the live continuation under a session_reset row.
+
+    Adoption must still find that unique live child. Restricting the lookup
+    to ``end_reason='compression'`` left the stale resume on the corpse and
+    let compress/publish raise ``Compression parent already ended``.
+    """
+    db.create_session("reset-parent", source="discord")
+    db.append_message("reset-parent", "user", "old work")
+    db.end_session("reset-parent", "session_reset")
+    db.create_session(
+        "reset-child", source="discord", parent_session_id="reset-parent"
+    )
+
+    child = db.find_live_compression_child("reset-parent")
+
+    assert child is not None
+    assert child["id"] == "reset-child"
+    assert child["ended_at"] is None
+
+
 def test_reopen_orphaned_compression_session_reopens_parent_without_child(
     db: SessionDB,
 ) -> None:

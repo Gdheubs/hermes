@@ -1830,3 +1830,56 @@ def test_exact_cooldown_restore_api_propagates_sqlite_write_failure(
                 "error": "must propagate",
             },
         )
+
+
+def test_compress_adopts_child_of_session_reset_parent(tmp_path: Path) -> None:
+    """No.1 2026-08-13: ``/new`` left a 252k-row corpse; stale TUI resume
+    still compressed it, hit ``Compression parent already ended``, rolled
+    back, and flushed the full transcript back onto the closed parent.
+
+    Compress must adopt the live ``/new`` child and never call the
+    compressor (or publish) against the reset parent.
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "RESET_PARENT"
+    child_sid = "RESET_CHILD"
+    db.create_session(parent_sid, source="discord")
+    for i in range(20):
+        db.append_message(parent_sid, "user", f"old{i}")
+    db.end_session(parent_sid, "session_reset")
+    db.create_session(child_sid, source="discord", parent_session_id=parent_sid)
+    db.append_message(child_sid, "user", "fresh")
+
+    agent = _build_agent_with_db(db, parent_sid)
+    stale = [{"role": "user", "content": f"old{i}"} for i in range(20)]
+    returned, _system_prompt = agent._compress_context(
+        stale, "sys", approx_tokens=120_000
+    )
+
+    assert agent.session_id == child_sid
+    assert [m["content"] for m in returned] == ["fresh"]
+    agent.context_compressor.compress.assert_not_called()
+    assert db.get_session(parent_sid)["message_count"] == 20
+    assert db.get_session(parent_sid)["end_reason"] == "session_reset"
+    assert _count_children(db, parent_sid) == 1
+
+
+def test_compress_skips_session_reset_parent_without_child(tmp_path: Path) -> None:
+    """Reset parent with no continuation must skip, not publish a child."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "RESET_ORPHAN"
+    db.create_session(parent_sid, source="discord")
+    db.append_message(parent_sid, "user", "old")
+    db.end_session(parent_sid, "session_reset")
+
+    agent = _build_agent_with_db(db, parent_sid)
+    returned, _system_prompt = agent._compress_context(
+        [{"role": "user", "content": "old"}],
+        "sys",
+        approx_tokens=120_000,
+    )
+
+    assert agent.session_id == parent_sid
+    assert returned == [{"role": "user", "content": "old"}]
+    agent.context_compressor.compress.assert_not_called()
+    assert _count_children(db, parent_sid) == 0

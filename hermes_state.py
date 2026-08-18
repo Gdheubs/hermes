@@ -2642,14 +2642,31 @@ def load_fts5_cjk_extension(conn: sqlite3.Connection) -> bool:
 
 
 class CompressionSessionClosedError(RuntimeError):
-    """A durable write targeted a parent already closed by compression."""
+    """A durable write targeted a parent closed by a lineage boundary."""
 
     def __init__(self, session_id: str):
         self.session_id = session_id
         super().__init__(
-            f"Session {session_id!r} is closed by compression; "
+            f"Session {session_id!r} is already ended; "
             "adopt its live continuation before appending messages"
         )
+
+
+# Intentional conversation boundaries. A stale resume must not append or
+# compact onto these parents — adopt the unique live child instead.
+# Accidental / hygiene ends (user_exit, timeout, cli_close, agent_close,
+# done, completed, …) stay writable so fixtures and post-close bookkeeping
+# keep working.
+_LINEAGE_CLOSED_END_REASONS = frozenset({
+    "compression",
+    "session_reset",
+    "session_switch",
+    "new_session",
+    "idle",
+    "daily",
+    "suspended",
+    "resume_pending_expired",
+})
 
 
 class CompressionSessionBusyError(RuntimeError):
@@ -5515,13 +5532,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def find_live_compression_child(
         self, parent_session_id: str
     ) -> Optional[Dict[str, Any]]:
-        """Return the unique live direct child of a compression-ended session.
+        """Return the unique live direct child of an ended session.
 
-        A stale agent may observe that another compression path already rotated
-        its parent. Recovery is safe only when the durable lineage identifies
-        exactly one live direct continuation. Multiple children are treated as
-        ambiguous and fail closed rather than guessing which transcript owns
-        subsequent messages.
+        A stale agent may observe that another path already closed its parent
+        (compression rotation *or* an intentional ``/new`` / session_reset).
+        Recovery is safe only when the durable lineage identifies exactly one
+        live direct continuation. Multiple children are treated as ambiguous
+        and fail closed rather than guessing which transcript owns subsequent
+        messages.
         """
         if not parent_session_id:
             return None
@@ -5530,11 +5548,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
                 (parent_session_id,),
             ).fetchone()
-            if (
-                parent is None
-                or parent["ended_at"] is None
-                or parent["end_reason"] != "compression"
-            ):
+            if parent is None or parent["ended_at"] is None:
                 return None
             rows = self._conn.execute(
                 """
@@ -9215,7 +9229,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if (
             session is not None
             and session["ended_at"] is not None
-            and session["end_reason"] == "compression"
+            and session["end_reason"] in _LINEAGE_CLOSED_END_REASONS
         ):
             raise CompressionSessionClosedError(session_id)
 
@@ -9876,7 +9890,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if (
                 session is not None
                 and session["ended_at"] is not None
-                and session["end_reason"] == "compression"
+                and session["end_reason"] in _LINEAGE_CLOSED_END_REASONS
             ):
                 raise CompressionSessionClosedError(session_id)
             if archive_dropped:

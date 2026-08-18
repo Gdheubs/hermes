@@ -1140,16 +1140,19 @@ def _refresh_persisted_compression_guards(
 
 
 def _session_was_rotated_by_compression(session_db: Any, session_id: str) -> bool:
-    """Return whether another path already rotated this compression parent."""
+    """Return whether this session already has a durable end.
+
+    Compression rotation is the original case, but ``/new`` / session_reset
+    (and any other explicit close) must also stop a stale resume from
+    compressing or flushing onto the corpse. Adoption still requires a
+    unique live child; without one the caller skips rather than reopening
+    an intentional reset.
+    """
     getter = getattr(type(session_db), "get_session", None)
     if not callable(getter):
         return False
     session = getter(session_db, session_id)
-    return bool(
-        session
-        and session.get("ended_at") is not None
-        and session.get("end_reason") == "compression"
-    )
+    return bool(session and session.get("ended_at") is not None)
 
 
 def _emit_compression_attempt_telemetry(
