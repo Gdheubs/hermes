@@ -225,9 +225,9 @@ SCHEMA_VERSION = 26
 # reaches the current version when a DB is either born fresh or explicitly
 # optimized via ``hermes sessions optimize-storage``. A legacy DB sits at
 # layout 0 (marker absent) with a working inline index until the user opts in.
-#   1 = v23 external-content layout (content/tool_name/tool_calls,
-#       tool-row-excluded trigram)
-FTS_STORAGE_VERSION = 1
+#   1 = v23 external-content layout with a tool-row-excluded trigram
+#   2 = trigram also excludes structured tool_calls JSON
+FTS_STORAGE_VERSION = 2
 
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
@@ -544,16 +544,17 @@ END;
 # ``messages_fts`` index; they just don't get trigram (CJK substring)
 # treatment.  ``search_messages`` routes CJK queries that filter on
 # ``role='tool'`` to the LIKE fallback for the same reason.
+# Structured ``tool_calls`` JSON stays searchable through ``messages_fts``;
+# excluding it here avoids indexing repetitive JSON syntax as trigrams.
 FTS_TRIGRAM_SQL = """
 CREATE VIEW IF NOT EXISTS messages_fts_trigram_src AS
-    SELECT id, role, content, tool_name, tool_calls
+    SELECT id, role, content, tool_name
     FROM messages
     WHERE role <> 'tool';
 
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts_trigram USING fts5(
     content,
     tool_name,
-    tool_calls,
     content='messages_fts_trigram_src',
     content_rowid='id',
     tokenize='trigram'
@@ -566,8 +567,8 @@ WHEN new.role <> 'tool'
      OR new.id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
                             WHERE key = 'fts_rebuild_progress'), -1))
 BEGIN
-    INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls)
-    VALUES (new.id, new.content, new.tool_name, new.tool_calls);
+    INSERT INTO messages_fts_trigram(rowid, content, tool_name)
+    VALUES (new.id, new.content, new.tool_name);
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_delete AFTER DELETE ON messages
@@ -577,26 +578,25 @@ WHEN old.role <> 'tool'
      OR old.id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
                             WHERE key = 'fts_rebuild_progress'), -1))
 BEGIN
-    INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content, tool_name, tool_calls)
-    VALUES ('delete', old.id, old.content, old.tool_name, old.tool_calls);
+    INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content, tool_name)
+    VALUES ('delete', old.id, old.content, old.tool_name);
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update
-AFTER UPDATE OF content, tool_name, tool_calls, role ON messages
+AFTER UPDATE OF content, tool_name, role ON messages
 WHEN (old.content IS NOT new.content
     OR old.tool_name IS NOT new.tool_name
-    OR old.tool_calls IS NOT new.tool_calls
     OR old.role IS NOT new.role)
    AND (old.id > COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
                            WHERE key = 'fts_rebuild_high_water'), -1)
      OR old.id <= COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta
                             WHERE key = 'fts_rebuild_progress'), -1))
 BEGIN
-    INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content, tool_name, tool_calls)
-    SELECT 'delete', old.id, old.content, old.tool_name, old.tool_calls
+    INSERT INTO messages_fts_trigram(messages_fts_trigram, rowid, content, tool_name)
+    SELECT 'delete', old.id, old.content, old.tool_name
     WHERE old.role <> 'tool';
-    INSERT INTO messages_fts_trigram(rowid, content, tool_name, tool_calls)
-    SELECT new.id, new.content, new.tool_name, new.tool_calls
+    INSERT INTO messages_fts_trigram(rowid, content, tool_name)
+    SELECT new.id, new.content, new.tool_name
     WHERE new.role <> 'tool';
 END;
 """
