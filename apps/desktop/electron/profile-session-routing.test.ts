@@ -6,7 +6,8 @@ import {
   buildSidebarSessionSliceParams,
   fetchPrimaryProfileSessions,
   fetchRemoteProfileSessions,
-  mergeProfileSessionWindow
+  mergeProfileSessionWindow,
+  resolveProfileSessionAggregateRoute
 } from './profile-session-routing'
 
 test('remote sidebar slices all follow the selected profile', () => {
@@ -50,6 +51,45 @@ test('remote sidebar slices fall back to the all-profiles scope and default limi
     assert.equal(slices.cron.get('limit'), '50')
     assert.equal(slices.messaging.get('limit'), '100')
   }
+})
+
+test('mixed global remote and primary override reads the aggregate from the global backend', () => {
+  assert.equal(
+    resolveProfileSessionAggregateRoute({ globalRemote: true, primaryProfileRemoteOverride: true }),
+    'global-remote'
+  )
+})
+
+test('global remote without a primary override reuses the primary backend', () => {
+  assert.equal(
+    resolveProfileSessionAggregateRoute({ globalRemote: true, primaryProfileRemoteOverride: false }),
+    'primary'
+  )
+})
+
+test('mixed remote aggregate fetches bypass the primary profile override', async () => {
+  const expected = { sessions: [{ id: 'default-telegram' }], total: 1, profile_totals: { default: 1 } }
+  const calls: string[] = []
+
+  const result = await fetchPrimaryProfileSessions(
+    new URLSearchParams({ profile: 'all' }),
+    async () => {
+      calls.push('primary')
+      throw new Error('the active profile override does not serve default')
+    },
+    {
+      globalRemote: true,
+      primaryProfileRemoteOverride: true,
+      fetchJsonForGlobalRemote: async () => {
+        calls.push('global-remote')
+
+        return expected
+      }
+    }
+  )
+
+  assert.equal(result, expected)
+  assert.deepEqual(calls, ['global-remote'])
 })
 
 test('primary session reads use the profile-aware request path', async () => {
