@@ -105,6 +105,7 @@ export interface Translations {
     deleteTitle: (name: string) => string
     deleteBody: string
     pathCopied: string
+    changeCwdTitle: string
   }
 
   boot: {
