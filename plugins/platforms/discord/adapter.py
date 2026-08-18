@@ -1417,6 +1417,45 @@ class DiscordAdapter(BasePlatformAdapter):
                 await adapter_self._on_platform_thread_update(before, after)
 
             @self._client.event
+            async def on_interaction(interaction):
+                """Handle button clicks from REST-delivered cron delivery embeds."""
+                if not DISCORD_AVAILABLE:
+                    return
+                data = getattr(interaction, "data", None) or {}
+                if isinstance(data, dict):
+                    custom_id = data.get("custom_id") or ""
+                else:
+                    custom_id = getattr(data, "custom_id", "") or ""
+                if not str(custom_id).startswith("cron:"):
+                    return
+                try:
+                    parts = str(custom_id).split(":")
+                    if len(parts) < 4:
+                        return
+                    delivery_id = parts[1]
+                    action = parts[2]
+                    buttons = _delivery_buttons_from_message(interaction.message)
+                    if not buttons:
+                        buttons = [{"label": action, "style": "secondary", "action": action}]
+                    view = CronDeliveryView(
+                        buttons=buttons,
+                        delivery_id=delivery_id,
+                        adapter=adapter_self,
+                    )
+                    await view._on_button(interaction, action, action)
+                except Exception as exc:
+                    logger.warning(
+                        "[cron-delivery] on_interaction handler raised: %s", exc, exc_info=True
+                    )
+                    try:
+                        if not interaction.response.is_done():
+                            await interaction.response.send_message(
+                                f"\u26a0\ufe0f Button handler failed: {exc}", ephemeral=True
+                            )
+                    except Exception:
+                        pass
+
+            @self._client.event
             async def on_voice_state_update(member, before, after):
                 """Track voice channel join/leave events."""
                 # Only track channels where the bot is connected
@@ -3501,6 +3540,70 @@ class DiscordAdapter(BasePlatformAdapter):
                     final=final_delivery,
                 )
                 return result
+
+            # ── Interactive cron delivery (discord-delivery block) ──────────
+            delivery_spec = _parse_delivery_block(content) if DISCORD_AVAILABLE else None
+            if delivery_spec and isinstance(delivery_spec, dict):
+                try:
+                    embed_spec = delivery_spec.get("embed") or {}
+                    embed = _build_embed_from_spec(embed_spec)
+                    if embed is None:
+                        raise ValueError("embed builder returned None")
+
+                    image_path = embed_spec.get("image_path")
+                    if image_path and os.path.exists(str(image_path)):
+                        img_file = discord.File(str(image_path), filename="delivery_image.webp")
+                        _probe_msg = await channel.send(file=img_file)
+                        _att = _probe_msg.attachments[0] if _probe_msg.attachments else None
+                        if _att:
+                            embed.set_image(url=_att.url)
+                        await _probe_msg.delete()
+
+                    buttons = delivery_spec.get("buttons") or []
+                    delivery_id = hashlib.md5(content.encode()).hexdigest()[:12]
+                    view = None
+                    if buttons and DISCORD_AVAILABLE:
+                        try:
+                            view = CronDeliveryView(
+                                buttons=buttons,
+                                delivery_id=delivery_id,
+                                adapter=self,
+                            )
+                        except Exception as _ve:
+                            logger.warning("[cron-delivery] View creation failed: %s", _ve)
+
+                    msg = await channel.send(
+                        embed=embed,
+                        view=view,
+                        reference=self._reply_reference_for_send(reply_to, channel),
+                    )
+                    if view:
+                        view._message = msg
+
+                    message_ids = [str(msg.id)]
+                    _target_id = thread_id or chat_id
+                    if nonconversational:
+                        self._nonconversational_messages.mark_many(message_ids)
+                    else:
+                        self._last_self_message_id[_target_id] = message_ids[-1]
+
+                    result = SendResult(
+                        success=True,
+                        message_id=message_ids[0],
+                        raw_response={"message_ids": message_ids},
+                    )
+                    await asyncio.to_thread(
+                        self._record_discord_response,
+                        reply_to=reply_to,
+                        result=result,
+                        content=content,
+                        final=final_delivery,
+                    )
+                    return result
+                except Exception as _de:
+                    logger.warning(
+                        "[cron-delivery] Rich delivery failed, falling back to plain text: %s", _de
+                    )
 
             # Format and split message if needed
             formatted = self.format_message(content)
@@ -8765,6 +8868,117 @@ def _resolve_exec_approval_admin_gate(
     return (True, admin_ids)
 
 
+# ── Interactive Cron Delivery support ───────────────────────────────
+# Layer 1 (rich embeds) + Layer 2 (button components) for cron job deliveries.
+# Cron agents emit a ```discord-delivery``` fenced JSON block in their response.
+# The adapter parser extracts it, builds a discord.Embed from the spec, and
+# attaches a CronDeliveryView with the specified buttons.  Any response that
+# does NOT contain a delivery block falls back to plain-text delivery unchanged.
+
+_DELIVERY_BLOCK_RE = re.compile(
+    r"```discord-delivery\s*\n(.*?)\n```",
+    re.DOTALL,
+)
+_DELIVERY_BUTTON_STYLE_MAP = {
+    "primary": "primary",
+    "secondary": "secondary",
+    "success": "success",
+    "danger": "danger",
+    "link": "link",
+}
+
+# Registry of custom cron delivery button actions, keyed by the "action" name
+# used in the discord-delivery block.  "dismiss" and "snooze" are built in;
+# anything else falls through to this registry.
+CRON_BUTTON_ACTIONS: Dict[str, Callable] = {}
+
+
+def register_cron_button_action(name: str, fn: Callable) -> None:
+    """Register a custom button action for cron delivery embeds.
+
+    fn signature: async def handler(interaction: discord.Interaction) -> None
+    """
+    CRON_BUTTON_ACTIONS[name] = fn
+
+
+def _parse_delivery_block(text: str) -> Optional[dict]:
+    """Extract and parse the first ```discord-delivery``` JSON block in text."""
+    m = _DELIVERY_BLOCK_RE.search(text)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(1))
+    except (ValueError, TypeError) as exc:
+        logger.debug("[cron-delivery] Failed to parse delivery block JSON: %s", exc)
+        return None
+
+
+def _build_embed_from_spec(spec: dict):
+    """Build a discord.Embed from a delivery spec dict."""
+    if not DISCORD_AVAILABLE:
+        return None
+    embed_kwargs = {}
+    color_val = spec.get("color")
+    if color_val is not None:
+        try:
+            embed_kwargs["color"] = discord.Color(int(color_val))
+        except Exception:
+            pass
+    title = spec.get("title")
+    if title:
+        embed_kwargs["title"] = str(title)[:256]
+    desc = spec.get("description")
+    if desc:
+        embed_kwargs["description"] = str(desc)[:4096]
+    url = spec.get("url")
+    if url:
+        embed_kwargs["url"] = str(url)
+    embed = discord.Embed(**embed_kwargs)
+    for field in (spec.get("fields") or [])[:25]:
+        if not isinstance(field, dict):
+            continue
+        fname = str(field.get("name", ""))[:256]
+        fval = str(field.get("value", "\u200b"))[:1024]
+        inline = bool(field.get("inline", False))
+        if fname:
+            embed.add_field(name=fname, value=fval, inline=inline)
+    footer = spec.get("footer")
+    if footer:
+        embed.set_footer(text=str(footer)[:2048])
+    return embed
+
+
+def _delivery_buttons_from_message(message) -> list:
+    """Rebuild delivery button specs from a live Discord message's components.
+
+    REST-delivered cron messages have no server-side View, so a button click
+    must reconstruct the full button set to re-render the row correctly (a
+    stub of one button would wipe the other buttons off the message on edit).
+    """
+    _style_names = {1: "primary", 2: "secondary", 3: "success", 4: "danger"}
+    specs = []
+    try:
+        for row in getattr(message, "components", None) or []:
+            for child in getattr(row, "children", None) or []:
+                url = getattr(child, "url", None)
+                label = getattr(child, "label", None) or ""
+                if url:
+                    specs.append({"label": label, "url": str(url)})
+                    continue
+                cid = str(getattr(child, "custom_id", "") or "")
+                cparts = cid.split(":")
+                action = cparts[2] if len(cparts) >= 4 else "dismiss"
+                style_val = getattr(getattr(child, "style", None), "value", 2)
+                specs.append({
+                    "label": label,
+                    "style": _style_names.get(style_val, "secondary"),
+                    "action": action,
+                })
+    except Exception:
+        return []
+    return specs
+
+
 def _define_discord_view_classes() -> None:
     """Register Discord UI view classes as module globals.
 
@@ -8775,7 +8989,7 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView, CronDeliveryView
 
     class ExecApprovalView(discord.ui.View):
         """
@@ -9806,6 +10020,131 @@ def _define_discord_view_classes() -> None:
                     await msg.edit(embed=embed, view=self)
                 except Exception:
                     pass
+
+    class CronDeliveryView(discord.ui.View):
+        """Button view for interactive cron delivery messages.
+
+        Renders up to 5 action buttons specified in the discord-delivery block.
+        Built-in actions are ``dismiss`` and ``snooze``; any other action name
+        is dispatched through the CRON_BUTTON_ACTIONS registry (see
+        register_cron_button_action).  URL-style buttons are also supported.
+        """
+
+        _CRON_DELIVERY_TIMEOUT_SECONDS = 900
+
+        def __init__(self, buttons, delivery_id, adapter, original_message_id=None):
+            super().__init__(timeout=self._CRON_DELIVERY_TIMEOUT_SECONDS)
+            self.delivery_id = delivery_id
+            self._adapter = adapter
+            self._original_message_id = original_message_id
+            self._fired = set()
+
+            style_map = {
+                "primary": discord.ButtonStyle.primary,
+                "secondary": discord.ButtonStyle.secondary,
+                "success": discord.ButtonStyle.success,
+                "danger": discord.ButtonStyle.danger,
+            }
+
+            for i, btn_spec in enumerate(list(buttons or [])[:5]):
+                if not isinstance(btn_spec, dict):
+                    continue
+                label = str(btn_spec.get("label", f"Action {i + 1}"))[:80]
+                style_name = str(btn_spec.get("style", "secondary")).lower()
+                style = style_map.get(style_name, discord.ButtonStyle.secondary)
+                action = str(btn_spec.get("action", "dismiss"))
+                url = btn_spec.get("url")
+                if url:
+                    btn = discord.ui.Button(
+                        label=label,
+                        style=discord.ButtonStyle.link,
+                        url=str(url),
+                        row=i // 5,
+                    )
+                else:
+                    btn = discord.ui.Button(
+                        label=label,
+                        style=style,
+                        custom_id=f"cron:{delivery_id}:{action}:{i}",
+                        row=i // 5,
+                    )
+                    btn.callback = self._make_action_callback(action, label)
+                self.add_item(btn)
+
+        def _make_action_callback(self, action, label):
+            async def _callback(interaction):
+                await self._on_button(interaction, action, label)
+            return _callback
+
+        async def _on_button(self, interaction, action, label):
+            key = f"{action}:{interaction.user.id}"
+            if key in self._fired:
+                await interaction.response.send_message("Already handled.", ephemeral=True)
+                return
+            self._fired.add(key)
+
+            try:
+                if action == "dismiss":
+                    await self._action_dismiss(interaction, label)
+                elif action == "snooze":
+                    await self._action_snooze(interaction, label)
+                else:
+                    handler = CRON_BUTTON_ACTIONS.get(action)
+                    if handler:
+                        await handler(interaction)
+                    else:
+                        await interaction.response.send_message(
+                            f"Unknown action: `{action}`", ephemeral=True
+                        )
+            except Exception as exc:
+                logger.warning("[cron-delivery] Button action '%s' raised: %s", action, exc, exc_info=True)
+                try:
+                    if interaction.response.is_done():
+                        await interaction.followup.send(f"\u26a0\ufe0f Action failed: {exc}", ephemeral=True)
+                    else:
+                        await interaction.response.send_message(f"\u26a0\ufe0f Action failed: {exc}", ephemeral=True)
+                except Exception:
+                    pass
+
+        async def _action_dismiss(self, interaction, label):
+            for child in self.children:
+                child.disabled = True
+            embed = (interaction.message.embeds[0] if interaction.message and interaction.message.embeds else None)
+            if embed:
+                embed.set_footer(text=f"\u2705 Dismissed by {interaction.user.display_name}")
+                embed.color = discord.Color.greyple()
+            try:
+                await interaction.response.edit_message(embed=embed, view=self)
+            except Exception:
+                await interaction.response.send_message("\U0001f44d", ephemeral=True)
+
+        async def _action_snooze(self, interaction, label):
+            for child in self.children:
+                child.disabled = True
+            embed = (interaction.message.embeds[0] if interaction.message and interaction.message.embeds else None)
+            if embed:
+                embed.set_footer(text=f"\u23f0 Snoozed by {interaction.user.display_name}")
+                embed.color = discord.Color.orange()
+            try:
+                await interaction.response.edit_message(embed=embed, view=self)
+            except Exception:
+                await interaction.response.send_message("\u23f0 Snoozed \u2014 check back later.", ephemeral=True)
+
+        async def on_timeout(self):
+            for child in self.children:
+                child.disabled = True
+            msg = getattr(self, "_message", None)
+            if msg:
+                try:
+                    embed = msg.embeds[0] if msg.embeds else None
+                    if embed:
+                        embed.color = discord.Color.greyple()
+                        embed.set_footer(text="\u23f1 Delivery expired")
+                    await msg.edit(embed=embed, view=self)
+                except Exception:
+                    pass
+
+
 if DISCORD_AVAILABLE:
     _define_discord_view_classes()
 
@@ -9826,6 +10165,77 @@ if DISCORD_AVAILABLE:
 _DISCORD_CHANNEL_TYPE_PROBE_CACHE: Dict[str, bool] = {}
 _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES = 1 * 1024 * 1024
 _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES = 8 * 1024
+
+# ── REST-API helpers for discord-delivery block (standalone sender path) ───
+
+_DELIVERY_REST_BUTTON_STYLE = {
+    "primary": 1,
+    "secondary": 2,
+    "success": 3,
+    "danger": 4,
+    "link": 5,
+}
+
+
+def _delivery_embed_to_rest_json(embed_spec: dict, attachment_filename=None) -> dict:
+    """Convert an embed spec dict to Discord REST API embed JSON."""
+    embed = {}
+    color_val = embed_spec.get("color")
+    if color_val is not None:
+        try:
+            embed["color"] = int(color_val)
+        except Exception:
+            pass
+    title = embed_spec.get("title")
+    if title:
+        embed["title"] = str(title)[:256]
+    desc = embed_spec.get("description")
+    if desc:
+        embed["description"] = str(desc)[:4096]
+    url = embed_spec.get("url")
+    if url:
+        embed["url"] = str(url)
+    fields = embed_spec.get("fields") or []
+    if fields:
+        embed["fields"] = [
+            {
+                "name": str(f.get("name", ""))[:256],
+                "value": str(f.get("value", "\u200b"))[:1024],
+                "inline": bool(f.get("inline", False)),
+            }
+            for f in fields[:25]
+            if isinstance(f, dict) and f.get("name")
+        ]
+    footer = embed_spec.get("footer")
+    if footer:
+        embed["footer"] = {"text": str(footer)[:2048]}
+    if attachment_filename:
+        embed["image"] = {"url": f"attachment://{attachment_filename}"}
+    return embed
+
+
+def _delivery_buttons_to_rest_json(buttons: list, delivery_id: str) -> list:
+    """Convert a buttons list to Discord REST API action-row components JSON."""
+    components = []
+    for i, btn in enumerate(list(buttons or [])[:5]):
+        if not isinstance(btn, dict):
+            continue
+        label = str(btn.get("label", f"Action {i + 1}"))[:80]
+        action = str(btn.get("action", "dismiss"))
+        url = btn.get("url")
+        if url:
+            components.append({"type": 2, "style": 5, "label": label, "url": str(url)})
+        else:
+            style_name = str(btn.get("style", "secondary")).lower()
+            components.append({
+                "type": 2,
+                "style": _DELIVERY_REST_BUTTON_STYLE.get(style_name, 2),
+                "label": label,
+                "custom_id": f"cron:{delivery_id}:{action}:{i}",
+            })
+    if not components:
+        return []
+    return [{"type": 1, "components": components}]
 
 
 def _remember_channel_is_forum(chat_id: str, is_forum: bool) -> None:
@@ -10120,6 +10530,88 @@ async def _standalone_send(
             url = f"https://discord.com/api/v10/channels/{chat_id}/messages"
 
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
+            # ── discord-delivery block detection ────────────────────────
+            _delivery_spec = _parse_delivery_block(message)
+            if _delivery_spec and isinstance(_delivery_spec, dict):
+                try:
+                    _embed_spec = _delivery_spec.get("embed") or {}
+                    _buttons = _delivery_spec.get("buttons") or []
+                    _delivery_id = hashlib.md5(message.encode()).hexdigest()[:12]
+                    _image_path = _embed_spec.get("image_path")
+                    _attach_filename = None
+                    _form = None
+                    _delivery_data = None
+
+                    if _image_path and os.path.exists(str(_image_path)):
+                        _attach_filename = os.path.basename(str(_image_path))
+                        _rest_embed = _delivery_embed_to_rest_json(
+                            _embed_spec, attachment_filename=_attach_filename
+                        )
+                        _rest_components = _delivery_buttons_to_rest_json(_buttons, _delivery_id)
+                        _payload = {"embeds": [_rest_embed]}
+                        if _rest_components:
+                            _payload["components"] = _rest_components
+                        _form = aiohttp.FormData()
+                        _form.add_field(
+                            "payload_json", json.dumps(_payload), content_type="application/json"
+                        )
+                        with open(str(_image_path), "rb") as _imgf:
+                            _form.add_field("files[0]", _imgf.read(), filename=_attach_filename)
+                    else:
+                        _rest_embed = _delivery_embed_to_rest_json(_embed_spec)
+                        _rest_components = _delivery_buttons_to_rest_json(_buttons, _delivery_id)
+                        _payload = {"embeds": [_rest_embed]}
+                        if _rest_components:
+                            _payload["components"] = _rest_components
+
+                    if _form is not None:
+                        async with session.post(url, headers=auth_headers, data=_form, **_req_kw) as resp:
+                            if resp.status in {200, 201}:
+                                _delivery_data = await _standalone_read_json_limited(
+                                    resp, _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES
+                                )
+                            else:
+                                body = await _standalone_read_text_limited(
+                                    resp, _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES
+                                )
+                                logger.warning(
+                                    "[cron-delivery] Embed+image send got %s: %s \u2014 falling back to text",
+                                    resp.status, body,
+                                )
+                    else:
+                        async with session.post(url, headers=json_headers, json=_payload, **_req_kw) as resp:
+                            if resp.status in {200, 201}:
+                                _delivery_data = await _standalone_read_json_limited(
+                                    resp, _DISCORD_STANDALONE_JSON_BODY_LIMIT_BYTES
+                                )
+                            else:
+                                body = await _standalone_read_text_limited(
+                                    resp, _DISCORD_STANDALONE_ERROR_BODY_LIMIT_BYTES
+                                )
+                                logger.warning(
+                                    "[cron-delivery] Embed send got %s: %s \u2014 falling back to text",
+                                    resp.status, body,
+                                )
+
+                    if _delivery_data is not None:
+                        result = {
+                            "success": True,
+                            "platform": "discord",
+                            "chat_id": chat_id,
+                            "message_id": _delivery_data.get("id"),
+                        }
+                        if thread_id:
+                            result["thread_id"] = thread_id
+                        if warnings:
+                            result["warnings"] = warnings
+                        return result
+                    # Fall through to plain-text on failure.
+                except Exception as _de:
+                    logger.warning(
+                        "[cron-delivery] Standalone embed delivery failed: %s \u2014 falling back to text",
+                        _de,
+                    )
+
             # Send text message (skip if empty and media is present)
             if message.strip() or not media_files:
                 async with session.post(url, headers=json_headers, json={"content": message}, **_req_kw) as resp:
