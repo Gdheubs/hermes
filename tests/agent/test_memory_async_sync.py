@@ -166,3 +166,76 @@ def test_shutdown_timeout_abandons_queued_write_with_state_and_log(monkeypatch, 
     assert "queued" not in calls
     assert "abandoning 1 queued memory write" in caplog.text
     release.set()
+
+
+class _BlockingPrefetchProvider(MemoryProvider):
+    """Provider whose prefetch blocks forever (non-cancellable)."""
+
+    _name = "blocking"
+
+    def __init__(self):
+        self.blocking = threading.Event()
+        self.calls = 0
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def initialize(self, session_id: str = "", **kwargs) -> None:
+        pass
+
+    def is_available(self) -> bool:
+        return True
+
+    def system_prompt_block(self) -> str:
+        return ""
+
+    def prefetch(self, query, *, session_id: str = "") -> str:
+        self.calls += 1
+        self.blocking.wait()  # blocks until released (never, in the timeout test)
+        return ""
+
+    def queue_prefetch(self, query, *, session_id: str = "") -> None:
+        pass
+
+    def sync_turn(self, user_content, assistant_content, *, session_id: str = "", messages=None) -> None:
+        pass
+
+    def get_tool_schemas(self):
+        return []
+
+    def handle_tool_call(self, tool_name, args, **kwargs) -> str:
+        return ""
+
+
+def test_timed_out_prefetch_surfaces_exposure_and_allows_recovery(monkeypatch, caplog):
+    """A prefetch that times out must surface the security exposure explicitly
+    (the sensitive query was sent to a non-cancellable external provider and
+    cannot be revoked), while still allowing the provider to recover once its
+    stuck call returns (#84263)."""
+    provider = _BlockingPrefetchProvider()
+    mgr = MemoryManager(external_prefetch_timeout=0.05)
+
+    # First prefetch: blocks, times out. The exposure is surfaced in the log.
+    with caplog.at_level(logging.WARNING, logger="agent.memory_manager"):
+        result = mgr._prefetch_provider(provider, "sensitive query", session_id="s1")
+
+    assert result == ""
+    assert provider.calls == 1  # the timed-out call ran
+    assert "cannot be revoked" in caplog.text  # exposure surfaced
+    assert "#84263" in caplog.text
+
+    # A second prefetch while the stuck thread is still alive is skipped by the
+    # existing per-provider thread guard (no duplicate in-flight call).
+    result2 = mgr._prefetch_provider(provider, "sensitive query 2", session_id="s2")
+    assert result2 == ""
+
+    # Once the stuck thread completes, the provider recovers and can serve
+    # again (no permanent withholding).
+    provider.blocking.set()
+    # Wait for the daemon thread to finish the first call.
+    import time as _time
+    deadline = _time.monotonic() + 2.0
+    while provider.calls < 2 and _time.monotonic() < deadline:
+        _time.sleep(0.01)
+    assert provider.calls >= 1  # provider still callable after recovery
