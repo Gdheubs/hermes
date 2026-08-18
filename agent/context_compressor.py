@@ -1419,6 +1419,27 @@ def _strip_image_parts_from_parts(parts: Any) -> Any:
     return out if had_image else None
 
 
+# #83714 — the shrunk value is replayed back to the model as its OWN past
+# tool call on every subsequent turn. A bare, prose-shaped marker like
+# "...[truncated]" is exactly the kind of terse ellipsis abbreviation a
+# model is already inclined to produce, so a model conditioned on seeing
+# itself "get away with" that pattern in its own history will imitate it in
+# a *new* tool call — writing the literal marker into a file instead of the
+# real content (observed with deepseek-v4-pro; see PR #83752 for the
+# resulting file-corruption guard). This marker is deliberately NOT
+# prose-shaped: distinctive non-ASCII delimiters that don't occur in normal
+# code/text, an explicit "not real content" disclaimer, and a per-instance
+# character count that won't match the next omission point even if copied
+# verbatim — all raise the bar against a model treating this as a stylistic
+# convention worth reusing.
+_COMPRESSION_MARKER_TEMPLATE = (
+    "⟪HERMES-CONTEXT-COMPRESSION: {omitted:,} of {total:,} chars omitted here "
+    "by Hermes's context compressor. This is NOT part of the original tool "
+    "call and must never be reproduced in new output — always write full, "
+    "untruncated content.⟫"
+)
+
+
 def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     """Shrink long string values inside a tool-call arguments JSON blob while
     preserving JSON validity.
@@ -1443,6 +1464,12 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     to begin with — some model backends use non-JSON tool arguments — the
     original string is returned unchanged rather than replaced with
     something neither we nor the backend can parse.
+
+    The shrunk value stays a plain string (never a nested object) so the
+    JSON *shape* is unchanged from the original — only #83714's marker text
+    changed, not the #11762 valid-JSON-and-matching-shape contract. See
+    ``_COMPRESSION_MARKER_TEMPLATE`` for why the marker itself looks nothing
+    like ``"...[truncated]"`` anymore.
     """
     try:
         parsed = json.loads(args)
@@ -1452,7 +1479,10 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     def _shrink(obj: Any) -> Any:
         if isinstance(obj, str):
             if len(obj) > head_chars:
-                return obj[:head_chars] + "...[truncated]"
+                marker = _COMPRESSION_MARKER_TEMPLATE.format(
+                    omitted=len(obj) - head_chars, total=len(obj)
+                )
+                return obj[:head_chars] + marker
             return obj
         if isinstance(obj, dict):
             return {k: _shrink(v) for k, v in obj.items()}
