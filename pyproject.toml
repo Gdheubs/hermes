@@ -93,6 +93,13 @@ dependencies = [
   # A pin here is not sufficient on its own. alibabacloud-tea-openapi caps
   # cryptography<49, so [tool.uv] also holds an override. Read that comment
   # before you move this version.
+  #
+  # No cryptography release publishes an Android wheel (checked across the
+  # whole 46-50 series), so Termux always source-builds this from the sdist
+  # regardless of which version is pinned here — do NOT "fix" a Termux OOM by
+  # downgrading this pin, which only reintroduces the CVEs above without
+  # avoiding the build. The actual OOM cause and fix (serialized Rust build)
+  # live in scripts/install.sh / setup-hermes.sh, see #87663.
   "cryptography==50.0.0",  # CVE-2026-69247, GHSA-m2h6-j472-rp4c, GHSA-jwv3-5hgf-82ww, CVE-2026-39892, CVE-2026-34073, GHSA-537c-gmf6-5ccf
   # Windows has no IANA tzdata shipped with the OS, so Python's ``zoneinfo``
   # (PEP 615) raises ``ZoneInfoNotFoundError`` for every non-UTC timezone

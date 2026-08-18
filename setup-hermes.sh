@@ -193,6 +193,15 @@ echo -e "${CYAN}→${NC} Installing dependencies..."
 if is_termux; then
     export ANDROID_API_LEVEL="$(getprop ro.build.version.sdk 2>/dev/null || printf '%s' "${ANDROID_API_LEVEL:-}")"
     echo -e "${CYAN}→${NC} Termux detected — installing the tested Android bundle"
+    # cryptography/pydantic-core have no Android wheel on PyPI, so pip always
+    # source-builds them here. Cargo's default one-rustc-per-core parallelism
+    # exhausts RAM+swap on a phone and gets silently OOM-killed, leaving pip
+    # hung on a dead child instead of failing loudly (#87663). Serialize the
+    # build; respect a caller-provided value instead of clobbering it.
+    if [ -z "${CARGO_BUILD_JOBS:-}" ]; then
+        export CARGO_BUILD_JOBS=1
+        echo -e "${CYAN}→${NC} Serializing Rust extension builds (CARGO_BUILD_JOBS=1) to avoid Termux OOM — this can take several minutes"
+    fi
     "$SETUP_PYTHON" -m pip install --upgrade pip setuptools wheel
     if [ -f "constraints-termux.txt" ]; then
         "$SETUP_PYTHON" -m pip install -e ".[termux]" -c constraints-termux.txt || {

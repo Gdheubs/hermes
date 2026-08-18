@@ -1505,6 +1505,22 @@ install_deps() {
             log_info "Using ANDROID_API_LEVEL=$ANDROID_API_LEVEL for Android wheel builds"
         fi
 
+        # cryptography (and pydantic-core, another maturin/Rust-backed direct
+        # dependency) ships no Android wheel on PyPI at any version, so pip
+        # always source-builds them on Termux. Cargo defaults to one rustc
+        # process per CPU core; on an 8-core phone sharing a few GB of RAM
+        # with the rest of Android, that many concurrent rustc processes
+        # exhausts RAM+swap. The OOM killer then reaps rustc without cargo
+        # surfacing a build error, so pip is left waiting on a dead child
+        # forever instead of failing loudly (#87663). Serializing the build
+        # keeps peak memory bounded at the cost of a slower (but finite)
+        # build; respect a caller-provided value instead of clobbering it.
+        if [ -z "${CARGO_BUILD_JOBS:-}" ]; then
+            export CARGO_BUILD_JOBS=1
+            log_info "Serializing Rust extension builds (CARGO_BUILD_JOBS=1) to avoid Termux OOM while compiling cryptography/pydantic-core from source"
+            log_info "This can take several minutes on a phone — it is not stuck."
+        fi
+
         "$PIP_PYTHON" -m pip install --upgrade pip setuptools wheel >/dev/null
 
         # On Android, psutil's setup.py rejects sys.platform == 'android' before
