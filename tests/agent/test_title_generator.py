@@ -47,6 +47,55 @@ class TestGenerateTitle:
         assert captured_kwargs["timeout"] is None
 
 
+    def test_passes_reasoning_config_none_when_reasoning_effort_disabled(self):
+        """When auxiliary.title_generation.reasoning_effort is 'none', the
+        title call must send reasoning_config={"enabled": False} so
+        reasoning-aware provider profiles (DeepSeek / OpenCode Go) translate
+        it into thinking.type=disabled. This closes the #83390 docstring/code
+        gap: the docstring claimed thinking was disabled but the call set
+        neither reasoning_config nor reasoning_effort, so DeepSeek V4 ran
+        thinking at max_tokens=64 and returned an empty content.
+        """
+        captured_kwargs = {}
+
+        def mock_call_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            response = MagicMock()
+            response.choices = [MagicMock()]
+            response.choices[0].message.content = '{"title": "Fix login"}'
+            return response
+
+        cfg = {"auxiliary": {"title_generation": {"reasoning_effort": "none"}}}
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm), patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value=cfg["auxiliary"]["title_generation"],
+        ):
+            assert generate_title("fix login") == "Fix login"
+
+        assert captured_kwargs.get("reasoning_config") == {"enabled": False}
+
+    def test_omits_reasoning_config_when_reasoning_effort_unset(self):
+        """With no reasoning_effort configured, the title call sends no
+        reasoning_config, leaving the provider default (thinking ON for
+        DeepSeek V4) unchanged — we must not force-disable thinking for
+        providers that don't support the field.
+        """
+        captured_kwargs = {}
+
+        def mock_call_llm(**kwargs):
+            captured_kwargs.update(kwargs)
+            response = MagicMock()
+            response.choices = [MagicMock()]
+            response.choices[0].message.content = '{"title": "Fix login"}'
+            return response
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm), patch(
+            "agent.auxiliary_client._get_auxiliary_task_config", return_value={}
+        ):
+            assert generate_title("fix login") == "Fix login"
+
+        assert captured_kwargs.get("reasoning_config") is None
+
 
     def test_strips_think_blocks(self):
         """Reasoning-model output wrapped in <think>...</think> must not

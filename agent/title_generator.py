@@ -282,6 +282,40 @@ def derive_title(user_message: str) -> Optional[str]:
     return line or None
 
 
+def _title_reasoning_config() -> Optional[dict]:
+    """Provider-agnostic reasoning config for the title call.
+
+    Reuses Hermes' existing ``auxiliary.title_generation.reasoning_effort``
+    knob instead of hardcoding a provider-specific ``thinking`` wire field.
+    ``parse_reasoning_effort`` maps ``none`` → ``{"enabled": False}``; the
+    DeepSeek / OpenCode Go provider profiles then translate that into the
+    native ``thinking.type: disabled`` wire shape. When the config value is
+    unset or unrecognized the profile keeps its provider default (thinking ON
+    for DeepSeek V4), so this only turns thinking OFF when the operator
+    explicitly asks for it — never for providers that don't support the field.
+
+    This closes the docstring/code gap noted in #83390: the title call's
+    docstring claims thinking is disabled, but the call set neither
+    ``reasoning_config`` nor ``reasoning_effort``, so DeepSeek-family models
+    ran thinking at ``max_tokens=64`` and returned empty ``content``.
+    """  # noqa: E501
+    try:
+        from hermes_constants import parse_reasoning_effort
+    except Exception:
+        return None
+    try:
+        from agent.auxiliary_client import _get_auxiliary_task_config
+    except Exception:
+        return None
+    try:
+        effort = _get_auxiliary_task_config("title_generation").get("reasoning_effort")
+    except Exception:
+        effort = None
+    if effort is None:
+        return None
+    return parse_reasoning_effort(effort)
+
+
 def _extract_title_text(content: str) -> str:
     """Pull the title out of a model response.
 
@@ -348,8 +382,16 @@ def generate_title(
     """Generate a session title from the user's opening message.
 
     Runs on the ``title_generation`` auxiliary task, which resolves to a
-    small/fast model tier. Thinking is disabled and the response is constrained
-    to ``{"title": "..."}`` so there is no preamble or reasoning to strip.
+    small/fast model tier. The response is constrained to
+    ``{"title": "..."}`` so there is no preamble or reasoning to strip.
+
+    When ``auxiliary.title_generation.reasoning_effort`` is set to ``none``
+    (or a disabled synonym), thinking is turned off via the provider-agnostic
+    ``reasoning_config`` knob, which reasoning-aware profiles (DeepSeek /
+    OpenCode Go) translate to ``thinking.type: disabled``. This prevents a
+    default-on reasoning model from burning the 64-token budget on
+    ``reasoning_content`` and returning an empty ``content``. When the knob is
+    unset, the provider default stands (thinking ON for DeepSeek V4).
 
     Titles come from the user's message alone — every surveyed implementation
     that titles well (Claude Code, OpenCode, Cursor, OpenClaw) does the same.
@@ -400,6 +442,12 @@ def generate_title(
     ]
 
     try:
+        # Reuse Hermes' provider-agnostic reasoning knob rather than hardcoding
+        # a provider-specific `thinking` wire field. Reasoning-aware profiles
+        # (DeepSeek / OpenCode Go) translate reasoning_config={"enabled":
+        # False} into thinking.type=disabled, so a default-on reasoning model
+        # can't burn the 64-token budget and return an empty content (the
+        # pre-existing DeepSeek leak noted in #83390).
         response = call_llm(
             task="title_generation",
             messages=messages,
@@ -410,6 +458,7 @@ def generate_title(
             timeout=timeout,
             main_runtime=main_runtime,
             extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
+            reasoning_config=_title_reasoning_config(),
         )
         content = response.choices[0].message.content or ""
         title = _clean_title(_extract_title_text(content))
