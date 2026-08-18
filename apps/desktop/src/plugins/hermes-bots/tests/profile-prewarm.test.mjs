@@ -110,16 +110,14 @@ test('regression: source transitions keep BotRow hook order stable', () => {
   assert.doesNotMatch(botRowSource, /remoteSource && Boolean\(useValue/)
 })
 
-test('behavior: pointer entry prewarms only the hovered bot', () => {
+test('behavior: pointer entry never prewarms; activation is click-driven', () => {
   const { row, warmed } = renderBotRow('alpha')
 
   assert.deepEqual(warmed, [])
-  assert.equal(typeof row.props.onPointerEnter, 'function')
-  row.props.onPointerEnter()
-  assert.deepEqual(warmed, ['alpha'])
+  assert.equal(row.props.onPointerEnter, undefined)
 })
 
-test('behavior: a remote Connections row stays in this chat instead of hopping SSH', async () => {
+test('behavior: a remote Connections row stays dormant on hover and in this chat on click', async () => {
   const { ensured, opened, row, warmed } = renderBotRow({
     connectionId: 'work',
     connectionLabel: 'Work',
@@ -128,8 +126,8 @@ test('behavior: a remote Connections row stays in this chat instead of hopping S
     sourceScoped: true
   })
 
-  row.props.onPointerEnter()
-  assert.deepEqual(warmed, [['work', 'research']])
+  assert.equal(row.props.onPointerEnter, undefined)
+  assert.deepEqual(warmed, [])
 
   await row.props.onClick()
   assert.deepEqual(ensured, [])

@@ -1,0 +1,12 @@
+{
+  "name": "hermes-bots",
+  "label": "Hermes Bot Mode",
+  "description": "Private durable state and routing API for Bot Mode groups.",
+  "icon": "people",
+  "version": "0.2.0",
+  "tab": {
+    "hidden": true
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

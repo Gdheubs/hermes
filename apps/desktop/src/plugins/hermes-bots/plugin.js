@@ -48,8 +48,10 @@ import {
   profileColor,
   queryClient,
   relativeTime,
+  ROUTES_AREA,
   ScrollArea,
   SearchField,
+  SIDEBAR_NAV_AREA,
   Select,
   SelectContent,
   SelectItem,
@@ -75,6 +77,8 @@ const createBudgetedLoop = typeof sdk === 'undefined' ? undefined : sdk.createBu
 const ID = 'hermes-bots'
 const ROSTER_KEY = [ID, 'roster']
 const ROUTINES_KEY = [ID, 'routines']
+const GROUPS_KEY = [ID, 'groups']
+const GROUP_ROUTE = '/bot-groups'
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
 
 /** Captured in register() so components can reach plugin storage. */
@@ -170,6 +174,7 @@ const $lastJobs = atom([])
 /** Bot the Routines tile is scoped to. Follows the live gateway profile
  *  (the bot you're actually chatting with) and roster clicks. */
 const $selectedBot = atom('default')
+const $selectedGroupId = atom(null)
 
 /** Optional secondary navigation inside the Bots pane. Primary row clicks still
  * open the bot's canonical chat; this state opens its stored-session browser. */
@@ -203,6 +208,68 @@ function handleSessionsGatewayTransition() {
 /** Per-bot appearance + display meta, persisted via ctx.storage:
  *  { [botName]: { shape, color, title } } */
 const $botMeta = atom({})
+
+/** Per-group chat-only preferences. These never rewrite member profiles.
+ *  { [groupId]: { modelOverride?: { provider, model } } } */
+const $groupChatPrefs = atom({})
+
+function canonicalGroupModelId(model) {
+  const raw = String(model || '').trim()
+  if (/^katana-qwen(?::latest)?$/i.test(raw)) {
+    return raw.toLowerCase().endsWith(':latest') ? 'qwen3.5-9b:latest' : 'qwen3.5-9b'
+  }
+  return raw
+}
+
+function groupModelKey(model) {
+  return canonicalGroupModelId(model).toLowerCase().replace(/:latest$/, '')
+}
+
+function canonicalGroupModelOverride(value) {
+  if (!value?.model) {
+    return value || null
+  }
+  return { ...value, model: canonicalGroupModelId(value.model) }
+}
+
+function migrateGroupChatPrefs(value) {
+  if (!value || typeof value !== 'object') {
+    return {}
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([groupId, prefs]) => [
+      groupId,
+      prefs && typeof prefs === 'object'
+        ? { ...prefs, modelOverride: canonicalGroupModelOverride(prefs.modelOverride) }
+        : prefs
+    ])
+  )
+}
+
+function saveGroupChatPrefs(groupId, patch) {
+  const current = $groupChatPrefs.get()
+  const normalizedPatch = {
+    ...patch,
+    ...(Object.prototype.hasOwnProperty.call(patch, 'modelOverride')
+      ? { modelOverride: canonicalGroupModelOverride(patch.modelOverride) }
+      : {})
+  }
+  const next = { ...current, [groupId]: { ...(current[groupId] || {}), ...normalizedPatch } }
+  $groupChatPrefs.set(next)
+  try {
+    Promise.resolve(pluginCtx?.storage?.set?.('group-chat-prefs', next)).catch(() => undefined)
+  } catch {
+    /* local persistence is best-effort */
+  }
+}
+
+function newBotInstanceId() {
+  try {
+    return globalThis.crypto?.randomUUID?.() || null
+  } catch {
+    return null
+  }
+}
 
 async function saveBotMeta(name, patch) {
   const prevMeta = $botMeta.get()[name] || {}
@@ -697,6 +764,688 @@ async function deleteBot(bot) {
 
   if (host.state.profile.get?.() === bot.name && typeof host.newChat === 'function') {
     host.newChat('default')
+  }
+}
+
+// ── durable Groups: stable identities, model/slash helpers, transcript API ──
+
+let identityReconcileInFlight = null
+let identityReconcileFingerprint = ''
+
+/** Reconcile immutable bot IDs with the installation-wide Groups backend.
+ *  Returns the assignments so Groups can await identity readiness instead of
+ *  disabling membership controls while reconciliation is still in flight. */
+function reconcileBotIdentities(roster) {
+  if (!pluginCtx?.rest) {
+    return Promise.reject(new Error('Groups backend is unavailable.'))
+  }
+
+  if (identityReconcileInFlight) {
+    return identityReconcileInFlight
+  }
+
+  const bots = roster.filter(bot => !bot.remoteSource).map(bot => ({
+    profile_name: bot.name,
+    instance_id: $botMeta.get()[bot.name]?.instanceId || null
+  }))
+  const fingerprint = JSON.stringify(bots)
+  const allReady = bots.every(bot => Boolean(bot.instance_id))
+
+  if (allReady && fingerprint === identityReconcileFingerprint) {
+    return Promise.resolve(bots)
+  }
+
+  identityReconcileInFlight = pluginCtx
+    .rest('/bots/reconcile', { method: 'POST', body: { bots } })
+    .then(result => {
+      const assignments = Array.isArray(result?.bots) ? result.bots : []
+
+      if (assignments.length !== bots.length) {
+        throw new Error('Groups backend returned an incomplete bot identity set.')
+      }
+
+      for (const assignment of assignments) {
+        if (!assignment?.profile_name || !assignment?.instance_id) {
+          throw new Error('Groups backend returned an invalid bot identity.')
+        }
+        if ($botMeta.get()[assignment.profile_name]?.instanceId !== assignment.instance_id) {
+          void saveBotMeta(assignment.profile_name, { instanceId: assignment.instance_id })
+        }
+      }
+
+      identityReconcileFingerprint = JSON.stringify(
+        assignments.map(assignment => ({
+          profile_name: assignment.profile_name,
+          instance_id: assignment.instance_id
+        }))
+      )
+      return assignments
+    })
+    .finally(() => {
+      identityReconcileInFlight = null
+    })
+
+  return identityReconcileInFlight
+}
+
+function newGroupMutationKey(action) {
+  const random = newBotInstanceId()
+  return `${action}:${random || `${Date.now()}-${Math.random().toString(36).slice(2)}`}`
+}
+
+async function groupMembersForNames(names, roster) {
+  await reconcileBotIdentities(roster)
+  const known = new Set(roster.map(bot => bot.name))
+  return names.map(name => {
+    if (!known.has(name)) {
+      throw new Error(`Bot ${name} is no longer in the live roster.`)
+    }
+    const instanceId = $botMeta.get()[name]?.instanceId
+    if (!instanceId) {
+      throw new Error(`Could not prepare a stable identity for ${name}. Retry the group action.`)
+    }
+    return { bot_instance_id: instanceId, profile_name: name }
+  })
+}
+
+function useGroups() {
+  return useQuery({
+    queryKey: GROUPS_KEY,
+    queryFn: () => pluginCtx.rest('/groups'),
+    staleTime: 3000,
+    retry: false
+  })
+}
+
+function useGroupModelOptions() {
+  return useQuery({
+    queryKey: [ID, 'group-model-options'],
+    queryFn: () => host.request('model.options', { explicit_only: true }),
+    staleTime: 30_000,
+    retry: false
+  })
+}
+
+function groupModelRows(data) {
+  const providers = Array.isArray(data?.providers) ? data.providers : []
+  return providers.flatMap(provider =>
+    (Array.isArray(provider.models) ? provider.models : []).map(model => ({
+      provider: provider.slug || provider.name,
+      providerName: provider.name || provider.slug,
+      model
+    }))
+  )
+}
+
+function groupModelDisplayName(model) {
+  const canonical = canonicalGroupModelId(model)
+  if (groupModelKey(canonical) === 'qwen3.5-9b') {
+    return 'Qwen3.5-9B'
+  }
+  return canonical
+}
+
+function groupModelLabel(value) {
+  if (!value?.model) {
+    return 'Profile default'
+  }
+  const label = groupModelDisplayName(value.model)
+  return value.provider ? `${value.provider} · ${label}` : label
+}
+
+function groupModelMatch(data, value) {
+  if (!value?.model) {
+    return null
+  }
+  const wantedModel = groupModelKey(value.model)
+  const wantedProvider = String(value.provider || '').toLowerCase()
+  const candidates = groupModelRows(data).filter(row => groupModelKey(row.model) === wantedModel)
+  if (!candidates.length) {
+    return null
+  }
+
+  if (wantedProvider) {
+    const exact = candidates.find(row => String(row.provider || '').toLowerCase() === wantedProvider)
+    if (exact) {
+      return exact
+    }
+
+    // A profile whose current model is a raw custom endpoint surfaces as
+    // provider `custom`, while the same shared endpoint saved under providers:
+    // gets the stable slug `custom:local-qwen`. Treat those as the same custom
+    // provider family for a matching model, then pass the member's concrete
+    // slug into session.create so Hermes resolves the correct endpoint.
+    if (wantedProvider === 'custom') {
+      const customCandidates = candidates.filter(row => {
+        const provider = String(row.provider || '').toLowerCase()
+        return provider === 'custom' || provider === 'local-qwen' || provider.startsWith('custom:')
+      })
+      const localQwen = customCandidates.find(row => {
+        const provider = String(row.provider || '').toLowerCase()
+        return provider === 'local-qwen' || provider === 'custom:local-qwen'
+      })
+      if (localQwen) {
+        return localQwen
+      }
+      if (customCandidates.length === 1) {
+        return customCandidates[0]
+      }
+    }
+  }
+
+  return wantedProvider ? null : candidates[0]
+}
+
+function groupModelSupported(data, value) {
+  return !value?.model || Boolean(groupModelMatch(data, value))
+}
+
+function groupSlashQuery(text) {
+  const match = String(text || '').match(/^\/([^\n]*)$/)
+  return match ? match[1] : null
+}
+
+function slashTextValue(value, fallback = '') {
+  if (typeof value === 'string') {
+    return value
+  }
+  if (Array.isArray(value)) {
+    return value.map(part => (Array.isArray(part) ? String(part[1] ?? '') : typeof part === 'string' ? part : '')).join('').trim()
+  }
+  return fallback
+}
+
+async function fetchGroupSlashSuggestions(text) {
+  const query = groupSlashQuery(text)
+  if (query === null) {
+    return []
+  }
+  const slashText = `/${query}`
+  if (!query) {
+    const catalog = await host.request('commands.catalog')
+    const sections = Array.isArray(catalog?.categories) && catalog.categories.length
+      ? catalog.categories
+      : [{ name: 'Commands', pairs: Array.isArray(catalog?.pairs) ? catalog.pairs : [] }]
+    const seen = new Set()
+    const rows = []
+    for (const section of sections) {
+      for (const pair of Array.isArray(section?.pairs) ? section.pairs : []) {
+        const command = slashTextValue(pair?.[0])
+        if (!command || seen.has(command.toLowerCase())) {
+          continue
+        }
+        seen.add(command.toLowerCase())
+        rows.push({ text: command.startsWith('/') ? command : `/${command}`, display: command, meta: slashTextValue(pair?.[1]), group: section.name || 'Commands' })
+      }
+    }
+    for (const pair of Array.isArray(catalog?.pairs) ? catalog.pairs : []) {
+      const command = slashTextValue(pair?.[0])
+      if (!command || seen.has(command.toLowerCase())) {
+        continue
+      }
+      seen.add(command.toLowerCase())
+      rows.push({ text: command.startsWith('/') ? command : `/${command}`, display: command, meta: slashTextValue(pair?.[1]), group: 'Skills' })
+    }
+    return rows.slice(0, 60)
+  }
+
+  const result = await host.request('complete.slash', { text: slashText })
+  const replaceFrom = typeof result?.replace_from === 'number' ? result.replace_from : 1
+  const isArgCompletion = replaceFrom > 1
+  const prefix = isArgCompletion ? slashText.slice(0, replaceFrom) : ''
+  return (Array.isArray(result?.items) ? result.items : []).map(item => {
+    const raw = slashTextValue(item?.text)
+    const completed = isArgCompletion ? `${prefix}${raw}` : raw.startsWith('/') ? raw : `/${raw}`
+    return {
+      text: completed,
+      display: slashTextValue(item?.display, completed),
+      meta: slashTextValue(item?.meta),
+      group: slashTextValue(item?.group, isArgCompletion ? 'Options' : 'Commands')
+    }
+  }).slice(0, 30)
+}
+
+function useGroupSlashSuggestions(text) {
+  const query = groupSlashQuery(text)
+  return useQuery({
+    queryKey: [ID, 'group-slash', query ?? 'off'],
+    queryFn: () => fetchGroupSlashSuggestions(text),
+    enabled: query !== null,
+    staleTime: query ? 1_500 : 15_000,
+    retry: false
+  })
+}
+
+function groupMessagesKey(groupId) {
+  return [ID, 'group-messages', groupId]
+}
+
+function useGroupMessages(groupId) {
+  return useQuery({
+    queryKey: groupMessagesKey(groupId),
+    queryFn: () => (groupId ? pluginCtx.rest(`/groups/${groupId}/messages`) : Promise.resolve([])),
+    enabled: Boolean(groupId),
+    staleTime: 1000,
+    retry: false
+  })
+}
+
+async function appendGroupTranscriptMessage(groupId, { content, senderBotInstanceId = null }) {
+  return pluginCtx.rest(`/groups/${groupId}/messages`, {
+    method: 'POST',
+    body: {
+      content,
+      sender_bot_instance_id: senderBotInstanceId,
+      idempotency_key: newGroupMutationKey('group-message')
+    }
+  })
+}
+
+function orderedGroupMembers(group) {
+  const members = Array.isArray(group?.members) ? group.members : []
+  const leader = members.find(member => member.bot_instance_id === group?.leader_bot_instance_id)
+  if (!leader) {
+    return members
+  }
+  return [leader, ...members.filter(member => member.bot_instance_id !== leader.bot_instance_id)]
+}
+
+function groupMentionQuery(text) {
+  const match = String(text || '').match(/(^|\s)@([a-z0-9_-]*)$/i)
+  return match ? match[2].toLowerCase() : null
+}
+
+function groupMentionSuggestions(group, roster, metaByName, text) {
+  const query = groupMentionQuery(text)
+  if (query === null) {
+    return []
+  }
+  const byName = new Map((Array.isArray(roster) ? roster : []).map(bot => [bot.name, bot]))
+  return (Array.isArray(group?.members) ? group.members : [])
+    .filter(member => {
+      const bot = byName.get(member.profile_name) || { name: member.profile_name }
+      const haystack = [
+        member.profile_name,
+        botHandle(member.profile_name),
+        displayName(bot, metaByName?.[member.profile_name])
+      ]
+        .join(' ')
+        .toLowerCase()
+      return !query || haystack.includes(query)
+    })
+    .slice(0, 8)
+}
+
+function completeGroupMention(text, profileName) {
+  return String(text || '').replace(/(^|\s)@[a-z0-9_-]*$/i, `$1@${botHandle(profileName)} `)
+}
+
+function mentionedGroupMembers(group, text) {
+  const members = Array.isArray(group?.members) ? group.members : []
+  const byHandle = new Map(members.map(member => [botHandle(member.profile_name).toLowerCase(), member]))
+  const found = []
+  const seen = new Set()
+  const pattern = /(?:^|[\s(])@([a-z0-9_-]+)/gi
+  let match
+  while ((match = pattern.exec(String(text || '')))) {
+    const member = byHandle.get(match[1].toLowerCase())
+    if (member && !seen.has(member.bot_instance_id)) {
+      seen.add(member.bot_instance_id)
+      found.push(member)
+    }
+  }
+  return found
+}
+
+function groupTurnMembers(group, text) {
+  const mentioned = mentionedGroupMembers(group, text)
+  return mentioned.length ? mentioned : orderedGroupMembers(group)
+}
+
+function groupTranscriptText(messages) {
+  const lines = (Array.isArray(messages) ? messages : []).slice(-80).map(message => {
+    const speaker = message.sender_profile_name ? `@${botHandle(message.sender_profile_name)}` : 'User'
+    return `${speaker}: ${String(message.content || '').trim()}`
+  })
+  while (lines.length > 1 && lines.join('\n\n').length > 24_000) {
+    lines.shift()
+  }
+  return lines.join('\n\n') || '(No messages yet.)'
+}
+
+function groupMemberPrompt(group, member, messages) {
+  const leader = (group.members || []).find(item => item.bot_instance_id === group.leader_bot_instance_id)
+  const isLeader = member.bot_instance_id === group.leader_bot_instance_id
+  const members = (group.members || []).map(item => `@${botHandle(item.profile_name)}`).join(', ')
+  return [
+    `You are @${botHandle(member.profile_name)}, participating in the persistent Hermes group chat “${group.name}”.`,
+    `Members: ${members}.`,
+    leader ? `Group leader: @${botHandle(leader.profile_name)}.${isLeader ? ' You are the leader and speak first on each user turn.' : ''}` : '',
+    '',
+    'This is a real shared group conversation. Read the transcript before answering.',
+    'Reply as yourself, not as a narrator or as the whole team. You may address the user or another member naturally.',
+    isLeader
+      ? 'Set a useful direction for the turn, but do not pretend the other members have already agreed with you.'
+      : 'Build on, refine, question, or disagree with earlier replies when useful instead of merely repeating them.',
+    'Do not run Hermes commands to message teammates from this turn; the group host will post your response directly into the shared room.',
+    'Keep the response focused and conversational unless the task genuinely needs detail.',
+    '',
+    'GROUP TRANSCRIPT',
+    '----------------',
+    groupTranscriptText(messages),
+    '----------------',
+    '',
+    `Reply now as @${botHandle(member.profile_name)}.`
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+const GROUP_MEMBER_TURN_TIMEOUT_MS = 75_000
+
+function terminalGroupStatusError(payload) {
+  const text = String(payload?.text || payload?.message || payload?.error || '').trim()
+  if (!text) {
+    return null
+  }
+
+  const lower = text.toLowerCase()
+  // Auxiliary helpers (title generation, summaries, etc.) may fail while the
+  // primary conversation remains perfectly healthy. Never let those abort a
+  // group member turn.
+  if (lower.includes('auxiliary title generation failed')) {
+    return null
+  }
+
+  // Let Hermes try a configured fallback first. Only cut the turn short once
+  // the runtime says the provider path is terminal, rather than on a transient
+  // 429 attempt that Hermes may still recover from.
+  if (lower.includes('switching to fallback')) {
+    return null
+  }
+
+  const terminal =
+    lower.includes('final error:') ||
+    lower.includes('rate limited after') ||
+    lower.includes("plan's usage limit has been reached") ||
+    lower.includes('no allowed providers are available') ||
+    lower.includes('billing wall')
+
+  return terminal ? new Error(text.replace(/\s+/g, ' ').slice(0, 500)) : null
+}
+
+function runHiddenGroupPrompt(sessionId, text) {
+  return new Promise((resolve, reject) => {
+    let settled = false
+    let terminal = null
+    let infoSeen = false
+    let timer = null
+    let terminalGrace = null
+    let offComplete = () => undefined
+    let offInfo = () => undefined
+    let offStatus = () => undefined
+    let offError = () => undefined
+
+    const finish = (error, value) => {
+      if (settled) {
+        return
+      }
+      settled = true
+      if (timer !== null) {
+        window.clearTimeout(timer)
+      }
+      if (terminalGrace !== null) {
+        window.clearTimeout(terminalGrace)
+      }
+      offComplete()
+      offInfo()
+      offStatus()
+      offError()
+      if (error) {
+        reject(error)
+      } else {
+        resolve(value)
+      }
+    }
+
+    const settleAfterTurn = () => {
+      if (!terminal) {
+        return
+      }
+      if (terminal.error) {
+        finish(terminal.error)
+      } else {
+        finish(null, terminal.response)
+      }
+    }
+
+    offComplete = host.onEvent('message.complete', event => {
+      if (event?.session_id !== sessionId) {
+        return
+      }
+      const payload = event.payload || {}
+      const response = String(payload.text || '').trim()
+      if (payload.status === 'error') {
+        terminal = {
+          error: new Error(String(payload.error || response || 'Group member turn failed.'))
+        }
+      } else if (!response) {
+        terminal = { error: new Error('Group member returned an empty response.') }
+      } else {
+        terminal = { response }
+      }
+
+      if (infoSeen) {
+        settleAfterTurn()
+        return
+      }
+
+      // Error paths on older gateways do not always emit the settled session.info
+      // frame. Give normal teardown a moment, then use the terminal frame itself.
+      terminalGrace = window.setTimeout(settleAfterTurn, 1_500)
+    })
+
+    // Hermes normally emits this after session.running is cleared and per-turn
+    // profile, transport, approval, and secret scopes have been restored.
+    offInfo = host.onEvent('session.info', event => {
+      if (event?.session_id !== sessionId) {
+        return
+      }
+      infoSeen = true
+      if (terminal) {
+        settleAfterTurn()
+      }
+    })
+
+    const stopOnTerminalRuntimeError = payload => {
+      const error = terminalGroupStatusError(payload)
+      if (!error) {
+        return
+      }
+      void host.request('session.interrupt', { session_id: sessionId }).catch(() => undefined)
+      finish(error)
+    }
+
+    offStatus = host.onEvent('status.update', event => {
+      if (event?.session_id === sessionId) {
+        stopOnTerminalRuntimeError(event.payload)
+      }
+    })
+
+    offError = host.onEvent('error', event => {
+      if (event?.session_id !== sessionId) {
+        return
+      }
+      const error = terminalGroupStatusError(event.payload)
+      if (!error) {
+        return
+      }
+      void host.request('session.interrupt', { session_id: sessionId }).catch(() => undefined)
+      finish(error)
+    })
+
+    timer = window.setTimeout(() => {
+      void host.request('session.interrupt', { session_id: sessionId }).catch(() => undefined)
+      finish(new Error('No reply after 75 seconds. This member was skipped so the rest of the group can continue.'))
+    }, GROUP_MEMBER_TURN_TIMEOUT_MS)
+
+    host
+      .request('prompt.submit', { session_id: sessionId, text })
+      .catch(error => finish(error instanceof Error ? error : new Error(String(error))))
+  })
+}
+
+async function cleanupGroupRuntimeSession(created, profileName) {
+  const sessionId = created?.session_id
+  const storedSessionId = created?.stored_session_id
+  if (sessionId) {
+    try {
+      await host.request('session.close', { session_id: sessionId })
+    } catch {
+      // Cleanup is best-effort; the gateway also reaps detached sessions.
+    }
+  }
+  if (storedSessionId) {
+    try {
+      await host.request('session.delete', { session_id: storedSessionId, profile: profileName })
+    } catch {
+      // Source "tool" stays hidden from normal session lists if cleanup loses a race.
+    }
+  }
+}
+
+function waitForGroupSessionReady(sessionId, timeoutMs = 12_000) {
+  return new Promise(resolve => {
+    let settled = false
+    let timer = null
+    let offInfo = () => undefined
+
+    const finish = payload => {
+      if (settled) {
+        return
+      }
+      settled = true
+      if (timer !== null) {
+        window.clearTimeout(timer)
+      }
+      offInfo()
+      resolve(payload || null)
+    }
+
+    offInfo = host.onEvent('session.info', event => {
+      if (event?.session_id !== sessionId) {
+        return
+      }
+      const payload = event.payload || {}
+      const model = String(payload.model || '').trim()
+      const provider = String(payload.provider || '').trim()
+      if (model && model !== '(unknown)' && provider && provider !== 'unknown') {
+        finish(payload)
+      }
+    })
+
+    void host.request('session.status', { session_id: sessionId })
+      .then(status => {
+        const output = String(status?.output || '')
+        const match = /^Model:\s+(.+?)\s+\((.+?)\)$/m.exec(output)
+        if (match && match[1] !== '(unknown)' && match[2] !== 'unknown') {
+          finish({ model: match[1], provider: match[2] })
+        }
+      })
+      .catch(() => undefined)
+
+    timer = window.setTimeout(() => finish(null), timeoutMs)
+  })
+}
+
+async function createGroupRuntimeSession({ profileName, title, modelOverride }) {
+  const baseParams = {
+    profile: profileName,
+    title,
+    source: 'tool',
+    close_on_disconnect: true
+  }
+
+  if (!modelOverride?.model) {
+    return { created: await host.request('session.create', baseParams), modelNotice: null }
+  }
+
+  // A room model is selected from the active profile's picker, but group members
+  // may have different provider catalogs. Probe the member's own hidden session
+  // before applying the override so one profile's custom provider can never brick
+  // the rest of a heterogeneous group.
+  const probe = await host.request('session.create', baseParams)
+  const probeSessionId = probe?.session_id
+  if (!probeSessionId) {
+    throw new Error(`Could not start @${botHandle(profileName)}.`)
+  }
+
+  let supported = false
+  let resolvedModelOverride = null
+  let validationError = null
+  const readyInfo = await waitForGroupSessionReady(probeSessionId)
+  if (!readyInfo) {
+    validationError = 'member session did not become ready for room-model validation'
+  } else {
+    try {
+      const options = await host.request('model.options', { session_id: probeSessionId, explicit_only: true })
+      const match = groupModelMatch(options, modelOverride)
+      supported = Boolean(match)
+      if (match) {
+        resolvedModelOverride = { provider: match.provider, model: match.model }
+      }
+    } catch (error) {
+      validationError = error instanceof Error ? error.message : String(error)
+    }
+  }
+
+  if (!supported) {
+    const reason = validationError
+      ? `could not verify ${groupModelLabel(modelOverride)} (${validationError})`
+      : `does not support ${groupModelLabel(modelOverride)}`
+    return {
+      created: probe,
+      modelNotice: `@${botHandle(profileName)} ${reason}; using profile default.`
+    }
+  }
+
+  await cleanupGroupRuntimeSession(probe, profileName)
+
+  const effectiveOverride = resolvedModelOverride || modelOverride
+  const overrideParams = { ...baseParams, model: effectiveOverride.model }
+  if (effectiveOverride.provider) {
+    overrideParams.provider = effectiveOverride.provider
+  }
+
+  try {
+    return { created: await host.request('session.create', overrideParams), modelNotice: null }
+  } catch (error) {
+    const fallback = await host.request('session.create', baseParams)
+    const detail = error instanceof Error ? error.message : String(error)
+    return {
+      created: fallback,
+      modelNotice: `@${botHandle(profileName)} could not start ${groupModelLabel(modelOverride)} (${detail}); using profile default.`
+    }
+  }
+}
+
+async function runGroupMemberTurn({ group, member, messages, modelOverride }) {
+  const prepared = await createGroupRuntimeSession({
+    profileName: member.profile_name,
+    title: `Group · ${group.name}`,
+    modelOverride
+  })
+  const created = prepared.created
+  const sessionId = created?.session_id
+  if (!sessionId) {
+    throw new Error(`Could not start @${botHandle(member.profile_name)}.`)
+  }
+
+  try {
+    const response = await runHiddenGroupPrompt(sessionId, groupMemberPrompt(group, member, messages))
+    return { response, modelNotice: prepared.modelNotice }
+  } finally {
+    await cleanupGroupRuntimeSession(created, member.profile_name)
   }
 }
 
@@ -4115,29 +4864,6 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
       : previewSession?.preview || bot.description || 'No conversations yet — say hi'
   )
 
-  const warm = () => {
-    // Multi-source row: pre-dial the agent's OWN source (feature-detected).
-    if (bot.sourceScoped && typeof host.warmAgent === 'function') {
-      try {
-        host.warmAgent(bot.connectionId, bot.name)
-      } catch {
-        /* warm is best-effort */
-      }
-
-      return
-    }
-
-    if (typeof host.warmProfile !== 'function') {
-      return
-    }
-
-    try {
-      host.warmProfile(bot.name)
-    } catch {
-      /* warm is best-effort */
-    }
-  }
-
   const open = async () => {
     haptic('tap')
     $selectedBot.set(bot.name)
@@ -4190,7 +4916,6 @@ function BotRow({ bot, onDelete, onEdit, onGroup }) {
 
   const row = jsxs('button', {
     type: 'button',
-    onPointerEnter: warm,
     onClick: open,
     className: cn(
       'flex w-full min-w-0 max-w-full items-center gap-2.5 overflow-hidden rounded-md px-2 py-2 text-left transition-colors',
@@ -7150,6 +7875,1602 @@ function ProfileSessionsWorkspace({ bot }) {
   })
 }
 
+// ── persistent managed Groups (durable team records) ───────────────────────────────────────────────────────────────────
+
+const GROUP_COLORS = ['blue', 'green', 'yellow', 'orange', 'red', 'purple', 'pink', 'gray']
+const GROUP_EMOJIS = [
+  '👥', '🤖', '🛠️', '🚀', '🧠', '⚡', '🔥', '🎯',
+  '🧭', '🛡️', '🔬', '💡', '🎨', '📣', '📦', '🧰',
+  '⚙️', '🌐', '💻', '🧪', '📝', '📊', '🏗️', '✨'
+]
+const GROUP_COLOR_HEX = {
+  blue: '#3b82f6',
+  green: '#22c55e',
+  yellow: '#eab308',
+  orange: '#f97316',
+  red: '#ef4444',
+  purple: '#8b5cf6',
+  pink: '#ec4899',
+  gray: '#6b7280'
+}
+
+function DurableGroupEmojiPicker({ value, onChange }) {
+  return jsx('div', {
+    role: 'group',
+    'aria-label': 'Choose group emoji',
+    className: 'grid grid-cols-8 gap-1 rounded-md border border-(--ui-stroke-secondary) p-2',
+    children: GROUP_EMOJIS.map(emoji =>
+      jsx(
+        'button',
+        {
+          type: 'button',
+          'aria-label': `Use ${emoji}`,
+          'aria-pressed': value === emoji,
+          className: cn(
+            'flex size-8 items-center justify-center rounded-md text-lg transition-colors hover:bg-(--chrome-action-hover)',
+            value === emoji && 'bg-(--chrome-action-hover) ring-1 ring-(--ui-stroke-primary)'
+          ),
+          onClick: () => onChange(emoji),
+          children: emoji
+        },
+        emoji
+      )
+    )
+  })
+}
+
+function filterGroupMemberRoster(roster, metaByName, query) {
+  return filterBots(roster, metaByName, query)
+}
+
+function DurableGroupGlyph({ group, size = 32 }) {
+  const style = {
+    width: `${size}px`,
+    height: `${size}px`,
+    backgroundColor: GROUP_COLOR_HEX[group?.color] || GROUP_COLOR_HEX.blue
+  }
+  return jsx('div', {
+    className: 'flex shrink-0 items-center justify-center rounded-lg text-white shadow-sm',
+    style,
+    children:
+      group?.icon_kind === 'codicon'
+        ? jsx(Codicon, { name: group.icon_value || 'organization' })
+        : jsx('span', { className: 'leading-none', children: group?.icon_value || '👥' })
+  })
+}
+
+function DurableBotsGroupsSwitch({ mode, onChange }) {
+  return jsxs('div', {
+    className: 'flex rounded-md bg-(--chrome-action-hover) p-0.5',
+    children: [
+      jsx('button', {
+        type: 'button',
+        className: cn(
+          'rounded px-2 py-1 text-[0.6875rem] font-semibold transition-colors',
+          mode === 'bots' ? 'bg-background text-foreground shadow-sm' : 'text-(--ui-text-tertiary)'
+        ),
+        onClick: () => onChange('bots'),
+        children: 'Bots'
+      }),
+      jsx('button', {
+        type: 'button',
+        className: cn(
+          'rounded px-2 py-1 text-[0.6875rem] font-semibold transition-colors',
+          mode === 'groups' ? 'bg-background text-foreground shadow-sm' : 'text-(--ui-text-tertiary)'
+        ),
+        onClick: () => onChange('groups'),
+        children: 'Groups'
+      })
+    ]
+  })
+}
+
+function DurableGroupModelPicker({ value, onChange, open, onOpenChange }) {
+  const { data, error, isLoading, refetch } = useGroupModelOptions()
+  const [query, setQuery] = useState('')
+  const needle = query.trim().toLowerCase()
+  const rows = groupModelRows(data).filter(row =>
+    !needle || `${row.providerName} ${row.provider} ${row.model}`.toLowerCase().includes(needle)
+  )
+  const choose = next => {
+    onChange(next)
+    setQuery('')
+    onOpenChange(false)
+  }
+
+  return jsxs('div', {
+    children: [
+      jsxs(Button, {
+        variant: 'secondary',
+        size: 'sm',
+        onClick: () => onOpenChange(true),
+        children: [jsx(Codicon, { name: 'sparkle' }), groupModelLabel(value)]
+      }),
+      jsx(Dialog, {
+        open,
+        onOpenChange: next => {
+          if (!next) {
+            setQuery('')
+          }
+          onOpenChange(next)
+        },
+        children: jsxs(DialogContent, {
+          className: 'max-w-xl',
+          children: [
+            jsxs(DialogHeader, {
+              children: [
+                jsx(DialogTitle, { children: 'Group model' }),
+                jsx(DialogDescription, {
+                  children: 'Choose a model for this group chat only. Member profile defaults are not changed.'
+                })
+              ]
+            }),
+            jsx(SearchField, {
+              'aria-label': 'Search group models',
+              containerClassName: 'w-full',
+              inputClassName: 'w-full',
+              placeholder: 'Search models…',
+              value: query,
+              onChange: setQuery
+            }),
+            jsx(ScrollArea, {
+              className: 'max-h-[55vh] rounded-lg border border-(--ui-stroke-secondary)',
+              children: jsxs('div', {
+                className: 'grid gap-1 p-2',
+                children: [
+                  jsxs('button', {
+                    type: 'button',
+                    className: cn(
+                      'flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left hover:bg-(--chrome-action-hover)',
+                      !value?.model && 'bg-(--chrome-action-hover)'
+                    ),
+                    onClick: () => choose(null),
+                    children: [
+                      jsx(Codicon, { name: 'settings-gear' }),
+                      jsxs('div', {
+                        className: 'min-w-0 flex-1',
+                        children: [
+                          jsx('div', { className: 'text-sm font-medium', children: 'Profile default' }),
+                          jsx('div', { className: 'text-xs text-(--ui-text-tertiary)', children: 'Each member uses its own configured default model.' })
+                        ]
+                      })
+                    ]
+                  }),
+                  isLoading
+                    ? jsx('div', { className: 'flex justify-center py-6', children: jsx(GlyphSpinner, { spinner: 'breathe' }) })
+                    : error
+                      ? jsxs('div', {
+                          className: 'grid gap-2 p-3 text-xs text-(--ui-text-tertiary)',
+                          children: [
+                            jsx('span', { children: 'Model options are unavailable.' }),
+                            jsx(Button, { size: 'sm', variant: 'secondary', onClick: () => void refetch(), children: 'Retry' })
+                          ]
+                        })
+                      : rows.length
+                        ? rows.map(row =>
+                            jsxs('button', {
+                              type: 'button',
+                              className: cn(
+                                'flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left hover:bg-(--chrome-action-hover)',
+                                value?.provider === row.provider && value?.model === row.model && 'bg-(--chrome-action-hover)'
+                              ),
+                              onClick: () => choose({ provider: row.provider, model: row.model }),
+                              children: [
+                                jsx(Codicon, { name: 'symbol-keyword' }),
+                                jsxs('div', {
+                                  className: 'min-w-0 flex-1',
+                                  children: [
+                                    jsx('div', { className: 'truncate text-sm font-medium', children: row.model }),
+                                    jsx('div', { className: 'truncate text-xs text-(--ui-text-tertiary)', children: row.providerName })
+                                  ]
+                                }),
+                                value?.provider === row.provider && value?.model === row.model
+                                  ? jsx(Codicon, { name: 'check' })
+                                  : null
+                              ]
+                            }, `${row.provider}:${row.model}`)
+                          )
+                        : jsx('div', { className: 'p-4 text-center text-xs text-(--ui-text-tertiary)', children: `No models match “${query.trim()}”` })
+                ]
+              })
+            })
+          ]
+        })
+      })
+    ]
+  })
+}
+
+function DurableGroupSlashMenu({ slashSuggestions, selectedIndex, onChoose }) {
+  if (!slashSuggestions.length) {
+    return null
+  }
+  return jsx('div', {
+    className: 'mx-auto mb-2 max-h-72 w-full max-w-4xl overflow-auto rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-sidebar-surface-background) p-1.5 shadow-lg',
+    children: slashSuggestions.map((item, index) =>
+      jsxs('button', {
+        type: 'button',
+        'aria-label': 'Group slash command',
+        className: cn(
+          'flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left',
+          index === selectedIndex ? 'bg-(--chrome-action-hover)' : 'hover:bg-(--chrome-action-hover)'
+        ),
+        onMouseDown: event => event.preventDefault(),
+        onClick: () => onChoose(item),
+        children: [
+          jsx(Codicon, { name: item.group === 'Skills' ? 'zap' : 'terminal' }),
+          jsxs('div', {
+            className: 'min-w-0 flex-1',
+            children: [
+              jsx('div', { className: 'truncate font-mono text-xs font-semibold', children: item.display || item.text }),
+              item.meta ? jsx('div', { className: 'truncate text-[0.65rem] text-(--ui-text-tertiary)', children: item.meta }) : null
+            ]
+          }),
+          item.group ? jsx('span', { className: 'shrink-0 text-[0.6rem] text-(--ui-text-quaternary)', children: item.group }) : null
+        ]
+      }, `${item.text}:${index}`)
+    )
+  })
+}
+
+function DurableCreateGroupDialog({ open, onClose, roster }) {
+  const [name, setName] = useState('')
+  const [color, setColor] = useState('blue')
+  const [iconKind, setIconKind] = useState('emoji')
+  const [iconValue, setIconValue] = useState('👥')
+  const [memberNames, setMemberNames] = useState([])
+  const [memberQuery, setMemberQuery] = useState('')
+  const [leaderName, setLeaderName] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
+  const botMeta = useValue($botMeta)
+  const filteredMemberRoster = filterGroupMemberRoster(roster, botMeta, memberQuery)
+
+  const reset = () => {
+    setName('')
+    setColor('blue')
+    setIconKind('emoji')
+    setIconValue('👥')
+    setMemberNames([])
+    setMemberQuery('')
+    setLeaderName('')
+    setBusy(false)
+    setError(null)
+  }
+
+  const toggleMember = (botName, checked) => {
+    const next = checked
+      ? memberNames.includes(botName)
+        ? memberNames
+        : [...memberNames, botName]
+      : memberNames.filter(name => name !== botName)
+    setMemberNames(next)
+    if (!next.includes(leaderName)) {
+      setLeaderName(next[0] || '')
+    }
+  }
+
+  const submit = async () => {
+    if (!name.trim() || !memberNames.length || !leaderName || busy) {
+      return
+    }
+    setBusy(true)
+    setError(null)
+    try {
+      const members = await groupMembersForNames(memberNames, roster)
+      const leader = members.find(member => member.profile_name === leaderName)
+      if (!leader) {
+        throw new Error('Choose a leader from the selected members.')
+      }
+      const created = await pluginCtx.rest('/groups', {
+        method: 'POST',
+        body: {
+          name: name.trim(),
+          color,
+          icon_kind: iconKind,
+          icon_value: iconValue.trim() || (iconKind === 'emoji' ? '👥' : 'organization'),
+          members,
+          leader_bot_instance_id: leader.bot_instance_id,
+          idempotency_key: newGroupMutationKey('create-group')
+        }
+      })
+      queryClient.invalidateQueries({ queryKey: GROUPS_KEY })
+      $selectedGroupId.set(created.id)
+      host.notify({ kind: 'success', message: `Group “${created.name}” created` })
+      reset()
+      onClose()
+      host.navigate(GROUP_ROUTE)
+    } catch (err) {
+      setBusy(false)
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  return jsx(Dialog, {
+    open,
+    onOpenChange: value => {
+      if (!value && !busy) {
+        reset()
+        onClose()
+      }
+    },
+    children: jsxs(DialogContent, {
+      className: 'max-w-lg',
+      children: [
+        jsxs(DialogHeader, {
+          children: [
+            jsx(DialogTitle, { children: 'New Group' }),
+            jsx(DialogDescription, {
+              children: 'Choose a persistent team of bots and one leader. Membership is stored installation-wide.'
+            })
+          ]
+        }),
+        jsxs('div', {
+          className: 'grid gap-3.5',
+          children: [
+            labeled(
+              'Name',
+              jsx(Input, {
+                autoFocus: true,
+                maxLength: 120,
+                placeholder: 'Support Crew',
+                value: name,
+                onChange: event => setName(event.target.value)
+              })
+            ),
+            jsxs('div', {
+              className: 'grid grid-cols-2 gap-3',
+              children: [
+                labeled(
+                  'Color',
+                  jsxs(Select, {
+                    value: color,
+                    onValueChange: setColor,
+                    children: [
+                      jsx(SelectTrigger, { children: jsx(SelectValue, {}) }),
+                      jsx(SelectContent, {
+                        children: GROUP_COLORS.map(value =>
+                          jsx(SelectItem, { value, children: value[0].toUpperCase() + value.slice(1) }, value)
+                        )
+                      })
+                    ]
+                  })
+                ),
+                labeled(
+                  'Icon type',
+                  jsxs(Select, {
+                    value: iconKind,
+                    onValueChange: value => {
+                      setIconKind(value)
+                      setIconValue(value === 'emoji' ? '👥' : 'organization')
+                    },
+                    children: [
+                      jsx(SelectTrigger, { children: jsx(SelectValue, {}) }),
+                      jsxs(SelectContent, {
+                        children: [
+                          jsx(SelectItem, { value: 'emoji', children: 'Emoji' }),
+                          jsx(SelectItem, { value: 'codicon', children: 'Codicon' })
+                        ]
+                      })
+                    ]
+                  })
+                )
+              ]
+            }),
+            iconKind === 'emoji'
+              ? jsxs('div', {
+                  className: 'grid gap-1.5',
+                  children: [
+                    jsx('div', { className: 'text-xs font-medium text-(--ui-text-secondary)', children: 'Emoji' }),
+                    jsx(DurableGroupEmojiPicker, { value: iconValue, onChange: setIconValue }),
+                    labeled(
+                      'Custom emoji',
+                      jsx(Input, {
+                        maxLength: 64,
+                        placeholder: 'Paste any emoji',
+                        value: iconValue,
+                        onChange: event => setIconValue(event.target.value)
+                      })
+                    )
+                  ]
+                })
+              : labeled(
+                  'Codicon name',
+                  jsx(Input, {
+                    maxLength: 64,
+                    placeholder: 'organization',
+                    value: iconValue,
+                    onChange: event => setIconValue(event.target.value)
+                  })
+                ),
+            jsxs('div', {
+              className: 'grid gap-1.5',
+              children: [
+                jsx('div', {
+                  className: 'text-xs font-medium text-(--ui-text-secondary)',
+                  children: `Members${memberNames.length ? ` · ${memberNames.length} selected` : ''}`
+                }),
+                jsx(SearchField, {
+                  'aria-label': 'Search group members',
+                  containerClassName: 'w-full',
+                  inputClassName: 'w-full',
+                  placeholder: 'Search bots…',
+                  value: memberQuery,
+                  onChange: setMemberQuery
+                }),
+                filteredMemberRoster.length
+                  ? jsx(ScrollArea, {
+                      className: 'max-h-44 rounded-md border border-(--ui-stroke-secondary)',
+                      children: jsx('div', {
+                        className: 'grid gap-0.5 p-2',
+                        children: filteredMemberRoster.map(bot => {
+                          const meta = botMeta[bot.name]
+                          const ready = Boolean(meta?.instanceId)
+                          return jsxs(
+                            'label',
+                            {
+                              className: cn(
+                                'flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-xs hover:bg-(--chrome-action-hover)',
+                                !ready && 'text-(--ui-text-tertiary)'
+                              ),
+                              title: ready ? bot.name : `${bot.name} · stable identity will be prepared automatically`,
+                              children: [
+                                jsx(Checkbox, {
+                                  checked: memberNames.includes(bot.name),
+                                  onCheckedChange: value => toggleMember(bot.name, Boolean(value))
+                                }),
+                                jsx('span', { className: 'min-w-0 flex-1 truncate', children: displayName(bot, meta) }),
+                                jsx('span', {
+                                  className: 'font-mono text-[0.6rem] text-(--ui-text-quaternary)',
+                                  children: `@${botHandle(bot.name)}`
+                                })
+                              ]
+                            },
+                            bot.name
+                          )
+                        })
+                      })
+                    })
+                  : jsx('div', {
+                      'aria-live': 'polite',
+                      className: 'rounded-md border border-(--ui-stroke-secondary) px-3 py-3 text-center text-xs text-(--ui-text-tertiary)',
+                      children: `No bots match “${memberQuery.trim()}”`
+                    })
+              ]
+            }),
+            memberNames.length
+              ? labeled(
+                  'Leader',
+                  jsxs(Select, {
+                    value: leaderName,
+                    onValueChange: setLeaderName,
+                    children: [
+                      jsx(SelectTrigger, { children: jsx(SelectValue, { placeholder: 'Choose a leader' }) }),
+                      jsx(SelectContent, {
+                        children: memberNames.map(memberName =>
+                          jsx(SelectItem, { value: memberName, children: `@${botHandle(memberName)}` }, memberName)
+                        )
+                      })
+                    ]
+                  })
+                )
+              : null,
+            error
+              ? jsx('div', { className: 'text-xs text-(--ui-accent)', children: error })
+              : null
+          ]
+        }),
+        jsxs(DialogFooter, {
+          children: [
+            jsx(Button, { variant: 'secondary', disabled: busy, onClick: onClose, children: 'Cancel' }),
+            jsx(Button, {
+              disabled: busy || !name.trim() || !memberNames.length || !leaderName,
+              onClick: submit,
+              children: busy ? 'Creating…' : 'Create Group'
+            })
+          ]
+        })
+      ]
+    })
+  })
+}
+
+function DurableGroupSettingsDialog({ group, open, onClose, roster }) {
+  const [name, setName] = useState('')
+  const [color, setColor] = useState('blue')
+  const [iconKind, setIconKind] = useState('emoji')
+  const [iconValue, setIconValue] = useState('👥')
+  const [memberNames, setMemberNames] = useState([])
+  const [memberQuery, setMemberQuery] = useState('')
+  const [leaderName, setLeaderName] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
+  const [deleteArmed, setDeleteArmed] = useState(false)
+  const botMeta = useValue($botMeta)
+  const filteredMemberRoster = filterGroupMemberRoster(roster, botMeta, memberQuery)
+
+  useEffect(() => {
+    if (!open || !group) {
+      return
+    }
+    setName(group.name || '')
+    setColor(group.color || 'blue')
+    setIconKind(group.icon_kind || 'emoji')
+    setIconValue(group.icon_value || '👥')
+    setMemberNames((group.members || []).map(member => member.profile_name))
+    setMemberQuery('')
+    setLeaderName(
+      (group.members || []).find(member => member.bot_instance_id === group.leader_bot_instance_id)?.profile_name || ''
+    )
+    setBusy(false)
+    setError(null)
+    setDeleteArmed(false)
+  }, [open, group?.id, group?.revision])
+
+  if (!group) {
+    return null
+  }
+
+  const toggleMember = (botName, checked) => {
+    const next = checked
+      ? memberNames.includes(botName)
+        ? memberNames
+        : [...memberNames, botName]
+      : memberNames.filter(name => name !== botName)
+    setMemberNames(next)
+    if (!next.includes(leaderName)) {
+      setLeaderName(next[0] || '')
+    }
+  }
+
+  const save = async () => {
+    if (!name.trim() || !memberNames.length || !leaderName || busy) {
+      return
+    }
+    setBusy(true)
+    setError(null)
+    try {
+      let revision = group.revision
+      const metadataChanged =
+        name.trim() !== group.name ||
+        color !== group.color ||
+        iconKind !== group.icon_kind ||
+        iconValue.trim() !== group.icon_value
+      if (metadataChanged) {
+        const updated = await pluginCtx.rest(`/groups/${group.id}`, {
+          method: 'PATCH',
+          body: {
+            expected_revision: group.revision,
+            name: name.trim(),
+            color,
+            icon_kind: iconKind,
+            icon_value: iconValue.trim() || (iconKind === 'emoji' ? '👥' : 'organization'),
+            idempotency_key: newGroupMutationKey('group-metadata')
+          }
+        })
+        revision = updated.revision
+      }
+
+      const members = await groupMembersForNames(memberNames, roster)
+      const leader = members.find(member => member.profile_name === leaderName)
+      if (!leader) {
+        throw new Error('Choose a leader from the selected members.')
+      }
+      const previousMembers = (group.members || []).map(member => member.bot_instance_id).sort().join('|')
+      const nextMembers = members.map(member => member.bot_instance_id).sort().join('|')
+      const membershipChanged =
+        previousMembers !== nextMembers || leader.bot_instance_id !== group.leader_bot_instance_id
+      if (membershipChanged) {
+        await pluginCtx.rest(`/groups/${group.id}/membership`, {
+          method: 'PUT',
+          body: {
+            expected_revision: revision,
+            members,
+            leader_bot_instance_id: leader.bot_instance_id,
+            idempotency_key: newGroupMutationKey('group-membership')
+          }
+        })
+      }
+
+      queryClient.invalidateQueries({ queryKey: GROUPS_KEY })
+      queryClient.invalidateQueries({ queryKey: [ID, 'group', group.id] })
+      host.notify({ kind: 'success', message: `Saved “${name.trim()}”` })
+      setBusy(false)
+      onClose()
+    } catch (err) {
+      setBusy(false)
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  const remove = async () => {
+    if (!deleteArmed) {
+      setDeleteArmed(true)
+      return
+    }
+    setBusy(true)
+    setError(null)
+    try {
+      await pluginCtx.rest(`/groups/${group.id}`, {
+        method: 'DELETE',
+        body: {
+          expected_revision: group.revision,
+          idempotency_key: newGroupMutationKey('delete-group')
+        }
+      })
+      if ($selectedGroupId.get() === group.id) {
+        $selectedGroupId.set(null)
+      }
+      queryClient.invalidateQueries({ queryKey: GROUPS_KEY })
+      host.notify({ kind: 'success', message: `Deleted “${group.name}”` })
+      onClose()
+    } catch (err) {
+      setBusy(false)
+      setError(err instanceof Error ? err.message : String(err))
+    }
+  }
+
+  return jsx(Dialog, {
+    open,
+    onOpenChange: value => {
+      if (!value && !busy) {
+        onClose()
+      }
+    },
+    children: jsxs(DialogContent, {
+      className: 'max-w-lg',
+      children: [
+        jsxs(DialogHeader, {
+          children: [
+            jsx(DialogTitle, { children: 'Group Settings' }),
+            jsx(DialogDescription, { children: 'Edit identity, membership, and the group leader.' })
+          ]
+        }),
+        jsxs('div', {
+          className: 'grid gap-3.5',
+          children: [
+            labeled(
+              'Name',
+              jsx(Input, { maxLength: 120, value: name, onChange: event => setName(event.target.value) })
+            ),
+            jsxs('div', {
+              className: 'grid grid-cols-2 gap-3',
+              children: [
+                labeled(
+                  'Color',
+                  jsxs(Select, {
+                    value: color,
+                    onValueChange: setColor,
+                    children: [
+                      jsx(SelectTrigger, { children: jsx(SelectValue, {}) }),
+                      jsx(SelectContent, {
+                        children: GROUP_COLORS.map(value =>
+                          jsx(SelectItem, { value, children: value[0].toUpperCase() + value.slice(1) }, value)
+                        )
+                      })
+                    ]
+                  })
+                ),
+                labeled(
+                  'Icon type',
+                  jsxs(Select, {
+                    value: iconKind,
+                    onValueChange: setIconKind,
+                    children: [
+                      jsx(SelectTrigger, { children: jsx(SelectValue, {}) }),
+                      jsxs(SelectContent, {
+                        children: [
+                          jsx(SelectItem, { value: 'emoji', children: 'Emoji' }),
+                          jsx(SelectItem, { value: 'codicon', children: 'Codicon' })
+                        ]
+                      })
+                    ]
+                  })
+                )
+              ]
+            }),
+            iconKind === 'emoji'
+              ? jsxs('div', {
+                  className: 'grid gap-1.5',
+                  children: [
+                    jsx('div', { className: 'text-xs font-medium text-(--ui-text-secondary)', children: 'Emoji' }),
+                    jsx(DurableGroupEmojiPicker, { value: iconValue, onChange: setIconValue }),
+                    labeled(
+                      'Custom emoji',
+                      jsx(Input, {
+                        maxLength: 64,
+                        placeholder: 'Paste any emoji',
+                        value: iconValue,
+                        onChange: event => setIconValue(event.target.value)
+                      })
+                    )
+                  ]
+                })
+              : labeled(
+                  'Codicon name',
+                  jsx(Input, {
+                    maxLength: 64,
+                    placeholder: 'organization',
+                    value: iconValue,
+                    onChange: event => setIconValue(event.target.value)
+                  })
+                ),
+            jsxs('div', {
+              className: 'grid gap-1.5',
+              children: [
+                jsx('div', {
+                  className: 'text-xs font-medium text-(--ui-text-secondary)',
+                  children: `Members${memberNames.length ? ` · ${memberNames.length} selected` : ''}`
+                }),
+                jsx(SearchField, {
+                  'aria-label': 'Search group members',
+                  containerClassName: 'w-full',
+                  inputClassName: 'w-full',
+                  placeholder: 'Search bots…',
+                  value: memberQuery,
+                  onChange: setMemberQuery
+                }),
+                filteredMemberRoster.length
+                  ? jsx(ScrollArea, {
+                      className: 'max-h-44 rounded-md border border-(--ui-stroke-secondary)',
+                      children: jsx('div', {
+                        className: 'grid gap-0.5 p-2',
+                        children: filteredMemberRoster.map(bot => {
+                          const ready = Boolean(botMeta[bot.name]?.instanceId)
+                          return jsxs(
+                            'label',
+                            {
+                              className: cn(
+                                'flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-xs hover:bg-(--chrome-action-hover)',
+                                !ready && 'text-(--ui-text-tertiary)'
+                              ),
+                              title: ready ? bot.name : `${bot.name} · stable identity will be prepared automatically`,
+                              children: [
+                                jsx(Checkbox, {
+                                  checked: memberNames.includes(bot.name),
+                                  onCheckedChange: value => toggleMember(bot.name, Boolean(value))
+                                }),
+                                jsx('span', { className: 'min-w-0 flex-1 truncate', children: displayName(bot, botMeta[bot.name]) }),
+                                jsx('span', {
+                                  className: 'font-mono text-[0.6rem] text-(--ui-text-quaternary)',
+                                  children: `@${botHandle(bot.name)}`
+                                })
+                              ]
+                            },
+                            bot.name
+                          )
+                        })
+                      })
+                    })
+                  : jsx('div', {
+                      'aria-live': 'polite',
+                      className: 'rounded-md border border-(--ui-stroke-secondary) px-3 py-3 text-center text-xs text-(--ui-text-tertiary)',
+                      children: `No bots match “${memberQuery.trim()}”`
+                    })
+              ]
+            }),
+            memberNames.length
+              ? labeled(
+                  'Leader',
+                  jsxs(Select, {
+                    value: leaderName,
+                    onValueChange: setLeaderName,
+                    children: [
+                      jsx(SelectTrigger, { children: jsx(SelectValue, { placeholder: 'Choose a leader' }) }),
+                      jsx(SelectContent, {
+                        children: memberNames.map(memberName =>
+                          jsx(SelectItem, { value: memberName, children: `@${botHandle(memberName)}` }, memberName)
+                        )
+                      })
+                    ]
+                  })
+                )
+              : null,
+            error ? jsx('div', { className: 'text-xs text-(--ui-accent)', children: error }) : null
+          ]
+        }),
+        jsxs(DialogFooter, {
+          className: 'justify-between sm:justify-between',
+          children: [
+            jsx(Button, {
+              variant: 'secondary',
+              disabled: busy,
+              onClick: remove,
+              children: deleteArmed ? 'Click again to delete' : 'Delete Group'
+            }),
+            jsxs('div', {
+              className: 'flex gap-2',
+              children: [
+                jsx(Button, { variant: 'secondary', disabled: busy, onClick: onClose, children: 'Cancel' }),
+                jsx(Button, {
+                  disabled: busy || !name.trim() || !memberNames.length || !leaderName,
+                  onClick: save,
+                  children: busy ? 'Saving…' : 'Save'
+                })
+              ]
+            })
+          ]
+        })
+      ]
+    })
+  })
+}
+
+function DurableGroupRow({ group, onEdit }) {
+  const leader = (group.members || []).find(member => member.bot_instance_id === group.leader_bot_instance_id)
+  const open = () => {
+    haptic('tap')
+    $selectedGroupId.set(group.id)
+    host.navigate(GROUP_ROUTE)
+  }
+  const row = jsxs('button', {
+    type: 'button',
+    onClick: open,
+    className: 'flex w-full min-w-0 items-center gap-2.5 rounded-md px-2 py-2 text-left transition-colors hover:bg-(--chrome-action-hover)',
+    children: [
+      jsx(DurableGroupGlyph, { group, size: 34 }),
+      jsxs('div', {
+        className: 'min-w-0 flex-1',
+        children: [
+          jsx('div', { className: 'truncate text-[0.8125rem] font-medium', children: group.name }),
+          jsx('div', {
+            className: 'truncate text-xs text-(--ui-text-tertiary)',
+            children: `${group.members?.length || 0} members${leader ? ` · leader @${botHandle(leader.profile_name)}` : ''}`
+          })
+        ]
+      })
+    ]
+  })
+
+  if (!onEdit) {
+    return row
+  }
+  return jsxs(ContextMenu, {
+    children: [
+      jsx(ContextMenuTrigger, { asChild: true, children: row }),
+      jsx(ContextMenuContent, {
+        children: jsx(ContextMenuItem, { onSelect: () => onEdit(group), children: 'Group Settings' })
+      })
+    ]
+  })
+}
+
+function DurableGroupsPane({ roster, onShowBots }) {
+  const { data, error, isLoading, refetch } = useGroups()
+  const [createOpen, setCreateOpen] = useState(false)
+  const [editing, setEditing] = useState(null)
+  const groups = Array.isArray(data) ? data : []
+
+  return jsxs('div', {
+    className: 'flex h-full flex-col',
+    children: [
+      jsxs('div', {
+        className: 'flex items-center justify-between gap-2 px-2.5 pt-2.5 pb-1.5',
+        children: [
+          jsx(DurableBotsGroupsSwitch, { mode: 'groups', onChange: mode => mode === 'bots' && onShowBots() }),
+          jsx(Tip, {
+            label: 'New Group',
+            children: jsx('button', {
+              type: 'button',
+              className: 'flex size-6 items-center justify-center rounded-md text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground',
+              onClick: () => setCreateOpen(true),
+              children: jsx(Codicon, { name: 'add' })
+            })
+          })
+        ]
+      }),
+      isLoading
+        ? jsx('div', {
+            className: 'flex flex-1 items-center justify-center',
+            children: jsx(GlyphSpinner, { spinner: 'breathe', className: 'text-(--ui-text-tertiary)' })
+          })
+        : error
+          ? jsxs('div', {
+              className: 'grid gap-2 px-3 py-4 text-xs text-(--ui-text-tertiary)',
+              children: [
+                jsx('div', { children: 'Persistent Groups are unavailable from the Bot Mode backend.' }),
+                jsx(Button, { variant: 'secondary', size: 'sm', onClick: () => void refetch(), children: 'Retry' })
+              ]
+            })
+          : groups.length
+            ? jsx(ScrollArea, {
+                className: 'min-h-0 flex-1',
+                children: jsx('div', {
+                  className: 'grid gap-0.5 px-1.5 pb-2',
+                  children: groups.map(group => jsx(DurableGroupRow, { group, onEdit: setEditing }, group.id))
+                })
+              })
+            : jsx(EmptyState, {
+                icon: 'organization',
+                title: 'No groups yet',
+                description: 'Assemble a few bots into a persistent team.'
+              }),
+      jsx('div', {
+        className: 'border-t border-(--ui-stroke-secondary) p-2',
+        children: jsxs(Button, {
+          className: 'w-full justify-center gap-1.5',
+          variant: 'secondary',
+          onClick: () => setCreateOpen(true),
+          children: [jsx(Codicon, { name: 'add' }), 'New Group']
+        })
+      }),
+      jsx(DurableCreateGroupDialog, { open: createOpen, onClose: () => setCreateOpen(false), roster }),
+      jsx(DurableGroupSettingsDialog, {
+        group: editing,
+        open: Boolean(editing),
+        onClose: () => setEditing(null),
+        roster
+      })
+    ]
+  })
+}
+
+function DurableGroupMessageRow({ message, group, roster, botMeta }) {
+  const fromBot = Boolean(message?.sender_bot_instance_id)
+  if (!fromBot) {
+    return jsxs('div', {
+      className: 'flex justify-end',
+      children: [
+        jsxs('div', {
+          className: 'max-w-[82%] rounded-2xl rounded-br-md bg-(--chrome-action-hover) px-3.5 py-2.5',
+          children: [
+            jsx('div', { className: 'mb-1 text-[0.65rem] font-semibold text-(--ui-text-tertiary)', children: 'You' }),
+            jsx('div', { className: 'whitespace-pre-wrap text-sm leading-6', children: message.content }),
+            jsx('div', {
+              className: 'mt-1 text-right text-[0.6rem] text-(--ui-text-quaternary)',
+              children: relativeTime(message.created_at_ms)
+            })
+          ]
+        })
+      ]
+    })
+  }
+
+  const profileName = message.sender_profile_name || 'unknown'
+  const bot = roster.find(item => item.name === profileName) || { name: profileName }
+  const meta = botMeta[profileName]
+  const appearance = botAppearance(profileName, meta)
+  const isLeader = message.sender_bot_instance_id === group.leader_bot_instance_id
+  return jsxs('div', {
+    className: 'flex items-start gap-2.5',
+    children: [
+      jsx(BotFace, {
+        shape: appearance.shape,
+        color: appearance.color,
+        image: appearance.image,
+        size: 32,
+        name: profileName
+      }),
+      jsxs('div', {
+        className: 'min-w-0 max-w-[82%]',
+        children: [
+          jsxs('div', {
+            className: 'mb-1 flex items-center gap-1.5',
+            children: [
+              jsx('span', { className: 'truncate text-xs font-semibold', children: displayName(bot, meta) }),
+              jsx('span', {
+                className: 'font-mono text-[0.6rem] text-(--ui-text-quaternary)',
+                children: `@${botHandle(profileName)}`
+              }),
+              isLeader
+                ? jsx('span', {
+                    className: 'rounded-full border border-(--ui-stroke-secondary) px-1.5 py-0.5 text-[0.55rem] font-semibold uppercase tracking-wide text-(--ui-text-tertiary)',
+                    children: 'Leader'
+                  })
+                : null
+            ]
+          }),
+          jsxs('div', {
+            className: 'rounded-2xl rounded-tl-md border border-(--ui-stroke-secondary) px-3.5 py-2.5',
+            children: [
+              jsx('div', { className: 'whitespace-pre-wrap text-sm leading-6', children: message.content }),
+              jsx('div', {
+                className: 'mt-1 text-[0.6rem] text-(--ui-text-quaternary)',
+                children: relativeTime(message.created_at_ms)
+              })
+            ]
+          })
+        ]
+      })
+    ]
+  })
+}
+
+function DurableGroupRoomPage() {
+  const selectedGroupId = useValue($selectedGroupId)
+  const { data: rosterData } = useRoster()
+  const liveRoster = Array.isArray(rosterData?.profiles) ? rosterData.profiles.filter(bot => !bot.remoteSource) : null
+  const roster = liveRoster ?? $lastRoster.get().filter(bot => !bot.remoteSource)
+
+  if (liveRoster) {
+    $lastRoster.set(liveRoster)
+    mergeServerMeta(liveRoster)
+    void reconcileBotIdentities(liveRoster).catch(() => undefined)
+  }
+  const botMeta = useValue($botMeta)
+  const groupsQuery = useGroups()
+  const [createOpen, setCreateOpen] = useState(false)
+  const [editing, setEditing] = useState(null)
+  const groupQuery = useQuery({
+    queryKey: [ID, 'group', selectedGroupId],
+    queryFn: () => (selectedGroupId ? pluginCtx.rest(`/groups/${selectedGroupId}`) : Promise.resolve(null)),
+    enabled: Boolean(selectedGroupId),
+    retry: false
+  })
+  const messagesQuery = useGroupMessages(selectedGroupId)
+  const [draft, setDraft] = useState('')
+  const [sending, setSending] = useState(false)
+  const [activeSpeaker, setActiveSpeaker] = useState(null)
+  const [sendError, setSendError] = useState(null)
+  const [commandNotice, setCommandNotice] = useState(null)
+  const [modelPickerOpen, setModelPickerOpen] = useState(false)
+  const [slashIndex, setSlashIndex] = useState(0)
+  const groupChatPrefs = useValue($groupChatPrefs)
+  const slashQuery = useGroupSlashSuggestions(draft)
+
+  useEffect(() => {
+    setSlashIndex(0)
+  }, [draft])
+
+  if (!selectedGroupId) {
+    const groups = Array.isArray(groupsQuery.data) ? groupsQuery.data : []
+    return jsxs('div', {
+      className: 'flex h-full min-h-0 flex-col',
+      children: [
+        jsxs('div', {
+          className: 'flex items-center justify-between border-b border-(--ui-stroke-secondary) px-6 py-4',
+          children: [
+            jsxs('div', {
+              children: [
+                jsx('h1', { className: 'text-lg font-semibold', children: 'Groups' }),
+                jsx('p', {
+                  className: 'mt-0.5 text-xs text-(--ui-text-tertiary)',
+                  children: 'Persistent bot teams with stable membership and leaders.'
+                })
+              ]
+            }),
+            jsxs(Button, {
+              onClick: () => setCreateOpen(true),
+              children: [jsx(Codicon, { name: 'add' }), 'New Group']
+            })
+          ]
+        }),
+        groupsQuery.isLoading
+          ? jsx('div', {
+              className: 'flex flex-1 items-center justify-center',
+              children: jsx(GlyphSpinner, { spinner: 'breathe', className: 'text-(--ui-text-tertiary)' })
+            })
+          : groups.length
+            ? jsx(ScrollArea, {
+                className: 'min-h-0 flex-1',
+                children: jsx('div', {
+                  className: 'mx-auto grid w-full max-w-4xl gap-3 p-6 md:grid-cols-2',
+                  children: groups.map(group =>
+                    jsx('div', {
+                      className: 'rounded-xl border border-(--ui-stroke-secondary) p-2',
+                      children: jsx(DurableGroupRow, { group, onEdit: setEditing })
+                    }, group.id)
+                  )
+                })
+              })
+            : jsx(EmptyState, {
+                icon: 'organization',
+                title: 'No groups yet',
+                description: 'Create a team from your existing Bots.'
+              }),
+        jsx(DurableCreateGroupDialog, { open: createOpen, onClose: () => setCreateOpen(false), roster }),
+        jsx(DurableGroupSettingsDialog, {
+          group: editing,
+          open: Boolean(editing),
+          onClose: () => setEditing(null),
+          roster
+        })
+      ]
+    })
+  }
+
+  if (groupQuery.isLoading) {
+    return jsx('div', {
+      className: 'flex h-full items-center justify-center',
+      children: jsx(GlyphSpinner, { spinner: 'breathe', className: 'text-(--ui-text-tertiary)' })
+    })
+  }
+  if (groupQuery.error || !groupQuery.data) {
+    return jsxs('div', {
+      className: 'flex h-full flex-col items-center justify-center gap-3 px-6 text-center',
+      children: [
+        jsx(Codicon, { name: 'warning', className: 'text-xl text-(--ui-text-tertiary)' }),
+        jsx('div', { className: 'text-sm font-medium', children: 'This group could not be loaded.' }),
+        jsx(Button, {
+          variant: 'secondary',
+          onClick: () => $selectedGroupId.set(null),
+          children: 'Back to Groups'
+        })
+      ]
+    })
+  }
+
+  const group = groupQuery.data
+  const leader = (group.members || []).find(member => member.bot_instance_id === group.leader_bot_instance_id)
+  const messages = Array.isArray(messagesQuery.data) ? messagesQuery.data : []
+  const messageKey = groupMessagesKey(group.id)
+  const mentionSuggestions = groupMentionSuggestions(group, roster, botMeta, draft)
+  const slashSuggestions = Array.isArray(slashQuery.data) ? slashQuery.data : []
+  const modelOverride = groupChatPrefs[group.id]?.modelOverride || null
+
+  const chooseMention = member => {
+    setDraft(current => completeGroupMention(current, member.profile_name))
+  }
+
+  const chooseSlash = item => {
+    const next = String(item?.text || '').trim()
+    if (!next) {
+      return
+    }
+    setDraft(`${next}${next.includes(' ') ? '' : ' '}`)
+  }
+
+  const setGroupModel = next => {
+    saveGroupChatPrefs(group.id, { modelOverride: next })
+    setCommandNotice(next?.model ? `Group model set to ${groupModelLabel(next)}.` : 'Group model reset to member profile defaults.')
+  }
+
+  const publishTranscript = next => {
+    queryClient.setQueryData(messageKey, next)
+  }
+
+  async function executeGroupSlashCommand(commandText) {
+    const command = String(commandText || '').trim()
+    const match = /^\/([^\s]+)(?:\s+([\s\S]*))?$/.exec(command)
+    if (!match) {
+      throw new Error('Invalid slash command.')
+    }
+    const name = match[1].toLowerCase()
+    const arg = (match[2] || '').trim()
+
+    if (name === 'model') {
+      if (!arg) {
+        setDraft('')
+        setModelPickerOpen(true)
+        setCommandNotice('Choose a model for this group chat.')
+        return
+      }
+      if (['default', 'profile', 'reset'].includes(arg.toLowerCase())) {
+        setGroupModel(null)
+        setDraft('')
+        return
+      }
+      const options = await host.request('model.options', { explicit_only: true })
+      const rows = groupModelRows(options)
+      const needle = arg.toLowerCase()
+      const chosen = rows.find(row =>
+        row.model.toLowerCase() === needle ||
+        `${row.provider}:${row.model}`.toLowerCase() === needle ||
+        `${row.providerName}:${row.model}`.toLowerCase() === needle
+      )
+      if (!chosen) {
+        throw new Error(`Model “${arg}” is not available. Type /model to open the picker.`)
+      }
+      setGroupModel({ provider: chosen.provider, model: chosen.model })
+      setDraft('')
+      return
+    }
+
+    if (name === 'help' || name === 'commands') {
+      setCommandNotice('Type / to browse live Hermes commands and skills. Use /model to change this room’s model; @ mentions target specific group members.')
+      setDraft('')
+      return
+    }
+
+    if (!leader) {
+      throw new Error('This group has no active leader for slash-command execution.')
+    }
+
+    const prepared = await createGroupRuntimeSession({
+      profileName: leader.profile_name,
+      title: `Group command · ${group.name}`,
+      modelOverride
+    })
+    const created = prepared.created
+    const sessionId = created?.session_id
+    if (!sessionId) {
+      throw new Error('Could not start the group command session.')
+    }
+    if (prepared.modelNotice) {
+      setCommandNotice(`Room model fallback: ${prepared.modelNotice}`)
+    }
+
+    try {
+      let dispatch
+      try {
+        dispatch = await host.request('slash.exec', { session_id: sessionId, command: command.replace(/^\/+/, '') })
+      } catch (slashError) {
+        try {
+          dispatch = await host.request('command.dispatch', { session_id: sessionId, name, arg })
+        } catch {
+          throw slashError
+        }
+      }
+
+      if (dispatch?.type === 'alias' && dispatch.target) {
+        setDraft(`/${dispatch.target}${arg ? ` ${arg}` : ''}`)
+        setCommandNotice(`/${name} redirects to /${dispatch.target}. Press Enter to run it.`)
+        return
+      }
+
+      if (dispatch?.type === 'prefill' && dispatch.message) {
+        setDraft(String(dispatch.message))
+        setCommandNotice(dispatch.notice || `/${name} prepared text in the composer.`)
+        return
+      }
+
+      if (dispatch?.type === 'skill' || dispatch?.type === 'send') {
+        const userMessage = await appendGroupTranscriptMessage(group.id, { content: command })
+        let transcript = [...messages, userMessage]
+        publishTranscript(transcript)
+        setDraft('')
+        const response = await runHiddenGroupPrompt(
+          sessionId,
+          [
+            String(dispatch.message || ''),
+            '',
+            `This command was invoked from the persistent Hermes group chat “${group.name}”.`,
+            'Use the shared group transcript below as additional conversation context.',
+            '',
+            groupTranscriptText(transcript)
+          ].join('\n')
+        )
+        const botMessage = await appendGroupTranscriptMessage(group.id, {
+          content: response,
+          senderBotInstanceId: leader.bot_instance_id
+        })
+        transcript = [...transcript, botMessage]
+        publishTranscript(transcript)
+        setCommandNotice(dispatch.notice || null)
+        return
+      }
+
+      const output = String(dispatch?.output || dispatch?.notice || '').trim()
+      setCommandNotice(output || `/${name} completed.`)
+      setDraft('')
+    } finally {
+      await cleanupGroupRuntimeSession(created, leader.profile_name)
+    }
+  }
+
+  const sendGroupMessage = async () => {
+    const text = draft.trim()
+    if (!text || sending) {
+      return
+    }
+
+    setSending(true)
+    setSendError(null)
+    setCommandNotice(null)
+    setActiveSpeaker(null)
+
+    if (text.startsWith('/')) {
+      try {
+        await executeGroupSlashCommand(text)
+      } catch (error) {
+        setSendError(error instanceof Error ? error.message : String(error))
+      } finally {
+        setSending(false)
+      }
+      return
+    }
+
+    try {
+      await reconcileBotIdentities(roster)
+      const userMessage = await appendGroupTranscriptMessage(group.id, { content: text })
+      let transcript = [...messages, userMessage]
+      publishTranscript(transcript)
+      setDraft('')
+
+      const failures = []
+      const modelNotices = []
+      for (const member of groupTurnMembers(group, text)) {
+        setActiveSpeaker(member.profile_name)
+        try {
+          const turn = await runGroupMemberTurn({ group, member, messages: transcript, modelOverride })
+          if (turn.modelNotice) {
+            modelNotices.push(turn.modelNotice)
+            setCommandNotice(`Room model fallback: ${turn.modelNotice}`)
+          }
+          const botMessage = await appendGroupTranscriptMessage(group.id, {
+            content: turn.response,
+            senderBotInstanceId: member.bot_instance_id
+          })
+          transcript = [...transcript, botMessage]
+          publishTranscript(transcript)
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error)
+          failures.push(`@${botHandle(member.profile_name)}: ${detail}`)
+          setSendError(`@${botHandle(member.profile_name)} could not reply: ${detail} Continuing with the rest of the group…`)
+        }
+      }
+
+      if (modelNotices.length) {
+        setCommandNotice(`Room model fallback: ${modelNotices.join(' · ')}`)
+      }
+      if (failures.length) {
+        setSendError(`Some group members could not reply. ${failures.join(' · ')}`)
+      }
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setActiveSpeaker(null)
+      setSending(false)
+      void messagesQuery.refetch()
+    }
+  }
+
+  return jsxs('div', {
+    className: 'flex h-full min-h-0 flex-col',
+    children: [
+      jsxs('div', {
+        className: 'flex items-center justify-between gap-4 border-b border-(--ui-stroke-secondary) px-6 py-4',
+        children: [
+          jsxs('div', {
+            className: 'flex min-w-0 items-center gap-3',
+            children: [
+              jsx('button', {
+                type: 'button',
+                className: 'flex size-8 items-center justify-center rounded-md text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover)',
+                onClick: () => $selectedGroupId.set(null),
+                children: jsx(Codicon, { name: 'arrow-left' })
+              }),
+              jsx(DurableGroupGlyph, { group, size: 42 }),
+              jsxs('div', {
+                className: 'min-w-0',
+                children: [
+                  jsx('h1', { className: 'truncate text-lg font-semibold', children: group.name }),
+                  jsx('div', {
+                    className: 'text-xs text-(--ui-text-tertiary)',
+                    children: `${group.members?.length || 0} members${leader ? ` · leader @${botHandle(leader.profile_name)}` : ''}`
+                  })
+                ]
+              })
+            ]
+          }),
+          jsx(Button, { variant: 'secondary', onClick: () => setEditing(group), children: 'Settings' })
+        ]
+      }),
+      jsx(ScrollArea, {
+        className: 'min-h-0 flex-1',
+        children: jsxs('div', {
+          className: 'mx-auto grid w-full max-w-4xl gap-5 p-6',
+          children: [
+            jsxs('section', {
+              className: 'rounded-xl border border-(--ui-stroke-secondary) p-4',
+              children: [
+                jsx('div', {
+                  className: 'mb-3 text-xs font-semibold uppercase tracking-wider text-(--ui-text-quaternary)',
+                  children: 'Members'
+                }),
+                jsx('div', {
+                  className: 'grid gap-2 sm:grid-cols-2',
+                  children: (group.members || []).map(member => {
+                    const bot = roster.find(item => item.name === member.profile_name) || { name: member.profile_name }
+                    const meta = botMeta[member.profile_name]
+                    const appearance = botAppearance(member.profile_name, meta)
+                    const isLeader = member.bot_instance_id === group.leader_bot_instance_id
+                    return jsxs(
+                      'div',
+                      {
+                        className: 'flex min-w-0 items-center gap-2.5 rounded-lg bg-(--chrome-action-hover) px-3 py-2.5',
+                        children: [
+                          jsx(BotFace, {
+                            shape: appearance.shape,
+                            color: appearance.color,
+                            image: appearance.image,
+                            size: 32,
+                            name: member.profile_name
+                          }),
+                          jsxs('div', {
+                            className: 'min-w-0 flex-1',
+                            children: [
+                              jsx('div', {
+                                className: 'truncate text-sm font-medium',
+                                children: displayName(bot, meta)
+                              }),
+                              jsx('div', {
+                                className: 'truncate font-mono text-[0.65rem] text-(--ui-text-quaternary)',
+                                children: `@${botHandle(member.profile_name)}`
+                              })
+                            ]
+                          }),
+                          isLeader
+                            ? jsx('span', {
+                                className: 'rounded-full border border-(--ui-stroke-secondary) px-2 py-0.5 text-[0.6rem] font-semibold uppercase tracking-wide text-(--ui-text-tertiary)',
+                                children: 'Leader'
+                              })
+                            : null
+                        ]
+                      },
+                      member.bot_instance_id
+                    )
+                  })
+                })
+              ]
+            }),
+            jsxs('section', {
+              className: 'grid gap-4',
+              children: [
+                messagesQuery.isLoading
+                  ? jsx('div', {
+                      className: 'flex justify-center py-10',
+                      children: jsx(GlyphSpinner, { spinner: 'breathe', className: 'text-(--ui-text-tertiary)' })
+                    })
+                  : messagesQuery.error
+                    ? jsx('div', {
+                        className: 'rounded-xl border border-(--ui-stroke-secondary) p-4 text-sm text-(--ui-text-tertiary)',
+                        children: 'The group transcript could not be loaded.'
+                      })
+                    : messages.length
+                      ? jsx('div', {
+                          className: 'grid gap-4',
+                          children: messages.map(message =>
+                            jsx(DurableGroupMessageRow, { message, group, roster, botMeta }, message.id)
+                          )
+                        })
+                      : jsxs('div', {
+                          className: 'rounded-xl border border-dashed border-(--ui-stroke-secondary) p-8 text-center',
+                          children: [
+                            jsx(Codicon, { name: 'comment-discussion', className: 'text-xl text-(--ui-text-tertiary)' }),
+                            jsx('div', { className: 'mt-2 text-sm font-medium', children: 'Start the conversation' }),
+                            jsx('p', {
+                              className: 'mx-auto mt-1 max-w-lg text-xs leading-5 text-(--ui-text-tertiary)',
+                              children: 'Send one message to the room. The leader replies first, then the other members join the same shared turn.'
+                            })
+                          ]
+                        }),
+                sending
+                  ? jsxs('div', {
+                      className: 'flex items-center gap-2 rounded-lg border border-(--ui-stroke-secondary) px-3 py-2 text-xs text-(--ui-text-tertiary)',
+                      children: [
+                        jsx(GlyphSpinner, { spinner: 'breathe' }),
+                        activeSpeaker ? `@${botHandle(activeSpeaker)} is replying…` : 'Starting group turn…'
+                      ]
+                    })
+                  : null
+              ]
+            })
+          ]
+        })
+      }),
+      jsxs('div', {
+        className: 'border-t border-(--ui-stroke-secondary) px-4 py-3',
+        children: [
+          sendError
+            ? jsx('div', {
+                className: 'mx-auto mb-2 w-full max-w-4xl rounded-md border border-(--ui-stroke-secondary) px-3 py-2 text-xs text-(--ui-text-tertiary)',
+                children: sendError
+              })
+            : null,
+          commandNotice
+            ? jsx('div', {
+                className: 'mx-auto mb-2 w-full max-w-4xl rounded-md bg-(--chrome-action-hover) px-3 py-2 text-xs text-(--ui-text-tertiary)',
+                children: commandNotice
+              })
+            : null,
+          jsx(DurableGroupSlashMenu, {
+            slashSuggestions,
+            selectedIndex: Math.min(slashIndex, Math.max(0, slashSuggestions.length - 1)),
+            onChoose: chooseSlash
+          }),
+          slashQuery.isLoading && groupSlashQuery(draft) !== null && !slashSuggestions.length
+            ? jsx('div', {
+                className: 'mx-auto mb-2 flex w-full max-w-4xl items-center gap-2 rounded-md border border-(--ui-stroke-secondary) px-3 py-2 text-xs text-(--ui-text-tertiary)',
+                children: [jsx(GlyphSpinner, { spinner: 'breathe' }), 'Loading commands…']
+              })
+            : null,
+          !slashSuggestions.length && mentionSuggestions.length
+            ? jsx('div', {
+                className: 'mx-auto mb-2 grid w-full max-w-4xl gap-1 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-sidebar-surface-background) p-1.5 shadow-lg',
+                children: mentionSuggestions.map(member => {
+                  const bot = roster.find(item => item.name === member.profile_name) || { name: member.profile_name }
+                  return jsxs(
+                    'button',
+                    {
+                      type: 'button',
+                      'aria-label': 'Mention group member',
+                      className: 'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-(--chrome-action-hover)',
+                      onMouseDown: event => event.preventDefault(),
+                      onClick: () => chooseMention(member),
+                      children: [
+                        jsx('span', { className: 'min-w-0 flex-1 truncate text-xs font-medium', children: displayName(bot, botMeta[member.profile_name]) }),
+                        jsx('span', { className: 'shrink-0 font-mono text-[0.65rem] text-(--ui-text-quaternary)', children: `@${botHandle(member.profile_name)}` })
+                      ]
+                    },
+                    member.bot_instance_id
+                  )
+                })
+              })
+            : null,
+          jsxs('div', {
+            className: 'mx-auto mb-2 flex w-full max-w-4xl items-center justify-between gap-2',
+            children: [
+              jsx(DurableGroupModelPicker, {
+                value: modelOverride,
+                onChange: setGroupModel,
+                open: modelPickerOpen,
+                onOpenChange: setModelPickerOpen
+              }),
+              jsx('div', {
+                className: 'text-[0.6rem] text-(--ui-text-quaternary)',
+                children: 'Room model · unsupported members use profile default · does not change profiles'
+              })
+            ]
+          }),
+          jsxs('div', {
+            className: 'mx-auto flex w-full max-w-4xl items-end gap-2',
+            children: [
+              jsx(Textarea, {
+                'aria-label': 'Message the group',
+                className: 'min-h-11 max-h-40 flex-1 resize-none',
+                disabled: sending,
+                placeholder: 'Message the group…',
+                value: draft,
+                onChange: event => setDraft(event.target.value),
+                onKeyDown: event => {
+                  if (slashSuggestions.length) {
+                    if (event.key === 'ArrowDown') {
+                      event.preventDefault()
+                      setSlashIndex(index => (index + 1) % slashSuggestions.length)
+                      return
+                    }
+                    if (event.key === 'ArrowUp') {
+                      event.preventDefault()
+                      setSlashIndex(index => (index - 1 + slashSuggestions.length) % slashSuggestions.length)
+                      return
+                    }
+                    const selectedSlash = slashSuggestions[slashIndex] || slashSuggestions[0]
+                    if (event.key === 'Enter' && !event.shiftKey && draft.trim() === String(selectedSlash?.text || '').trim()) {
+                      event.preventDefault()
+                      void sendGroupMessage()
+                      return
+                    }
+                    if (event.key === 'Tab' || (event.key === 'Enter' && !event.shiftKey)) {
+                      event.preventDefault()
+                      chooseSlash(selectedSlash)
+                      return
+                    }
+                  }
+                  if (mentionSuggestions.length && (event.key === 'Tab' || (event.key === 'Enter' && !event.shiftKey))) {
+                    event.preventDefault()
+                    chooseMention(mentionSuggestions[0])
+                    return
+                  }
+                  if (event.key === 'Enter' && !event.shiftKey) {
+                    event.preventDefault()
+                    void sendGroupMessage()
+                  }
+                }
+              }),
+              jsx(Button, {
+                disabled: sending || !draft.trim(),
+                onClick: () => void sendGroupMessage(),
+                children: sending ? 'Group replying…' : 'Send to group'
+              })
+            ]
+          }),
+          jsx('div', {
+            className: 'mx-auto mt-1 w-full max-w-4xl text-[0.6rem] text-(--ui-text-quaternary)',
+            children: 'Enter to send · Shift+Enter for a new line · / commands · @ members'
+          })
+        ]
+      }),
+      jsx(DurableGroupSettingsDialog, {
+        group: editing,
+        open: Boolean(editing),
+        onClose: () => setEditing(null),
+        roster
+      })
+    ]
+  })
+}
+
 // ── roster pane ──────────────────────────────────────────────────────────────
 
 /** "Active now" presence strip above the roster: chips for every bot that is
@@ -7920,6 +10241,7 @@ function BotsPane() {
   const [deleting, setDeleting] = useState(null)
   const [grouping, setGrouping] = useState(null)
   const [query, setQuery] = useState('')
+  const [mode, setMode] = useState('bots')
   const activityToasts = useValue($activityToasts)
   const sessionsWorkspaceName = useValue($botSessionsWorkspace)
   const groupChatName = useValue($groupChatWorkspace)
@@ -8015,6 +10337,10 @@ function BotsPane() {
     : null
   const sessionsWorkspaceBot = roster.find(bot => bot.name === sessionsWorkspaceName)
 
+  if (mode === 'groups') {
+    return jsx(DurableGroupsPane, { roster: activeSourceRoster, onShowBots: () => setMode('bots') })
+  }
+
   if (sessionsWorkspaceBot) {
     return jsx(ProfileSessionsWorkspace, { bot: sessionsWorkspaceBot })
   }
@@ -8031,10 +10357,7 @@ function BotsPane() {
       jsxs('div', {
         className: 'flex items-center justify-between gap-2 px-2.5 pt-2.5 pb-1.5',
         children: [
-          jsx('span', {
-            className: 'text-[0.6875rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary)',
-            children: 'Bots'
-          }),
+          jsx(DurableBotsGroupsSwitch, { mode: 'bots', onChange: setMode }),
           jsxs('div', {
             className: 'flex items-center gap-0.5',
             children: [
@@ -8414,6 +10737,22 @@ export default {
       /* no storage on this shell — defaults stay */
     }
 
+    try {
+      Promise.resolve(ctx.storage?.get?.('group-chat-prefs'))
+        .then(value => {
+          if (value && typeof value === 'object') {
+            const migrated = migrateGroupChatPrefs(value)
+            $groupChatPrefs.set(migrated)
+            if (JSON.stringify(migrated) !== JSON.stringify(value)) {
+              Promise.resolve(ctx.storage?.set?.('group-chat-prefs', migrated)).catch(() => undefined)
+            }
+          }
+        })
+        .catch(() => undefined)
+    } catch {
+      /* durable group chat preferences stay at defaults */
+    }
+
     // Bot Mode sessions are always hidden now — the old "hide Bot Chats"
     // pref is gone (its stored key is simply ignored). The reconciliation
     // sweep below hides any rows born visible under the old pref.
@@ -8526,6 +10865,25 @@ export default {
       data: { placement: 'left', width: '260px', dock: { pane: 'sessions', pos: 'center', enforce: true } },
       render: () => jsx(BotsPane, {})
     })
+
+    if (typeof ROUTES_AREA !== 'undefined') {
+      ctx.register({
+        id: 'groups-page',
+        area: ROUTES_AREA,
+        title: 'Groups',
+        data: { path: GROUP_ROUTE },
+        render: () => jsx(DurableGroupRoomPage, {})
+      })
+    }
+
+    if (typeof SIDEBAR_NAV_AREA !== 'undefined') {
+      ctx.register({
+        id: 'groups-nav',
+        area: SIDEBAR_NAV_AREA,
+        order: 45,
+        data: { codicon: 'organization', label: 'Groups', path: GROUP_ROUTE }
+      })
+    }
 
     // Routines — its OWN tiling pane splitting the workspace's right edge
     // (NOT the collapsible right sidebar; placement 'right' is that sidebar's

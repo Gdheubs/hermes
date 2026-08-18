@@ -75,12 +75,17 @@ test('roster without profiles never throws', () => {
 })
 
 test('ActiveNowStrip renders above the roster, is a live region, and is click-accessible', () => {
-  // Strip is placed between the pane header and the search field.
-  const headerEnd = source.indexOf("children: 'Bots'")
-  const searchField = source.indexOf("placeholder: 'Search bots…'")
+  // Inspect BotsPane specifically. Durable Groups has its own search field and
+  // header switch earlier in the source, so whole-file first-match ordering is
+  // no longer a meaningful layout assertion.
+  const paneStart = source.indexOf('function BotsPane(')
+  const paneEnd = source.indexOf('// ── plugin', paneStart)
+  const pane = source.slice(paneStart, paneEnd)
+  const headerEnd = pane.indexOf("jsx(DurableBotsGroupsSwitch, { mode: 'bots'")
+  const searchField = pane.indexOf("placeholder: 'Search bots…'")
   assert.ok(headerEnd >= 0 && searchField > headerEnd)
 
-  const stripStart = source.indexOf('jsx(ActiveNowStrip')
+  const stripStart = pane.indexOf('jsx(ActiveNowStrip')
   assert.ok(stripStart > headerEnd && stripStart < searchField, 'strip sits between header and search')
 
   // Live region announces membership changes politely.

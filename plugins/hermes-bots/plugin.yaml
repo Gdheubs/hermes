@@ -1,0 +1,9 @@
+name: hermes-bots
+version: 0.2.0
+description: "Bot Mode roster, durable bot groups, and bounded multi-agent collaboration for Hermes Desktop."
+author: NousResearch
+kind: standalone
+platforms:
+  - linux
+  - macos
+  - windows
