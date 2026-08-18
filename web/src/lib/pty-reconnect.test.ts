@@ -110,6 +110,23 @@ describe("shouldReconnectPtyOnPageResume", () => {
       }),
     ).toBe(true);
   });
+
+  it("does not double-reconnect on rapid resume events when ptyState transitions to connecting", () => {
+    // Simulates reconnectPty() being called (ptyState becomes "connecting"),
+    // immediately followed by another resume event (visibilitychange + focus
+    // burst). The ref must be in sync so the second call sees "connecting"
+    // and defers (returns false) instead of firing a redundant reconnect.
+    expect(
+      shouldReconnectPtyOnPageResume({
+        isActive: true,
+        visibilityState: "visible",
+        online: true,
+        socketReadyState: null,
+        ptyState: "connecting",
+        connectInFlight: true,
+      }),
+    ).toBe(false);
+  });
 });
 
 describe("shouldBlockPtyInput", () => {
