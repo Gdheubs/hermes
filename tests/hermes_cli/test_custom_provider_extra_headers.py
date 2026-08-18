@@ -244,3 +244,33 @@ def test_fetch_api_models_sends_extra_headers_to_models_probe(monkeypatch):
     assert captured["headers"]["authorization"] == "Bearer proxy-key"
     assert captured["headers"]["sleeve-harness"] == "hermes"
     assert captured["headers"]["sleeve-base-url"] == "http://localhost:8081/v1"
+
+
+def test_apply_extra_headers_injects_opencode_zen_api_key():
+    client_kwargs = {"api_key": "zen-secret", "base_url": "https://opencode.ai/zen/v1"}
+    apply_custom_provider_extra_headers_to_client_kwargs(
+        client_kwargs, client_kwargs["base_url"], custom_providers=[]
+    )
+    assert client_kwargs["default_headers"] == {"x-api-key": "zen-secret"}
+
+
+def test_apply_extra_headers_preserves_case_insensitive_zen_header():
+    base_url = "https://opencode.ai/zen/v1"
+    client_kwargs = {"api_key": "ignored", "base_url": base_url}
+    providers = [{"base_url": base_url, "extra_headers": {"X-Api-Key": "user"}}]
+    apply_custom_provider_extra_headers_to_client_kwargs(
+        client_kwargs, base_url, custom_providers=providers
+    )
+    assert client_kwargs["default_headers"] == {"X-Api-Key": "user"}
+
+
+def test_apply_extra_headers_excludes_go_and_lookalike_hosts():
+    for base_url in (
+        "https://opencode.ai/zen/go/v1",
+        "https://evil.com/opencode.ai/zen/v1",
+    ):
+        client_kwargs = {"api_key": "secret", "base_url": base_url}
+        apply_custom_provider_extra_headers_to_client_kwargs(
+            client_kwargs, base_url, custom_providers=[]
+        )
+        assert "default_headers" not in client_kwargs

@@ -1622,3 +1622,13 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
     assert resolved["source"] == "pool:lmstudio-pool"
     assert resolved["provider"] == "custom"
     assert resolved["requested_provider"] == "custom:lmstudio"
+
+
+def test_direct_alias_zen_runtime_includes_x_api_key(monkeypatch):
+    monkeypatch.setattr(rp, "_try_resolve_from_custom_pool", lambda *a, **k: None)
+    resolved = rp._resolve_named_custom_runtime(
+        requested_provider="custom",
+        explicit_api_key="zen-key",
+        explicit_base_url="https://opencode.ai/zen/v1",
+    )
+    assert resolved["extra_headers"] == {"x-api-key": "zen-key"}

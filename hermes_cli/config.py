@@ -1703,6 +1703,20 @@ def normalize_extra_headers(extra_headers: Any) -> Dict[str, str]:
     return {str(k): str(v) for k, v in extra_headers.items() if v is not None}
 
 
+def _is_opencode_zen_endpoint(base_url: str) -> bool:
+    """Return whether *base_url* is OpenCode Zen, excluding OpenCode Go."""
+    try:
+        from utils import base_url_host_matches
+        normalized = str(base_url or "").lower().rstrip("/")
+        return (
+            base_url_host_matches(normalized, "opencode.ai")
+            and normalized.endswith("/zen/v1")
+            and "/zen/go/" not in normalized
+        )
+    except Exception:
+        return False
+
+
 def get_custom_provider_extra_headers(
     base_url: str,
     custom_providers: Optional[List[Dict[str, Any]]] = None,
@@ -1755,6 +1769,10 @@ def apply_custom_provider_extra_headers_to_client_kwargs(
     SECURITY: values may carry credentials — never log them.
     """
     extra_headers = get_custom_provider_extra_headers(base_url, custom_providers, config)
+    api_key = client_kwargs.get("api_key")
+    if api_key and _is_opencode_zen_endpoint(base_url):
+        if not any(str(key).lower() == "x-api-key" for key in extra_headers):
+            extra_headers = {**extra_headers, "x-api-key": str(api_key)}
     if not extra_headers:
         return
     merged = dict(client_kwargs.get("default_headers") or {})

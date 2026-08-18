@@ -44,6 +44,7 @@ from hermes_cli.config import (
     get_compatible_custom_providers,
     load_config,
     normalize_extra_headers,
+    _is_opencode_zen_endpoint,
 )
 from hermes_cli.providers import custom_provider_aliases, custom_provider_slug
 from hermes_constants import OPENROUTER_BASE_URL
@@ -1137,7 +1138,7 @@ def _resolve_named_custom_runtime(
             (c for c in api_key_candidates if has_usable_secret(c)),
             "",
         ) or "no-key-required"
-        return {
+        result: Dict[str, Any] = {
             "provider": "custom",
             "api_mode": _detect_api_mode_for_url(base_url) or "chat_completions",
             "base_url": base_url,
@@ -1145,6 +1146,9 @@ def _resolve_named_custom_runtime(
             "source": "direct-alias",
             "requested_provider": requested_provider,
         }
+        if api_key and _is_opencode_zen_endpoint(base_url):
+            result["extra_headers"] = {"x-api-key": api_key}
+        return result
 
     custom_provider = _get_named_custom_provider(requested_provider)
     if not custom_provider:
@@ -1177,7 +1181,13 @@ def _resolve_named_custom_runtime(
         # Cloudflare Access service tokens) still apply with pooled
         # credentials. NEVER log the values.
         if custom_provider.get("extra_headers"):
-            pool_result["extra_headers"] = dict(custom_provider["extra_headers"])
+            pool_result["extra_headers"] = normalize_extra_headers(
+                custom_provider["extra_headers"]
+            )
+        if pool_result.get("api_key") and _is_opencode_zen_endpoint(base_url):
+            headers = pool_result.setdefault("extra_headers", {})
+            if not any(str(key).lower() == "x-api-key" for key in headers):
+                headers["x-api-key"] = pool_result["api_key"]
         return pool_result
 
     _cp_is_openai_url   = base_url_host_matches(base_url, "openai.com") or base_url_host_matches(base_url, "openai.azure.com")
@@ -1229,8 +1239,12 @@ def _resolve_named_custom_runtime(
         result["max_output_tokens"] = custom_provider["max_output_tokens"]
     # Per-provider extra HTTP headers (proxies, gateways, custom auth).
     # Values may carry credentials — NEVER log them.
-    if custom_provider.get("extra_headers"):
-        result["extra_headers"] = dict(custom_provider["extra_headers"])
+    extra_headers = normalize_extra_headers(custom_provider.get("extra_headers"))
+    if api_key and _is_opencode_zen_endpoint(base_url):
+        if not any(str(key).lower() == "x-api-key" for key in extra_headers):
+            extra_headers["x-api-key"] = api_key
+    if extra_headers:
+        result["extra_headers"] = extra_headers
     request_overrides = _custom_provider_request_overrides(custom_provider)
     if request_overrides:
         result["request_overrides"] = request_overrides
