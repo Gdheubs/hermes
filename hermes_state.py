@@ -3134,6 +3134,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # wait out the full routine patience under contention. Sub-second budget;
     # a skipped write is retried naturally at the next heartbeat window.
     _ACTIVITY_WRITE_PATIENCE_S = 0.5
+    # Turn-end terminal stamp gets its own elevated patience. The turn is
+    # already over (we are in the ``finally`` block), so there is no
+    # response-critical path to protect. A dropped terminal stamp leaves
+    # ``last_activity_at`` stuck at a stale value, which breaks Desktop UI
+    # freshness detection — the exact bug this fixes. 2.0s is enough to survive
+    # routine lock contention on a large state.db without blocking indefinitely.
+    _ACTIVITY_FINALIZE_PATIENCE_S = 2.0
     # A live compression lock gets its own, much shorter budget than the write
     # lock. Compression publishes in a couple of seconds, so a brief wait saves
     # the overwhelming majority of concurrent turns (#75083). It deliberately
@@ -5889,6 +5896,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             return False
 
+    def list_open_cron_sessions(self) -> List[Dict[str, Any]]:
+        """Return open (``ended_at IS NULL``) cron sessions for reaper inspection.
+
+        Read-only: each row carries ``id`` and ``started_at`` so the caller can
+        cross-reference the owning run's liveness via a lease sidecar before
+        deciding whether to close.  Closing is done with ``end_session`` (exact
+        id + ``ended_at IS NULL`` guard), never by this list method.
+        """
+        sql = (
+            "SELECT id, started_at FROM sessions "
+            "WHERE source = 'cron' AND ended_at IS NULL "
+            "ORDER BY started_at ASC"
+        )
+        with self._lock:
+            return [dict(r) for r in self._conn.execute(sql)]
+
     def update_session_cwd(
         self,
         session_id: str,
@@ -6395,18 +6418,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         Returns ``True`` on success (caller now owns the lock and must
         release via :meth:`release_compression_lock`).  Returns ``False``
-        if another holder already owns a non-expired lock — the caller
-        MUST NOT proceed with compression in that case (its rotation would
-        race against the holder's, splitting the session lineage).
+        if another holder already owns a non-expired lock or if the session
+        has already completed a compression rotation. The caller MUST NOT
+        proceed in either case: a late AIAgent can still carry the ended
+        parent id after the winner releases its lock, and rotating that stale
+        parent would split the session lineage.
 
         Expired locks (``expires_at < now``) are reclaimed transparently.
         Structured holders whose local ``pid=`` no longer exists are reclaimed
         immediately, so a gateway killed during compression does not stall the
         replacement process for the full lease TTL.
 
-        Implementation: single-transaction DELETE-expired + INSERT-or-IGNORE,
-        followed by a SELECT to confirm we got the row. SQLite serialises
-        writes, so the whole sequence is atomic against other writers.
+        Implementation: one transaction first rejects an already-rotated
+        parent, then performs DELETE-expired + INSERT-or-IGNORE followed by a
+        SELECT to confirm ownership. SQLite serialises writes, so the whole
+        sequence is atomic against other writers and completed rotations.
         """
         if not session_id:
             return False
@@ -6414,6 +6440,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         expires_at = now + ttl_seconds
 
         def _do(conn):
+            # A competing AIAgent can reach the lock only after the winner has
+            # rotated and released it. Already-rotated detection lives in the
+            # caller — returning False here would make recovery unreachable.
             reclaimed_holder = None
             row = conn.execute(
                 "SELECT holder, expires_at FROM compression_locks "
@@ -6825,6 +6854,53 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
         self._execute_write(_do, patience_s=self._ACTIVITY_WRITE_PATIENCE_S)
+
+    def finalize_session_activity(
+        self,
+        session_id: str,
+        ts: Optional[float] = None,
+        *,
+        patience_s: Optional[float] = None,
+    ) -> None:
+        """Atomically stamp ``last_activity_at`` and clear mid-turn labels.
+
+        Called from the turn ``finally`` block (via
+        ``AIAgent._finalize_activity_after_turn``) to ensure the terminal
+        timestamp is persisted even when all intermediate heartbeats were
+        throttled or dropped. Unlike :meth:`touch_session_activity`, this
+        method:
+
+        - Uses an **elevated write patience** (``_ACTIVITY_FINALIZE_PATIENCE_S``)
+          because the turn is already over and there is no response-critical
+          path to protect.
+        - **Clears** ``last_activity_description`` and
+          ``last_activity_provenance`` in the same UPDATE, avoiding a
+          transient ``"turn completed"`` label flash and halving teardown
+          writes.
+        - Never moves ``last_activity_at`` backwards (monotonic guard).
+
+        Fail-open: a failed write is debug-logged and never raises — the
+        next session start or heartbeat retries naturally.
+        """
+        if not session_id:
+            return
+        from agent.session_activity import ActivityProvenance
+
+        when = float(ts if ts is not None else time.time())
+        prov = ActivityProvenance.UNKNOWN.value
+        budget = patience_s if patience_s is not None else self._ACTIVITY_FINALIZE_PATIENCE_S
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET "
+                "last_activity_at = ?, "
+                "last_activity_description = '', "
+                "last_activity_provenance = ? "
+                "WHERE id = ? AND (last_activity_at IS NULL OR last_activity_at < ?)",
+                (when, prov, session_id, when),
+            )
+
+        self._execute_write(_do, patience_s=budget)
 
     def get_session_activity(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Return the durable activity snapshot for *session_id*, or None."""
@@ -9282,6 +9358,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         platform_message_id: str = None,
         observed: bool = False,
         effect_disposition: Optional[str] = None,
+        interrupted_tool_tail: bool = False,
         timestamp: Any = None,
         api_content: Optional[str] = None,
         display_kind: Optional[str] = None,
@@ -9355,10 +9432,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
-                   tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
+                   tool_calls, tool_name, effect_disposition, interrupted_tool_tail, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(session_id, role, content, timestamp) WHERE active=1 DO NOTHING""",
                 (
                     session_id,
                     role,
@@ -9367,6 +9445,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     tool_calls_json,
                     _scrub_surrogates(tool_name),
                     effect_disposition,
+                    1 if interrupted_tool_tail else 0,
                     message_timestamp,
                     token_count,
                     finish_reason,
@@ -9384,6 +9463,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 ),
             )
             msg_id = cursor.lastrowid
+            if cursor.rowcount == 0:
+                # Duplicate of an already-live row: idempotent no-op — resolve
+                # to the existing row's id and leave sessions.* counters alone.
+                existing = conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? AND role = ? "
+                    "AND content IS ? AND timestamp = ? AND active = 1 "
+                    "ORDER BY id DESC LIMIT 1",
+                    (session_id, role, stored_content, message_timestamp),
+                ).fetchone()
+                if existing is not None:
+                    msg_id = existing["id"]
+                    # Skip counter update — the row already exists.
+                    return msg_id
 
             # Update counters
             if num_tool_calls > 0:
@@ -9407,6 +9499,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return self._execute_write(
             _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
         )
+
+    def mark_tool_tail_interrupted(
+        self,
+        session_id: str,
+        tool_call_id: str,
+    ) -> bool:
+        """Persist interruption provenance on an already-written tool result."""
+        if not session_id or not tool_call_id:
+            return False
+
+        def _do(conn):
+            cursor = conn.execute(
+                """UPDATE messages SET interrupted_tool_tail = 1
+                   WHERE id = (
+                       SELECT id FROM messages
+                       WHERE session_id = ? AND active = 1
+                         AND role = 'tool' AND tool_call_id = ?
+                       ORDER BY id DESC LIMIT 1
+                   )""",
+                (session_id, tool_call_id),
+            )
+            return cursor.rowcount > 0
+
+        return bool(self._execute_write(_do))
 
     def append_messages_batch(
         self,
@@ -9776,20 +9892,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 except (json.JSONDecodeError, TypeError):
                     tool_calls = []
             tool_calls_json = json.dumps(tool_calls) if tool_calls else None
-            # Accept either `platform_message_id` (new explicit name) or
-            # `message_id` (yuanbao's existing convention on message dicts).
+            # Match append persistence precedence for external and internal
+            # canonical source identity forms.
             platform_msg_id = (
-                msg.get("platform_message_id") or msg.get("message_id")
+                msg.get("platform_message_id")
+                or msg.get("message_id")
+                or msg.get("_source_message_id")
             )
 
             api_content = msg.get("api_content")
 
             cur = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
-                   tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
+                   tool_calls, tool_name, effect_disposition, interrupted_tool_tail, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(session_id, role, content, timestamp) WHERE active=1 DO NOTHING""",
                 (
                     session_id,
                     role,
@@ -9798,6 +9917,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     tool_calls_json,
                     _scrub_surrogates(msg.get("tool_name")),
                     msg.get("effect_disposition"),
+                    1 if (
+                        msg.get("_interrupted_tool_tail")
+                        or msg.get("interrupted_tool_tail")
+                    ) else 0,
                     message_timestamp,
                     msg.get("token_count"),
                     msg.get("finish_reason"),
@@ -9814,10 +9937,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._encode_display_metadata(msg.get("display_metadata")),
                 ),
             )
-            if isinstance(msg, dict) and cur.lastrowid is not None:
+            if cur.rowcount and isinstance(msg, dict) and cur.lastrowid is not None:
                 msg["_row_id"] = cur.lastrowid
-            inserted += 1
-            if tool_calls is not None:
+            inserted += 1 if cur.rowcount else 0
+            if cur.rowcount and tool_calls is not None:
                 tool_calls_total += (
                     len(tool_calls) if isinstance(tool_calls, list) else 1
                 )
@@ -10144,6 +10267,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         offset: int = 0,
         latest: bool = False,
         after_id: Optional[int] = None,
+        include_ancestors: bool = False,
     ) -> List[Dict[str, Any]]:
         """Load messages for a session in insertion order.
 
@@ -10159,6 +10283,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         unreachable once the UI exhausts its active-only window. Soft-deleted
         Undo/Rewind rows (``active=0, compacted=0``) stay excluded; use
         ``include_inactive`` for those.
+
+        Pass ``include_ancestors=True`` to also load messages from parent
+        sessions in the compression-continuation chain (root → tip).
+        This mirrors ``get_messages_as_conversation(include_ancestors=True)``
+        and ensures the REST messages endpoint returns the full transcript
+        after a compression rotation, not just the child continuation.
 
         Ordered by AUTOINCREMENT id (true insertion order) rather than
         timestamp — see c03acca50 for the WSL2 clock-regression rationale.
@@ -10180,6 +10310,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             raise ValueError("after_id is incompatible with latest/offset paging")
         if after_id is not None and include_compacted:
             raise ValueError("after_id is incompatible with include_compacted (deduped display reads use offset paging)")
+        session_ids = [session_id]
+        if include_ancestors:
+            session_ids = self._session_lineage_root_to_tip(session_id)
         if include_inactive:
             # Audit / debug reads: every row, including soft-deleted.
             active_clause = ""
@@ -10191,11 +10324,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         else:
             active_clause = " AND active = 1"
         keyset_clause = " AND id > ?" if after_id is not None else ""
-        sql = (
-            "SELECT * FROM messages WHERE session_id = ?"
-            f"{active_clause}{keyset_clause} ORDER BY id {'DESC' if latest else 'ASC'}"
-        )
-        params: list = [session_id]
+        if len(session_ids) == 1:
+            sql = (
+                "SELECT * FROM messages WHERE session_id = ?"
+                f"{active_clause}{keyset_clause} ORDER BY id {'DESC' if latest else 'ASC'}"
+            )
+            params: list = [session_id]
+        else:
+            placeholders = ",".join("?" for _ in session_ids)
+            sql = (
+                f"SELECT * FROM messages WHERE session_id IN ({placeholders})"
+                f"{active_clause}{keyset_clause} ORDER BY id {'DESC' if latest else 'ASC'}"
+            )
+            params = list(session_ids)
         if after_id is not None:
             params.append(after_id)
         if include_compacted:
@@ -10481,12 +10622,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         as well. See :meth:`rewind_to_message`.
 
         ``repair_alternation=True`` runs ``repair_message_sequence`` over the
-        loaded list before returning it. Callers that restore a session for
-        LIVE REPLAY should pass it: a durable alternation violation (e.g. a
-        ``user;user`` pair left by a turn that persisted no assistant row)
-        otherwise re-triggers the pre-request defensive repair on every
-        single request for the rest of the session's life — the repair
-        mutates only the per-request list, never the stored transcript.
+        loaded live-replay copy before returning it. This repairs malformed
+        assistant/tool structure such as split assistant turns and orphaned
+        tool results without rewriting the durable transcript. Adjacent
+        ``user`` messages remain distinct canonical source turns; the
+        per-request provider copy later merges them via
+        ``drop_thinking_only_and_merge_users`` for strict role alternation.
         Inspection/export consumers keep the default and see the transcript
         verbatim.
         """
@@ -10525,7 +10666,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # SELECT can feed both the model-fed and display views.
     _CONVERSATION_ROW_COLUMNS = (
         "id, role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
-        "finish_reason, reasoning, reasoning_content, reasoning_details, "
+        "interrupted_tool_tail, finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
         "api_content, display_kind, display_metadata"
     )
@@ -10582,6 +10723,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 msg["tool_name"] = row["tool_name"]
             if row["effect_disposition"]:
                 msg["effect_disposition"] = row["effect_disposition"]
+            if row["interrupted_tool_tail"]:
+                msg["_interrupted_tool_tail"] = True
             if row["tool_calls"]:
                 try:
                     msg["tool_calls"] = json.loads(row["tool_calls"])
@@ -10655,9 +10798,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             repaired = repair_message_sequence(None, messages)
             if repaired:
                 logger.info(
-                    "Repaired %d message-alternation violation(s) while "
-                    "restoring session %s — durable transcript kept them, "
-                    "see repair_message_sequence",
+                    "Repaired %d malformed assistant/tool sequence violation(s) "
+                    "while restoring session %s — durable transcript retained "
+                    "its original rows; see repair_message_sequence",
                     repaired,
                     session_id,
                 )
