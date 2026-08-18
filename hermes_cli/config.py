@@ -5278,6 +5278,17 @@ def set_config_value(key: str, value: str, force: bool = False):
             file=sys.stderr,
         )
         sys.exit(1)
+    # Deprecated-key alias (config v38): memory.memory_enabled → memory.builtin_enabled.
+    # New writes use the canonical name so configs stop carrying the key whose
+    # "false + provider" combination read as "memory disabled" (issues #60805,
+    # #32624). The legacy name still reads fine via the alias in memory_tool.
+    if key == "memory.memory_enabled":
+        print(
+            "  ℹ️  memory.memory_enabled is deprecated; writing "
+            "memory.builtin_enabled instead.",
+            file=sys.stderr,
+        )
+        key = "memory.builtin_enabled"
     # Check if it's an API key (goes to .env)
     if _is_env_config_key(key):
         # Unified lifecycle: also rotates any config.yaml mirror of the old
@@ -5503,6 +5514,22 @@ def set_config_value(key: str, value: str, force: bool = False):
 
 def get_config_value(key: str, *, as_json: bool = False):
     """Print a resolved configuration value."""
+    # Deprecated-key alias (config v38): reading memory.memory_enabled resolves
+    # through memory.builtin_enabled so pre-rename tooling/scripts keep working
+    # during the transition (the write path aliases the other direction in
+    # set_config_value). Before the v38 migration runs, the *legacy* persisted
+    # key is the source of truth, so we prefer it when explicitly present;
+    # otherwise fall back to the merged canonical key (which reflects the
+    # renamed value post-migration).
+    if key == "memory.memory_enabled":
+        raw_mem = read_raw_config_readonly().get("memory") or {}
+        legacy = raw_mem.get("memory_enabled", _MISSING)
+        if legacy is not _MISSING:
+            value = legacy
+            print(_format_config_get_value(value, as_json=as_json))
+            return
+        key = "memory.builtin_enabled"
+
     if _is_env_config_key(key):
         env_value = get_env_value(key.upper())
         value = _MISSING if env_value is None else env_value

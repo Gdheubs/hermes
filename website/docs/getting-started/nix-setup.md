@@ -241,7 +241,7 @@ services.hermes-agent.settings = {
 # personality.nix
 services.hermes-agent.settings = {
   display = { compact = false; personality = "kawaii"; };
-  memory = { memory_enabled = true; user_profile_enabled = true; };
+  memory = { builtin_enabled = true; user_profile_enabled = true; };
 };
 ```
 
@@ -278,7 +278,7 @@ Run `nix build .#configKeys && cat result` to see every leaf config key extracte
         threshold = 0.85;
         summary_model = "google/gemini-3-flash-preview";
       };
-      memory = { memory_enabled = true; user_profile_enabled = true; };
+      memory = { builtin_enabled = true; user_profile_enabled = true; };
       display = { compact = false; personality = "kawaii"; };
       agent = { max_turns = 60; verbose = false; };
     };

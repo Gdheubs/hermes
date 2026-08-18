@@ -3221,7 +3221,7 @@ def _blank_slate_minimize_config(config: dict):
 
     # No automatic memory / user-profile capture.
     mem = config.setdefault("memory", {})
-    mem["memory_enabled"] = False
+    mem["builtin_enabled"] = False
     mem["user_profile_enabled"] = False
 
     # No filesystem checkpoints, no smart model routing, no auto session reset.

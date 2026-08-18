@@ -294,7 +294,9 @@ class TestMemoryToolDispatcher:
     def test_no_store_returns_error(self):
         result = json.loads(memory_tool(action="add", content="test"))
         assert result["success"] is False
-        assert "not available" in result["error"]
+        # State-aware since the v38 builtin_enabled rename: names the state and
+        # never invites a config flip (the old generic message did).
+        assert "no config change is needed" in result["error"]
 
 
     def test_replace_missing_content_still_distinct_error(self, store):

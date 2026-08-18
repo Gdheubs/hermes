@@ -903,7 +903,7 @@ def mock_config():
             "timeout": 30,
         },
         "compression": {"enabled": False},
-        "memory": {"memory_enabled": False, "user_profile_enabled": False},
+        "memory": {"builtin_enabled": False, "user_profile_enabled": False},
         "command_allowlist": [],
     }
 

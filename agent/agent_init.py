@@ -1773,7 +1773,12 @@ def init_agent(
     if not skip_memory or _memory_toolset_requested:
         try:
             mem_config = _agent_cfg.get("memory", {})
-            agent._memory_enabled = mem_config.get("memory_enabled", False)
+            # Effective built-in store enablement. Reads the raw user config so an
+            # explicit legacy memory.memory_enabled: false is never masked by the
+            # builtin_enabled default (True) before the v38 migration rewrites it.
+            from tools.memory_tool import builtin_memory_enabled
+
+            agent._memory_enabled = builtin_memory_enabled()
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:

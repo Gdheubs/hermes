@@ -2,8 +2,10 @@
 
 Covers:
 - Status output shows config-aware indicators instead of hardcoded 'always active'
-- memory_enabled, user_profile_enabled, and memory tool are each reflected
+- builtin_enabled (and the legacy memory_enabled alias), user_profile_enabled,
+  and the memory tool are each reflected
 - Memory tool resolution uses the canonical _get_platform_tools resolver
+- Provider-aware resolved-state line when built-in is off and a provider is active
 - Original issue: 'Built-in: always active' was misleading when features were disabled
 """
 
@@ -15,7 +17,8 @@ def _run_cmd_status(capfd, mem_config=None, memory_tools=None):
     """Run cmd_status with a mocked config and return captured stdout.
 
     Args:
-        mem_config: The "memory" section of config.
+        mem_config: The "memory" section of config (raw — what
+                    builtin_memory_enabled() reads).
         memory_tools: Set of tool names returned by _get_platform_tools.
                       Defaults to {"memory"} (tool enabled).
     """
@@ -26,12 +29,17 @@ def _run_cmd_status(capfd, mem_config=None, memory_tools=None):
         memory_tools = {"memory"}
 
     with patch("hermes_cli.config.load_config", return_value=config):
-        with patch("hermes_cli.memory_setup._get_available_providers", return_value=[]):
+        with patch(
+            "hermes_cli.config.read_raw_config_readonly", return_value=config
+        ):
             with patch(
-                "hermes_cli.tools_config._get_platform_tools",
-                return_value=memory_tools,
+                "hermes_cli.memory_setup._get_available_providers", return_value=[]
             ):
-                cmd_status(args=None)
+                with patch(
+                    "hermes_cli.tools_config._get_platform_tools",
+                    return_value=memory_tools,
+                ):
+                    cmd_status(args=None)
 
     captured = capfd.readouterr()
     return captured.out
@@ -40,7 +48,6 @@ def _run_cmd_status(capfd, mem_config=None, memory_tools=None):
 class TestMemoryStatusLabels:
     """Status output should reflect actual config, not a hardcoded string."""
 
-
     def test_shows_memory_injection_enabled_by_default(self, capfd):
         """Memory injection defaults to enabled."""
         out = _run_cmd_status(capfd)
@@ -48,10 +55,26 @@ class TestMemoryStatusLabels:
         assert "enabled ✓" in out
 
     def test_shows_memory_injection_disabled(self, capfd):
-        """When memory_enabled is false, status reflects it."""
+        """When builtin_enabled is false, status reflects it."""
+        out = _run_cmd_status(capfd, mem_config={"builtin_enabled": False})
+        assert "Memory injection:" in out
+        assert "disabled ✗" in out
+
+    def test_legacy_memory_enabled_alias_reflected(self, capfd):
+        """Pre-v38 key still controls status until the migration rewrites it."""
         out = _run_cmd_status(capfd, mem_config={"memory_enabled": False})
         assert "Memory injection:" in out
         assert "disabled ✗" in out
 
+    def test_provider_active_state_line(self, capfd):
+        """Built-in off + provider active prints the resolved-state line."""
+        out = _run_cmd_status(
+            capfd, mem_config={"builtin_enabled": False, "provider": "memtensor"}
+        )
+        assert "Provider:  memtensor" in out
+        assert "recommended combo" in out
 
-
+    def test_no_state_line_when_builtin_enabled(self, capfd):
+        """No state line when the built-in store is on (provider is additive)."""
+        out = _run_cmd_status(capfd, mem_config={"provider": "memtensor"})
+        assert "recommended combo" not in out

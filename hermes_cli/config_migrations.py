@@ -815,6 +815,42 @@ def _migrate_to_37(results: Dict[str, Any], quiet: bool) -> None:
             )
 
 
+def _migrate_to_38(results: Dict[str, Any], quiet: bool) -> None:
+    # ── Version 37 → 38: rename memory.memory_enabled → memory.builtin_enabled ──
+    # memory_enabled conflated "is the memory subsystem on?" with "is the
+    # built-in MEMORY.md/USER.md file store on?". With an external memory
+    # provider (memory.provider) active, the recommended state is
+    # builtin_enabled: false + provider — which read as "memory disabled" under
+    # the old name and made agents try to "fix" a correct configuration
+    # (issues #60805, #32624). builtin_enabled scopes the key to the built-in
+    # store so the provider combo reads coherently. Code honours the legacy key
+    # as an alias until this migration rewrites it, so nothing breaks between
+    # upgrade and `hermes config migrate`.
+    _c = _cfg()
+    read_raw_config = _c.read_raw_config
+    _persist_migration = _c._persist_migration
+
+    config = read_raw_config()
+    mem = config.get("memory")
+    if not isinstance(mem, dict) or "memory_enabled" not in mem:
+        return
+    old = mem.pop("memory_enabled")
+    if "builtin_enabled" not in mem:
+        mem["builtin_enabled"] = old
+        results["config_added"].append(
+            f"memory.memory_enabled → memory.builtin_enabled={old!r}"
+        )
+        if not quiet:
+            print(f"  ✓ Renamed memory.memory_enabled → memory.builtin_enabled ({old!r})")
+    else:
+        # Both keys present — canonical wins; drop the stale legacy key.
+        results["warnings"].append(
+            "memory.memory_enabled dropped (memory.builtin_enabled already set)"
+        )
+    _persist_migration(config)
+
+
+
 #: Registry of (target_version, migration_fn), strictly ascending. The driver
 #: applies every entry whose target version is greater than the on-disk
 #: observe earlier steps' writes via read_raw_config() (filesystem state).
@@ -839,6 +875,7 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (35, _migrate_to_35),
     (36, _migrate_to_36),
     (37, _migrate_to_37),
+    (38, _migrate_to_38),
 )
 
 

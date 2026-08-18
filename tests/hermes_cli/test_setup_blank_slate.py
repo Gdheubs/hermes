@@ -69,7 +69,7 @@ class TestBlankSlateMinimizeConfig:
         cfg = {}
         _blank_slate_minimize_config(cfg)
         assert cfg["compression"]["enabled"] is False
-        assert cfg["memory"]["memory_enabled"] is False
+        assert cfg["memory"]["builtin_enabled"] is False
         assert cfg["memory"]["user_profile_enabled"] is False
         assert cfg["checkpoints"]["enabled"] is False
         assert cfg["smart_model_routing"]["enabled"] is False

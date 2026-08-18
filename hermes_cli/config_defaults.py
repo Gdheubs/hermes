@@ -1794,7 +1794,7 @@ DEFAULT_CONFIG = {
 
     # Persistent memory -- bounded curated memory injected into system prompt
     "memory": {
-        "memory_enabled": True,
+        "builtin_enabled": True,   # legacy alias: memory_enabled (v38)
         "user_profile_enabled": True,
         # Approval gate for memory writes (add/replace/remove), applied to BOTH
         # foreground agent turns and the background self-improvement review fork
@@ -1807,7 +1807,9 @@ DEFAULT_CONFIG = {
         #                     on a prompt). Review staged entries with
         #                     /memory pending, /memory approve <id>,
         #                     /memory reject <id>.
-        # To disable memory entirely, use memory_enabled: false instead.
+        # To disable the built-in store entirely (an external provider may
+        # still serve memory via memory.provider), use builtin_enabled: false.
+        # The legacy key memory_enabled is an alias (renamed in config v38).
         "write_approval": False,
         "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
         "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
@@ -3530,7 +3532,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 37,
+    "_config_version": 38,
 }
 
 # Optional environment variables that enhance functionality

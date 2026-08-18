@@ -1080,7 +1080,27 @@ def memory_tool(
     Returns JSON string with results.
     """
     if store is None:
-        return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            provider = (load_config_readonly().get("memory") or {}).get("provider", "") or ""
+        except Exception:
+            provider = ""
+        if provider:
+            return tool_error(
+                "Built-in memory (MEMORY.md/USER.md) is disabled because an external "
+                f"memory provider is active (memory.provider: {provider}). Memory is "
+                "served by the provider's own tools (e.g. memos_search, "
+                "memos_environment) — use those instead. The built-in store is "
+                "intentionally off; no config change is needed.",
+                success=False,
+            )
+        return tool_error(
+            "Built-in memory is disabled (memory.builtin_enabled: false), so no "
+            "persistent memory store exists in this session. Nothing is broken and "
+            "no config change is needed.",
+            success=False,
+        )
 
     # Accept new_text as an alias for content (single-op path). See docstring.
     if content is None and new_text is not None:
@@ -1143,9 +1163,53 @@ def memory_tool(
     return json.dumps(result, ensure_ascii=False)
 
 
-def check_memory_requirements() -> bool:
-    """Memory tool has no external requirements -- always available."""
+def builtin_memory_enabled() -> bool:
+    """Effective built-in (MEMORY.md/USER.md) store enablement for this install.
+
+    The built-in store exists iff memory.builtin_enabled (legacy alias:
+    memory_enabled) or memory.user_profile_enabled is true — the same predicate
+    that creates ``agent._memory_store`` (agent/agent_init.py). Reads the *raw*
+    user config so an explicit legacy ``memory.memory_enabled: false`` is never
+    masked by the new ``builtin_enabled`` default (True) before the v38
+    migration rewrites the key. An absent builtin/legacy key defaults to True,
+    so a config that sets only ``user_profile_enabled`` keeps the pre-v38
+    behavior (built-in store on) rather than silently disabling it. Explicit
+    user settings win; a user with no memory section gets the default (built-in
+    enabled). Fail-open True on config read errors — never hide memory on an
+    unrelated failure (note: a provider serving memory may then diverge briefly
+    from the tool's advertised availability until the config error clears).
+    """
+    try:
+        from hermes_cli.config import read_raw_config_readonly
+
+        mem = read_raw_config_readonly().get("memory") or {}
+    except Exception:
+        return True  # fail open — never hide memory on config read errors
+    if any(
+        k in mem for k in ("builtin_enabled", "memory_enabled", "user_profile_enabled")
+    ):
+        # Only an EXPLICIT builtin/legacy key can turn the store off; an absent
+        # builtin key defaults to True so a config that sets only
+        # user_profile_enabled keeps the pre-v38 default (built-in store on),
+        # matching the old merged memory_enabled: true default.
+        return bool(
+            mem.get("builtin_enabled", mem.get("memory_enabled", True))
+            or mem.get("user_profile_enabled", False)
+        )
     return True
+
+
+def check_memory_requirements() -> bool:
+    """Memory tool is advertised only when the built-in store can actually work.
+
+    Matches the ``agent._memory_store`` creation predicate in agent_init. When
+    an external memory provider (memory.provider) is active, the provider's own
+    tools serve memory; advertising the built-in tool would hand agents a tool
+    that can only fail ("Memory is not available") and invite a wrong config
+    change (see #60805, #32624). The ``memory`` toolset stays enabled so
+    provider tools (memos_*) pass the toolset gate; only this tool is filtered.
+    """
+    return builtin_memory_enabled()
 
 
 def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[str, Any]:

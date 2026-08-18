@@ -483,7 +483,9 @@ def cmd_status(args) -> None:
     mem_config = config.get("memory", {})
     provider_name = mem_config.get("provider", "")
 
-    memory_enabled = mem_config.get("memory_enabled", True)
+    from tools.memory_tool import builtin_memory_enabled
+
+    memory_enabled = builtin_memory_enabled()
     user_profile_enabled = mem_config.get("user_profile_enabled", True)
 
     mem_mark = "enabled ✓" if memory_enabled else "disabled ✗"
@@ -502,6 +504,9 @@ def cmd_status(args) -> None:
     print(f"    User profile:       {user_mark}")
     print(f"    Memory tool:        {tool_mark}")
     print(f"  Provider:  {provider_name or '(none — built-in only)'}")
+    if provider_name and not memory_enabled:
+        print("  State:     built-in off + provider active — memory is served by the")
+        print("             provider's tools (e.g. memos_search); recommended combo.")
 
     providers = _get_available_providers()
     provider = None

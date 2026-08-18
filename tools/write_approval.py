@@ -63,7 +63,7 @@ _SUBSYSTEMS = (MEMORY, SKILLS)
 # default (writes flow freely, the pre-gate behaviour), and ON means stage /
 # prompt every write for the user's approval. There is intentionally no third
 # "block all writes" state — to disable a subsystem entirely use its own
-# enable flag (e.g. ``memory.memory_enabled: false``).
+# enable flag (e.g. ``memory.builtin_enabled: false``).
 CONFIG_KEY = "write_approval"
 
 

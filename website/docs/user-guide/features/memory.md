@@ -233,7 +233,7 @@ The same `list` / `delete <id>` / `edit <id>` subcommands work from the in-chat 
 ```yaml
 # In ~/.hermes/config.yaml
 memory:
-  memory_enabled: true
+  builtin_enabled: true
   user_profile_enabled: true
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
@@ -252,7 +252,13 @@ first, set `memory.write_approval: true`. It's a simple on/off gate applied to
 | `false` (default) | Write freely — the gate is off (the pre-gate behaviour). |
 | `true` | Require approval before anything is saved. In the interactive CLI, foreground writes prompt you inline (entries are small enough to read in full). Everywhere else — messaging platforms, scripts, and the background self-improvement review — writes are **staged** for review with `/memory pending`. |
 
-> To turn memory off entirely (not just gate it), set `memory_enabled: false`.
+> To turn the built-in store off entirely (not just gate it), set
+> `builtin_enabled: false`. With an external memory provider configured
+> (`memory.provider`), `builtin_enabled: false` is the **recommended** state:
+> memory is then captured and recalled through the provider's own tools (e.g.
+> `memos_search`) instead of MEMORY.md/USER.md. `builtin_enabled: false` with
+> no provider means memory is fully off. The legacy key `memory_enabled` is an
+> alias for `builtin_enabled` (renamed in config v38).
 
 Review staged writes from the CLI or any messaging platform:
 

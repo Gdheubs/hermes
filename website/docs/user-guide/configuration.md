@@ -673,7 +673,7 @@ When on, skill writes are staged under `~/.hermes/pending/skills/` and reviewed 
 
 ```yaml
 memory:
-  memory_enabled: true
+  builtin_enabled: true
   user_profile_enabled: true
   memory_char_limit: 2200   # ~800 tokens
   user_char_limit: 1375     # ~500 tokens
