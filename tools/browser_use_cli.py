@@ -634,6 +634,15 @@ def browser_exec(
             input=code,
             capture_output=True,
             text=True,
+            # text=True alone decodes with locale.getencoding(), which on
+            # Windows is the ANSI code page (cp1252/cp932/…), never UTF-8.
+            # The CLI inherits PYTHONIOENCODING/PYTHONUTF8 from
+            # hermes_bootstrap and emits UTF-8, so the pair must be pinned
+            # here too — otherwise a page title or log line with a non-ASCII
+            # character comes back as mojibake, or raises UnicodeDecodeError,
+            # which is a ValueError and so escapes the OSError handler below.
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             env=env,
             **popen_extra,

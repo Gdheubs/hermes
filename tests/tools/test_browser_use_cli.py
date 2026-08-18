@@ -835,6 +835,31 @@ class TestBrowserExec:
         result = json.loads(bu_cli.browser_exec("print(1)", timeout_s=1))
         assert "timed out" in result["error"]
 
+    def test_pipes_are_pinned_to_utf8(self, tmp_path, monkeypatch):
+        """text=True alone decodes with the locale codec — on Windows the ANSI
+        code page, which mangles or rejects the CLI's UTF-8 output."""
+        cli = _fake_cli(tmp_path, "cat > /dev/null\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        seen = {}
+        real_run = bu_cli.subprocess.run
+
+        def _capture(*args, **kwargs):
+            seen.update(kwargs)
+            return real_run(*args, **kwargs)
+
+        monkeypatch.setattr(bu_cli.subprocess, "run", _capture)
+        bu_cli.browser_exec("print(1)")
+        assert seen.get("encoding") == "utf-8"
+        assert seen.get("errors") == "replace"
+
+    def test_non_ascii_output_round_trips(self, tmp_path, monkeypatch):
+        """A page title with non-ASCII characters must survive the pipe."""
+        cli = _fake_cli(tmp_path, "cat > /dev/null\nprintf 'P\\303\\241gina \\342\\206\\222 caf\\303\\251\\n'\n")
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        result = json.loads(bu_cli.browser_exec("print(1)"))
+        assert result["success"] is True
+        assert "Página → café" in result["output"]
+
 
 class TestFindCliManagedBin:
     """MANAGED-FIRST: _find_cli probes $HERMES_HOME/bin before PATH and
