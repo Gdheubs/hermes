@@ -1104,19 +1104,75 @@ _CREDENTIAL_ACL_BENIGN_ACCOUNTS = frozenset({
 })
 
 
+def _resolve_account_sid(account: str) -> str | None:
+    """Resolve a Windows account name to its SID string (or None).
+
+    Used to compare ACL principals by SID instead of display name — the
+    leaf-name comparison ``DOMAIN_A\\alice == DOMAIN_B\\alice`` conflates
+    distinct principals (F1). Best-effort via advapi32 LookupAccountNameW;
+    returns None when the account cannot be resolved (fail closed upstream).
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        advapi32.LookupAccountNameW.argtypes = [
+            wintypes.LPCWSTR, wintypes.LPCWSTR,
+            ctypes.c_void_p, wintypes.LPDWORD,
+            wintypes.LPWSTR, wintypes.LPDWORD, wintypes.LPDWORD,
+        ]
+        sid_size = wintypes.DWORD(0)
+        domain_size = wintypes.DWORD(0)
+        use = wintypes.DWORD(0)
+        ok = advapi32.LookupAccountNameW(
+            None, account, None,
+            ctypes.byref(sid_size), None, ctypes.byref(domain_size),
+            ctypes.byref(use),
+        )
+        if not ok and ctypes.get_last_error() != 122:  # 122: insufficient buffer
+            return None
+        sid_buf = ctypes.create_string_buffer(sid_size.value)
+        domain_buf = ctypes.create_unicode_buffer(domain_size.value)
+        if not advapi32.LookupAccountNameW(
+            None, account, sid_buf,
+            ctypes.byref(sid_size), domain_buf, ctypes.byref(domain_size),
+            ctypes.byref(use),
+        ):
+            return None
+        str_sid = ctypes.c_wchar_p()
+        advapi32.ConvertSidToStringSidW.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p),
+        ]
+        if not advapi32.ConvertSidToStringSidW(sid_buf, ctypes.byref(str_sid)):
+            return None
+        result = str_sid.value
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree(str_sid)
+        return result
+    except Exception:
+        return None
+
+
 def credential_file_is_user_restricted(path: Path) -> bool:
     """Return True when only the current user (+OS/admin) can access *path*.
 
     POSIX: checks the mode bits (group/other must have no read/write).
     Windows: runs ``icacls`` and verifies every ACE belongs to the current
-    user, SYSTEM, or Administrators. Returns False when the check cannot be
-    performed (missing icacls, unreadable path) so callers fail closed.
+    user, SYSTEM, or Administrators. Identity is compared by SID (resolved
+    via LookupAccountName), not display-name suffix — ``DOMAIN_A\\alice``
+    and ``DOMAIN_B\\alice`` are different principals even though their leaf
+    names match (F1). Returns False when the check cannot be performed
+    (missing icacls, unreadable path, unresolvable account) so callers fail
+    closed.
     """
     try:
         if os.name != "nt":
             mode = stat.S_IMODE(os.stat(path).st_mode)
             return (mode & 0o077) == 0  # no group/other read/write/execute
         user = _current_windows_user().lower()
+        user_sid = _resolve_account_sid(user) if user else None
         import subprocess
         result = subprocess.run(
             ["icacls", str(path)], capture_output=True, text=True, timeout=30
@@ -1141,9 +1197,16 @@ def credential_file_is_user_restricted(path: Path) -> bool:
                 continue
             if account in _CREDENTIAL_ACL_BENIGN_ACCOUNTS:
                 continue
-            if account == user or account.endswith("\\" + user):
-                continue
-            # Any other account with a grant is a cross-account exposure.
+            # The current user's own SID (name form or "*S-1-5-21-..." form)
+            # is the only non-benign account that may hold a grant.
+            if user_sid:
+                if account.startswith("*s-") and account[1:].lower() == user_sid.lower():
+                    continue
+                ace_sid = _resolve_account_sid(account)
+                if ace_sid is not None and ace_sid.lower() == user_sid.lower():
+                    continue
+            # Different principal (same leaf name on another domain included),
+            # or unresolvable -> fail closed: cross-account exposure.
             return False
         return True
     except Exception:

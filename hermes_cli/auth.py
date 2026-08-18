@@ -1392,10 +1392,43 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
             os.O_WRONLY | os.O_CREAT | os.O_EXCL,
             stat.S_IRUSR | stat.S_IWUSR,
         )
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
+        _fd_open = True
+        try:
+            # F1 (P3): apply the user-only ACL to the TEMP file BEFORE any
+            # credential bytes are written. On Windows the 0o600 mode above
+            # is meaningless — the file inherits the parent directory's ACL
+            # until icacls runs — so bytes written before restriction are
+            # exposed to every account the parent grants. Fail closed: if
+            # the temp cannot be restricted, no credential bytes are ever
+            # written and the destination is never touched.
+            from hermes_constants import (
+                credential_file_is_user_restricted,
+                restrict_credential_file,
+            )
+
+            if not restrict_credential_file(tmp_path):
+                raise OSError(
+                    f"F1: could not restrict temp auth store {tmp_path} "
+                    "before writing; refusing to persist."
+                )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                _fd_open = False
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            # Re-verify the bytes-bearing temp is still user-restricted
+            # (icacls race / exotic filesystem) before it becomes the store.
+            if not credential_file_is_user_restricted(tmp_path):
+                raise OSError(
+                    f"F1: temp auth store {tmp_path} lost its user-only ACL "
+                    "before replacement; refusing to persist."
+                )
+        finally:
+            if _fd_open:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
         atomic_replace(tmp_path, auth_file)
         try:
             dir_fd = os.open(str(auth_file.parent), os.O_RDONLY)
@@ -1412,28 +1445,36 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
                 tmp_path.unlink()
         except OSError:
             pass
-    # Restrict file permissions to owner only
+    # Restrict file permissions to owner only (POSIX no-op on Windows).
     try:
         auth_file.chmod(stat.S_IRUSR | stat.S_IWUSR)
     except OSError:
         pass
-    # The chmod above is a no-op on Windows, where the file inherits the
-    # parent directory's ACL instead (F1). Enforce a user-only ACL via
-    # icacls; on failure warn loudly but do NOT refuse the write — the
-    # Hermes store must stay functional even on exotic filesystems, and
-    # the parent-dir (secure_parent_dir) already narrows most exposure.
+    # F1 (P3): the destination must be user-restricted AFTER the atomic
+    # replace. The temp's ACL normally survives os.replace, but an exotic
+    # filesystem or a concurrent writer could still widen it — fail closed
+    # (raise) rather than silently leaving every stored credential exposed.
     try:
-        from hermes_constants import restrict_credential_file
-        if not restrict_credential_file(auth_file):
-            logger.warning(
-                "auth: wrote %s but could not restrict it to the current "
-                "user (ACL enforcement failed); check the file's "
-                "permissions on Windows (icacls %s /inheritance:r "
-                '/grant:r "%USERNAME%":(R,W)).',
-                auth_file, auth_file,
+        from hermes_constants import credential_file_is_user_restricted
+
+        if not credential_file_is_user_restricted(auth_file):
+            raise OSError(
+                f"F1: wrote {auth_file} but could not restrict it to the "
+                "current user; refusing to leave an exposed credential "
+                "store (fail closed). Check the file's permissions "
+                "(POSIX: chmod 600; Windows: icacls /inheritance:r "
+                '/grant:r "%USERNAME%":(R,W)) and retry.'
             )
+    except OSError:
+        raise
     except Exception as exc:
-        logger.debug("auth: ACL restriction skipped for %s: %s", auth_file, exc)
+        # The verification itself failed (icacls unavailable, unreadable
+        # path) — we cannot prove the store is user-only, so fail closed.
+        raise OSError(
+            f"F1: could not verify {auth_file} is user-restricted after "
+            f"write ({exc}); refusing to leave an exposed credential "
+            "store (fail closed)."
+        ) from exc
     return auth_file
 
 
