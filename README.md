@@ -115,6 +115,13 @@ hermes setup        # Run the full setup wizard (configures everything at once)
 hermes claw migrate # Migrate from OpenClaw (if coming from OpenClaw)
 hermes update       # Update to the latest version
 hermes doctor       # Diagnose any issues
+hermes status       # Show current status (profile, gateway, model, session)
+hermes secrets bitwarden setup   # Connect Bitwarden Secrets Manager (install bws, store token, pick project)
+hermes security     # Security posture surface
+hermes egress       # Egress control surface
+hermes backup       # Back up sessions, config, and state
+hermes sessions     # List and manage sessions
+hermes insights     # Token/cost usage insights
 ```
 
 📖 **[Full documentation →](https://hermes-agent.nousresearch.com/docs/)**
@@ -153,7 +160,7 @@ Hermes has two entry points: start the terminal UI with `hermes`, or run the gat
 | Retry or undo the last turn    | `/retry`, `/undo`                             | `/retry`, `/undo`                                                                |
 | Compress context / check usage | `/compress`, `/usage`, `/insights [--days N]` | `/compress`, `/usage`, `/insights [days]`                                        |
 | Browse skills                  | `/skills` or `/<skill-name>`                  | `/<skill-name>`                                                                  |
-| Interrupt current work         | `Ctrl+C` or send a new message                | `/stop` or send a new message                                                    |
+| Interrupt current work         | `/busy steer` or `/stop`                     | `/stop` or send a new message                                                  |
 | Platform-specific status       | `/platforms`                                  | `/status`, `/sethome`                                                            |
 
 For the full command lists, see the [CLI guide](https://hermes-agent.nousresearch.com/docs/user-guide/cli) and the [Messaging Gateway guide](https://hermes-agent.nousresearch.com/docs/user-guide/messaging).
