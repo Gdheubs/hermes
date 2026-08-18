@@ -232,3 +232,46 @@ class TestCommandCodeModelFiltering:
         assert "startswith(\"claude-\")" in source or '"claude-" in m' in source, (
             "CommandCodeAnthropicProfile.fetch_models should filter to claude-* models"
         )
+
+
+# ── Picker contract ──────────────────────────────────────────────────────────
+
+class TestCommandCodeFetchModelsPickerContract:
+    """``fetch_models`` must accept the kwargs the model picker passes.
+
+    Regression: the generic live-fetch path in ``hermes_cli/models.py``
+    (``provider_model_ids``) calls ``profile.fetch_models(api_key=...,
+    base_url=...)``. The original CommandCode overrides only accepted
+    ``api_key``/``timeout``, so every picker open raised TypeError, which
+    was swallowed, leaving the provider with zero models.
+    """
+
+    @pytest.mark.parametrize("profile_name", ["commandcode", "commandcode-anthropic"])
+    def test_accepts_base_url_kwarg(self, profile_name):
+        import inspect
+
+        import model_tools  # noqa: F401 — triggers discovery
+        import providers
+
+        profile = providers.get_provider_profile(profile_name)
+        assert profile is not None
+        assert "base_url" in inspect.signature(profile.fetch_models).parameters
+
+    def test_resolve_provider_full(self):
+        """Both profiles must resolve through the model-switch path.
+
+        Regression: ``resolve_provider_full`` only knew models.dev + overlay
+        providers, so plugin-only providers (commandcode) failed with
+        "Unknown provider" on /model switches even though the picker listed
+        them.
+        """
+        from hermes_cli.providers import resolve_provider_full
+
+        chat = resolve_provider_full("commandcode", {}, [])
+        assert chat is not None and chat.id == "commandcode"
+        assert chat.transport == "openai_chat"
+        assert "COMMANDCODE_API_KEY" in chat.api_key_env_vars
+
+        anth = resolve_provider_full("commandcode-anthropic", {}, [])
+        assert anth is not None and anth.id == "commandcode-anthropic"
+        assert anth.transport == "anthropic_messages"
