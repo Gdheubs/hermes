@@ -1488,3 +1488,68 @@ def test_extra_args_set_shm_size_helper():
     assert docker_env._extra_args_set_shm_size(None) is False
     # non-string entries must not crash (config.yaml can be malformed)
     assert docker_env._extra_args_set_shm_size([42, None, "--shm-size=1g"]) is True
+
+
+def _run_args(calls):
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    return run_calls[0][0]
+
+
+def test_volume_target_parses_container_side_target():
+    # Named volume, plain host path, and a Windows source carrying its own colon.
+    assert docker_env._volume_target("myvol:/root") == "/root"
+    assert docker_env._volume_target("/host/path:/workspace") == "/workspace"
+    assert docker_env._volume_target(r"C:\Users\me\.config\gh:/root/.config/gh") == "/root/.config/gh"
+    # Trailing option fields never start with "/" and must not be mistaken for the target.
+    assert docker_env._volume_target(r"C:\src\secrets.env:/root/secrets.env:ro") == "/root/secrets.env"
+    assert docker_env._volume_target("myvol:/root/") == "/root"
+    assert docker_env._volume_target("nocolon") == ""
+
+
+def test_named_volume_for_root_replaces_home_bind(monkeypatch, tmp_path):
+    """A user-supplied /root mount must suppress our own home bind.
+
+    Emitting both would target the same mount point twice and make
+    `docker run` fail outright, so the persistent home bind is skipped.
+    """
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path))
+    calls = _mock_subprocess_run(monkeypatch)
+
+    env = _make_dummy_env(persistent_filesystem=True, volumes=["hermeshome:/root"])
+
+    run_args = _run_args(calls)
+    root_mounts = [a for a in run_args if a.endswith(":/root")]
+    assert root_mounts == ["hermeshome:/root"], run_args
+    assert env._home_dir is None
+
+
+def test_nested_root_bind_does_not_suppress_home_bind(monkeypatch, tmp_path):
+    """`...:/root/.config/gh` is not a /root mount and must not disable the bind."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setenv("TERMINAL_SANDBOX_DIR", str(tmp_path))
+    calls = _mock_subprocess_run(monkeypatch)
+
+    env = _make_dummy_env(
+        persistent_filesystem=True,
+        volumes=[r"C:\Users\me\.config\gh:/root/.config/gh"],
+    )
+
+    run_args = _run_args(calls)
+    root_mounts = [a for a in run_args if a.endswith(":/root")]
+    assert root_mounts == [f"{env._home_dir}:/root"], run_args
+
+
+def test_named_volume_for_root_replaces_tmpfs_when_ephemeral(monkeypatch):
+    """Non-persistent mode mounts /root as tmpfs; a user /root mount replaces it."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(persistent_filesystem=False, volumes=["hermeshome:/root"])
+
+    run_args = _run_args(calls)
+    assert not any(a.startswith("/root:") for a in run_args), run_args
+    assert "hermeshome:/root" in run_args
+    # /home is unrelated and must still be a tmpfs.
+    assert any(a.startswith("/home:") for a in run_args), run_args

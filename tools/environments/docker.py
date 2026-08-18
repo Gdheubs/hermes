@@ -100,6 +100,22 @@ def _normalize_env_dict(env: dict | None) -> dict[str, str]:
     return normalized
 
 
+def _volume_target(vol: str) -> str:
+    """Return the container-side mount target of a ``docker -v`` spec.
+
+    Handles Windows sources whose drive letter carries its own colon
+    (``C:\\src:/root/x``) and trailing option fields (``:ro``, ``:z``, ...),
+    which never start with ``/``. Returns "" when no target can be found.
+    """
+    parts = vol.split(":")
+    while parts and not parts[-1].startswith("/"):
+        parts.pop()
+    if len(parts) < 2:
+        return ""
+    target = parts[-1].rstrip("/")
+    return target or "/"
+
+
 def _load_hermes_env_vars() -> dict[str, str]:
     """Load ~/.hermes/.env values without failing Docker command execution."""
     try:
@@ -952,6 +968,7 @@ class DockerEnvironment(BaseEnvironment):
         # User-configured volume mounts (from config.yaml docker_volumes)
         volume_args = []
         workspace_explicitly_mounted = False
+        home_explicitly_mounted = False
         for vol in (volumes or []):
             if not isinstance(vol, str):
                 logger.warning("Docker volume entry is not a string: %r", vol)
@@ -961,8 +978,11 @@ class DockerEnvironment(BaseEnvironment):
                 continue
             if ":" in vol:
                 volume_args.extend(["-v", vol])
-                if ":/workspace" in vol:
+                target = _volume_target(vol)
+                if target == "/workspace":
                     workspace_explicitly_mounted = True
+                elif target == "/root":
+                    home_explicitly_mounted = True
             else:
                 logger.warning("Docker volume '%s' missing colon, skipping", vol)
 
@@ -981,11 +1001,18 @@ class DockerEnvironment(BaseEnvironment):
         writable_args = []
         if self._persistent:
             sandbox = get_sandbox_dir() / "docker" / task_id
-            self._home_dir = str(sandbox / "home")
-            os.makedirs(self._home_dir, exist_ok=True)
-            writable_args.extend([
-                "-v", f"{self._home_dir}:/root",
-            ])
+            if home_explicitly_mounted:
+                # User supplied their own /root mount (e.g. a named volume so
+                # the home dir lives on the VM's native filesystem instead of a
+                # slow host bind). Adding ours too would collide on the same
+                # mount target and make `docker run` fail outright.
+                logger.debug("Skipping docker home bind mount: /root already mounted by user config")
+            else:
+                self._home_dir = str(sandbox / "home")
+                os.makedirs(self._home_dir, exist_ok=True)
+                writable_args.extend([
+                    "-v", f"{self._home_dir}:/root",
+                ])
             if not bind_host_cwd and not workspace_explicitly_mounted:
                 self._workspace_dir = str(sandbox / "workspace")
                 os.makedirs(self._workspace_dir, exist_ok=True)
@@ -999,8 +1026,11 @@ class DockerEnvironment(BaseEnvironment):
                 ])
             writable_args.extend([
                 "--tmpfs", "/home:rw,exec,size=1g",
-                "--tmpfs", "/root:rw,exec,size=1g",
             ])
+            if not home_explicitly_mounted:
+                writable_args.extend([
+                    "--tmpfs", "/root:rw,exec,size=1g",
+                ])
 
         if bind_host_cwd:
             logger.info("Mounting configured host cwd to /workspace: %s", host_cwd_abs)
