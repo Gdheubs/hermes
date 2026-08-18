@@ -210,3 +210,116 @@ class TestScriptContentGateWired:
         )
         update_job(job["id"], {"script": "b.sh"})
         assert get_job(job["id"])["script"] == "b.sh"
+
+
+# ---------------------------------------------------------------------------
+# F3 (execution boundary): fire-time scan + validated-copy binding
+# ---------------------------------------------------------------------------
+
+
+class TestFireTimeExecutionGate:
+    """F3: the bytes that actually run are scanned AGAIN at fire time, and
+    execution binds to the scanned bytes via a validated copy. The
+    create-time gate cannot be bypassed by overwriting the script file
+    afterwards, pre-existing stored jobs are covered, and a mid-run
+    self-overwrite cannot change what executed."""
+
+    def _hermes_env(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes"
+        (home / "scripts").mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        return home
+
+    def _make_job(self, home, body, name="job.sh"):
+        from cron.jobs import create_job
+        (home / "scripts" / name).write_text(body, encoding="utf-8")
+        return create_job(
+            prompt=None, schedule="every 5m",
+            script=name, no_agent=True, deliver="local",
+        )
+
+    def test_benign_then_overwrite_rejected_at_fire(self, tmp_path, monkeypatch):
+        """Review matrix case 1: benign script at create → the SAME PATH is
+        overwritten with a dangerous payload (no job-record update) → the
+        next fire is REJECTED. The create-time scan alone would have let the
+        swapped bytes execute."""
+        from cron.scheduler import run_job
+        home = self._hermes_env(tmp_path, monkeypatch)
+        job = self._make_job(home, "echo 'RAM 92% on host'\n", name="watchdog.sh")
+        # In-place overwrite bypassing the create/update doors.
+        (home / "scripts" / "watchdog.sh").write_text(
+            "sed -i 's/deny/approve/' ~/.hermes/config.yaml\n", encoding="utf-8"
+        )
+        success, doc, final_response, error = run_job(job)
+        assert success is False
+        assert error is not None and "Blocked" in error
+
+    def test_pre_existing_stored_dangerous_job_rejected_at_fire(
+        self, tmp_path, monkeypatch
+    ):
+        """Review matrix case 2: a stored no_agent job whose record pre-dates
+        this gate (persisted directly to the store, never passing a
+        create-time scan) must be rejected at fire time."""
+        from cron import jobs as cron_jobs
+        from cron.scheduler import run_job
+        home = self._hermes_env(tmp_path, monkeypatch)
+        (home / "scripts" / "legacy.sh").write_text(
+            "cat ~/.hermes/auth.json\n", encoding="utf-8"
+        )
+        with cron_jobs.use_cron_store(tmp_path / "store"):
+            cron_jobs.ensure_dirs()
+            legacy = {
+                "id": "abc123def456",
+                "name": "legacy",
+                "schedule": {"every": 300, "display": "every 5m"},
+                "prompt": None,
+                "script": "legacy.sh",
+                "no_agent": True,
+                "deliver": "local",
+                "enabled": True,
+            }
+            cron_jobs.save_jobs([legacy])
+            success, doc, final_response, error = run_job(legacy)
+        assert success is False
+        assert error is not None and "Blocked" in error
+
+    def test_execution_runs_validated_copy_not_original(
+        self, tmp_path, monkeypatch
+    ):
+        """Execution binds to a validated copy of the scanned bytes: the
+        subprocess's ``$0`` (the file it executes from) is the per-run
+        ``.hermes-exec-*`` copy inside the scripts dir — NOT the original
+        script path. An in-place overwrite of the original (between scan and
+        exec, or during the run) therefore cannot change what executed, and
+        the ORIGINAL file on disk is left intact. No exec copies linger
+        after the run."""
+        from cron.scheduler import run_job
+        home = self._hermes_env(tmp_path, monkeypatch)
+        job = self._make_job(
+            home, "#!/bin/bash\necho \"EXEC_PATH=$0\"\n", name="selfie.sh"
+        )
+        success, doc, final_response, error = run_job(job)
+        assert success is True, error
+        assert "EXEC_PATH=" in final_response
+        exec_ref = final_response.split("EXEC_PATH=", 1)[1].splitlines()[0].strip()
+        # The executed file is a validated copy inside the scripts dir.
+        assert ".hermes-exec-" in exec_ref, f"$0 was not the validated copy: {exec_ref}"
+        assert exec_ref.rstrip("/\\").split("/")[-1].split("\\")[-1] != "selfie.sh"
+        # The original script on disk is untouched.
+        original_text = (home / "scripts" / "selfie.sh").read_text(encoding="utf-8")
+        assert "EXEC_PATH" in original_text  # original still the authored script
+        leftovers = [
+            p.name
+            for p in (home / "scripts").iterdir()
+            if p.name.startswith(".hermes-exec-")
+        ]
+        assert leftovers == [], f"exec copies left behind: {leftovers}"
+
+    def test_benign_script_fires_normally(self, tmp_path, monkeypatch):
+        """Control: an untouched benign script still fires and delivers."""
+        from cron.scheduler import run_job
+        home = self._hermes_env(tmp_path, monkeypatch)
+        job = self._make_job(home, "#!/bin/bash\necho 'RAM 92% on host'\n")
+        success, doc, final_response, error = run_job(job)
+        assert success is True
+        assert "RAM 92% on host" in final_response

@@ -3643,6 +3643,49 @@ def _restore_config_yaml_if_tampered(snapshot: Optional[tuple]) -> Optional[str]
     )
 
 
+def _write_script_exec_copy(original: Path, script_text: str) -> Optional[Path]:
+    """Write *script_text* to a random-named, user-only copy next to
+    *original* (same directory + same suffix) and return it.
+
+    F3 execution binding: the subprocess runs THIS copy, so the bytes that
+    execute are exactly the bytes that were read and scanned
+    (``read_and_scan_script_text``) — an in-place overwrite of the original
+    between scan and exec (or during the run) cannot change what executes.
+    Same-directory placement preserves the script's relative-import /
+    ``dirname $0`` semantics; the copy is deleted by ``_run_job_script``'s
+    finally block after the run.
+
+    Returns None (and removes any partial file) when the copy cannot be
+    created — callers fail closed rather than executing unbound bytes.
+    """
+    import secrets
+    import stat
+
+    copy_path: Optional[Path] = None
+    try:
+        suffix = original.suffix.lower()
+        copy_path = original.with_name(
+            f".hermes-exec-{os.getpid()}-{secrets.token_hex(4)}{suffix}"
+        )
+        fd = os.open(
+            str(copy_path),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(script_text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        return copy_path
+    except OSError:
+        if copy_path is not None:
+            try:
+                copy_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return None
+
+
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
@@ -3730,6 +3773,31 @@ def _run_job_script(
     if not path.is_file():
         return False, f"Script path is not a file: {path}"
 
+    # F3 (execution boundary): scan the EXACT bytes that are about to run.
+    # The create/update door scans at authoring time, but the file can be
+    # overwritten in place afterwards (or the job may pre-date this gate),
+    # so the bytes are re-read and re-scanned here, immediately before
+    # execution. Execution then binds to those bytes by running a validated
+    # copy of the scanned text (see _write_script_exec_copy), closing the
+    # scan/use race: whatever overwrites the original cannot change what
+    # executes. Fail closed: an un-scannable script (oversized, non-regular,
+    # cloud placeholder) or a dangerous payload refuses to run.
+    try:
+        from cron.lifecycle_guard import (
+            CronScriptContentBlocked,
+            read_and_scan_script_text,
+        )
+
+        script_text = read_and_scan_script_text(path)
+    except CronScriptContentBlocked as exc:
+        return False, str(exc)
+    exec_path = _write_script_exec_copy(path, script_text)
+    if exec_path is None:
+        return False, (
+            f"Blocked: could not prepare a validated execution copy of "
+            f"{path}; refusing to run the script unbound from its scan."
+        )
+
     script_timeout = _get_script_timeout()
 
     # Pick an interpreter by extension.  Bash for .sh/.bash, Python for
@@ -3752,7 +3820,7 @@ def _run_job_script(
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
         )
-        argv = [_bash, str(path)]
+        argv = [_bash, str(exec_path)]
         env_overlay: dict[str, str] = {}
     else:
         python_exe, env_overlay = _windows_cron_python_invocation(sys.executable)
@@ -3760,9 +3828,9 @@ def _run_job_script(
             # Overlay mode (Windows uv venv): PYTHONPATH alone cannot make
             # editable installs importable — .pth processing needs
             # site.addsitedir() (see _windows_cron_bootstrap_argv).
-            argv = _windows_cron_bootstrap_argv(python_exe, env_overlay, str(path))
+            argv = _windows_cron_bootstrap_argv(python_exe, env_overlay, str(exec_path))
         else:
-            argv = [python_exe, str(path)]
+            argv = [python_exe, str(exec_path)]
 
     try:
         from tools.environments.local import build_subprocess_env
@@ -3780,7 +3848,9 @@ def _run_job_script(
         # Use the job's workdir as the subprocess cwd when configured,
         # otherwise default to the scripts-dir parent (back-compat).
         # NEVER mutate the Python process cwd — that would leak into
-        # concurrent gateway sessions (#69396).
+        # concurrent gateway sessions (#69396). The validated exec copy
+        # lives in the SAME directory as the original script, so
+        # ``dirname $0`` / ``sys.path[0]`` semantics are preserved.
         _script_cwd = workdir or str(path.parent)
 
         # F4: config.yaml is the security policy (approvals.cron_mode,
@@ -3870,6 +3940,14 @@ def _run_job_script(
 
     except Exception as exc:
         return False, f"Script execution failed: {exc}"
+    finally:
+        # F3: the validated execution copy is per-run scratch — remove it on
+        # every exit path (success, cancel, timeout, tamper revert, error) so
+        # no scanned-bytes copy lingers in the scripts dir.
+        try:
+            exec_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _run_job_script_with_claim_heartbeat(
