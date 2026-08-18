@@ -4686,7 +4686,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent = agent_ref[0] if agent_ref else None
             if agent is not None:
                 try:
-                    request_hard_interrupt(agent, "SSE client disconnected")
+                    request_hard_interrupt(agent, "SSE client disconnected", stop_kind="client_disconnect")
                 except Exception:
                     pass
                 _reap_disconnected_agent_processes(agent)
@@ -5262,7 +5262,7 @@ class APIServerAdapter(BasePlatformAdapter):
             agent = agent_ref[0] if agent_ref else None
             if agent is not None:
                 try:
-                    request_hard_interrupt(agent, "SSE client disconnected")
+                    request_hard_interrupt(agent, "SSE client disconnected", stop_kind="client_disconnect")
                 except Exception:
                     pass
                 _reap_disconnected_agent_processes(agent)
