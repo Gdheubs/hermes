@@ -330,13 +330,19 @@ def _run_agent(
     run a single conversation.  Returns ``(final_response, run_result)``."""
     # Imports are local so they don't run when hermes is invoked for
     # other commands (keeps top-level CLI startup cheap).
-    from hermes_cli.config import load_config
+    from hermes_cli.config import (
+        load_config,
+        resolve_ephemeral_system_prompt_from_config,
+    )
     from hermes_cli.models import detect_provider_for_model
     from hermes_cli.runtime_provider import resolve_runtime_provider
     from hermes_cli.tools_config import _get_platform_tools
     from run_agent import AIAgent
 
     cfg = load_config()
+    ephemeral_system_prompt = os.getenv(
+        "HERMES_EPHEMERAL_SYSTEM_PROMPT", ""
+    ) or resolve_ephemeral_system_prompt_from_config(cfg)
 
     # Resolve effective model: explicit arg → env var → config.
     model_cfg = cfg.get("model") or {}
@@ -448,6 +454,7 @@ def _run_agent(
             session_db=session_db,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
+            ephemeral_system_prompt=ephemeral_system_prompt,
             # Interactive callbacks are intentionally NOT wired beyond this
             # one.  In oneshot mode there's no user sitting at a terminal:
             #   - clarify  → returns a synthetic "pick a default" instruction
