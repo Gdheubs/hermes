@@ -9690,7 +9690,9 @@ def _call_llm_impl(
                         resolved_provider=resolved_provider,
                         resolved_model=resolved_model,
                         resolved_base_url=resolved_base_url,
-                        resolved_api_key=resolved_api_key,
+                        # A MoA slot may have captured the now-exhausted key in
+                        # its runtime snapshot. Rebuild from the rotated pool.
+                        resolved_api_key=None,
                         resolved_api_mode=resolved_api_mode,
                         main_runtime=main_runtime,
                         final_model=final_model,
@@ -10393,7 +10395,9 @@ async def _async_call_llm_impl(
                         resolved_provider=resolved_provider,
                         resolved_model=resolved_model,
                         resolved_base_url=resolved_base_url,
-                        resolved_api_key=resolved_api_key,
+                        # Match sync recovery: rotation invalidates an explicit
+                        # runtime key captured before the request.
+                        resolved_api_key=None,
                         resolved_api_mode=resolved_api_mode,
                         final_model=final_model,
                         messages=messages,
