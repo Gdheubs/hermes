@@ -5482,6 +5482,11 @@ class BasePlatformAdapter(ABC):
         to a plain-text version before giving up. If all attempts fail due to
         network errors, sends the user a brief delivery-failure notice so they
         know to retry rather than waiting indefinitely.
+
+        ``metadata["single_external_attempt"] is True`` returns the first
+        result unchanged. The caller has already persisted its mutation
+        boundary and owns ambiguity reconciliation, so this wrapper must not
+        retry, fallback-send, or emit a second failure-notice mutation.
         """
 
         result = await self.send(
@@ -5496,6 +5501,13 @@ class BasePlatformAdapter(ABC):
 
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
+        single_external_attempt = (
+            isinstance(metadata, dict)
+            and metadata.get("single_external_attempt") is True
+        )
+
+        if single_external_attempt:
+            return result
 
         # Timeout errors are not safe to retry (message may have been
         # delivered) and not formatting errors — return the failure as-is.
