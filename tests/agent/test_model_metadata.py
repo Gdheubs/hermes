@@ -162,6 +162,22 @@ class TestEstimateMessagesTokensRough:
         # Raw base64 would be ~100K tokens; the flat per-image model is ~1.5K.
         assert estimate_messages_tokens_rough([msg]) < 5_000
 
+    def test_image_payload_is_not_pinned_by_message_token_cache(self):
+        """Image estimates must not retain raw base64 after the call returns."""
+        import agent.model_metadata as mm
+
+        mm._MSG_TOKENS_CACHE.clear()
+        payload = "data:image/png;base64," + ("A" * 1_000_000)
+        msg = {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": payload}},
+            ],
+        }
+
+        assert estimate_messages_tokens_rough([msg]) >= 1_500
+        assert mm._MSG_TOKENS_CACHE == {}
+
 
 
 class TestEstimateRequestTokensRough:

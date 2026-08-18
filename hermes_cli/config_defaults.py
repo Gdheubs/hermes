@@ -42,6 +42,21 @@ DEFAULT_CONFIG = {
         # behavior everywhere.
         "terminal_continue": True,
     },
+    # Local-only memory telemetry and restart guard for long-lived Hermes
+    # Python processes. Parent RSS and descendant RSS are tracked separately.
+    "resource_guard": {
+        "enabled": True,
+        "poll_seconds": 15,
+        "telemetry_enabled": False,
+        "telemetry_seconds": 60,
+        "warn_rss_mb": 2048,
+        "snapshot_rss_mb": 4096,
+        "hard_rss_mb": 8192,
+        "descendant_warn_rss_mb": 8192,
+        "descendant_hard_rss_mb": 24576,
+        "hard_limit_confirmations": 2,
+        "snapshot_cooldown_seconds": 300,
+    },
     "agent": {
         "max_turns": 500,
         # Inactivity timeout for gateway agent execution (seconds).
@@ -355,6 +370,16 @@ DEFAULT_CONFIG = {
         # window so it can't leak indefinitely. 0 disables escalation (SIGTERM
         # only — the historical behavior). Floored internally at 0.
         "daemon_term_grace_seconds": 2.0,
+        # Resource policy for local tracked background processes. Large model
+        # downloads are serialized; every host process tree is warned/capped
+        # by aggregate RSS so child workers cannot silently exhaust unified
+        # memory outside the Hermes process's own guard. Descendant-tree
+        # thresholds are owned by the resource_guard block (single source of
+        # truth) and shared rather than redefined here.
+        "background_resource_limits": {
+            "large_download_max_concurrent": 1,
+            "poll_seconds": 15,
+        },
         # Environment variables to pass through to sandboxed execution
         # (terminal and execute_code).  Skill-declared required_environment_variables
         # are passed through automatically; this list is for non-skill use cases.

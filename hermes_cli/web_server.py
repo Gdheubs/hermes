@@ -18923,6 +18923,33 @@ def start_server(
     )
     server = uvicorn.Server(config)
 
+    def _desktop_memory_metrics() -> dict[str, Any]:
+        metrics: dict[str, Any] = {}
+        try:
+            from tui_gateway import server as tui_server
+
+            with tui_server._sessions_lock:
+                sessions = list(tui_server._sessions.values())
+            metrics["live_sessions"] = len(sessions)
+            metrics["running_sessions"] = sum(
+                1 for session in sessions if session.get("running")
+            )
+        except Exception:
+            pass
+        try:
+            from agent.model_metadata import message_token_cache_stats
+
+            metrics["message_token_cache"] = message_token_cache_stats()
+        except Exception:
+            pass
+        try:
+            from tools.process_registry import process_registry
+
+            metrics["tracked_background_processes"] = process_registry.count_running()
+        except Exception:
+            pass
+        return metrics
+
     async def _serve():
         # Split startup from main_loop so we can read the bound port
         # after the socket is live (ephemeral port discovery).
@@ -18974,6 +19001,21 @@ def start_server(
                 print(f"  Hermes Web UI → http://{host}:{actual_port}")
             _maybe_open_browser(host, actual_port, open_browser, initial_profile)
 
+            # Local-only telemetry plus a fail-closed restart threshold.  The
+            # normal uvicorn shutdown path lets tui_gateway's atexit/session
+            # finalizers persist active conversation state before Desktop
+            # relaunches the managed backend.
+            from hermes_cli.resource_guard import ProcessMemoryGuard
+
+            _server_loop = asyncio.get_running_loop()
+            _memory_guard = ProcessMemoryGuard(
+                component="desktop-serve" if headless else "dashboard",
+                metrics_fn=_desktop_memory_metrics,
+                on_hard_limit=lambda _snapshot: _server_loop.call_soon_threadsafe(
+                    setattr, server, "should_exit", True
+                ),
+            ).start()
+
             # Collapse the peer-hangup teardown flood (#50005). When the Desktop
             # forcibly closes its WebSocket mid-write, asyncio logs a full
             # traceback per pending connection-lost callback — 50+ identical
@@ -19016,9 +19058,12 @@ def start_server(
                 _hb_interval, _loop_heartbeat, _hb_loop.time() + _hb_interval
             )
 
-            await server.main_loop()
-            if server.started:
-                await server.shutdown()
+            try:
+                await server.main_loop()
+                if server.started:
+                    await server.shutdown()
+            finally:
+                _memory_guard.stop()
 
     # On POSIX, keep the long-standing ``asyncio.run(_serve())`` runner —
     # Python's default loop there is already a SelectorEventLoop (or uvloop when

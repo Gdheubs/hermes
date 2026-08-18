@@ -6629,6 +6629,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _loop_heartbeat_task: Optional["asyncio.Task"] = None
     _loop_floor_timer_handle: Optional[Any] = None
     _loop_liveness_watchdog: Optional[Any] = None
+    _resource_guard: Optional[Any] = None
     _gateway_started_at: float = 0.0
     _shutdown_watchdog_done: Optional["threading.Event"] = None
     _platform_lock_takeover_on_start: bool = False
@@ -6641,6 +6642,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        self._resource_guard = None
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -12128,6 +12130,66 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Legacy session recovery on startup failed: %s", exc)
         return exact, fallback
 
+    def _start_resource_guard(self, loop: asyncio.AbstractEventLoop) -> None:
+        if self._resource_guard is not None:
+            return
+
+        def _metrics() -> dict:
+            cache = getattr(self, "_agent_cache", {})
+            cache_lock = getattr(self, "_agent_cache_lock", None)
+            if cache_lock is not None:
+                with cache_lock:
+                    cache_size = len(cache)
+            else:
+                cache_size = len(cache)
+            result: dict = {
+                "agent_cache_entries": cache_size,
+                "running_agents": self._running_agent_count(),
+                "active_work": self._active_work_count(),
+            }
+            try:
+                from agent.model_metadata import message_token_cache_stats
+
+                result["message_token_cache"] = message_token_cache_stats()
+            except Exception:
+                pass
+            try:
+                from tools.process_registry import process_registry
+
+                result["tracked_background_processes"] = process_registry.count_running()
+            except Exception:
+                pass
+            return result
+
+        def _hard_limit(_snapshot: dict) -> None:
+            def _request() -> None:
+                # request_restart refuses new turns immediately, waits for
+                # active work to settle, then runs the normal checkpointing
+                # and service-restart path.
+                self.request_restart(via_service=True)
+
+            loop.call_soon_threadsafe(_request)
+
+        try:
+            from hermes_cli.resource_guard import ProcessMemoryGuard
+
+            self._resource_guard = ProcessMemoryGuard(
+                component="messaging-gateway",
+                metrics_fn=_metrics,
+                on_hard_limit=_hard_limit,
+            ).start()
+        except Exception:
+            logger.exception("Failed to start gateway resource guard")
+
+    def _stop_resource_guard(self) -> None:
+        guard = self._resource_guard
+        self._resource_guard = None
+        if guard is not None:
+            try:
+                guard.stop()
+            except Exception:
+                logger.debug("Failed to stop gateway resource guard", exc_info=True)
+
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -12184,6 +12246,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._gateway_loop = None
         if self._gateway_loop is not None:
             self._start_loop_liveness_guards(self._gateway_loop)
+            self._start_resource_guard(self._gateway_loop)
         logger.info("Session storage: %s", self.config.sessions_dir)
 
         # Sanity-check that systemd's TimeoutStopSec covers our drain
@@ -14280,6 +14343,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)
         if callable(_stop_guards):
             _stop_guards()
+        self._stop_resource_guard()
         if restart:
             self._restart_requested = True
             self._restart_detached = detached_restart

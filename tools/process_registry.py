@@ -384,6 +384,8 @@ class ProcessSession:
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
+    resource_class: str = "background"
+    _resource_warned: bool = field(default=False, repr=False)
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run (#70716)
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
@@ -502,6 +504,175 @@ class ProcessRegistry:
         while lines and any(noise in lines[0] for noise in ProcessRegistry._SHELL_NOISE_SUBSTRINGS):
             lines.pop(0)
         return "\n".join(lines)
+
+    @staticmethod
+    def _background_resource_policy() -> dict[str, float | int]:
+        # Descendant-tree memory thresholds and the hard-limit confirmation
+        # count are owned by the resource_guard config block (single source of
+        # truth), so per-process caps cannot drift from the gateway guard.
+        # Only terminal-specific knobs live under terminal.background_resource_limits.
+        from hermes_cli.resource_guard import (
+            DESCENDANT_WARN_RSS_MB,
+            DESCENDANT_HARD_RSS_MB,
+            HARD_LIMIT_CONFIRMATIONS,
+        )
+
+        defaults = {
+            "large_download_max_concurrent": 1,
+            "descendant_warn_rss_mb": DESCENDANT_WARN_RSS_MB,
+            "descendant_hard_rss_mb": DESCENDANT_HARD_RSS_MB,
+            "hard_limit_confirmations": HARD_LIMIT_CONFIRMATIONS,
+            "poll_seconds": 15.0,
+        }
+        try:
+            from hermes_cli.config import load_config_readonly
+
+            cfg = load_config_readonly() or {}
+            terminal = cfg.get("terminal") if isinstance(cfg, dict) else None
+            raw = (
+                terminal.get("background_resource_limits")
+                if isinstance(terminal, dict)
+                else None
+            )
+            guard = cfg.get("resource_guard") if isinstance(cfg, dict) else None
+            policy = dict(defaults)
+            if isinstance(raw, dict):
+                policy["large_download_max_concurrent"] = max(
+                    1, int(raw.get("large_download_max_concurrent", 1))
+                )
+                policy["poll_seconds"] = max(
+                    2.0, float(raw.get("poll_seconds", 15))
+                )
+            if isinstance(guard, dict):
+                policy["descendant_warn_rss_mb"] = max(
+                    1,
+                    int(guard.get("descendant_warn_rss_mb", DESCENDANT_WARN_RSS_MB)),
+                )
+                policy["descendant_hard_rss_mb"] = max(
+                    int(policy["descendant_warn_rss_mb"]),
+                    int(guard.get("descendant_hard_rss_mb", DESCENDANT_HARD_RSS_MB)),
+                )
+                policy["hard_limit_confirmations"] = max(
+                    1,
+                    int(guard.get("hard_limit_confirmations", HARD_LIMIT_CONFIRMATIONS)),
+                )
+            return policy
+        except (TypeError, ValueError, OSError):
+            return defaults
+
+    @staticmethod
+    def _resource_class_for_command(command: str) -> str:
+        normalized = " ".join(str(command or "").lower().split())
+        hugging_face = any(
+            marker in normalized
+            for marker in (
+                "hf_hub_download",
+                "snapshot_download",
+                "huggingface-cli download",
+                "hf download",
+            )
+        )
+        direct_model_download = (
+            any(tool in normalized for tool in ("curl ", "wget ", "aria2c "))
+            and any(
+                suffix in normalized
+                for suffix in (".gguf", ".safetensors", ".ckpt", ".pth")
+            )
+        )
+        return "large_download" if hugging_face or direct_model_download else "background"
+
+    def _assert_resource_spawn_allowed(self, resource_class: str) -> None:
+        if resource_class != "large_download":
+            return
+        policy = self._background_resource_policy()
+        cap = int(policy["large_download_max_concurrent"])
+        with self._lock:
+            active = [
+                session
+                for session in self._running.values()
+                if not session.exited and session.resource_class == "large_download"
+            ]
+        if len(active) >= cap:
+            ids = ", ".join(session.id for session in active[:4])
+            raise RuntimeError(
+                "Large-download concurrency limit reached "
+                f"({len(active)}/{cap}); wait for or stop {ids} before starting another."
+            )
+
+    @staticmethod
+    def _process_tree_rss_bytes(pid: int) -> int:
+        import psutil
+
+        try:
+            parent = psutil.Process(pid)
+            processes = [parent, *parent.children(recursive=True)]
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            return 0
+        total = 0
+        for process in processes:
+            try:
+                total += int(process.memory_info().rss)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                continue
+        return total
+
+    def _start_resource_monitor(self, session: ProcessSession) -> None:
+        if session.pid_scope != "host" or not session.pid:
+            return
+
+        def _monitor() -> None:
+            policy = self._background_resource_policy()
+            warn_bytes = int(policy["descendant_warn_rss_mb"]) * 1024 * 1024
+            hard_bytes = int(policy["descendant_hard_rss_mb"]) * 1024 * 1024
+            confirmations = int(policy["hard_limit_confirmations"])
+            poll_seconds = float(policy["poll_seconds"])
+            hard_violations = 0
+            while not session._completion_event.wait(poll_seconds):
+                if session.exited or not session.pid:
+                    return
+                rss = self._process_tree_rss_bytes(session.pid)
+                if rss <= 0:
+                    return
+                if rss >= warn_bytes and not session._resource_warned:
+                    logger.warning(
+                        "Background process memory warning: session=%s pid=%s "
+                        "class=%s tree_rss_mb=%.1f warn_mb=%d",
+                        session.id,
+                        session.pid,
+                        session.resource_class,
+                        rss / (1024 * 1024),
+                        int(policy["descendant_warn_rss_mb"]),
+                    )
+                    session._resource_warned = True
+                elif rss < warn_bytes * 0.8:
+                    session._resource_warned = False
+                # Debounce the hard limit: a single transient spike above the
+                # cap must not terminate the tree; require consecutive
+                # over-cap samples before acting.
+                if rss >= hard_bytes:
+                    hard_violations += 1
+                else:
+                    hard_violations = 0
+                if hard_violations >= confirmations:
+                    logger.error(
+                        "Background process memory hard limit: session=%s pid=%s "
+                        "class=%s tree_rss_mb=%.1f hard_mb=%d confirmations=%d; "
+                        "terminating tree",
+                        session.id,
+                        session.pid,
+                        session.resource_class,
+                        rss / (1024 * 1024),
+                        int(policy["descendant_hard_rss_mb"]),
+                        hard_violations,
+                    )
+                    self.kill_process(session.id, source="resource_guard")
+                    return
+
+        threading.Thread(
+            target=_monitor,
+            daemon=True,
+            name=f"proc-resource-{session.id}",
+        ).start()
 
     def _emit_output(self, session: ProcessSession, chunk: str) -> None:
         """Forward a freshly-read chunk to the live-output sink, if one is set.
@@ -997,6 +1168,8 @@ class ProcessRegistry:
         from tools.terminal_tool import _rewrite_compound_background as _rewrite_bg
 
         safe_command = _rewrite_bg(command)
+        resource_class = self._resource_class_for_command(command)
+        self._assert_resource_spawn_allowed(resource_class)
 
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
@@ -1005,6 +1178,7 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            resource_class=resource_class,
         )
 
         pty_scope_attempted = False
@@ -1070,6 +1244,7 @@ class ProcessRegistry:
                     self._running[session.id] = session
 
                 self._write_checkpoint()
+                self._start_resource_monitor(session)
                 return session
 
             except ImportError:
@@ -1176,6 +1351,7 @@ class ProcessRegistry:
                 self._running[session.id] = session
 
             self._write_checkpoint()
+            self._start_resource_monitor(session)
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
@@ -2563,6 +2739,7 @@ class ProcessRegistry:
                             "started_at": s.started_at,
                             "task_id": s.task_id,
                             "session_key": s.session_key,
+                            "resource_class": s.resource_class,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
                             "watcher_user_id": s.watcher_user_id,
@@ -2670,11 +2847,14 @@ class ProcessRegistry:
                 parent_session_id=entry.get("parent_session_id", ""),
                 notify_on_complete=entry.get("notify_on_complete", False),
                 watch_patterns=entry.get("watch_patterns", []),
+                resource_class=entry.get("resource_class")
+                or self._resource_class_for_command(entry.get("command", "")),
             )
             with self._lock:
                 self._running[session.id] = session
             recovered += 1
             logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
+            self._start_resource_monitor(session)
 
             # Re-enqueue watcher so gateway can resume notifications
             if session.watcher_interval > 0:

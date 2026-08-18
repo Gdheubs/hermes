@@ -144,6 +144,58 @@ def _wait_until(predicate, timeout: float = 5.0, interval: float = 0.05) -> bool
     return False
 
 
+def test_large_model_downloads_are_classified_and_serialized(registry, monkeypatch):
+    monkeypatch.setattr(
+        registry,
+        "_background_resource_policy",
+        lambda: {
+            "large_download_max_concurrent": 1,
+            "descendant_warn_rss_mb": 8192,
+            "descendant_hard_rss_mb": 24576,
+            "poll_seconds": 15.0,
+        },
+    )
+    command = "python -c \"from huggingface_hub import hf_hub_download\""
+    assert registry._resource_class_for_command(command) == "large_download"
+    active = _make_session(sid="proc_download", command=command)
+    active.resource_class = "large_download"
+    registry._running[active.id] = active
+
+    with pytest.raises(RuntimeError, match="concurrency limit reached"):
+        registry._assert_resource_spawn_allowed("large_download")
+
+    # Ordinary servers and builds are unaffected by the download-specific cap.
+    registry._assert_resource_spawn_allowed("background")
+
+
+def test_background_resource_policy_reads_descendant_thresholds_from_guard(monkeypatch):
+    """Descendant thresholds and the confirmation count come from the
+    resource_guard block (single source of truth), not a duplicated
+    terminal-level knob."""
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "resource_guard": {
+                "descendant_warn_rss_mb": 4096,
+                "descendant_hard_rss_mb": 16384,
+                "hard_limit_confirmations": 3,
+            },
+            "terminal": {
+                "background_resource_limits": {
+                    "large_download_max_concurrent": 2,
+                    "poll_seconds": 10,
+                }
+            },
+        },
+    )
+    policy = ProcessRegistry._background_resource_policy()
+    assert policy["descendant_warn_rss_mb"] == 4096
+    assert policy["descendant_hard_rss_mb"] == 16384
+    assert policy["hard_limit_confirmations"] == 3
+    assert policy["large_download_max_concurrent"] == 2
+    assert policy["poll_seconds"] == 10.0
+
+
 @pytest.mark.windows_only
 def test_write_stdin_uses_str_for_windows_pty(registry):
     """pywinpty expects str input; bytes raises a PyString conversion error.

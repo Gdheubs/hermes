@@ -3316,6 +3316,22 @@ _MSG_TOKENS_CACHE: Dict[Any, Tuple[list, int]] = {}
 _MSG_TOKENS_CACHE_MAX = 4096
 
 
+def message_token_cache_stats() -> Dict[str, int]:
+    """Return redacted cache-retention counters for local memory telemetry."""
+    pinned_strings = 0
+    pinned_chars = 0
+    for pins, _tokens in list(_MSG_TOKENS_CACHE.values()):
+        for value in pins:
+            if isinstance(value, str):
+                pinned_strings += 1
+                pinned_chars += len(value)
+    return {
+        "entries": len(_MSG_TOKENS_CACHE),
+        "pinned_strings": pinned_strings,
+        "pinned_string_chars": pinned_chars,
+    }
+
+
 def _msg_fingerprint(value: Any, pins: list) -> Any:
     if value is None or value is True or value is False:
         return value
@@ -3338,6 +3354,18 @@ def _msg_fingerprint(value: Any, pins: list) -> Any:
 
 
 def _estimate_message_tokens_cached(msg: Any, image_cost: int) -> int:
+    # Never memoize multimodal messages.  The fingerprint cache deliberately
+    # pins every string leaf so object ids cannot be recycled while an entry is
+    # live.  For an image_url that would pin the *raw base64 payload* even
+    # though the estimator's wire shadow replaces it with ``[stripped]``.
+    # Long-lived desktop/gateway processes can see hundreds of unique images;
+    # keeping up to _MSG_TOKENS_CACHE_MAX full payloads turns this small CPU
+    # memo into a multi-GB retention cache.  Image-bearing messages are rare
+    # enough that computing their small stripped shadow directly is cheaper
+    # and, importantly, releases the payload with the request/session.
+    image_tokens = _count_image_tokens(msg, image_cost)
+    if image_tokens:
+        return _estimate_message_tokens_without_images(msg) + image_tokens
     try:
         pins: list = []
         key = _msg_fingerprint(msg, pins)
@@ -3345,14 +3373,14 @@ def _estimate_message_tokens_cached(msg: Any, image_cost: int) -> int:
     except Exception:
         return (
             _estimate_message_tokens_without_images(msg)
-            + _count_image_tokens(msg, image_cost)
+            + image_tokens
         )
     cached = _MSG_TOKENS_CACHE.get(key)
     if cached is not None:
         return cached[1]
     tokens = (
         _estimate_message_tokens_without_images(msg)
-        + _count_image_tokens(msg, image_cost)
+        + image_tokens
     )
     _MSG_TOKENS_CACHE[key] = (pins, tokens)
     while len(_MSG_TOKENS_CACHE) > _MSG_TOKENS_CACHE_MAX:
