@@ -66,6 +66,24 @@ describe('useContextBreakdown', () => {
     expect(requestGateway).not.toHaveBeenCalled()
   })
 
+  it('drops a pre-turn estimate while live usage is streaming', async () => {
+    const requestGateway = vi.fn().mockResolvedValue(breakdown)
+
+    const { rerender, result } = renderHook(
+      ({ busy }) => useContextBreakdown({ busy, enabled: true, requestGateway, sessionId: 'runtime-1' }),
+      { initialProps: { busy: false } }
+    )
+
+    await waitFor(() => expect(result.current.breakdown).toEqual(breakdown))
+
+    rerender({ busy: true })
+
+    // The status bar must fall back to the live `session.usage` frame rather
+    // than overwrite it with the snapshot fetched before this turn started.
+    expect(result.current.breakdown).toBeNull()
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+  })
+
   it('refetches on a session switch and never reports the previous session numbers', async () => {
     const requestGateway = vi.fn().mockResolvedValue(breakdown)
 

@@ -31,7 +31,13 @@ export function useContextBreakdown({ busy, enabled, requestGateway, sessionId }
   useEffect(() => {
     // Mid-turn the transcript changes on every delta and the gateway already
     // streams measured usage, so an estimate would be both stale and wasteful.
+    // Drop the previous turn's estimate as well: otherwise the status bar
+    // prefers it over each live `session.usage` frame until this turn ends.
     if (!enabled || !sessionId || busy) {
+      if (busy) {
+        setFetched(current => (current ? null : current))
+      }
+
       return
     }
 
@@ -57,7 +63,10 @@ export function useContextBreakdown({ busy, enabled, requestGateway, sessionId }
   }, [busy, enabled, requestGateway, sessionId])
 
   return {
-    breakdown: fetched && fetched.sessionId === sessionId ? fetched.breakdown : null,
+    // Hide a prior breakdown immediately when a turn begins. Effects run
+    // after paint, so relying solely on the clear above can flash stale
+    // occupancy over the first streamed usage frame.
+    breakdown: !busy && fetched && fetched.sessionId === sessionId ? fetched.breakdown : null,
     loading
   }
 }
