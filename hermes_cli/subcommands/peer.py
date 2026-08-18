@@ -77,6 +77,8 @@ def _peer_secret(name: str) -> str:
 
 
 def _request(url: str, key: str, *, method: str = "GET", body: dict | None = None, timeout: int = LIST_TIMEOUT_S) -> dict:
+    from hermes_cli.urllib_security import open_credentialed_url
+
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(
         url,
@@ -88,7 +90,11 @@ def _request(url: str, key: str, *, method: str = "GET", body: dict | None = Non
             "User-Agent": "hermes-peer-dm",
         },
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — user-registered peer URL
+    # The peer URL is user-registered (``hermes peer add``); a redirect to a
+    # different origin must not carry the Authorization: Bearer key with it —
+    # a compromised/MITM'd peer could otherwise harvest it. open_credentialed_url
+    # strips non-safelisted headers across a cross-origin redirect.
+    with open_credentialed_url(req, timeout=timeout) as resp:
         payload = resp.read().decode("utf-8", "replace")
     try:
         parsed = json.loads(payload)

@@ -186,3 +186,73 @@ def test_dm_reuses_existing_bot_chat(monkeypatch, capsys, fake_peer_server):
     assert payload["reply"] == "reply from the other machine"
     # No new session was created — the existing canonical chat was reused.
     assert _FakePeer.sessions == ["bc_existing"]
+
+
+# ── cross-origin redirect must not carry the peer's Bearer key ──────────────
+
+
+class _AttackerOrigin(BaseHTTPRequestHandler):
+    """A second real HTTP server standing in for an attacker-controlled host
+    a compromised/MITM'd peer could redirect a ``hermes peer dm`` request to."""
+
+    auth_seen: list = []
+
+    def do_GET(self):
+        type(self).auth_seen.append(self.headers.get("Authorization"))
+        body = json.dumps({"object": "list", "data": []}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):  # noqa: D102 — silence test server logging
+        pass
+
+
+class _RedirectingPeer(BaseHTTPRequestHandler):
+    """A "peer" that 302-redirects every request to a different origin —
+    the shape of a compromised peer or a LAN MITM answering ``hermes peer
+    add``'s registered URL."""
+
+    redirect_target: str = ""
+
+    def do_GET(self):
+        self.send_response(302)
+        self.send_header("Location", type(self).redirect_target + self.path)
+        self.end_headers()
+
+    def log_message(self, *args):  # noqa: D102 — silence test server logging
+        pass
+
+
+def test_request_strips_bearer_key_across_redirect_origin():
+    """``_request`` must not forward the peer's Authorization: Bearer key to
+    a different origin a redirect points at (compromised peer / LAN MITM) —
+    the exact class of leak ``open_credentialed_url`` exists to close."""
+    _AttackerOrigin.auth_seen = []
+    attacker = HTTPServer(("127.0.0.1", 0), _AttackerOrigin)
+    attacker_thread = threading.Thread(target=attacker.serve_forever, daemon=True)
+    attacker_thread.start()
+
+    _RedirectingPeer.redirect_target = f"http://127.0.0.1:{attacker.server_port}"
+    peer = HTTPServer(("127.0.0.1", 0), _RedirectingPeer)
+    peer_thread = threading.Thread(target=peer.serve_forever, daemon=True)
+    peer_thread.start()
+
+    try:
+        # The attacker origin answers with a well-formed (empty) listing, so
+        # the redirect completes successfully — the request itself is not
+        # the point of this test, only whether the Bearer key rode along.
+        result = peer_cmd._request(f"http://127.0.0.1:{peer.server_port}/api/sessions", "top-secret-peer-key")
+        assert result == {"object": "list", "data": []}
+    finally:
+        peer.shutdown()
+        peer_thread.join(timeout=5)
+        attacker.shutdown()
+        attacker_thread.join(timeout=5)
+
+    assert _AttackerOrigin.auth_seen, "redirect target was never reached"
+    assert all(header is None for header in _AttackerOrigin.auth_seen), (
+        f"peer's Bearer key leaked to the redirect target: {_AttackerOrigin.auth_seen}"
+    )
