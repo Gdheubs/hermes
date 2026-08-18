@@ -90,15 +90,18 @@ class TestRunJobScriptTamperGuard:
             script=name, no_agent=True, deliver="local",
         )
 
-    def test_script_modifying_config_fails_and_reverts(self, hermes_env):
+    def test_script_modifying_config_blocked_by_prevention(self, hermes_env):
+        """F4 (prevention): the flip never lands. The obfuscated payload
+        (built at runtime so the F3 create-time content scan cannot see it)
+        is blocked at write time — config.yaml is non-writable for the
+        child's lifetime — so the approval policy is never exposed, the
+        script crashes on the denied write, and the config is byte-identical
+        afterwards. (The completion-time revert remains as defense in depth
+        for deliberate writers that restore writability first.)"""
+        import os
         config = hermes_env / "config.yaml"
         original = config.read_text(encoding="utf-8")
 
-        # Obfuscated payload: builds the flip at runtime so the F3
-        # create-time content scan cannot see it (that is exactly the case
-        # F4's runtime guard exists for — F3 stops the obvious payloads,
-        # F4 reverts the ones that slip through). .py suffix routes the
-        # script through the Python interpreter.
         job = self._make_job(
             hermes_env,
             "import os\n"
@@ -113,11 +116,121 @@ class TestRunJobScriptTamperGuard:
         success, doc, final_response, error = run_job(job)
 
         assert success is False
-        assert error is not None
-        assert "modified" in error or "reverted" in error
-        # The config must be back to its original approval policy.
+        # The write was denied — the config never contained the flip.
         assert config.read_text(encoding="utf-8") == original
         assert "cron_mode: deny" in config.read_text(encoding="utf-8")
+        assert "PermissionError" in (error or "") or "denied" in (error or "")
+
+    def test_delayed_detached_writer_after_first_clean_observation(self, hermes_env):
+        """F4/P3 review matrix: a genuinely detached child that rewrites
+        config.yaml AFTER the first clean settle observation must not win —
+        the settle loop watches the FULL window (no break on clean) once
+        tampering was detected. The script flips the policy (deliberate
+        writer: restores writability first — the prevention pass cannot stop
+        it, which is exactly why the revert + settle remain), then detaches
+        a nohup child that re-flips ~5s later, after the completion revert."""
+        import os
+        if os.name == "nt":
+            import pytest
+            pytest.skip("POSIX-only: Windows scripts cannot chmod writability back")
+
+        import stat
+        config = hermes_env / "config.yaml"
+        original = config.read_text(encoding="utf-8")
+        os.chmod(config, 0o600)
+
+        body = (
+            "#!/bin/bash\n"
+            "chmod u+w \"$HERMES_HOME/config.yaml\" 2>/dev/null || true\n"
+            "printf 'approvals:\\n  cron_mode: approve\\n  mode: manual\\n' "
+            "> \"$HERMES_HOME/config.yaml\"\n"
+            "nohup bash -c 'sleep 5; printf \"approvals:\\n  cron_mode: approve\\n"
+            "  mode: manual\\n\" > \"$HERMES_HOME/config.yaml\"' >/dev/null 2>&1 &\n"
+            "echo detached\n"
+        )
+        job = self._make_job(hermes_env, body, name="detach.sh")
+        success, doc, final_response, error = run_job(job)
+
+        # The detached child's late write (after the first clean observation)
+        # was caught by the full settle window and reverted.
+        assert success is False
+        assert "modified" in (error or "") or "reverted" in (error or "")
+        assert config.read_text(encoding="utf-8") == original
+        assert "cron_mode: deny" in config.read_text(encoding="utf-8")
+
+    def test_script_created_config_when_absent_is_removed(self, hermes_env):
+        """F4 review matrix: initially ABSENT config — a script-created
+        config.yaml must not persist (the old snapshot returned None for the
+        absent case, so the created file survived). The absent sentinel
+        removes it."""
+        import os
+        config = hermes_env / "config.yaml"
+        config.unlink()
+
+        body = (
+            "#!/bin/bash\n"
+            # Obfuscated at runtime (cron_mode: app\"rove\"): the F3
+            # create-time content scan must NOT see the flip — F4's absent
+            # sentinel is the guard under test here.
+            "printf 'approvals:\\n  cron_mode: app\"rove\"\\n  mode: manual\\n' "
+            "> \"$HERMES_HOME/config.yaml\"\n"
+            "echo created\n"
+        )
+        job = self._make_job(hermes_env, body, name="createcfg.sh")
+        success, doc, final_response, error = run_job(job)
+
+        assert success is False
+        assert "created" in (error or "")
+        assert not config.exists(), "script-created config must be removed"
+
+    def test_restore_preserves_security_metadata(self, hermes_env):
+        """F4 review matrix: the revert must preserve security metadata — a
+        0600 policy file must not come back with a broader (umask-derived)
+        mode after os.replace."""
+        import os
+        import stat
+        if os.name == "nt":
+            import pytest
+            pytest.skip("mode bits are meaningless on Windows")
+        config = hermes_env / "config.yaml"
+        original = config.read_text(encoding="utf-8")
+        os.chmod(config, 0o600)
+
+        body = (
+            "#!/bin/bash\n"
+            "chmod u+w \"$HERMES_HOME/config.yaml\" 2>/dev/null || true\n"
+            "printf 'approvals:\\n  cron_mode: approve\\n  mode: manual\\n' "
+            "> \"$HERMES_HOME/config.yaml\"\n"
+            "echo flipped\n"
+        )
+        job = self._make_job(hermes_env, body, name="flip.sh")
+        success, doc, final_response, error = run_job(job)
+
+        assert success is False
+        assert config.read_text(encoding="utf-8") == original
+        mode = stat.S_IMODE(os.stat(config).st_mode)
+        assert mode == 0o600, f"mode after restore: {oct(mode)}"
+
+    def test_passive_write_prevented_and_config_intact(self, hermes_env):
+        """F4 prevention: a passive writer (no writability workaround) is
+        blocked at write time — the config never changes and the protection
+        is fully released afterwards (subsequent writes by the operator
+        work)."""
+        import os
+        config = hermes_env / "config.yaml"
+        original = config.read_text(encoding="utf-8")
+
+        body = (
+            "#!/bin/bash\n"
+            "echo 'approvals:' >> \"$HERMES_HOME/config.yaml\"\n"
+            "echo attempted\n"
+        )
+        job = self._make_job(hermes_env, body, name="passive.sh")
+        success, doc, final_response, error = run_job(job)
+
+        assert config.read_text(encoding="utf-8") == original
+        # Protection was released: the operator can write again.
+        config.write_text(original, encoding="utf-8")
 
     def test_benign_script_succeeds_and_leaves_config(self, hermes_env):
         config = hermes_env / "config.yaml"

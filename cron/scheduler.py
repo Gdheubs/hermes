@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 import uuid
+import stat as _stat_mod
 from datetime import datetime, timezone
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
@@ -3577,17 +3578,35 @@ def _windows_cron_bootstrap_argv(
 
 
 def _snapshot_config_yaml() -> Optional[tuple]:
-    """Snapshot the Hermes config.yaml bytes + mtime for tamper detection.
+    """Snapshot the Hermes config.yaml for tamper detection and restoration.
 
-    Returns ``(path, bytes, mtime_ns)`` or None when the config cannot be
-    read (no config yet, unreadable). Used by the F4 script-lane guard to
-    revert config.yaml modifications made by a no_agent script subprocess.
+    Returns ``(path, bytes_or_None, mtime_ns_or_None, stat_or_None)``:
+
+    - ``bytes`` — the exact pre-run contents (None means the config did NOT
+      exist before the run: an explicit ABSENT sentinel, so a script that
+      CREATES config.yaml is detected and removed instead of persisting).
+    - ``mtime_ns`` — pre-run mtime, restored on revert so the mtime-keyed
+      approval-policy cache never observes a flip.
+    - ``stat`` — pre-run metadata (mode/uid/gid), restored on revert so the
+      restored file does not inherit a broader umask-derived mode.
+
+    Returns None only when the config cannot even be stat/read (unreadable
+    path, filesystem error) — in that case no restore is possible and
+    callers fall back to the completion-time byte check where feasible.
+
+    Used by the F4 script-lane guard to revert config.yaml modifications
+    made by a no_agent script subprocess.
     """
     try:
         from hermes_cli.config import get_config_path
         path = get_config_path()
-        st = path.stat()
-        return (path, path.read_bytes(), st.st_mtime_ns)
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            # Explicitly-absent sentinel: no config yet. A script-created
+            # config must be removed after the run, never silently blessed.
+            return (path, None, None, None)
+        return (path, path.read_bytes(), st.st_mtime_ns, st)
     except Exception:
         return None
 
@@ -3604,10 +3623,47 @@ def _restore_config_yaml_if_tampered(snapshot: Optional[tuple]) -> Optional[str]
     Scripts run outside the file_tools/terminal hard-blocks that protect
     config.yaml, so the restore here is the script lane's equivalent of
     the file_tools deny.
+
+    P3: the restore is metadata-preserving (mode/owner/mtime restored with
+    the bytes — os.replace alone would swap in a umask-derived inode, e.g.
+    a 0600 policy file becoming 0644), and the ABSENT sentinel is honored
+    (a script-created config is removed, not preserved).
     """
     if snapshot is None:
         return None
-    path, original_bytes, original_mtime = snapshot
+    path, original_bytes, original_mtime, original_stat = snapshot
+    if original_bytes is None:
+        # The config did not exist before the run. A script-created config
+        # must NOT persist (the P2 code had no snapshot to restore because
+        # the absent case returned None — the created file survived).
+        try:
+            current_exists = path.exists()
+        except OSError:
+            current_exists = False
+        if not current_exists:
+            return None
+        try:
+            path.unlink()
+        except OSError as exc:
+            logger.error(
+                "Security: cron script CREATED %s during its run; "
+                "attempted removal FAILED: %s",
+                path, exc,
+            )
+            return (
+                f"Security: script created {path} during its run; "
+                f"attempted removal FAILED ({exc}). Check the file "
+                "immediately — it did not exist before the run."
+            )
+        logger.warning(
+            "Security: cron script created %s during its run — removing it "
+            "(the config did not exist before the run).",
+            path,
+        )
+        return (
+            f"Security: script created {path} during its run; the file was "
+            "removed (it did not exist before the run)."
+        )
     try:
         current = path.read_bytes()
     except OSError:
@@ -3628,6 +3684,20 @@ def _restore_config_yaml_if_tampered(snapshot: Optional[tuple]) -> Optional[str]
             os.utime(path, ns=(original_mtime, original_mtime))
         except OSError:
             pass
+        # P3: os.replace swapped in a NEW inode with umask-derived mode —
+        # restore the pre-run security metadata (mode/owner/group) so a 0600
+        # policy file is never replaced by a broader-mode file. Windows
+        # ignores chmod/chown (ACLs govern there; the write-protection pass
+        # restores the ACL on its own exit path).
+        if original_stat is not None:
+            try:
+                os.chmod(path, _stat_mod.S_IMODE(original_stat.st_mode))
+            except OSError:
+                pass
+            try:
+                os.chown(path, original_stat.st_uid, original_stat.st_gid)
+            except (OSError, AttributeError):
+                pass
     except OSError as exc:
         logger.error(
             "Security: could not revert %s after script tampering: %s",
@@ -3641,6 +3711,51 @@ def _restore_config_yaml_if_tampered(snapshot: Optional[tuple]) -> Optional[str]
         f"Security: script modified {path} during its run; the change was "
         "reverted (approval-policy tampering guard). Review the script."
     )
+
+
+@contextlib.contextmanager
+def _config_write_protection(snapshot: Optional[tuple]):
+    """Prevent a script subprocess from WRITING config.yaml during its run.
+
+    F4 (prevention, not just rollback): the completion-time revert only
+    undoes exposure AFTER the child finishes — during the child's lifetime
+    the flipped policy is live and consumable (another gateway task, a
+    nested ``hermes`` invocation, or the script's own next command). Making
+    config.yaml non-writable for the duration of the run stops passive
+    writes at the source (``open(..., 'w')`` / ``echo >> config.yaml`` get
+    Permission denied); the completion-time byte-check + revert remains as
+    defense in depth for writers that deliberately restore writability
+    first, and the settle loop catches detached children that outlive this
+    block.
+
+    Mechanism: ``os.chmod(path, mode & ~0o222)`` — on POSIX this strips the
+    kernel-enforced write bits; on Windows CPython maps it to the read-only
+    FILE ATTRIBUTE (writes blocked, reads allowed), which is trivially
+    reversible. Deliberately NOT a Windows deny-write ACE: the deny ACE
+    also blocked READS on Windows and its removal is SID-fragile (the bare
+    username form fails to match the machine-qualified deny entry, leaving
+    the file locked). Best-effort — if protection cannot be applied the
+    completion-time revert still covers the run.
+    """
+    if snapshot is None:
+        yield
+        return
+    path, original_bytes, _mtime, original_stat = snapshot
+    if original_bytes is None or original_stat is None:
+        yield
+        return
+    try:
+        os.chmod(path, original_stat.st_mode & ~0o222)
+    except Exception:
+        # Protection is best-effort; the completion-time revert still runs.
+        pass
+    try:
+        yield
+    finally:
+        try:
+            os.chmod(path, _stat_mod.S_IMODE(original_stat.st_mode))
+        except Exception:
+            pass
 
 
 def _write_script_exec_copy(original: Path, script_text: str) -> Optional[Path]:
@@ -3862,34 +3977,41 @@ def _run_job_script(
         # restore it if the script modified it.
         config_snapshot = _snapshot_config_yaml()
 
-        proc = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            cwd=_script_cwd,
-            env=env,
-            **popen_kwargs,
-        )
-        deadline = time.monotonic() + script_timeout
-        early_error = None
-        while True:
-            if cancel_event is not None and cancel_event.is_set():
-                _terminate_cron_script_process(proc)
-                _drain_script_pipes(proc)
-                early_error = "Script cancelled because cron fire ownership was lost"
-                break
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                _terminate_cron_script_process(proc)
-                _drain_script_pipes(proc)
-                early_error = f"Script timed out after {script_timeout}s: {path}"
-                break
-            try:
-                stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
-                break
-            except subprocess.TimeoutExpired:
-                continue
+        # P3 (prevention, not just rollback): while the child is alive,
+        # config.yaml is made non-writable (mode-bits / deny-write ACE), so
+        # the script cannot flip the policy mid-run and consume it. The
+        # completion-time byte-check + revert (below) remains as defense in
+        # depth for writers that deliberately restore writability, and the
+        # settle loop catches detached children that outlive this block.
+        with _config_write_protection(config_snapshot):
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=_script_cwd,
+                env=env,
+                **popen_kwargs,
+            )
+            deadline = time.monotonic() + script_timeout
+            early_error = None
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    _terminate_cron_script_process(proc)
+                    _drain_script_pipes(proc)
+                    early_error = "Script cancelled because cron fire ownership was lost"
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _terminate_cron_script_process(proc)
+                    _drain_script_pipes(proc)
+                    early_error = f"Script timed out after {script_timeout}s: {path}"
+                    break
+                try:
+                    stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
 
         # Detect and revert any config.yaml modification the script made.
         # Runs on EVERY completion path (success, cancel, timeout) so the
@@ -3902,13 +4024,19 @@ def _run_job_script(
         # completion revert. When tampering was detected, settle-check the
         # config for a few seconds and re-revert any re-flip so a lingering
         # child cannot win. Clean runs add no delay.
+        # F4/P3: the loop no longer breaks on the FIRST clean observation —
+        # a detached child can write AFTER that observation and would
+        # otherwise win. The full settle window is checked whenever
+        # tampering was detected.
         if tamper_message:
             for _delay in (1.0, 2.0, 4.0):
                 time.sleep(_delay)
                 _later = _restore_config_yaml_if_tampered(config_snapshot)
-                if _later is None:
-                    break
-                tamper_message = _later
+                if _later is not None:
+                    tamper_message = _later
+                # P3: NO break on a clean observation. A detached child may
+                # write AFTER the first clean check; the full settle window
+                # must be watched once tampering was detected.
 
         if early_error:
             return False, early_error
