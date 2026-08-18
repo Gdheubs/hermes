@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useI18n } from '@/i18n'
 import { chatMessageText, collectUnspokenTurnSpeech } from '@/lib/chat-messages'
 import { triggerHaptic } from '@/lib/haptics'
+import { wasTextAlreadySpoken } from '@/lib/voice-playback'
 import { clearWakeIndicator, syncWakeIndicatorWithVoice } from '@/lib/wake-indicator'
 import { $voiceConversationStartRequest, takeVoiceConversationStart } from '@/store/composer'
 import { resetBrowseState } from '@/store/composer-input-history'
@@ -84,7 +85,7 @@ export function useComposerVoice({
 
     const text = chatMessageText(last).trim()
 
-    if (!text) {
+    if (!text || wasTextAlreadySpoken(text, sessionId)) {
       return null
     }
 
@@ -149,7 +150,8 @@ export function useComposerVoice({
     pendingResponse: pendingTurnResponse,
     // Before the conversation opens the mic, wait for any in-flight wake.pause
     // to finish releasing the capture device (see wakePauseBarrierRef).
-    beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined
+    beforeMicOpen: () => wakePauseBarrierRef.current ?? undefined,
+    sessionId
   })
 
   // eslint-disable-next-line no-restricted-syntax -- ownership token used only by unmount cleanup

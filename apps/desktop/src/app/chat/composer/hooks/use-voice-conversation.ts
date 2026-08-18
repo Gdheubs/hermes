@@ -39,6 +39,8 @@ interface VoiceConversationOptions {
   /** Awaited right before the mic is opened. Used to let the wake-word listener
    *  fully release the capture device first, so the two never contend. */
   beforeMicOpen?: () => Promise<void> | void
+  /** Scopes the spoken-text dedupe fingerprint to this composer's session. */
+  sessionId?: string | null
 }
 
 /** How long a barge-triggered interrupt may take to settle before we submit
@@ -55,7 +57,8 @@ export function useVoiceConversation({
   onTranscribeAudio,
   pendingResponse,
   consumePendingResponse,
-  beforeMicOpen
+  beforeMicOpen,
+  sessionId
 }: VoiceConversationOptions) {
   const { t } = useI18n()
   const voiceCopy = t.notifications.voice
@@ -459,7 +462,7 @@ export function useVoiceConversation({
         // this is a safety net for read-aloud-style entries into the loop.
         ensureBargeMonitor()
 
-        const playback = playSpeechText(response.text, { source: 'voice-conversation' })
+        const playback = playSpeechText(response.text, { sessionId, source: 'voice-conversation' })
         // playSpeechText performs its normal cleanup synchronously before
         // returning. Capture the sequence after that internal increment so
         // only a later, external stop suppresses the next listen cycle.
@@ -477,7 +480,7 @@ export function useVoiceConversation({
 
       poll()
     },
-    [ensureBargeMonitor, pendingResponse, settleAfterSpeech, voiceCopy.playbackFailed]
+    [ensureBargeMonitor, pendingResponse, sessionId, settleAfterSpeech, voiceCopy.playbackFailed]
   )
 
   /**

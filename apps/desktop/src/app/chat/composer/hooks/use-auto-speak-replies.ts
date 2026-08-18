@@ -75,7 +75,7 @@ export function useAutoSpeakReplies({
       // ran in every window, so peers just stay quiet.
       void ownsAmbientCue(`speak:${reply.id}`).then(owns => {
         if (owns) {
-          void playSpeechText(reply.text, { messageId: reply.id, source: 'read-aloud' }).catch(error =>
+          void playSpeechText(reply.text, { messageId: reply.id, sessionId, source: 'read-aloud' }).catch(error =>
             notifyError(error, failureLabel)
           )
         }

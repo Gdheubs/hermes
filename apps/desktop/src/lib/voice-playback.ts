@@ -66,6 +66,10 @@ function currentState(
 
 export interface VoicePlaybackOptions {
   messageId?: string | null
+  /** Scopes the spoken-text fingerprint (see wasTextAlreadySpoken) to one
+   *  session/tile, so two unrelated composers never suppress each other's
+   *  replies just because the text happens to match. */
+  sessionId?: string | null
   source: VoicePlaybackSource
 }
 
@@ -463,6 +467,10 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
         }
 
         setVoicePlaybackState(currentState('idle'))
+        // Marked only once playback has actually finished, not before it
+        // starts — so a failed/barged-in attempt never suppresses a later
+        // retry of the same text.
+        markTextSpoken(text, options.sessionId)
 
         return true
       }
@@ -476,6 +484,7 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
 
     if (played) {
       setVoicePlaybackState(currentState('idle'))
+      markTextSpoken(text, options.sessionId)
     }
 
     return played
@@ -492,6 +501,28 @@ export async function playSpeechText(text: string, options: VoicePlaybackOptions
 
 export function isVoicePlaybackActive() {
   return $voicePlayback.get().status !== 'idle'
+}
+
+// ---------------------------------------------------------------------------
+// Spoken-text fingerprint — read-aloud and auto-speak both funnel through
+// playSpeechText, so marking it here (rather than in each caller's own ref)
+// survives the live→committed message-id rewrite (#86601): the row id changes
+// across that transition and across the manual Read Aloud button, but the
+// spoken text doesn't. Keyed per sessionId — like lastSpokenIdRef, which is
+// scoped per useComposerVoice() instance — so two open tiles (or two turns in
+// different sessions) that happen to produce identical short text never
+// suppress each other; only a genuine same-session repeat is deduped.
+// ---------------------------------------------------------------------------
+
+const NO_SESSION_KEY = ''
+const lastSpokenTextBySession = new Map<string, string>()
+
+export function markTextSpoken(text: string, sessionId?: string | null): void {
+  lastSpokenTextBySession.set(sessionId ?? NO_SESSION_KEY, text.trim())
+}
+
+export function wasTextAlreadySpoken(text: string, sessionId?: string | null): boolean {
+  return lastSpokenTextBySession.get(sessionId ?? NO_SESSION_KEY) === text.trim()
 }
 
 // ---------------------------------------------------------------------------
