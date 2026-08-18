@@ -1,3 +1,16 @@
+const FULL_GIT_SHA = /^[0-9a-f]{40}$/i
+
+// A packaged client executes the assets recorded by its build stamp. The
+// checkout used to stage the next update may legitimately be older, so using
+// that checkout's HEAD makes a freshly installed app look behind. Dev runs do
+// execute from the checkout and keep using its live HEAD.
+function resolveRunningClientSha({ checkoutSha, installStamp, isPackaged }) {
+  const stampedSha = installStamp?.commit
+  const hasUsableStamp = FULL_GIT_SHA.test(stampedSha || '') && !/^0{40}$/.test(stampedSha)
+
+  return isPackaged && hasUsableStamp ? stampedSha : checkoutSha
+}
+
 // Whether `git rev-list HEAD..origin/<branch> --count` produces a meaningful
 // number worth computing. Installer checkouts are shallow (`--depth 1`), so
 // their visible graph is incomplete even when `merge-base` happens to find a
@@ -9,12 +22,23 @@ function shouldCountCommits({ isShallow }) {
   return !isShallow
 }
 
+function commitCountRevision({ currentSha, branch }) {
+  return `${currentSha}..origin/${branch}`
+}
+
 // Resolve how many commits the local checkout is behind origin for the desktop
 // update indicator. Shallow checkouts use SHA equality plus any positively
 // proven local-ahead ancestry; exact counts remain exclusive to full clones.
-function resolveBehindCount({ countStr, currentSha, targetSha, isShallow, targetIsAncestorOfHead = false }) {
+function resolveBehindCount({
+  countStr,
+  currentSha,
+  targetSha,
+  isShallow,
+  countAvailable = true,
+  targetIsAncestorOfCurrent = false
+}) {
   if (!shouldCountCommits({ isShallow })) {
-    if (currentSha && targetSha && (currentSha === targetSha || targetIsAncestorOfHead)) {
+    if (currentSha && targetSha && (currentSha === targetSha || targetIsAncestorOfCurrent)) {
       return 0
     }
 
@@ -22,6 +46,14 @@ function resolveBehindCount({ countStr, currentSha, targetSha, isShallow, target
     // Return null — never a numeric sentinel: the UI used to render the old
     // `1` as a literal "1 change included" even when the true distance was
     // far larger. null lets every surface say "update available" honestly.
+    return null
+  }
+
+  // A packaged stamp can name a commit that is not present in the update
+  // checkout (for example a locally built client). Do not turn a failed
+  // rev-list into zero; let the compare API recover the count, or surface the
+  // honest unknown-count state when the commit is not published.
+  if (!countAvailable) {
     return null
   }
 
@@ -44,9 +76,7 @@ function resolveCommitLogSelection({ branch, isShallow }) {
 // clone depth required. Pure URL builder + response parser here; the network
 // call lives with the caller.
 function compareApiUrl({ currentSha, originUrl, targetSha }) {
-  const sha = /^[0-9a-f]{40}$/i
-
-  if (!sha.test(currentSha || '') || !sha.test(targetSha || '')) {
+  if (!FULL_GIT_SHA.test(currentSha || '') || !FULL_GIT_SHA.test(targetSha || '')) {
     return null
   }
 
@@ -89,4 +119,12 @@ function parseCompareBehindCount(payload) {
   return ahead
 }
 
-export { compareApiUrl, parseCompareBehindCount, resolveBehindCount, resolveCommitLogSelection, shouldCountCommits }
+export {
+  commitCountRevision,
+  compareApiUrl,
+  parseCompareBehindCount,
+  resolveBehindCount,
+  resolveCommitLogSelection,
+  resolveRunningClientSha,
+  shouldCountCommits
+}

@@ -289,10 +289,12 @@ import {
 import { createStreamThrottle } from './stream-throttle'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import {
+  commitCountRevision,
   compareApiUrl,
   parseCompareBehindCount,
   resolveBehindCount,
   resolveCommitLogSelection,
+  resolveRunningClientSha,
   shouldCountCommits
 } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
@@ -2668,12 +2670,14 @@ async function checkUpdates() {
   if (isOfficialSshRemote(originUrl)) {
     const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
 
-    const [currentSha, target, dirtyStr, currentBranch] = await Promise.all([
+    const [checkoutSha, target, dirtyStr, currentBranch] = await Promise.all([
       git(['rev-parse', 'HEAD']),
       runGit(['ls-remote', OFFICIAL_REPO_HTTPS_URL, `refs/heads/${branch}`], { cwd: updateRoot }),
       git(['status', '--porcelain']),
       git(['rev-parse', '--abbrev-ref', 'HEAD'])
     ])
+
+    const currentSha = resolveRunningClientSha({ checkoutSha, installStamp: INSTALL_STAMP, isPackaged: IS_PACKAGED })
 
     const targetSha = firstLine(target.stdout).split(/\s+/)[0] || ''
 
@@ -2739,7 +2743,7 @@ async function checkUpdates() {
 
   const git = args => runGit(args, { cwd: updateRoot }).then(r => r.stdout.trim())
 
-  const [currentSha, targetSha, dirtyStr, currentBranch, shallowStr] = await Promise.all([
+  const [checkoutSha, targetSha, dirtyStr, currentBranch, shallowStr] = await Promise.all([
     git(['rev-parse', 'HEAD']),
     git(['rev-parse', `origin/${branch}`]),
     git(['status', '--porcelain']),
@@ -2747,25 +2751,34 @@ async function checkUpdates() {
     git(['rev-parse', '--is-shallow-repository'])
   ])
 
+  const currentSha = resolveRunningClientSha({ checkoutSha, installStamp: INSTALL_STAMP, isPackaged: IS_PACKAGED })
+
   const isShallow = shallowStr === 'true'
 
-  // A shallow graph cannot provide a trustworthy exact count, even when it has
-  // a visible merge-base. Skip the ancestry walk and use the SHA fallback.
-  const countStr = shouldCountCommits({ isShallow }) ? await git(['rev-list', `HEAD..origin/${branch}`, '--count']) : ''
+  // Count from the code this packaged app is actually running, not from the
+  // checkout that happens to stage its next update. A shallow graph cannot
+  // provide a trustworthy exact count even when it has a visible merge-base.
+  const countResult = shouldCountCommits({ isShallow })
+    ? await runGit(['rev-list', commitCountRevision({ currentSha, branch }), '--count'], { cwd: updateRoot })
+    : null
+
+  const countAvailable = countResult?.code === 0
+  const countStr = countAvailable ? countResult.stdout.trim() : ''
 
   // A positive directional ancestry result remains trustworthy in a shallow
   // graph and prevents a local commit on top of origin from looking outdated.
-  const targetIsAncestorOfHead =
+  const targetIsAncestorOfCurrent =
     isShallow &&
     currentSha !== targetSha &&
-    (await runGit(['merge-base', '--is-ancestor', `origin/${branch}`, 'HEAD'], { cwd: updateRoot })).code === 0
+    (await runGit(['merge-base', '--is-ancestor', `origin/${branch}`, currentSha], { cwd: updateRoot })).code === 0
 
   let behind = resolveBehindCount({
     countStr,
     currentSha,
     targetSha,
     isShallow,
-    targetIsAncestorOfHead
+    countAvailable,
+    targetIsAncestorOfCurrent
   })
 
   // Recover the exact count a shallow clone can't compute: the GitHub compare
