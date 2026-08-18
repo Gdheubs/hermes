@@ -622,6 +622,82 @@ class TestLaunchdServiceRecovery:
         assert "PID 88888" in out
         assert "NOT available" in out
 
+    def test_launchd_status_uses_domain_print_when_list_rejects_bare_label(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """Modern launchctl can reject ``list <label>`` for a live gui job."""
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: True)
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        monkeypatch.setattr(
+            "gateway.status.get_running_pid", lambda cleanup_stale=False: 4242
+        )
+
+        def fake_run(cmd, **kwargs):
+            if cmd == ["launchctl", "list", gateway_cli.get_launchd_label()]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="not found")
+            assert cmd == [
+                "launchctl",
+                "print",
+                f"gui/501/{gateway_cli.get_launchd_label()}",
+            ]
+            return SimpleNamespace(
+                returncode=0,
+                stdout="state = running\npid = 4242\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_status()
+
+        out = capsys.readouterr().out
+        assert "Gateway is supervised by launchd (PID 4242)" in out
+        assert "not loaded" not in out.lower()
+
+    def test_launchd_runtime_probe_uses_domain_print_when_list_rejects_bare_label(
+        self, tmp_path, monkeypatch
+    ):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text("plist", encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+
+        def fake_run(cmd, **kwargs):
+            if cmd == ["launchctl", "list", gateway_cli.get_launchd_label()]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="not found")
+            return SimpleNamespace(
+                returncode=0,
+                stdout="state = running\npid = 4242\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._probe_launchd_service_running() is True
+
+    def test_launchd_reload_check_uses_domain_print_when_list_rejects_bare_label(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+
+        def fake_run(cmd, **kwargs):
+            if cmd == ["launchctl", "list", gateway_cli.get_launchd_label()]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="not found")
+            return SimpleNamespace(
+                returncode=0,
+                stdout="state = running\npid = 4242\n",
+                stderr="",
+            )
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._launchctl_label_supervising_process(
+            gateway_cli.get_launchd_label()
+        ) is True
+
 
 class TestLaunchdDomainDetection:
     """Regression tests for _launchd_domain() probing (#40831).

@@ -1375,50 +1375,70 @@ def _recover_pending_systemd_restart(
 
 
 def _parse_launchd_pid_from_list_output(output: str) -> int | None:
-    """Extract the PID from ``launchctl list <label>`` output.
+    """Extract a positive PID from ``launchctl list`` or ``print`` output.
 
     When launchd is actively supervising a process, the output includes a
-    ``"PID" = <number>;`` line.  When the service definition is only *registered*
-    but not running (macOS 26+ with an unmanageable domain, fallback active),
-    the output lacks a PID field entirely.  Returns ``None`` when no PID is
-    found or the PID is non-positive (e.g. ``-1`` for a recently-crashed service).
+    ``"PID" = <number>;`` (``list``) or ``pid = <number>`` (``print``) line.
+    When the service definition is only *registered* but not running, the
+    output lacks a positive PID. Returns ``None`` when no PID is found or the
+    PID is non-positive (e.g. ``-1`` for a recently-crashed service).
     """
     for line in output.splitlines():
         stripped = line.strip()
-        if stripped.startswith('"PID"') or stripped.startswith("PID"):
-            parts = stripped.split("=", 1)
-            if len(parts) == 2:
-                val = parts[1].strip().rstrip(";").strip('"')
-                try:
-                    pid = int(val)
-                    return pid if pid > 0 else None
-                except ValueError:
-                    return None
+        key, separator, value = stripped.partition("=")
+        if separator and key.strip().strip('"').lower() == "pid":
+            val = value.strip().rstrip(";").strip('"')
+            try:
+                pid = int(val)
+                return pid if pid > 0 else None
+            except ValueError:
+                return None
     return None
+
+
+def _read_launchd_service(label: str) -> tuple[bool, str]:
+    """Return whether launchd knows ``label`` and its status output.
+
+    ``launchctl list <label>`` is the legacy query. Recent macOS releases can
+    reject that bare-label form even while the domain-qualified job is running,
+    so fall back to ``launchctl print <domain>/<label>`` before reporting a
+    service as unloaded.
+    """
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", label],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False, ""
+    if result.returncode == 0:
+        return True, result.stdout
+
+    try:
+        result = subprocess.run(
+            ["launchctl", "print", f"{_launchd_domain()}/{label}"],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False, ""
+    return result.returncode == 0, result.stdout
 
 
 def _probe_launchd_service_running() -> bool:
     """Return True when launchd is actively supervising the gateway process.
 
-    ``launchctl list <label>`` returns exit 0 whenever the service definition is
-    registered with launchd — even when ``state = not running`` (macOS 26+).
-    We additionally require a PID in the output to confirm launchd is actually
-    managing a live process, not just holding a static definition.
+    A registered service is not enough: require a positive PID in the
+    ``launchctl list`` or domain-qualified ``launchctl print`` output to
+    confirm launchd is managing a live process.
     """
     if not get_launchd_plist_path().exists():
         return False
-    try:
-        result = subprocess.run(
-            ["launchctl", "list", get_launchd_label()],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            timeout=10,
-        )
-    except subprocess.TimeoutExpired:
-        return False
-    if result.returncode != 0:
-        return False
-    return _parse_launchd_pid_from_list_output(result.stdout) is not None
+    service_listed, service_output = _read_launchd_service(get_launchd_label())
+    return service_listed and _parse_launchd_pid_from_list_output(service_output) is not None
 
 
 def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot:
@@ -4358,12 +4378,9 @@ def _append_launchd_reload_log(message: str) -> None:
 def _launchctl_label_supervising_process(label: str) -> bool:
     """True when launchd both knows ``label`` AND is running a process for it.
 
-    A bare ``launchctl list <label>`` exit-0 only proves a *definition* is
-    registered — it also returns 0 for ``state = not running`` (macOS 26+),
-    which is why :func:`_probe_launchd_service_running` already insists on a
-    PID. The reload's success check needs the same standard: ending the retry
-    loop on "a definition exists" can report success for a job launchd is not
-    actually running.
+    A launchd query only proves a *definition* is registered; it may still be
+    ``state = not running``. The reload's success check therefore requires a
+    positive PID, using the same legacy-list/domain-print fallback as status.
 
     Measured against live launchd (2026-08-05): immediately after ``bootout``
     the label deregisters within ~1s (rc=113) while the old process keeps
@@ -4372,19 +4389,8 @@ def _launchctl_label_supervising_process(label: str) -> bool:
     does that. This check is the narrower guarantee: success means launchd is
     supervising a live process.
     """
-    try:
-        result = subprocess.run(
-            ["launchctl", "list", label],
-            check=False,
-            timeout=10,
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-        )
-        if result.returncode != 0:
-            return False
-        return _parse_launchd_pid_from_list_output(result.stdout) is not None
-    except (subprocess.TimeoutExpired, OSError):
-        return False
+    service_listed, service_output = _read_launchd_service(label)
+    return service_listed and _parse_launchd_pid_from_list_output(service_output) is not None
 
 
 def _retry_launchctl_bootstrap_until_registered(
@@ -5207,18 +5213,7 @@ def launchd_restart():
 def launchd_status(deep: bool = False):
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
-    try:
-        result = subprocess.run(
-            ["launchctl", "list", label],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            timeout=10,
-        )
-        service_listed = result.returncode == 0
-        list_output = result.stdout
-    except subprocess.TimeoutExpired:
-        service_listed = False
-        list_output = ""
+    service_listed, list_output = _read_launchd_service(label)
 
     # Determine whether launchd is actively supervising a process.
     # ``launchctl list`` returns exit 0 whenever the service definition is
