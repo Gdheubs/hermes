@@ -6220,6 +6220,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         snapshot["session_total_tokens"] = getattr(agent, "session_total_tokens", 0) or 0
         snapshot["session_api_calls"] = getattr(agent, "session_api_calls", 0) or 0
 
+        # Per-last-call TPS for status bar / output-speed display
+        last_dur = getattr(agent, "last_api_duration", 0.0) or 0.0
+        last_out = getattr(agent, "last_output_tokens", 0) or 0
+        if last_dur > 0 and last_out > 0:
+            snapshot["output_speed"] = last_out / last_dur
+        else:
+            snapshot["output_speed"] = None
+        # peak_speed includes reasoning tokens
+        reasoning = getattr(agent, "session_reasoning_tokens", 0) or 0
+        if last_dur > 0 and (last_out + reasoning) > 0:
+            snapshot["peak_speed"] = (last_out + reasoning) / last_dur
+        else:
+            snapshot["peak_speed"] = None
+
         compressor = getattr(agent, "context_compressor", None)
         if compressor:
             # last_prompt_tokens is parked at the -1 sentinel right after a
@@ -6905,6 +6919,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
             if battery_label:
                 parts.insert(0, battery_label)
+
+            # TPS from last API call (when configured)
+            if self.config.get("display", {}).get("show_output_speed") and snapshot.get("output_speed") is not None:
+                tps = snapshot["output_speed"]
+                parts.append(f"{tps:.0f}t/s")
             if compressions:
                 parts.append(f"🗜️ {compressions}")
             bg_count = snapshot.get("active_background_tasks", 0)
@@ -11649,6 +11668,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._show_subscription()
         elif canonical == "topup":
             self._show_billing(cmd_original)
+        elif canonical == "tps":
+            self._show_tps()
         elif canonical == "insights":
             self._show_insights(cmd_original)
         elif canonical == "copy":
@@ -13136,6 +13157,35 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # into stream-retry events, credential rotations, etc.
             # Console quietness is enforced by hermes_logging not
             # installing a console StreamHandler in non-verbose mode.
+
+    def _show_tps(self):
+        """`/tps` — show tokens-per-second of the last API response.
+
+        In gateway/desktop mode, /tps is intercepted by slash.exec before
+        reaching this method, which reads directly from the session agent.
+        This handler serves CLI (terminal) users where the local agent
+        processes API calls directly.
+        """
+        agent = getattr(self, "agent", None)
+        last_dur = getattr(agent, "last_api_duration", 0.0) or 0.0
+        last_out = getattr(agent, "last_output_tokens", 0) or 0
+        reasoning = getattr(agent, "session_reasoning_tokens", 0) or 0
+
+        print()
+        print("  ⚡ Tokens per second")
+        print(f"  {'─' * 41}")
+        if last_dur > 0 and last_out > 0:
+            tps_avg = last_out / last_dur
+            total_tok = last_out + reasoning
+            tps_peak = total_tok / last_dur if total_tok > 0 else tps_avg
+            print(f"  Output tokens:       {last_out:,} in {last_dur:.1f}s")
+            print(f"  Average speed:       {tps_avg:,.0f} tok/s")
+            print(f"  Peak speed (est):    {tps_peak:,.0f} tok/s")
+            if reasoning:
+                print(f"  Reasoning tokens:    {reasoning:,}")
+        else:
+            print(f"  No API response recorded yet in this session.")
+            print(f"  Send a message first, then run /tps.")
 
     def _show_insights(self, command: str = "/insights"):
         """Show usage insights and analytics from session history."""

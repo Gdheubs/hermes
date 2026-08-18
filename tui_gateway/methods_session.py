@@ -1513,6 +1513,21 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, usage)
 
 
+@method("session.tps")
+def _(rid, params: dict) -> dict:
+    """Return tokens-per-second of the last API response for this session."""
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    agent = session.get("agent")
+    if agent is None:
+        return _ok(rid, {"tps": None, "tokens": 0, "duration_s": 0.0})
+    last_dur = getattr(agent, "last_api_duration", 0.0) or 0.0
+    last_out = getattr(agent, "last_output_tokens", 0) or 0
+    tps = round(last_out / last_dur, 1) if last_dur > 0 and last_out > 0 else None
+    return _ok(rid, {"tps": tps, "tokens": last_out, "duration_s": round(last_dur, 2)})
+
+
 @method("session.context_breakdown")
 def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)

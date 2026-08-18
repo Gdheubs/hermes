@@ -1222,6 +1222,38 @@ def _(rid, params: dict) -> dict:
         except Exception as e:
             return _ok(rid, {"output": f"Plugin command error: {e}"})
 
+    # Handle /tps directly — reads from the session agent, no slash worker
+    # needed (spawning a worker for a read-only counter would be wasteful,
+    # and the worker's own agent never makes API calls).
+    if _cmd_base == "tps":
+        agent = session.get("agent")
+        if agent is None:
+            return _ok(rid, {"output": "No active agent in this session."})
+        last_dur = getattr(agent, "last_api_duration", 0.0) or 0.0
+        last_out = getattr(agent, "last_output_tokens", 0) or 0
+        reasoning = getattr(agent, "session_reasoning_tokens", 0) or 0
+        if last_dur > 0 and last_out > 0:
+            tps_avg = last_out / last_dur
+            total_tok = last_out + reasoning
+            tps_peak = total_tok / last_dur if total_tok > 0 else tps_avg
+            output = (
+                f"⚡ Tokens per second\n"
+                f"─────────────────────────────────────────\n"
+                f"Output tokens:       {last_out:,} in {last_dur:.1f}s\n"
+                f"Average speed:       {tps_avg:,.0f} tok/s\n"
+                f"Peak speed (est):    {tps_peak:,.0f} tok/s"
+            )
+            if reasoning > 0:
+                output += f"\nReasoning tokens:    {reasoning:,}"
+        else:
+            output = (
+                "⚡ Tokens per second\n"
+                "─────────────────────────────────────────\n"
+                "No API response recorded yet in this session.\n"
+                "Send a message first, then run /tps."
+            )
+        return _ok(rid, {"output": output})
+
     worker = session.get("slash_worker")
     if not worker:
         # On-demand spawn is now the ONLY spawn path for a fresh session

@@ -2177,6 +2177,7 @@ export const ar = defineLocale({
       cron: 'المهام',
       openCron: 'فتح المهام المجدولة',
       turnRunning: 'الدور يعمل',
+      tokensPerSecond: 'سرعة إخراج آخر استجابة (رمز في الثانية)',
       contextUsage: 'استخدام السياق',
       session: 'الجلسة',
       yoloOn: 'YOLO مفعل',

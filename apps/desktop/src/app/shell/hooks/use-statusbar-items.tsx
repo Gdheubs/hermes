@@ -557,6 +557,13 @@ export function useStatusbarItems({
         variant: 'text'
       },
       {
+        hidden: !currentUsage?.output_speed,
+        id: 'output-speed',
+        label: `${currentUsage?.output_speed ?? 0}t/s`,
+        title: copy.tokensPerSecond,
+        variant: 'text'
+      },
+      {
         detail: contextBar || undefined,
         hidden: !contextUsage,
         id: 'context-usage',
@@ -607,6 +614,7 @@ export function useStatusbarItems({
       contextBreakdownLoading,
       contextUsage,
       copy,
+      currentUsage?.output_speed,
       gaugeUsage,
       sessionStartedAt,
       gatewayState,

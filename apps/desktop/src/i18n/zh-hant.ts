@@ -2357,6 +2357,7 @@ export const zhHant = defineLocale({
       starmap: '記憶圖譜',
       openStarmap: '開啟記憶圖譜',
       turnRunning: '執行中',
+      tokensPerSecond: '上次回應的輸出速度（每秒 token 數）',
       contextUsage: '上下文使用量',
       contextUsagePanel: {
         categories: {

@@ -5348,6 +5348,24 @@ def _get_usage(agent) -> dict:
         "total": g("session_total_tokens"),
         "calls": g("session_api_calls"),
     }
+    # Per-last-call tokens-per-second for the desktop status bar.
+    # Coerce defensively: test doubles (MagicMock) and partially-built agents
+    # can expose non-numeric attributes here.
+    try:
+        last_dur = float(getattr(agent, "last_api_duration", 0.0) or 0.0)
+        last_out = int(getattr(agent, "last_output_tokens", 0) or 0)
+    except (TypeError, ValueError):
+        last_dur, last_out = 0.0, 0
+    if last_dur > 0 and last_out > 0:
+        usage["output_speed"] = round(last_out / last_dur, 1)
+        # peak_speed includes reasoning tokens in the numerator
+        try:
+            reasoning = int(usage.get("reasoning", 0) or 0)
+        except (TypeError, ValueError):
+            reasoning = 0
+        total_out = last_out + reasoning
+        if total_out > 0:
+            usage["peak_speed"] = round(total_out / last_dur, 1)
     comp = getattr(agent, "context_compressor", None)
     if comp:
         # context_used is the *current-window* occupancy. Do NOT fall back to

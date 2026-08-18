@@ -2441,6 +2441,7 @@ export const ja = defineLocale({
       starmap: 'メモリグラフ',
       openStarmap: 'メモリグラフを開く',
       turnRunning: '実行中',
+      tokensPerSecond: '直前の応答の出力速度（トークン/秒）',
       contextUsage: 'コンテキスト使用状況',
       contextUsagePanel: {
         categories: {

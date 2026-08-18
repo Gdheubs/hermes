@@ -2911,6 +2911,7 @@ export const zh: Translations = {
       starmap: '记忆图谱',
       openStarmap: '打开记忆图谱',
       turnRunning: '运行中',
+      tokensPerSecond: '上次响应的输出速度（每秒 token 数）',
       contextUsage: '上下文用量',
       contextUsagePanel: {
         categories: {
