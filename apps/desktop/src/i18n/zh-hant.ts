@@ -2509,7 +2509,25 @@ export const zhHant = defineLocale({
       loadFailedConsole: (code, message) => `載入失敗${code ? ` (${code})` : ''}：${message}`,
       unreachableDescription: '無法連線至預覽頁面。',
       openTarget: url => `開啟 ${url}`,
-      fallbackTitle: '預覽'
+      openExternal: '在預設瀏覽器開啟',
+      fallbackTitle: '預覽',
+      goBack: '上一頁',
+      goForward: '下一頁',
+      reload: '重新載入預覽',
+      address: '預覽網址',
+      navigate: '瀏覽預覽',
+      viewport: '預覽檢視區',
+      viewportFree: '自由尺寸',
+      viewportDesktop: '桌面',
+      viewportLaptop: '筆電',
+      viewportMobile: '手機',
+      viewportWidth: '寬度',
+      viewportHeight: '高度',
+      viewportApply: '套用',
+      pick: '選擇網頁元素加入聊天',
+      pickCancel: '取消網頁元素選擇',
+      pickFailed: '網頁元素選擇失敗',
+      pickUnavailable: '預覽頁面尚未就緒。'
     }
   },
 
