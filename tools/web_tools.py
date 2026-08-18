@@ -861,6 +861,9 @@ async def web_extract_tool(
         if not safe_urls:
             results = []
         else:
+            # Plugin-backed extract providers must be discovered before backend
+            # selection, matching the web search dispatch path.
+            _ensure_web_plugins_loaded()
             backend = _get_extract_backend()
 
             # All seven providers (brave-free, ddgs, searxng, exa, parallel,
@@ -870,7 +873,6 @@ async def web_extract_tool(
             # detect coroutine functions and await; sync functions run
             # inline (the policy gate, SSRF re-check, etc. live inside the
             # provider itself for the firecrawl per-URL loop).
-            _ensure_web_plugins_loaded()
             from agent.web_search_registry import (
                 get_active_extract_provider,
                 get_provider as _wsp_get_provider,
