@@ -236,15 +236,22 @@ def check_website_access(url: str, config_path: Optional[Path] = None) -> Option
     Returns ``None`` if access is allowed, or a dict with block metadata
     (``host``, ``rule``, ``source``, ``message``) if blocked.
 
-    Never raises on policy errors — logs a warning and returns ``None``
-    (fail-open) so a config typo doesn't break all web tools.  Pass
-    ``config_path`` explicitly (tests) to get strict error propagation.
+    Load/config failures FAIL CLOSED: if the policy cannot be loaded because
+    its config is malformed or an unexpected error occurs, the URL is treated
+    as blocked (a structured result with ``rule="policy-unavailable"``) rather
+    than silently allowed — a broken blocklist must never disable web
+    enforcement.  Operator-disabled policy (``enabled: false``) is a distinct,
+    explicit operator state that returns ``None`` (allow) and is logged as a
+    visible setting.  Pass ``config_path`` explicitly (tests) to get strict
+    error propagation.
     """
-    # Fast path: if no explicit config_path and the cached policy is disabled
-    # or empty, skip all work (no YAML read, no host extraction).
+    # Fast path: if no explicit config_path and the cached policy is disabled,
+    # skip all work (no YAML read, no host extraction). Operator-disabled is
+    # an explicit, visible allow — not an error fallback.
     if config_path is None:
         with _cache_lock:
             if _cached_policy is not None and not _cached_policy.get("enabled"):
+                logger.info("Website blocklist operator-disabled — allowing URL (explicit operator setting): %s", url)
                 return None
 
     host = _extract_host_from_urlish(url)
@@ -256,13 +263,32 @@ def check_website_access(url: str, config_path: Optional[Path] = None) -> Option
     except WebsitePolicyError as exc:
         if config_path is not None:
             raise  # Tests pass explicit paths — let errors propagate
-        logger.warning("Website policy config error (failing open): %s", exc)
-        return None
+        logger.error("Website policy config error (failing closed): %s", exc)
+        return {
+            "url": url,
+            "host": host,
+            "rule": "policy-unavailable",
+            "source": "website-policy-config-error",
+            "message": (
+                f"Blocked: website policy configuration is invalid and cannot be "
+                f"enforced ({exc}); refusing navigation to be safe"
+            ),
+        }
     except Exception as exc:
-        logger.warning("Unexpected error loading website policy (failing open): %s", exc)
-        return None
+        logger.error("Unexpected error loading website policy (failing closed): %s", exc)
+        return {
+            "url": url,
+            "host": host,
+            "rule": "policy-unavailable",
+            "source": "website-policy-load-error",
+            "message": (
+                f"Blocked: website policy could not be loaded ({exc}); refusing "
+                f"navigation to be safe"
+            ),
+        }
 
     if not policy.get("enabled"):
+        logger.info("Website blocklist operator-disabled — allowing URL (explicit operator setting): %s", url)
         return None
 
     for rule in policy.get("rules", []):

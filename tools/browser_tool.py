@@ -145,7 +145,18 @@ def _build_browser_env() -> dict:
 try:
     from tools.website_policy import check_website_access
 except Exception:
-    check_website_access = lambda url: None  # noqa: E731 — fail-open if policy module unavailable
+    # Fail-closed: if the website-policy module cannot be imported, a URL
+    # admission query is UNKNOWN — treat it as blocked rather than silently
+    # allowing navigation past a policy we could not load. The call sites
+    # interpret a truthy result as "blocked"; the error text tells the user
+    # the policy module is unavailable so the cause is visible, not silent.
+    def check_website_access(url):  # noqa: E731 — fail-closed if policy module unavailable
+        return {
+            "message": "Blocked: website policy module unavailable (cannot evaluate access); refusing navigation to be safe",
+            "host": url,
+            "rule": "policy-unavailable",
+            "source": "policy-module-unavailable",
+        }
 
 try:
     from tools.url_safety import (

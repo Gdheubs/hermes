@@ -181,6 +181,167 @@ def test_browser_navigate_allows_when_shared_file_missing(monkeypatch, tmp_path)
     assert result is None
 
 
+def test_browser_tool_fails_closed_when_policy_module_unavailable(monkeypatch):
+    """If the website-policy module cannot be imported, navigation must be
+    blocked (fail-closed), never allowed past a policy we could not load.
+
+    Regression for the fail-open path that returned ``None`` (allow) when the
+    policy module import raised — silently bypassing the website blocklist.
+    """
+    import builtins
+    import importlib
+    from tools import browser_tool
+
+    real_import = builtins.__import__
+
+    def _blocked_policy_import(name, *a, **kw):
+        if name == "tools.website_policy":
+            raise ImportError("simulated website_policy module failure")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked_policy_import)
+
+    # Force the module to re-run its import guard with the policy import
+    # blocked. The guard must install a FAIL-CLOSED fallback, not
+    # ``lambda url: None``.
+    importlib.reload(browser_tool)
+
+    try:
+        result = browser_tool.check_website_access("https://unknown.test")
+    finally:
+        # Restore the real import before anything else imports the module.
+        monkeypatch.setattr(builtins, "__import__", real_import)
+        importlib.reload(browser_tool)
+
+    # Fail-closed: the result must be truthy (blocked), never None/allow.
+    assert result is not None
+    assert bool(result) is True
+    assert result.get("rule") == "policy-unavailable"
+    assert "unavailable" in result.get("message", "").lower()
+
+
+def _reload_browser_tool_with_policy_import_blocked(monkeypatch):
+    """Reload tools.browser_tool with the website_policy import raising, so its
+    fail-closed fallback is installed. Returns the reloaded module and a
+    callable that restores the real import + reloads. Callers must invoke the
+    restore in a finally.
+    """
+    import builtins
+    import importlib
+    from tools import browser_tool
+
+    real_import = builtins.__import__
+
+    def _blocked_policy_import(name, *a, **kw):
+        if name == "tools.website_policy":
+            raise ImportError("simulated website_policy module failure")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", _blocked_policy_import)
+    importlib.reload(browser_tool)
+
+    def _restore():
+        monkeypatch.setattr(builtins, "__import__", real_import)
+        importlib.reload(browser_tool)
+
+    return browser_tool, _restore
+
+
+def test_both_pre_navigation_paths_fail_closed_when_policy_module_unavailable(monkeypatch):
+    """Acceptance contract: with the website_policy import raised, BOTH
+    pre-navigation policy call sites — ``evaluate_url_safety`` and
+    ``browser_navigate`` — must return a blocked/error result for a normally
+    denied host, never None/success.
+    """
+    import json
+    from tools import browser_tool
+
+    browser_tool, _restore = _reload_browser_tool_with_policy_import_blocked(monkeypatch)
+    try:
+        # Let the synthetic URL pass the SSRF / private-address pre-checks so
+        # the website-policy check is what's exercised.
+        monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: True)
+        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: True)
+
+        # Pre-navigation path #1: evaluate_url_safety
+        safety = browser_tool.evaluate_url_safety("https://blocked.test")
+        assert safety is not None
+        assert safety["success"] is False
+        assert safety["blocked_by_policy"]["rule"] == "policy-unavailable"
+        assert "unavailable" in safety["error"].lower()
+
+        # Pre-navigation path #2: browser_navigate
+        nav = json.loads(browser_tool.browser_navigate("https://blocked.test"))
+        assert nav["success"] is False
+        assert nav["blocked_by_policy"]["rule"] == "policy-unavailable"
+        assert "unavailable" in nav["error"].lower()
+    finally:
+        _restore()
+
+
+def test_check_website_access_fails_closed_on_malformed_config(tmp_path, monkeypatch):
+    """Malformed config with default path must FAIL CLOSED (return a blocked
+    result), never silently allow. Regression for the prior fail-open behavior
+    that returned ``None`` (allow) on a config error — a broken blocklist must
+    not disable web enforcement.
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("security: [oops\n", encoding="utf-8")
+
+    # With explicit config_path (test mode), errors propagate
+    with pytest.raises(WebsitePolicyError):
+        check_website_access("https://example.com", config_path=config_path)
+
+    # Simulate default path by pointing HERMES_HOME to tmp_path
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import website_policy
+    website_policy.invalidate_cache()
+
+    # With default path, errors are caught and FAIL CLOSED — blocked, not allowed
+    result = check_website_access("https://example.com")
+    assert result is not None
+    assert bool(result) is True
+    assert result["rule"] == "policy-unavailable"
+    assert result["source"] == "website-policy-config-error"
+    assert "blocked" in result["message"].lower()
+
+
+def test_check_website_access_operator_disabled_is_visible_allow(tmp_path, monkeypatch, caplog):
+    """Operator-disabled policy (enabled: false, valid config) is a distinct,
+    explicit allow — NOT an error fallback. It returns None (allow) but is
+    logged as an explicit operator setting, and the rule is NOT the
+    fail-closed 'policy-unavailable' error.
+    """
+    import logging
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "security": {
+                    "website_blocklist": {
+                        "enabled": False,
+                        "domains": ["blocked.test"],
+                    }
+                }
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import website_policy
+    website_policy.invalidate_cache()
+
+    with caplog.at_level(logging.INFO, logger="tools.website_policy"):
+        result = check_website_access("https://blocked.test")
+
+    # Operator-disabled is an explicit allow — never a blocked result
+    assert result is None
+    assert any("operator-disabled" in rec.message.lower() for rec in caplog.records)
+
+
 class TestWebToolPolicy:
     """Tests that exercise web_extract_tool with website-policy gates.
 
@@ -282,22 +443,3 @@ class TestWebToolPolicy:
         assert result["results"][0]["url"] == "https://blocked.test/final"
         assert result["results"][0]["content"] == ""
         assert result["results"][0]["blocked_by_policy"]["rule"] == "blocked.test"
-
-
-def test_check_website_access_fails_open_on_malformed_config(tmp_path, monkeypatch):
-    """Malformed config with default path should fail open (return None), not crash."""
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text("security: [oops\n", encoding="utf-8")
-
-    # With explicit config_path (test mode), errors propagate
-    with pytest.raises(WebsitePolicyError):
-        check_website_access("https://example.com", config_path=config_path)
-
-    # Simulate default path by pointing HERMES_HOME to tmp_path
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    from tools import website_policy
-    website_policy.invalidate_cache()
-
-    # With default path, errors are caught and fail open
-    result = check_website_access("https://example.com")
-    assert result is None  # allowed, not crashed
