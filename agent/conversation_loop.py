@@ -1700,6 +1700,7 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    persist_user_message_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1725,6 +1726,9 @@ def run_conversation(
         persist_user_display_metadata: Optional payload for that event
             (e.g. a delegation's task count).
                 or queuing follow-up prefetch work.
+        moa_config: Optional mixture-of-agents configuration for this turn.
+        persist_user_message_id: Optional stable source identity to retain on
+            the canonical user message and persisted row.
 
     Returns:
         Dict: Complete conversation result with final response and message history
@@ -1801,6 +1805,7 @@ def run_conversation(
         persist_user_timestamp,
         persist_user_display_kind=persist_user_display_kind,
         persist_user_display_metadata=persist_user_display_metadata,
+        persist_user_message_id=persist_user_message_id,
         restore_or_build_system_prompt=_restore_or_build_system_prompt,
         install_safe_stdio=_install_safe_stdio,
         sanitize_surrogates=_sanitize_surrogates,
@@ -2083,13 +2088,15 @@ def run_conversation(
             )
         ]
 
-        # Defensive: repair malformed role-alternation before API call.
-        # Catches cases where the history got wedged into a
-        # ``tool → user`` or ``user → user`` tail (e.g. after empty-
-        # response scaffolding was stripped and a new user message
-        # landed after an orphan tool result). Most providers return
-        # empty content on malformed sequences, which would otherwise
-        # retrigger the empty-retry loop indefinitely.
+        # Defensive: repair malformed assistant/tool structure in canonical
+        # history before the API call. This collapses split assistant turns and
+        # drops orphaned tool results without collapsing adjacent user source
+        # messages. Strict-provider user-role alternation is repaired later by
+        # ``_drop_thinking_only_and_merge_users`` on the per-request copy.
+        # ``repair_message_sequence_with_cursor`` also recomputes the SessionDB
+        # flush cursor (_last_flushed_db_idx) when canonical repair compacts the
+        # list, so turn-end flushing cannot skip shifted assistant/tool rows
+        # (#44837).
         # repair_message_sequence_with_cursor also recomputes the SessionDB
         # flush cursor (_last_flushed_db_idx) when repair compacts the list,
         # so the turn-end flush doesn't skip the assistant/tool chain (#44837).
@@ -2131,6 +2138,17 @@ def run_conversation(
             # Bookkeeping, never a provider field — only the chat-completions
             # transport strips underscore keys, so drop it centrally here.
             api_msg.pop("_row_id", None)
+            # Source ordering/deduplication metadata belongs to the canonical
+            # transcript and SessionDB, never to a provider request. Strip it
+            # at the common API-copy boundary so native Anthropic/Codex paths
+            # do not depend on transport-specific unknown-field filtering.
+            for metadata_key in (
+                "timestamp",
+                "message_id",
+                "platform_message_id",
+                "_source_message_id",
+            ):
+                api_msg.pop(metadata_key, None)
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks
@@ -7188,6 +7206,14 @@ def run_conversation(
                 # commentary only after the canonical SessionDB append above.
                 if not duplicate_previous_interim:
                     agent._emit_interim_assistant_message(assistant_msg)
+                    # Local patch: if the assistant message had no text content
+                    # but does have tool calls, emit a synthetic status line so
+                    # the user can see what's happening during silent tool chains.
+                    _asst_content = assistant_msg.get("content")
+                    if not _asst_content or (
+                        isinstance(_asst_content, str) and not _asst_content.strip()
+                    ):
+                        agent._emit_tool_call_status(assistant_msg)
 
                 # Close any open streaming display (response box, reasoning
                 # box) before tool execution begins.  Intermediate turns may
@@ -7977,8 +8003,8 @@ def run_conversation(
                     # attempted final answer before the verification loop runs.
                     # Only the nudge is flagged synthetic so it gets stripped
                     # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
-                    append_message(messages, final_msg)
+                    agent._emit_interim_assistant_message(final_msg, force_display=True)
+                    messages.append(final_msg)
                     try:
                         agent._flush_messages_to_session_db(messages, conversation_history)
                     except Exception:
@@ -8021,7 +8047,7 @@ def run_conversation(
                     from hermes_cli.lifecycle import has_hook
                     from hermes_cli.plugins import get_pre_verify_continue_message
 
-                    if _edited and has_hook("pre_verify") and _attempt < max_verify_nudges():
+                    if has_hook("pre_verify") and _attempt < max_verify_nudges():
                         # Posture is fixed for the session — resolve once + cache.
                         coding = getattr(agent, "_resolved_is_coding", None)
                         if coding is None:
@@ -8049,8 +8075,8 @@ def run_conversation(
                     # attempted final answer before the pre_verify loop runs.
                     # Only the nudge is flagged synthetic so it gets stripped
                     # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
-                    append_message(messages, final_msg)
+                    agent._emit_interim_assistant_message(final_msg, force_display=True)
+                    messages.append(final_msg)
                     try:
                         agent._flush_messages_to_session_db(messages, conversation_history)
                     except Exception:
@@ -8120,6 +8146,63 @@ def run_conversation(
                     final_response = None
                     continue
 
+                # ── False-stop detection guard ─────────────────────────
+                # When the model produces finish_reason=stop with text that
+                # indicates intent to continue (a colon-preamble that lost its
+                # tool_calls, or a narrated continuation) right after a tool
+                # round completed, nudge it to issue the actual tool call
+                # instead of silently ending the turn (#42503). Bounded to 2
+                # retries; the budget resets on any successful tool round or
+                # genuine completion. Complementary to intent_ack_continuation
+                # (which fires at turn start, not after a tool round) and
+                # #57610 (which targets progress-placeholder text specifically).
+                try:
+                    from agent.false_stop import (
+                        build_false_stop_nudge,
+                        false_stop_detection_enabled,
+                    )
+
+                    _false_nudge = None
+                    if false_stop_detection_enabled():
+                        _false_nudge = build_false_stop_nudge(
+                            content=(final_response or "").strip(),
+                            messages=messages,
+                            attempts=getattr(agent, "_false_stop_nudges", 0),
+                        )
+                except Exception:
+                    logger.debug("false-stop check failed", exc_info=True)
+                    _false_nudge = None
+
+                if _false_nudge:
+                    agent._false_stop_nudges = (
+                        getattr(agent, "_false_stop_nudges", 0) + 1
+                    )
+                    final_msg["finish_reason"] = "false_stop_retry"
+                    final_msg["_false_stop_nudge"] = True
+                    agent._emit_interim_assistant_message(final_msg)
+                    append_message(messages, final_msg)
+                    append_message(messages, {
+                        "role": "user",
+                        "content": _false_nudge,
+                        "_false_stop_synthetic": True,
+                    })
+                    agent._session_messages = messages
+                    logger.info(
+                        "false-stop nudge issued (attempt %d) model=%s",
+                        agent._false_stop_nudges,
+                        getattr(agent, "model", ""),
+                    )
+                    agent._emit_status(
+                        "⚠️ Model stopped prematurely — nudging to continue..."
+                    )
+                    _pending_verification_response = final_response
+                    _pending_verification_response_previewed = (
+                        agent._interim_content_was_streamed(final_response or "")
+                    )
+                    final_response = None
+                    continue
+
+                agent._false_stop_nudges = 0  # genuine completion — reset for next turn
                 append_message(messages, final_msg)
                 # Make the completed answer durable before leaving the loop —
                 # a session torn down before finalize_turn's _persist_session
