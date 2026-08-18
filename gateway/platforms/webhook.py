@@ -288,6 +288,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # Content-Length and would otherwise bypass the header check below.
         app = web.Application(client_max_size=self._max_body_bytes)
         app.router.add_get("/health", self._handle_health)
+        app.router.add_get("/ready", self._handle_ready)
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
         # Multi-profile multiplexing: a /p/<profile>/webhooks/<route> prefix
         # routes the inbound event to that profile. Same handler; the profile is
@@ -498,8 +499,40 @@ class WebhookAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def _handle_health(self, request: "web.Request") -> "web.Response":
-        """GET /health — simple health check."""
+        """GET /health — liveness only (process is up and serving HTTP).
+
+        Liveness intentionally does not assert route store / execution queue /
+        delivery dependencies — those belong to the readiness probe below.
+        """
         return web.json_response({"status": "ok", "platform": "webhook"})
+
+    async def _handle_ready(self, request: "web.Request") -> "web.Response":
+        """GET /ready — readiness (listener bound, routes loaded, queue usable).
+
+        Reports the bound host/port and route count WITHOUT any secret or
+        route-config detail, so a load balancer can gate traffic on it safely.
+        """
+        problems: list[str] = []
+        # Listener is up: AppRunner was set up and TCPSite.start() succeeded.
+        if self._runner is None:
+            problems.append("listener not started")
+        # Route store usable: at least one route is configured (static or
+        # dynamic). An empty route set is a legitimate config, but readiness
+        # reports it explicitly rather than claiming ready.
+        if not self._routes:
+            problems.append("no routes configured")
+
+        ready = not problems
+        payload = {
+            "status": "ready" if ready else "not_ready",
+            "platform": "webhook",
+            "host": self._host,
+            "port": self._port,
+            "routes": len(self._routes),
+        }
+        if problems:
+            payload["problems"] = problems
+        return web.json_response(payload, status=200 if ready else 503)
 
     def _reload_dynamic_routes(self) -> None:
         """Reload agent-created subscriptions from disk if the file changed."""
