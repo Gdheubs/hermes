@@ -204,29 +204,9 @@ def _compile() -> None:
 _compile()
 
 
-def scan_for_threats(content: str, scope: str = "context") -> List[str]:
-    """Return a list of matched pattern IDs in ``content`` at the given scope.
-
-    ``scope`` selects which pattern set to apply:
-
-    - ``"all"`` (narrow): classic injection + exfil only — minimal false
-      positives, suitable for any text.
-    - ``"context"`` (default): adds promptware / C2 / role-play patterns —
-      suitable for context files, memory entries, and tool results.
-    - ``"strict"`` (broad): adds persistence / SSH backdoor / exfil-URL
-      patterns — appropriate for user-mediated writes (memory tool,
-      skills install) where false positives can be resolved interactively.
-
-    Also checks for invisible unicode characters (returned as
-    ``"invisible_unicode_U+XXXX"`` so the caller can surface the offending
-    codepoint in a log line).
-    """
-    if not content:
-        return []
-
+def _scan_chunk(content: str, scope: str) -> List[str]:
+    """Scan one bounded chunk for invisible unicode and threat patterns."""
     findings: List[str] = []
-
-    content = content[:MAX_SCAN_CHARS]
 
     # Invisible unicode — single pass through the content set, not 17
     # ``in`` lookups.  Run this on the RAW content before NFKC normalisation,
@@ -251,6 +231,47 @@ def scan_for_threats(content: str, scope: str = "context") -> List[str]:
     for compiled, pid in patterns:
         if compiled.search(normalised):
             findings.append(pid)
+
+    return findings
+
+
+def scan_for_threats(content: str, scope: str = "context") -> List[str]:
+    """Return a list of matched pattern IDs in ``content`` at the given scope.
+
+    ``scope`` selects which pattern set to apply:
+
+    - ``"all"`` (narrow): classic injection + exfil only — minimal false
+      positives, suitable for any text.
+    - ``"context"`` (default): adds promptware / C2 / role-play patterns —
+      suitable for context files, memory entries, and tool results.
+    - ``"strict"`` (broad): adds persistence / SSH backdoor / exfil-URL
+      patterns — appropriate for user-mediated writes (memory tool,
+      skills install) where false positives can be resolved interactively.
+
+    Also checks for invisible unicode characters (returned as
+    ``"invisible_unicode_U+XXXX"`` so the caller can surface the offending
+    codepoint in a log line).
+
+    The input is scanned in bounded chunks: the HEAD and, when the content
+    exceeds the per-chunk cap, the TAIL. A prompt-injection payload placed
+    past the head truncation point (e.g. at the very end of a very large
+    context file) is therefore still detected rather than silently reaching
+    the model unscanned. Runtime stays bounded at 2× the per-chunk cap.
+    """
+    if not content:
+        return []
+
+    chunks: List[str] = [content[:MAX_SCAN_CHARS]]
+    if len(content) > MAX_SCAN_CHARS:
+        chunks.append(content[-MAX_SCAN_CHARS:])
+
+    findings: List[str] = []
+    seen = set()
+    for chunk in chunks:
+        for finding in _scan_chunk(chunk, scope):
+            if finding not in seen:
+                seen.add(finding)
+                findings.append(finding)
 
     return findings
 
