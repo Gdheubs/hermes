@@ -41,7 +41,7 @@ def _install_test_section(manager: PluginManager, content) -> None:
     )
 
 
-def test_real_aiagent_builds_section_once_and_keeps_it_out_of_static_prefix(monkeypatch):
+def test_real_aiagent_builds_section_once_and_keeps_it_out_of_static_prefix(monkeypatch, tmp_path):
     calls = []
 
     def section(session_info):
@@ -51,6 +51,9 @@ def test_real_aiagent_builds_section_once_and_keeps_it_out_of_static_prefix(monk
     manager = PluginManager()
     _install_test_section(manager, section)
     monkeypatch.setattr(plugins, "_plugin_manager", manager)
+    # CI merge checkouts are detached HEAD; a second git probe can drop the
+    # branch line. This test is about plugin-section caching, not live git.
+    monkeypatch.setattr("agent.system_prompt.resolve_context_cwd", lambda: tmp_path)
     agent = _real_agent()
 
     first = build_system_prompt(agent)
