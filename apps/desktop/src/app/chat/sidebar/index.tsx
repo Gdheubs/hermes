@@ -167,10 +167,11 @@ import {
   StartWorkButton,
   useRepoWorktreeMap
 } from './projects'
-import { WorktreeDialog } from './projects/worktree-dialog'
 import { SidebarBlankState, SidebarPinnedEmptyState, SidebarSessionSkeletons } from './section-states'
 import { buildSessionByAnyId, resolvePinnedSessions } from './session-index'
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
+import { WorktreeDialog } from './projects/worktree-dialog'
+import { SidebarFoldersSection } from './folders-section'
 import { CONTEXT_SPLIT_KIT, SplitSubmenu } from './split-submenu'
 
 // Non-session groups (messaging platforms) stay compact: show a few rows up
@@ -362,6 +363,7 @@ export function ChatSidebar({
   const pinsOpen = useStore($sidebarPinsOpen)
   const agentsOpen = useStore($sidebarRecentsOpen)
   const cronOpen = useStore($sidebarCronOpen)
+  const [foldersOpen, setFoldersOpen] = useState(true)
   // The sidebar highlight tracks the FOCUSED session — the interacted tile's
   // tab, else the main selection — so it stays 1:1 with whatever tab is active.
   const selectedSessionId = useStore($focusedStoredSessionId)
@@ -1614,6 +1616,20 @@ export function ChatSidebar({
                 sessions={pinnedSessions}
                 showProfileTags={showAllProfiles}
                 sortable={pinnedSessions.length > 1}
+              />
+            )}
+
+            {!trimmedQuery && !showAllProfiles && (
+              <SidebarFoldersSection
+                label={s.row.folders ?? 'Folders'}
+                onArchiveSession={onArchiveSession}
+                onDeleteSession={onDeleteSession}
+                onResumeSession={onResumeSession}
+                onToggle={() => setFoldersOpen(!foldersOpen)}
+                onTogglePin={pinSession}
+                onToggleUnread={toggleUnread}
+                open={foldersOpen}
+                profile={profileScope}
               />
             )}
 

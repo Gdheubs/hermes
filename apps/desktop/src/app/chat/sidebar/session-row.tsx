@@ -57,6 +57,8 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   isSelected: boolean
   /** Backend-derived read state — same value the dot paints. */
   unread: boolean
+  isWorking?: boolean
+  currentFolderId?: string
   onArchive: () => void
   onBranch?: () => void
   onDelete: () => void
@@ -124,6 +126,8 @@ function SidebarSessionRowImpl({
   isPinned,
   isSelected,
   unread,
+  isWorking,
+  currentFolderId,
   onArchive,
   onBranch,
   onDelete,
@@ -309,6 +313,7 @@ function SidebarSessionRowImpl({
         onToggleUnread={onToggleUnread}
         pinned={isPinned}
         profile={session.profile}
+        currentFolderId={currentFolderId}
         sessionId={session.id}
         title={title}
         unread={unread}
@@ -338,6 +343,7 @@ function SidebarSessionRowImpl({
       onToggleUnread={onToggleUnread}
       pinned={isPinned}
       profile={session.profile}
+      currentFolderId={currentFolderId}
       sessionId={session.id}
       title={title}
       unread={unread}

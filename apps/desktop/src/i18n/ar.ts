@@ -1720,7 +1720,16 @@ export const ar = defineLocale({
       ageNow: 'الآن',
       ageDay: 'يوم',
       ageHour: 'ساعة',
-      ageMin: 'دقيقة'
+      ageMin: 'دقيقة',
+      folders: 'المجلدات',
+      createFolder: 'مجلد جديد…',
+      renameFolder: 'إعادة تسمية المجلد',
+      deleteFolder: 'حذف المجلد',
+      deleteFolderConfirm: 'حذف "{name}"؟ لن يتم حذف الجلسات الموجودة فيه.',
+      moveToFolder: 'نقل إلى مجلد',
+      removeFromFolder: 'إزالة من المجلد',
+      addToFolder: 'إضافة إلى مجلد',
+      noFolders: 'لا توجد مجلدات بعد'
     }
   },
   composer: {

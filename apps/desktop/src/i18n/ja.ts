@@ -1881,7 +1881,16 @@ export const ja = defineLocale({
       ageNow: 'たった今',
       ageDay: '日',
       ageHour: '時間',
-      ageMin: '分'
+      ageMin: '分',
+      folders: 'フォルダ',
+      createFolder: '新しいフォルダ…',
+      renameFolder: 'フォルダ名を変更',
+      deleteFolder: 'フォルダを削除',
+      deleteFolderConfirm: '「{name}」を削除しますか？内のセッションは削除されません。',
+      moveToFolder: 'フォルダへ移動',
+      removeFromFolder: 'フォルダから削除',
+      addToFolder: 'フォルダに追加',
+      noFolders: 'フォルダはまだありません'
     },
     dateDivider: {
       today: '今日の早い時間',

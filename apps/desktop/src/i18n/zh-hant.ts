@@ -1818,7 +1818,16 @@ export const zhHant = defineLocale({
       ageNow: '剛才',
       ageDay: '天',
       ageHour: '時',
-      ageMin: '分'
+      ageMin: '分',
+      folders: '資料夾',
+      createFolder: '新增資料夾…',
+      renameFolder: '重新命名資料夾',
+      deleteFolder: '刪除資料夾',
+      deleteFolderConfirm: '刪除「{name}」？其中的工作階段不會被刪除。',
+      moveToFolder: '移至資料夾',
+      removeFromFolder: '從資料夾移除',
+      addToFolder: '新增至資料夾',
+      noFolders: '尚無資料夾'
     },
     dateDivider: {
       today: '今天稍早',

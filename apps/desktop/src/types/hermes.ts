@@ -1501,3 +1501,12 @@ export interface ModelAssignmentResponse {
   stale_aux?: StaleAuxAssignment[]
   tasks?: string[]
 }
+
+export interface SessionFolder {
+  id: string
+  name: string
+  sort_order: number
+  created_at: number
+  session_count: number
+  session_ids: string[]
+}

@@ -83,6 +83,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
 from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
 from hermes_state_search import SessionSearchMixin
+from hermes_state_folders import SessionFolderMixin
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -3090,7 +3091,7 @@ def classify_session_status(
     return SESSION_STATUS_COMPLETE
 
 
-class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
+class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin, SessionFolderMixin):
     """
     SQLite-backed session storage with FTS5 search.
 
@@ -11427,6 +11428,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if actual_ids != expected_ids:
                     return False
             removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
+            conn.execute("DELETE FROM session_folder_members WHERE session_id = ?", (session_id,))
             # Orphan remaining child sessions (branches, etc.) so FK is satisfied.
             conn.execute(
                 "UPDATE sessions SET parent_session_id = NULL "
@@ -11465,6 +11467,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         flushed. Returns True if the session was deleted.
         """
         def _do(conn):
+            conn.execute("DELETE FROM session_folder_members WHERE session_id = ?", (session_id,))
             cursor = conn.execute(
                 """
                 DELETE FROM sessions
@@ -11656,6 +11659,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 conn.execute(
                     "DELETE FROM messages WHERE session_id = ?", (sid,)
                 )
+                conn.execute("DELETE FROM session_folder_members WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
             self._delete_unreferenced_system_prompts(conn)
@@ -12017,6 +12021,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             for sid in session_ids:
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+                conn.execute("DELETE FROM session_folder_members WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
                 removed_ids.append(sid)
             self._delete_unreferenced_system_prompts(conn)
