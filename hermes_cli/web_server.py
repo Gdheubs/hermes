@@ -480,6 +480,9 @@ def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
 app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
 
 
+_HSTS_HEADER_VALUE = "max-age=86400"
+
+
 # Memory-provider OAuth connect routes live in the memory layer, not here.
 from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
 
@@ -933,6 +936,70 @@ async def _dashboard_health_middleware(request: Request, call_next):
     if response.status_code >= 500:
         DASHBOARD_HEALTH.record_error(f"http_{response.status_code}", request.url.path)
     return response
+
+
+@app.middleware("http")
+async def hsts_middleware(request: Request, call_next):
+    """Advertise the short initial HSTS policy on HTTPS responses.
+
+    ``request.url.scheme`` is the scheme resolved by the ASGI server. Do not
+    read ``X-Forwarded-Proto`` directly here: public dashboard starts enable
+    uvicorn's trusted proxy-header handling, which resolves the scheme before
+    the request reaches application middleware.
+    """
+    response = await call_next(request)
+    if request.url.scheme == "https":
+        response.headers.setdefault("Strict-Transport-Security", _HSTS_HEADER_VALUE)
+    return response
+
+
+class _HSTSASGIMiddleware:
+    """Add HSTS at the ASGI send boundary, including generated 500 responses.
+
+    Starlette's ``ServerErrorMiddleware`` wraps the user middleware stack and
+    creates the final response for an unhandled exception after the inner
+    ``@app.middleware(\"http\")`` functions have unwound. Wrapping the FastAPI
+    application at the ASGI boundary lets that response receive the same
+    policy without changing the application's exception behavior.
+
+    The scheme is read from the already-resolved ASGI scope. In particular, we
+    intentionally do not parse the raw ``X-Forwarded-Proto`` header here.
+    ``start_server`` enables uvicorn proxy-header resolution only for the
+    authenticated TLS-terminator path.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or scope.get("scheme") != "https":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_hsts(message):
+            if message.get("type") == "http.response.start":
+                headers = list(message.get("headers") or [])
+                if not any(
+                    name.lower() == b"strict-transport-security"
+                    for name, _value in headers
+                ):
+                    headers.append(
+                        (
+                            b"strict-transport-security",
+                            _HSTS_HEADER_VALUE.encode("latin-1"),
+                        )
+                    )
+                    message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_hsts)
+
+
+# The wrapper is outside FastAPI's ServerErrorMiddleware, so it also sees
+# response.start emitted for an unhandled exception. It keeps the FastAPI app
+# object available for route/state access while making the server's ASGI entry
+# point satisfy the all-HTTPS-responses contract.
+_dashboard_asgi_app = _HSTSASGIMiddleware(app)
 
 
 # ---------------------------------------------------------------------------
@@ -18822,7 +18889,7 @@ def start_server(
     # window.
     _is_loopback = host in ("127.0.0.1", "localhost", "::1")
     config = uvicorn.Config(
-        app, host=host, port=port, log_level="warning",
+        _dashboard_asgi_app, host=host, port=port, log_level="warning",
         # proxy_headers defaults to False so _ws_client_is_allowed sees
         # the real connection peer rather than X-Forwarded-For's rewritten
         # value (which would defeat the loopback gate when behind a reverse

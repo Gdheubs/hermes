@@ -258,6 +258,66 @@ class TestWebServerEndpoints:
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
+    def test_http_health_omits_hsts_header(self):
+        from starlette.testclient import TestClient
+        from hermes_cli import web_server
+
+        response = TestClient(
+            web_server._dashboard_asgi_app,
+            base_url="http://testserver",
+        ).get("/api/health")
+
+        assert response.status_code == 200
+        assert "strict-transport-security" not in response.headers
+
+    def test_https_health_includes_hsts_header(self):
+        from starlette.testclient import TestClient
+        from hermes_cli import web_server
+
+        response = TestClient(
+            web_server._dashboard_asgi_app,
+            base_url="https://testserver",
+        ).get("/api/health")
+
+        assert response.status_code == 200
+        assert response.headers["strict-transport-security"] == "max-age=86400"
+
+    def test_https_unauthenticated_redirect_includes_hsts_header(self, monkeypatch):
+        from starlette.testclient import TestClient
+        from hermes_cli import web_server
+
+        monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
+        response = TestClient(
+            web_server._dashboard_asgi_app,
+            base_url="https://testserver",
+            follow_redirects=False,
+        ).get("/")
+
+        assert response.status_code == 302
+        assert response.headers["strict-transport-security"] == "max-age=86400"
+
+    def test_https_unhandled_error_includes_hsts_header(self):
+        from starlette.routing import Route
+        from starlette.testclient import TestClient
+        from hermes_cli import web_server
+
+        async def raise_error(_request):
+            raise RuntimeError("hsts regression")
+
+        route = Route("/__hsts_unhandled_error", raise_error)
+        web_server.app.router.routes.insert(0, route)
+        try:
+            response = TestClient(
+                web_server._dashboard_asgi_app,
+                base_url="https://testserver",
+                raise_server_exceptions=False,
+            ).get("/__hsts_unhandled_error")
+        finally:
+            web_server.app.router.routes.remove(route)
+
+        assert response.status_code == 500
+        assert response.headers["strict-transport-security"] == "max-age=86400"
+
     @pytest.mark.requires_wal
     def test_get_sessions_poll_preserves_pending_wal(self):
         """Repeated GET-only polls must not checkpoint another writer's WAL."""
