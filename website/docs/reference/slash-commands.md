@@ -184,7 +184,7 @@ Two config formats are supported:
 ```yaml
 model_aliases:
   fav:
-    model: claude-sonnet-4.6
+    model: claude-sonnet-5
     provider: anthropic
   grok:
     model: grok-4
