@@ -248,3 +248,158 @@ async def test_post_turn_session_resolution_failure_is_logged(loop_env, caplog):
         )
 
     assert "post-turn session resolution failed: store unavailable" in caplog.text
+
+
+def _install_scoped_loop_db(home) -> None:
+    """Pre-populate loops._DB_CACHE with an explicitly-pathed SessionDB for
+    `home`.
+
+    tests/conftest.py's autouse _hermetic_environment fixture re-points
+    hermes_state.DEFAULT_DB_PATH to ONE fixed file for the whole test (a
+    hygiene guard against a bare SessionDB() ever touching a developer's
+    real ~/.hermes). _get_session_db() calls SessionDB() with no explicit
+    db_path, so — left alone — every simulated profile home in a
+    multi-profile test would collapse onto that same pinned file instead of
+    getting its own. Installing an explicitly-pathed instance under the
+    cache key _get_session_db() will look up (str(get_hermes_home()) while
+    `home` is the active override) bypasses that shortcut and restores the
+    real per-home separation this test needs to exercise.
+    """
+    from hermes_state import SessionDB
+
+    key = str(home)
+    if key not in loops._DB_CACHE:
+        loops._DB_CACHE[key] = SessionDB(db_path=home / "state.db")
+
+
+def _seed_due_loop(home, session_id: str, chat_id: str) -> None:
+    """Persist a due, routed loop directly to `home`'s own state.db."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    _install_scoped_loop_db(home)
+    token = set_hermes_home_override(str(home))
+    try:
+        state = loops.LoopState(
+            prompt="poll CI",
+            interval_seconds=300,
+            next_due_at=time.time() - 1,
+            route={
+                "platform": "discord",
+                "chat_id": chat_id,
+                "chat_type": "dm",
+                "thread_id": "",
+                "user_id": "",
+                "user_name": "",
+            },
+        )
+        loops.save_loop(session_id, state)
+    finally:
+        reset_hermes_home_override(token)
+
+
+async def _run_one_wakeup_tick(monkeypatch, runner):
+    """Drive _loop_wakeup_watcher for exactly one tick (mirrors the same
+    technique tests/gateway/test_kanban_notifier.py uses for its watcher)."""
+    import asyncio
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay):
+        if delay == 5:
+            return None
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    await GatewayRunner._loop_wakeup_watcher(runner, interval=1)
+
+
+@pytest.mark.asyncio
+async def test_loop_wakeup_watcher_fires_secondary_profile_loops(tmp_path, monkeypatch):
+    """Regression: _loop_wakeup_watcher is a single gateway-wide asyncio
+    task. get_hermes_home() would otherwise stay pinned to whichever
+    profile's context was ambient when the task was created, and adapter
+    resolution only ever consulted the default profile's self.adapters —
+    so a loop set from a secondary profile's chat would never fire, and
+    even if it were scanned, would risk firing through the WRONG (default
+    profile's) bot. Seeds one due loop per profile, in that profile's own
+    state.db, each routed to a different chat, and asserts each fires
+    through its OWN profile's adapter."""
+    home_default = tmp_path / "default_home"
+    home_work = tmp_path / "work_home"
+    home_default.mkdir()
+    home_work.mkdir()
+    _seed_due_loop(home_default, "sid-default", "chat-default")
+    _seed_due_loop(home_work, "sid-work", "chat-work")
+
+    adapter_default = AsyncMock()
+    adapter_work = AsyncMock()
+
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner.adapters = {Platform.DISCORD: adapter_default}
+    runner._profile_adapters = {"work": {Platform.DISCORD: adapter_work}}
+    runner._running_agents = {}
+    runner._cached_session_sources = {}
+    runner._session_sources_max = 512
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex, profile_allowlist=None: [("default", home_default), ("work", home_work)],
+    )
+    monkeypatch.setattr(GatewayRunner, "_active_profile_name", lambda self: "default")
+
+    await _run_one_wakeup_tick(monkeypatch, runner)
+
+    assert adapter_default.handle_message.await_count == 1, "default profile's due loop never fired"
+    assert adapter_work.handle_message.await_count == 1, "secondary profile's due loop never fired"
+    assert adapter_default.handle_message.call_args.args[0].source.chat_id == "chat-default"
+    assert adapter_work.handle_message.call_args.args[0].source.chat_id == "chat-work"
+
+    # Each profile's own loop must be marked fired — not left due forever
+    # (which would also produce a false "it fired" from a retried scan).
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    for name, home in (("sid-default", home_default), ("sid-work", home_work)):
+        token = set_hermes_home_override(str(home))
+        try:
+            reloaded = loops.load_loop(name)
+            assert reloaded.ticks_fired == 1
+        finally:
+            reset_hermes_home_override(token)
+
+
+@pytest.mark.asyncio
+async def test_loop_wakeup_watcher_single_profile_unchanged(tmp_path, monkeypatch, loop_env):
+    """Non-multiplex gateways (the overwhelming majority) must see
+    byte-for-byte the same single-profile behavior as before this fix, and
+    the fix must resolve the served-profile set with THIS gateway's own
+    multiplex_profiles flag — not unconditionally multiplex=True (which
+    would sweep in every profile directory found on disk, including ones
+    this gateway was never configured to serve)."""
+    _seed_due_loop(loop_env, "sid-solo", "chat-solo")
+
+    adapter = AsyncMock()
+    runner = object.__new__(GatewayRunner)
+    runner._running = True
+    runner.config = GatewayConfig(multiplex_profiles=False)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._profile_adapters = {}
+    runner._running_agents = {}
+    runner._cached_session_sources = {}
+    runner._session_sources_max = 512
+
+    seen_multiplex_flags = []
+
+    def fake_profiles_to_serve(multiplex, profile_allowlist=None):
+        seen_multiplex_flags.append(multiplex)
+        return [("default", loop_env)]
+
+    monkeypatch.setattr("hermes_cli.profiles.profiles_to_serve", fake_profiles_to_serve)
+
+    await _run_one_wakeup_tick(monkeypatch, runner)
+
+    assert seen_multiplex_flags == [False]
+    assert adapter.handle_message.await_count == 1
+    assert adapter.handle_message.call_args.args[0].source.chat_id == "chat-solo"
