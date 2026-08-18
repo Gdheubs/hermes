@@ -246,16 +246,26 @@ def install_modify_other_keys_aliases() -> int:
 
     def _install_paired(modifier: int, mapping: dict) -> None:
         """Install both modifyOtherKeys (ESC[27;N;CP~) and CSI-u (ESC[CP;Nu)
-        mappings for the given modifier and codepoint→key mapping."""
+        mappings for the given modifier and codepoint→key mapping.
+
+        kitty ORs lock-key state into the modifier field of EVERY CSI-u
+        key event while a lock is on (CapsLock=64, NumLock=128, both=192),
+        so e.g. Backspace with NumLock arrives as ``ESC[127;129u`` instead
+        of ``ESC[127;5u``.  Install the lock-offset variants
+        (mod+64/+128/+192) for every registered mapping so locked keys
+        don't leak as literal text (#88221).
+        """
         nonlocal changed
         for codepoint, key_val in mapping.items():
-            for seq in (
-                f"\x1b[27;{modifier};{codepoint}~",
-                f"\x1b[{codepoint};{modifier}u",
-            ):
-                if seq not in ANSI_SEQUENCES:
-                    ANSI_SEQUENCES[seq] = key_val
-                    changed += 1
+            for lock_offset in (0, 64, 128, 192):
+                mod = modifier + lock_offset
+                for seq in (
+                    f"\x1b[27;{mod};{codepoint}~",
+                    f"\x1b[{codepoint};{mod}u",
+                ):
+                    if seq not in ANSI_SEQUENCES:
+                        ANSI_SEQUENCES[seq] = key_val
+                        changed += 1
 
     # Ctrl+letter / Ctrl+digit / Ctrl+symbol (modifier 5)
     _install_paired(5, ctrl_key_map)
@@ -321,7 +331,15 @@ def install_modify_other_keys_aliases() -> int:
     # (#56684 — previously leaked "[27u" as literal text into the prompt).
     # Modifiers run to 16 because kitty reports Cmd as the super bit
     # (mod 9+) — same reason install_cmd_backspace_alias maps 9/10.
-    for seq in ["\x1b[27u"] + [f"\x1b[27;{m}u" for m in range(2, 17)]:
+    # Also install the lock-offset variants (mod+64/+128/+192, plus the
+    # lock-only 65/129/193) so Esc keeps working with NumLock/CapsLock on
+    # (#88221).
+    esc_mods = set(range(2, 17))
+    for m in range(2, 17):
+        for lock in (64, 128, 192):
+            esc_mods.add(m + lock)
+    esc_mods.update((65, 129, 193))
+    for seq in ["\x1b[27u"] + [f"\x1b[27;{m}u" for m in sorted(esc_mods)]:
         if seq not in ANSI_SEQUENCES:
             ANSI_SEQUENCES[seq] = Keys.Escape
             changed += 1
@@ -343,6 +361,20 @@ def install_modify_other_keys_aliases() -> int:
         9: Keys.ControlI,                   # Ctrl+Tab — degrade to Tab
         127: (Keys.Escape, Keys.ControlH),  # Ctrl+Backspace — backward-kill-word,
                                             # matching Ink TUI + Desktop (#78285)
+    })
+
+    # -- Lock-only forms for the plain keys (modifier 1 + lock bits) ----
+    # Enter/Tab/Backspace/Space have NO modifier-1 CSI-u entries (plain
+    # keys are sent as bare ESC[13u / ESC[9u / ESC[127u / ESC[32u).  With
+    # NumLock/CapsLock on, kitty sends ESC[13;129u / ESC[9;129u /
+    # ESC[127;129u / ESC[32;129u (129 = 1|128, etc.), which would
+    # otherwise leak as literal text.  Install via the lock-offset loop in
+    # _install_paired (mod 1 -> 65/129/193) (#88221).
+    _install_paired(1, {
+        13: Keys.ControlM,      # Enter
+        9: Keys.ControlI,       # Tab
+        127: Keys.Backspace,    # Backspace
+        32: " ",                # Space
     })
 
     # -- Kitty functional keys (Private Use Area codepoints) ----

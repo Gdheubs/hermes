@@ -433,3 +433,31 @@ def test_cmd_backspace_alias_not_clobbered():
     install_cmd_backspace_alias()
     install_modify_other_keys_aliases()
     assert _parse("\x1b[127;9u") == [Keys.ControlU]
+
+
+# ---------------------------------------------------------------------------
+# Kitty lock-key state bits (NumLock/CapsLock) — #88221
+# ---------------------------------------------------------------------------
+# kitty ORs CapsLock (64), NumLock (128), both (192) into the modifier
+# field of EVERY CSI-u event while the lock is on, so e.g. Backspace with
+# NumLock arrives as ESC[127;129u instead of ESC[127u. Those lock-offset
+# variants must decode to the same key as the base modifier — never leak
+# as literal text.
+
+@pytest.mark.parametrize("seq,expected", [
+    ("\x1b[127;129u", Keys.Backspace),          # Backspace + NumLock (1|128)
+    ("\x1b[127;65u",  Keys.Backspace),          # Backspace + CapsLock (1|64)
+    ("\x1b[127;193u", Keys.Backspace),          # Backspace + both (1|192)
+    ("\x1b[99;133u",  Keys.ControlC),           # Ctrl+C + NumLock (5|128)
+    ("\x1b[99;197u",  Keys.ControlC),           # Ctrl+C + both (5|192)
+    ("\x1b[13;129u",  Keys.ControlM),           # Enter + NumLock (1|128)
+    ("\x1b[9;129u",   Keys.ControlI),           # Tab + NumLock
+    ("\x1b[32;129u",  " "),                     # Space + NumLock
+    ("\x1b[27;129u",  Keys.Escape),             # Esc + NumLock
+    ("\x1b[27;65u",   Keys.Escape),             # Esc + CapsLock
+    ("\x1b[97;133u",  Keys.ControlA),           # Ctrl+A + NumLock
+])
+def test_lock_key_state_bits_do_not_leak(seq, expected):
+    """Lock-offset CSI-u variants must decode to the base key, not leak
+    as literal escape text (#88221)."""
+    assert _parse(seq) == [expected], f"{seq!r} leaked: {_parse(seq)!r}"
