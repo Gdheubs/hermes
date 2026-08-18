@@ -2965,6 +2965,7 @@ export const en: Translations = {
       moreActions: 'More actions',
       branchNewChat: 'Branch in new chat',
       react: 'React',
+      quoteInNewMessage: 'Quote in new message',
       dismissError: 'Dismiss error',
       filesChanged: count => (count === 1 ? '1 file changed' : `${count} files changed`),
       reviewChanges: 'Review',
