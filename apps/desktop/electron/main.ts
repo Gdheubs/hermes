@@ -266,8 +266,8 @@ import {
   revalidateRemoteConnection
 } from './remote-liveness'
 import { missingRendererAssets } from './renderer-bundle'
-import { assertRuntimeProvisioningAllowed, type RuntimeProvisioningIntent } from './runtime-provisioning-policy'
 import { attachRendererConsoleCapture, formatRendererBoundaryReport } from './renderer-log'
+import { assertRuntimeProvisioningAllowed, type RuntimeProvisioningIntent } from './runtime-provisioning-policy'
 import {
   buildSessionWindowUrl,
   chatWindowWebPreferences,

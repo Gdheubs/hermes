@@ -3,10 +3,10 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import {
-  RuntimeProvisioningDeniedError,
-  SECONDARY_RUNTIME_NOT_INSTALLED,
   assertRuntimeProvisioningAllowed,
-  runtimeNeedsProvisioning
+  runtimeNeedsProvisioning,
+  RuntimeProvisioningDeniedError,
+  SECONDARY_RUNTIME_NOT_INSTALLED
 } from './runtime-provisioning-policy'
 
 test('only the unresolved bootstrap sentinel requires provisioning', () => {
