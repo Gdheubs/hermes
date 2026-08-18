@@ -260,7 +260,20 @@ function ConnectedProviderRow({
         )}
       </RowButton>
       <div className="flex items-center gap-1 pr-2">
-        <Trail className="size-4 text-muted-foreground transition group-hover:text-foreground" />
+        {terminalDisconnect ? (
+          <Button
+            aria-label={`${copy.disconnect} ${title} in terminal`}
+            onClick={() => onTerminalDisconnect(provider)}
+            size="icon-xs"
+            title={copy.disconnectInTerminal}
+            type="button"
+            variant="ghost"
+          >
+            <Terminal className="size-4" />
+          </Button>
+        ) : (
+          <Trail className="size-4 text-muted-foreground transition group-hover:text-foreground" />
+        )}
         {canDisconnect && (
           <Button
             aria-label={`${t.common.remove} ${title}`}
@@ -400,7 +413,7 @@ export function ProvidersSettings({
     runInTerminal(command)
     notify({
       kind: 'info',
-      title: t.settings.providers.removedTitle,
+      title: t.settings.providers.disconnect,
       message: t.settings.providers.removeTerminalRunning(name)
     })
   }

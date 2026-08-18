@@ -10347,11 +10347,14 @@ def _claude_code_only_status() -> Dict[str, Any]:
     when they also have a separate Hermes-managed PKCE login.
     """
     try:
-        from agent.anthropic_adapter import read_claude_code_credentials
+        from agent.anthropic_adapter import (
+            is_claude_code_token_valid,
+            read_claude_code_credentials,
+        )
         creds = read_claude_code_credentials()
     except Exception:
         creds = None
-    if creds and creds.get("accessToken"):
+    if creds and is_claude_code_token_valid(creds):
         return {
             "logged_in": True,
             "source": "claude_code_cli",
@@ -10587,6 +10590,12 @@ def _oauth_provider_disconnect_command(provider: Dict[str, Any]) -> Optional[str
         return None
     if provider.get("id") == "claude-code":
         rm_file = "rm -f ~/.claude/.credentials.json"
+        if sys.platform == "win32":
+            return (
+                'if (Test-Path -LiteralPath "$HOME/.claude/.credentials.json") { '
+                'Remove-Item -LiteralPath "$HOME/.claude/.credentials.json" '
+                "-Force -ErrorAction Stop }"
+            )
         if sys.platform == "darwin":
             return f'security delete-generic-password -s "Claude Code-credentials" 2>/dev/null; {rm_file}'
         return rm_file
@@ -10748,27 +10757,50 @@ async def disconnect_oauth_provider(
                     if oauth_file.exists():
                         oauth_file.unlink()
                         cleared = True
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log.exception("disconnect %s OAuth file failed", provider_id)
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to remove stored credentials for {provider['name']}.",
+                    )
                 # Also clear the credential pool entry if present.
                 try:
                     from hermes_cli.auth import clear_provider_auth
                     cleared = clear_provider_auth("anthropic") or cleared
-                except Exception:
-                    pass
+                except Exception as e:
+                    _log.exception("disconnect %s auth store failed", provider_id)
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"Failed to remove stored credentials for {provider['name']}.",
+                    )
+                if not cleared:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"No stored credentials were removed for {provider['name']}.",
+                    )
                 _log.info("oauth/disconnect: %s", provider_id)
-                return {"ok": bool(cleared), "provider": provider_id}
+                return {"ok": True, "provider": provider_id}
 
             try:
                 from hermes_cli.auth import clear_provider_auth, invalidate_nous_auth_status_cache
                 cleared = clear_provider_auth(provider_id)
                 if provider_id == "nous":
                     invalidate_nous_auth_status_cache()
+                if not cleared:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"No stored credentials were removed for {provider['name']}.",
+                    )
                 _log.info("oauth/disconnect: %s (cleared=%s)", provider_id, cleared)
-                return {"ok": bool(cleared), "provider": provider_id}
+                return {"ok": True, "provider": provider_id}
+            except HTTPException:
+                raise
             except Exception as e:
                 _log.exception("disconnect %s failed", provider_id)
-                raise HTTPException(status_code=500, detail=str(e))
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to remove stored credentials for {provider['name']}.",
+                )
 
     return await asyncio.to_thread(_run)
 

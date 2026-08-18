@@ -9,6 +9,8 @@ const disconnectOAuthProvider = vi.fn()
 const getEnvVars = vi.fn()
 const startManualProviderOAuth = vi.fn()
 const startManualLocalEndpoint = vi.fn()
+const runInTerminal = vi.fn()
+const notify = vi.fn()
 const onboarding = atom({ manual: false })
 
 vi.mock('@/hermes', () => ({
@@ -21,6 +23,15 @@ vi.mock('@/store/onboarding', () => ({
   $desktopOnboarding: onboarding,
   startManualProviderOAuth: (providerId: string) => startManualProviderOAuth(providerId),
   startManualLocalEndpoint: (reason: null | string) => startManualLocalEndpoint(reason)
+}))
+
+vi.mock('@/app/right-sidebar/store', () => ({
+  runInTerminal: (command: string) => runInTerminal(command)
+}))
+
+vi.mock('@/store/notifications', () => ({
+  notify: (notification: unknown) => notify(notification),
+  notifyError: vi.fn()
 }))
 
 function provider(id: string, loggedIn: boolean, patch: Partial<OAuthProvider> = {}): OAuthProvider {
@@ -65,6 +76,10 @@ beforeEach(() => {
     providers: [provider('nous', true), provider('minimax-oauth', false)]
   })
   vi.spyOn(window, 'confirm').mockReturnValue(true)
+  Object.defineProperty(window, 'hermesDesktop', {
+    configurable: true,
+    value: { terminal: {} }
+  })
 })
 
 afterEach(() => {
@@ -125,6 +140,32 @@ describe('ProvidersSettings', () => {
     expect(await screen.findByText('Qwen Code')).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Remove Qwen Code' })).toBeNull()
     expect(screen.getByText(/managed by its own CLI/)).toBeTruthy()
+  })
+
+  it('runs a connected external provider terminal affordance without reopening sign-in', async () => {
+    const command = 'Remove-Item -Force "$HOME/.claude/.credentials.json"'
+    listOAuthProviders.mockResolvedValue({
+      providers: [
+        provider('claude-code', true, {
+          disconnect_command: command,
+          disconnectable: false,
+          flow: 'external',
+          name: 'Anthropic OAuth'
+        })
+      ]
+    })
+
+    await renderProvidersSettings()
+
+    fireEvent.click(
+      await screen.findByRole('button', {
+        name: /Disconnect Anthropic OAuth: Required Extra Usage Credits to Use Subscription in terminal/
+      })
+    )
+
+    expect(runInTerminal).toHaveBeenCalledWith(command)
+    expect(startManualProviderOAuth).not.toHaveBeenCalled()
+    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ kind: 'info', title: 'Disconnect' }))
   })
 
   it('renders a Keys card for a backend-tagged provider with no PROVIDER_GROUPS prefix', async () => {

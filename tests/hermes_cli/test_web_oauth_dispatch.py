@@ -534,6 +534,42 @@ def test_oauth_catalog_marks_external_providers_not_disconnectable():
     assert cmd and ".claude/.credentials.json" in cmd
 
 
+def test_expired_claude_code_credentials_are_not_connected(monkeypatch):
+    """Accounts must use the same local validity gate as Anthropic resolution."""
+    from agent import anthropic_adapter
+
+    monkeypatch.setattr(
+        anthropic_adapter,
+        "read_claude_code_credentials",
+        lambda: {"accessToken": "expired-token", "expiresAt": 1},
+    )
+
+    resp = client.get("/api/providers/oauth", headers=HEADERS)
+    assert resp.status_code == 200, resp.text
+    providers = {p["id"]: p for p in resp.json()["providers"]}
+
+    assert providers["claude-code"]["status"]["logged_in"] is False
+
+
+@pytest.mark.windows_only
+def test_claude_code_disconnect_command_is_native_powershell_on_windows():
+    from hermes_cli import web_server
+
+    provider = next(
+        p for p in web_server._build_oauth_catalog() if p["id"] == "claude-code"
+    )
+
+    command = web_server._oauth_provider_disconnect_command(provider)
+
+    assert command is not None
+    assert "Test-Path" in command
+    assert "Remove-Item" in command
+    assert "-Force" in command
+    assert "-ErrorAction Stop" in command
+    assert "SilentlyContinue" not in command
+    assert "rm -f" not in command
+
+
 def test_external_oauth_disconnect_rejected_before_auth_mutation(monkeypatch):
     """DELETE must not pretend to remove credentials owned by another CLI."""
     from hermes_cli import auth as auth_mod
@@ -564,6 +600,48 @@ def test_env_sourced_oauth_status_is_not_disconnectable(monkeypatch):
     delete_resp = client.delete("/api/providers/oauth/anthropic", headers=HEADERS)
     assert delete_resp.status_code == 400, delete_resp.text
     assert "Settings" in delete_resp.text
+
+
+def test_disconnect_returns_error_when_no_credentials_were_removed(monkeypatch):
+    from hermes_cli import auth as auth_mod
+
+    monkeypatch.setattr(auth_mod, "get_nous_auth_status_local", lambda: {"logged_in": True})
+    monkeypatch.setattr(auth_mod, "clear_provider_auth", lambda _provider: False)
+
+    resp = client.delete("/api/providers/oauth/nous", headers=HEADERS)
+
+    assert resp.status_code == 409, resp.text
+    assert "No stored credentials were removed" in resp.text
+
+
+def test_anthropic_disconnect_surfaces_auth_store_failure(tmp_path, monkeypatch):
+    from agent import anthropic_adapter
+    from hermes_cli import auth as auth_mod
+    from hermes_cli import web_server
+
+    monkeypatch.setattr(
+        web_server,
+        "_resolve_provider_status",
+        lambda _provider_id, _status_fn: {"logged_in": True, "source": "hermes_pkce"},
+    )
+    monkeypatch.setattr(
+        anthropic_adapter,
+        "_get_hermes_oauth_file",
+        lambda: tmp_path / "missing-oauth.json",
+    )
+
+    sensitive_detail = f"auth store is read-only: {tmp_path}"
+
+    def fail_clear(_provider):
+        raise OSError(sensitive_detail)
+
+    monkeypatch.setattr(auth_mod, "clear_provider_auth", fail_clear)
+
+    resp = client.delete("/api/providers/oauth/anthropic", headers=HEADERS)
+
+    assert resp.status_code == 500, resp.text
+    assert "Failed to remove stored credentials for Anthropic API Key" in resp.text
+    assert sensitive_detail not in resp.text
 
 
 def test_xai_dashboard_poller_seeds_single_entry_and_clears_suppression(tmp_path, monkeypatch):
