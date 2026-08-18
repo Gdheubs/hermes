@@ -78,6 +78,16 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
 }
 
 const AGE_KEY = { day: 'ageDay', hour: 'ageHour', minute: 'ageMin' } as const
+const JS_DATE_MAX_UNIX_SECONDS = 8_640_000_000_000
+
+function isDateRepresentableUnixSeconds(value: unknown): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isFinite(value) &&
+    value >= -JS_DATE_MAX_UNIX_SECONDS &&
+    value <= JS_DATE_MAX_UNIX_SECONDS
+  )
+}
 
 // Hover marquee (card title): measure the actual overflow on pointerenter and
 // arm the CSS animation only when there is some — CSS can't detect overflow on
@@ -152,10 +162,17 @@ function SidebarSessionRowImpl({
     toolCallCount: fmt.toolCallCount
   })
 
-  const timestamp = session.last_active || session.started_at
-  const age = formatAge(timestamp, r)
-  const timestampDate = new Date(timestamp * 1000)
-  const absoluteAge = formatMessageTimestamp(timestampDate, t.assistant.thread)
+  // Preserve the existing zero-as-unset contract for last_active while
+  // rejecting numeric values a JavaScript Date cannot represent.
+  const timestamp = isDateRepresentableUnixSeconds(session.last_active) && session.last_active !== 0
+    ? session.last_active
+    : isDateRepresentableUnixSeconds(session.started_at)
+      ? session.started_at
+      : null
+
+  const age = timestamp === null ? '' : formatAge(timestamp, r)
+  const timestampDate = timestamp === null ? null : new Date(timestamp * 1000)
+  const absoluteAge = timestampDate ? formatMessageTimestamp(timestampDate, t.assistant.thread) : ''
   const handleLabel = `Reorder ${title}`
   // Opt-in row metadata from the sidebar's filter menu. Read from the store
   // rather than threaded as props: the subscription re-renders past the memo
@@ -202,7 +219,7 @@ function SidebarSessionRowImpl({
     trailing.push({ key: 'pr', node: <PrTag pr={pr} /> })
   }
 
-  const showAge = pinnedAge || card
+  const showAge = timestamp !== null && (pinnedAge || card)
 
   if (figures.length || showAge) {
     // The card's meta lines separate by spacing alone, so its header figures
@@ -224,7 +241,7 @@ function SidebarSessionRowImpl({
                 <time
                   aria-label={`${age}, ${absoluteAge}`}
                   className="pointer-events-auto focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-sidebar-ring"
-                  dateTime={timestampDate.toISOString()}
+                  dateTime={timestampDate!.toISOString()}
                   tabIndex={0}
                 >
                   {age}

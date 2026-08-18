@@ -60,6 +60,7 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _ephemeral_child_sql,
     _legacy_reset_child_sql,
     _shape_preview,
+    _sql_date_representable_timestamp,
     _sql_session_last_active,
     _sql_session_last_active_by_id,
     escape_like as _escape_like,
@@ -8882,7 +8883,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         ''
                     ) AS _preview_raw,
                     {_sql_session_last_active("s")} AS last_active,
-                    COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
+                    COALESCE(cm.effective_last_active, {_sql_date_representable_timestamp('s.started_at')}) AS _effective_last_active
                 FROM sessions s
                 LEFT JOIN chain_max cm ON cm.root_id = s.id
                 {prompt_join}
@@ -8943,10 +8944,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                          ORDER BY m.timestamp, m.id LIMIT 1),
                         ''
                     ) AS _preview_raw,
-                    COALESCE(
-                        (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
-                        s.started_at
-                    ) AS last_active
+                    {_sql_session_last_active("s")} AS last_active
                 FROM sessions s
                 {prompt_join}
                 {pinned_where}
