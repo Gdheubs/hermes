@@ -63,6 +63,12 @@ def test_export_snippet_shape():
     assert snippet.rstrip().endswith('> "$__hermes_snap_tmp"')
 
 
+def test_export_snippet_excludes_delegated_child_lineage():
+    snippet = _export_dump_excluding_session_vars('"$__hermes_snap_tmp"')
+
+    assert "HERMES_DELEGATED_CHILD_CONTEXT" in snippet
+
+
 # ---------------------------------------------------------------------------
 # Integration: real LocalEnvironment, two sessions, no cross-contamination.
 # ---------------------------------------------------------------------------
@@ -104,5 +110,28 @@ def test_shared_snapshot_no_cross_session_leak(tmp_path):
         if os.path.exists(snap):
             with open(snap) as f:
                 assert "HERMES_SESSION_ID" not in f.read()
+    finally:
+        env.cleanup()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX bash snapshot path")
+def test_shared_snapshot_does_not_turn_later_commands_into_delegated_children(tmp_path):
+    from tools.environments.local import LocalEnvironment
+
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+    env.init_session()
+    try:
+        delegated = env.execute(
+            "export HERMES_DELEGATED_CHILD_CONTEXT=1; "
+            "printf '%s' \"$HERMES_DELEGATED_CHILD_CONTEXT\""
+        )
+        normal = env.execute(
+            "printf '%s' \"${HERMES_DELEGATED_CHILD_CONTEXT-unset}\""
+        )
+
+        assert delegated["output"] == "1"
+        assert normal["output"] == "unset"
+        with open(env._snapshot_path) as f:
+            assert "HERMES_DELEGATED_CHILD_CONTEXT" not in f.read()
     finally:
         env.cleanup()
