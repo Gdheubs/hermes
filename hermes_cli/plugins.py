@@ -3395,6 +3395,13 @@ class PluginManager:
         self.scope_key = scope_key or hermes_home_key()
         self.home_path = Path(self.scope_key)
         self._discovery_lock = threading.RLock()
+        # ``_discovered`` is deliberately set before plugin registration so a
+        # plugin may re-enter discovery from its own register() callback. Keep
+        # the active owner separately so non-blocking startup readers do not
+        # mistake that re-entrancy guard for a completed registry.
+        self._discovery_state_lock = threading.Lock()
+        self._discovery_owner: Optional[int] = None
+        self._discovery_depth = 0
         self._plugins: Dict[str, LoadedPlugin] = {}
         self._hooks: Dict[str, List[Callable]] = {}
         self._middleware: Dict[str, List[Callable]] = {}
@@ -3770,27 +3777,34 @@ class PluginManager:
 
         When ``force`` is true, clear cached discovery state first so config
         changes or newly-added bundled backends become visible in long-lived
-        sessions without requiring a full agent restart.
+        sessions without requiring a full agent restart. Concurrent callers
+        serialize through ``_discovery_lock``; ``_discovered`` still guards
+        same-thread registration re-entry.
         """
         with self._discovery_lock, _plugin_home_scope(self.home_path):
             if self._discovered and not force:
                 return
-            if force:
-                # The ledger owns teardown.  Clearing manager-local containers by
-                # itself leaves process-global tools/platforms/providers installed.
-                self.unload()
-            if env_var_enabled("HERMES_SAFE_MODE"):
-                logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
-                self._discovered = True
-                return
-            # Set the flag up front as a re-entrancy guard (a plugin's register()
-            # can transitively trigger discovery again), but reset it if the sweep
-            # raises so a failed scan is NOT cached as "discovered with an empty
-            # registry" — callers swallow the exception and would otherwise be
-            # permanently stranded on the early-return above (the "No web provider
-            # configured" class of failures).
-            self._discovered = True
+            current_thread = threading.get_ident()
+            with self._discovery_state_lock:
+                if self._discovery_owner is None:
+                    self._discovery_owner = current_thread
+                self._discovery_depth += 1
             try:
+                if force:
+                    # The ledger owns teardown.  Clearing manager-local containers by
+                    # itself leaves process-global tools/platforms/providers installed.
+                    self.unload()
+                if env_var_enabled("HERMES_SAFE_MODE"):
+                    logger.info("HERMES_SAFE_MODE=1 — plugin discovery skipped")
+                    self._discovered = True
+                    return
+                # Set the flag up front as a re-entrancy guard (a plugin's register()
+                # can transitively trigger discovery again), but reset it if the sweep
+                # raises so a failed scan is NOT cached as "discovered with an empty
+                # registry" — callers swallow the exception and would otherwise be
+                # permanently stranded on the early-return above (the "No web provider
+                # configured" class of failures).
+                self._discovered = True
                 self._discover_and_load_inner()
                 # Plugin secret sources register during discover; the initial
                 # load_hermes_dotenv() already ran at import time. Re-pull so the
@@ -3806,6 +3820,21 @@ class PluginManager:
             except BaseException:
                 self._discovered = False
                 raise
+            finally:
+                with self._discovery_state_lock:
+                    self._discovery_depth -= 1
+                    if self._discovery_depth == 0:
+                        self._discovery_owner = None
+
+    def _discovery_is_in_progress(self) -> bool:
+        """Return whether plugin registration is still running."""
+        with self._discovery_state_lock:
+            return self._discovery_owner is not None
+
+    def _discovery_is_owned_by_current_thread(self) -> bool:
+        """Return whether this thread is registering plugins now."""
+        with self._discovery_state_lock:
+            return self._discovery_owner == threading.get_ident()
 
     def _re_register_shell_hooks_after_force(self) -> None:
         """Restore config.yaml shell hooks wiped by force-clear of ``_hooks``."""
@@ -5669,9 +5698,8 @@ def discover_plugins(force: bool = False) -> None:
     Default behavior is idempotent. Pass ``force=True`` to rescan plugin
     manifests and reload state in the current process.
 
-    If a background discovery started via
-    :func:`start_background_plugin_discovery` is still running, this waits
-    for it instead of racing a second scan.
+    If discovery is already running, this waits for completed plugin
+    registration instead of racing a second scan.
     """
     _join_background_discovery()
     get_plugin_manager().discover_and_load(force=force)
@@ -5694,9 +5722,11 @@ def start_background_plugin_discovery() -> None:
     """
     global _background_discovery_thread
     manager = get_plugin_manager()
-    if manager._discovered:
+    if manager._discovered or manager._discovery_is_in_progress():
         return
     with _background_discovery_lock:
+        if manager._discovered or manager._discovery_is_in_progress():
+            return
         if _background_discovery_thread is not None and _background_discovery_thread.is_alive():
             return
 
@@ -5715,6 +5745,8 @@ def start_background_plugin_discovery() -> None:
 
 def _join_background_discovery(timeout: float = 30.0) -> None:
     """Wait for an in-flight background discovery (no-op from its own thread)."""
+    if get_plugin_manager()._discovery_is_owned_by_current_thread():
+        return
     t = _background_discovery_thread
     if t is None or not t.is_alive() or t is threading.current_thread():
         return
@@ -5773,9 +5805,11 @@ def get_plugin_toolset_keys_nowait() -> "set[str]":
     """
     manager = get_plugin_manager()
     t = _background_discovery_thread
-    if manager._discovered and (t is None or not t.is_alive()):
+    manager_in_flight = manager._discovery_is_in_progress()
+    tracked_in_flight = t is not None and t.is_alive()
+    if manager._discovered and not manager_in_flight and not tracked_in_flight:
         return {ts_key for ts_key, _, _ in get_plugin_toolsets()}
-    if t is not None and t.is_alive():
+    if manager_in_flight or tracked_in_flight:
         blob = _read_plugin_keys_cache()
         if blob is not None:
             keys = blob.get("toolset_keys")
@@ -5794,9 +5828,11 @@ def get_portable_mcp_server_names_nowait() -> "set[str]":
     """
     manager = get_plugin_manager()
     t = _background_discovery_thread
-    if manager._discovered and (t is None or not t.is_alive()):
+    manager_in_flight = manager._discovery_is_in_progress()
+    tracked_in_flight = t is not None and t.is_alive()
+    if manager._discovered and not manager_in_flight and not tracked_in_flight:
         return set(manager.get_portable_mcp_servers())
-    if t is not None and t.is_alive():
+    if manager_in_flight or tracked_in_flight:
         blob = _read_plugin_keys_cache()
         if blob is not None:
             names = blob.get("portable_mcp")

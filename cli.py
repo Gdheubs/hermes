@@ -5137,7 +5137,38 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # live registry aliases (registered during discover_mcp_tools),
             # but discovery hasn't run yet at this point, so exclude them.
             mcp_names = set((CLI_CONFIG.get("mcp_servers") or {}).keys())
-            invalid = [t for t in toolsets if not validate_toolset(t) and t not in mcp_names]
+            # Background discovery may already have completed by the time this
+            # validation runs; consult the nowait registry so a legitimate
+            # plugin toolset passes the first pass and the synchronous join
+            # below only happens while discovery is genuinely still in flight.
+            from hermes_cli.plugins import get_plugin_toolset_keys_nowait
+
+            plugin_toolset_keys = get_plugin_toolset_keys_nowait()
+            invalid = [
+                t
+                for t in toolsets
+                if not validate_toolset(t) and t not in mcp_names and t not in plugin_toolset_keys
+            ]
+            if invalid:
+                # Config resolution can select a persisted plugin toolset while
+                # startup discovery is still importing that plugin. Join only
+                # when validation would otherwise reject a name, preserving the
+                # background overlap for ordinary built-in-only startup.
+                try:
+                    from hermes_cli.plugins import discover_plugins
+
+                    discover_plugins()
+                except Exception:
+                    logger.warning(
+                        "plugin discovery failed during CLI toolset validation; "
+                        "the following toolset warning may misreport valid plugins",
+                        exc_info=True,
+                    )
+                invalid = [
+                    t
+                    for t in toolsets
+                    if not validate_toolset(t) and t not in mcp_names
+                ]
             if invalid:
                 self._console_print(f"[bold red]Warning: Unknown toolsets: {', '.join(invalid)}[/]")
         

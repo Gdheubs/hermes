@@ -3,6 +3,7 @@
 import logging
 import json
 import sys
+import threading
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -353,6 +354,103 @@ class TestPluginDiscovery:
             if p.manifest.source != "bundled"
         }
         assert len(non_bundled) == 1
+
+    def test_discovery_allows_same_thread_register_reentry(self, monkeypatch):
+        """A plugin register callback may transitively ensure discovery."""
+        manager = PluginManager()
+        sweeps = []
+
+        def _reentrant_sweep():
+            sweeps.append("started")
+            manager.discover_and_load()
+            sweeps.append("finished")
+
+        monkeypatch.setattr(manager, "_discover_and_load_inner", _reentrant_sweep)
+
+        manager.discover_and_load()
+
+        assert sweeps == ["started", "finished"]
+        assert manager._discovered is True
+        assert manager._discovery_owner is None
+
+    def test_public_discovery_reentry_does_not_join_a_waiting_thread(
+        self, monkeypatch
+    ):
+        """An owner must not join a background caller waiting on that owner."""
+        from hermes_cli import plugins as plugins_mod
+
+        manager = PluginManager()
+
+        class WaitingBackgroundThread:
+            @staticmethod
+            def is_alive():
+                return True
+
+            @staticmethod
+            def join(timeout=None):
+                raise AssertionError("discovery owner joined its own waiter")
+
+        def _reentrant_sweep():
+            monkeypatch.setattr(
+                plugins_mod,
+                "_background_discovery_thread",
+                WaitingBackgroundThread(),
+            )
+            plugins_mod.discover_plugins()
+
+        monkeypatch.setattr(plugins_mod, "_plugin_manager", manager)
+        monkeypatch.setattr(manager, "_discover_and_load_inner", _reentrant_sweep)
+
+        manager.discover_and_load()
+
+        assert manager._discovered is True
+
+    def test_waiter_retries_after_discovery_owner_fails(self, monkeypatch):
+        """A concurrent caller retries after the active sweep fails."""
+        manager = PluginManager()
+        first_sweep_entered = threading.Event()
+        allow_first_failure = threading.Event()
+        waiter_started = threading.Event()
+        calls = []
+        errors = []
+
+        def _sweep():
+            calls.append(threading.current_thread().name)
+            if len(calls) == 1:
+                first_sweep_entered.set()
+                if not allow_first_failure.wait(timeout=5):
+                    raise RuntimeError("waiter never reached discovery")
+                raise RuntimeError("first sweep failed")
+
+        def _run_owner():
+            try:
+                manager.discover_and_load()
+            except RuntimeError as exc:
+                errors.append(str(exc))
+
+        def _run_waiter():
+            waiter_started.set()
+            manager.discover_and_load()
+
+        monkeypatch.setattr(manager, "_discover_and_load_inner", _sweep)
+        owner = threading.Thread(target=_run_owner, name="owner", daemon=True)
+        waiter = threading.Thread(target=_run_waiter, name="waiter", daemon=True)
+        owner.start()
+        assert first_sweep_entered.wait(timeout=5)
+        waiter.start()
+        assert waiter_started.wait(timeout=5)
+        assert calls == ["owner"]
+
+        allow_first_failure.set()
+        owner.join(timeout=5)
+        waiter.join(timeout=5)
+
+        assert not owner.is_alive()
+        assert not waiter.is_alive()
+        assert errors == ["first sweep failed"]
+        assert calls == ["owner", "waiter"]
+        assert manager._discovered is True
+        assert manager._discovery_owner is None
 
 
 
