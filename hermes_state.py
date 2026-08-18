@@ -1844,8 +1844,8 @@ def _bump_schema_cookie(conn: sqlite3.Connection) -> None:
 #
 # * a sidecar attempt ledger (``<db>.repair-attempts.json``) that refuses
 #   further surgery after ``_MAX_PERSISTENT_REPAIR_ATTEMPTS`` failures on
-#   the SAME damaged file (fingerprint = size + mtime; any successful repair
-#   or replacement changes it and resets the count);
+#   the SAME damaged file (fingerprint = size + a bounded content sample; any
+#   successful repair or replacement changes it and resets the count);
 # * backup dedupe + a retention cap in ``_backup_db_file`` — an identical
 #   damaged file is never copied twice, and only the newest
 #   ``_MAX_MALFORMED_BACKUPS`` forensic copies are kept.
@@ -1853,22 +1853,137 @@ def _bump_schema_cookie(conn: sqlite3.Connection) -> None:
 _MAX_PERSISTENT_REPAIR_ATTEMPTS = 3
 _MAX_MALFORMED_BACKUPS = 3
 
+# Sidecars copied alongside a damaged DB and pruned with it. ``-journal`` is
+# included because rollback-journal (DELETE) mode — Hermes's fallback on
+# NFS/SMB/FUSE/ZFS and on WAL-reset-vulnerable SQLite builds — leaves a hot
+# journal on disk whenever a transaction was open, and that file is what
+# interprets the damaged bytes. Omitting it from the forensic copy means the
+# backup cannot be rolled back to a consistent state by hand.
+_DB_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+
+# Head/tail bytes sampled by ``_db_fingerprint``. Enough to change whenever
+# the DB is genuinely repaired, truncated or restored (SQLite rewrites the
+# header on any real recovery), while staying O(1) on a multi-GB file.
+_FINGERPRINT_SAMPLE_BYTES = 65536
+
+# Byte ranges inside SQLite's 100-byte database header that move on ordinary
+# commits rather than on repair, and are therefore masked out of the content
+# sample. In rollback-journal (DELETE) mode a commit writes the main file
+# directly, bumping the file change counter (24-27) and version-valid-for
+# (92-95); a malformed-SCHEMA DB still accepts those writes, so without the
+# mask any live session write re-keys the ledger and the repair budget resets
+# to 1 forever — the exact unbounded loop this ledger exists to stop. (WAL mode
+# routes commits to the -wal sidecar, so the main file's header only moves on
+# checkpoint; masking is harmless there and correct for both.) Everything that
+# matters for repair identity — the page-1 sqlite_master b-tree — sits after
+# byte 100 and stays in the sample.
+_FINGERPRINT_VOLATILE_HEADER_RANGES = ((24, 28), (92, 96))
+
+
+def _mask_volatile_header(head: bytes) -> bytes:
+    """Zero the commit-counter fields so ordinary writes don't re-key the ledger."""
+    if len(head) < 96:
+        return head
+    buf = bytearray(head)
+    for start, end in _FINGERPRINT_VOLATILE_HEADER_RANGES:
+        buf[start:end] = b"\x00" * (end - start)
+    return bytes(buf)
+
+# Free-space headroom for the pre-repair forensic backup. The backup is a
+# full raw copy of the damaged DB (plus its -wal/-shm sidecars), so a repair
+# loop on a large state.db is a disk amplifier: the reporting incident wrote
+# ~98MB every ~10s until the volume was nearly full, which would have taken
+# down every agent on the host.
+#
+# Proportional, not a flat floor: an absolute multi-GB reserve would refuse
+# backups that fit comfortably on small container/VM volumes, and because a
+# refused backup is a HARD STOP (#69603) that would silently convert "repair
+# loops" into "repair never runs" for those deployments. Require the copy
+# itself plus a small slice of the volume, clamped to a modest floor.
+_REPAIR_BACKUP_MIN_FREE_BYTES = 256 * 1024 * 1024  # 256 MiB absolute floor
+_REPAIR_BACKUP_FREE_FRACTION = 0.02  # plus 2% of the volume
+
+
+def _repair_backup_headroom_bytes(total_bytes: int) -> int:
+    """Free space required *beyond* the copy itself, for a volume of *total_bytes*."""
+    return max(
+        _REPAIR_BACKUP_MIN_FREE_BYTES,
+        int(total_bytes * _REPAIR_BACKUP_FREE_FRACTION),
+    )
+
 
 def _repair_ledger_path(db_path: Path) -> Path:
     return db_path.with_name(db_path.name + ".repair-attempts.json")
 
 
 def _db_fingerprint(db_path: Path) -> "Optional[str]":
-    """Cheap identity for a damaged DB file: size + mtime_ns.
+    """Cheap identity for a damaged DB file: size + a bounded content sample.
 
-    Hashing a multi-GB corrupt file on every open is exactly the kind of
-    repeated cost this ledger exists to avoid; size+mtime is stable for a
-    file nothing can successfully write to, and any successful repair,
-    truncation or manual restore changes it (resetting the attempt count).
+    Deliberately EXCLUDES mtime. The original ledger keyed on
+    ``size:mtime_ns`` on the assumption that "nothing can successfully write
+    to a damaged file", but that does not hold for the malformed-schema
+    class: the DB still opens and accepts writes (only ``sqlite_master`` is
+    unreadable), so live writers, WAL checkpoints and the in-place repair
+    strategies themselves all move mtime between passes. Every pass then
+    looked like a NEW file — the attempt counter reset to 1 forever, never
+    reaching ``_MAX_PERSISTENT_REPAIR_ATTEMPTS``, and the ``_backup_db_file``
+    dedupe (which compares mtime too) never matched, so each pass wrote
+    another full-size forensic copy. Observed: a repair every ~10s, a fresh
+    98MB copy each time, 2.3GB in 20 minutes, disk heading to zero.
+
+    Hashing a multi-GB corrupt file on every open is the repeated cost this
+    ledger exists to avoid, so sample instead of digesting the whole file:
+    size plus the head/tail slices that any real repair, truncation or
+    restore necessarily changes. Stable across passes that merely touch
+    mtime; still resets the attempt count after genuine recovery.
+
+    The content read runs under ``offline_file_access`` because it takes a raw
+    descriptor, and ``close()`` on ANY descriptor cancels every POSIX advisory
+    lock this process holds on the file — including a peer connection's
+    RESERVED lock (see ``hermes_cli.sqlite_safe_read`` rule 1). This function
+    is reached from ``repair_state_db_schema``'s exhaustion probe BEFORE
+    ``_backup_db_file``'s ``has_live_connection`` guard, and the repair path is
+    entered by one SessionDB while the gateway holds others, so a live peer is
+    the expected case rather than a theoretical one.
+
+    Returns ``None`` when a live connection makes the read unsafe. Callers MUST
+    NOT substitute a differently-shaped key (an earlier revision fell back to
+    ``size:mtime_ns``): the ledger compares keys for equality, so alternating
+    between a content key and an mtime key across passes never matches, the
+    counter resets to 1 every time and the unbounded repair loop this ledger
+    exists to stop comes straight back. ``None`` means "identity unavailable",
+    and the ledger helpers below keep using the key already on record.
     """
     try:
         st = db_path.stat()
-        return f"{st.st_size}:{st.st_mtime_ns}"
+        try:
+            from hermes_cli.sqlite_safe_read import (
+                LiveConnectionError,
+                offline_file_access,
+            )
+        except ImportError:
+            # Scaffold/embed installs ship hermes_state without hermes_cli. No
+            # tracked connections exist there, so the raw read is safe.
+            @contextmanager
+            def offline_file_access(_path, **_kw):
+                yield
+
+            class LiveConnectionError(Exception):
+                pass
+
+        try:
+            with offline_file_access(db_path, what="fingerprint"):
+                with open(db_path, "rb") as fh:
+                    head = fh.read(_FINGERPRINT_SAMPLE_BYTES)
+                    if st.st_size > _FINGERPRINT_SAMPLE_BYTES:
+                        fh.seek(max(0, st.st_size - _FINGERPRINT_SAMPLE_BYTES))
+                        tail = fh.read(_FINGERPRINT_SAMPLE_BYTES)
+                    else:
+                        tail = b""
+        except LiveConnectionError:
+            return None
+        digest = hashlib.sha256(_mask_volatile_header(head) + tail).hexdigest()[:32]
+        return f"{st.st_size}:{digest}"
     except OSError:
         return None
 
@@ -1890,15 +2005,28 @@ def _persistent_repair_attempts_exhausted(db_path: Path) -> bool:
     failed attempts against the CURRENT file fingerprint. Never raises; a
     missing/corrupt ledger or unstatable DB reads as "not exhausted" (the
     in-process claim and cross-process lock still bound a single run).
+
+    When the fingerprint is unavailable because a live connection makes the
+    content read unsafe, fall back to the SIZE the ledger recorded rather than
+    reading as "not exhausted". Otherwise a peer connection is enough to hide
+    an exhausted budget on every pass, which is the unbounded loop again.
     """
+    ledger = _read_repair_ledger(db_path)
+    recorded = ledger.get("fingerprint")
     fp = _db_fingerprint(db_path)
     if fp is None:
+        # Size is the one component both key shapes share and that a raw read
+        # is not needed for; an unchanged size means the damaged file is very
+        # likely the same one the budget was burned on.
+        try:
+            size_prefix = f"{db_path.stat().st_size}:"
+        except OSError:
+            return False
+        if not isinstance(recorded, str) or not recorded.startswith(size_prefix):
+            return False
+    elif recorded != fp:
         return False
-    ledger = _read_repair_ledger(db_path)
-    return (
-        ledger.get("fingerprint") == fp
-        and int(ledger.get("failed_attempts", 0)) >= _MAX_PERSISTENT_REPAIR_ATTEMPTS
-    )
+    return int(ledger.get("failed_attempts", 0)) >= _MAX_PERSISTENT_REPAIR_ATTEMPTS
 
 
 def _record_repair_outcome(
@@ -1908,20 +2036,30 @@ def _record_repair_outcome(
 
     Defaults to the post-attempt fingerprint — the file state the NEXT
     attempt's exhaustion probe will observe.
+
+    When the fingerprint is unavailable (a live connection makes the content
+    read unsafe), keep the key already on record and still increment: dropping
+    the pass would let a peer connection reset the budget every time, which is
+    the unbounded loop this ledger exists to stop. Never write a differently
+    shaped key — the probe compares for equality, so mixing key shapes across
+    passes never matches.
     """
     ledger_path = _repair_ledger_path(db_path)
     try:
         if repaired:
             ledger_path.unlink(missing_ok=True)
             return
+        ledger = _read_repair_ledger(db_path)
+        recorded = ledger.get("fingerprint")
         fp = fingerprint if fingerprint is not None else _db_fingerprint(db_path)
         if fp is None:
-            return
-        ledger = _read_repair_ledger(db_path)
+            if not isinstance(recorded, str):
+                # No prior key to extend and no way to mint one safely: the
+                # in-process claim and cross-process lock still bound this run.
+                return
+            fp = recorded
         attempts = (
-            int(ledger.get("failed_attempts", 0)) + 1
-            if ledger.get("fingerprint") == fp
-            else 1
+            int(ledger.get("failed_attempts", 0)) + 1 if recorded == fp else 1
         )
         import datetime
 
@@ -1949,7 +2087,7 @@ def _existing_malformed_backups(db_path: Path) -> "List[Path]":
             p
             for p in db_path.parent.iterdir()
             if p.name.startswith(prefix)
-            and not p.name.endswith(("-wal", "-shm"))
+            and not p.name.endswith(_DB_SIDECAR_SUFFIXES)
         ]
     except OSError:
         return []
@@ -1961,8 +2099,7 @@ def _prune_malformed_backups(db_path: Path, keep: int = _MAX_MALFORMED_BACKUPS) 
     for stale in _existing_malformed_backups(db_path)[keep:]:
         for victim in (
             stale,
-            stale.with_name(stale.name + "-wal"),
-            stale.with_name(stale.name + "-shm"),
+            *(stale.with_name(stale.name + suffix) for suffix in _DB_SIDECAR_SUFFIXES),
         ):
             try:
                 victim.unlink(missing_ok=True)
@@ -2014,18 +2151,38 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
         )
         seq += 1
     try:
+        # Sweep staging debris from an earlier interrupted pass (kill mid-copy)
+        # BEFORE the dedupe below. A leftover staging file is a byte-identical
+        # copy of the damaged DB, so its fingerprint MATCHES and the dedupe
+        # would otherwise hand it back as a legitimate forensic backup.
+        # Matches sidecar staging names (``.backup-staging-<stamp>-wal``) too.
+        # The second pattern is the pre-merge ``.incomplete`` spelling, swept so
+        # a host that ran that build does not keep prefix-matching debris that
+        # sorts NEWEST and survives prune forever.
+        for pattern in (
+            f"{db_path.name}.backup-staging-*",
+            f"{db_path.name}.malformed-backup-*.incomplete*",
+        ):
+            for old in db_path.parent.glob(pattern):
+                try:
+                    old.unlink(missing_ok=True)
+                except OSError:  # pragma: no cover - best effort
+                    pass
         # Dedupe (#86747): a repair loop used to copy the SAME damaged bytes
         # on every restart — ~900MB a pass, 89GB over 11 days in the
         # reporting install. If the newest existing backup already matches
-        # this file (size + mtime preserved by copy2), reuse it.
+        # this file, reuse it.
+        #
+        # Matching on mtime made this dedupe miss exactly when it mattered
+        # most: the malformed-SCHEMA class still accepts writes, so live
+        # writers and the in-place repair strategies move mtime between
+        # passes and every pass wrote another full-size copy (2.3GB in 20
+        # minutes). Compare the content fingerprint instead, which is stable
+        # while the damaged bytes are.
         try:
-            src_stat = db_path.stat()
+            src_fp = _db_fingerprint(db_path)
             for existing in _existing_malformed_backups(db_path)[:1]:
-                est = existing.stat()
-                if (
-                    est.st_size == src_stat.st_size
-                    and est.st_mtime_ns == src_stat.st_mtime_ns
-                ):
+                if src_fp is not None and _db_fingerprint(existing) == src_fp:
                     logger.info(
                         "Reusing existing forensic backup %s (identical to the "
                         "damaged DB).", existing,
@@ -2033,11 +2190,79 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
                     return existing, None
         except OSError:
             pass
-        shutil.copy2(db_path, backup_path)
-        for suffix in ("-wal", "-shm"):
-            sidecar = db_path.with_name(db_path.name + suffix)
-            if sidecar.exists():
-                shutil.copy2(sidecar, backup_path.with_name(backup_path.name + suffix))
+        # Disk guard: this is a full raw copy of a possibly multi-GB DB plus
+        # its sidecars. On a host whose volume is already nearly full — which
+        # a preceding repair loop may itself have caused — taking it can
+        # finish off the disk and take down every process on the machine.
+        # Refuse while there is still room to refuse in.
+        try:
+            need = db_path.stat().st_size
+            for suffix in _DB_SIDECAR_SUFFIXES:
+                sidecar = db_path.with_name(db_path.name + suffix)
+                if sidecar.exists():
+                    need += sidecar.stat().st_size
+            usage = shutil.disk_usage(db_path.parent)
+            headroom = _repair_backup_headroom_bytes(usage.total)
+            if usage.free - need < headroom:
+                reason = (
+                    f"only {usage.free / 1e9:.2f}GB free on {db_path.parent}; "
+                    f"copying the damaged DB needs {need / 1e9:.2f}GB and must "
+                    f"leave {headroom / 1e9:.2f}GB headroom. Free disk space, "
+                    f"then retry (or recover manually with `sqlite3 {db_path} "
+                    '".recover"`).'
+                )
+                logger.error("Refusing forensic backup of %s: %s", db_path, reason)
+                return None, reason
+        except OSError as exc:
+            # Fail CLOSED. This guard exists for the nearly-full volume, which
+            # is exactly where stat()/disk_usage() is most likely to fail — and
+            # proceeding would take the multi-GB copy that finishes off the
+            # disk. A refused backup is a HARD STOP (#69603), so repair simply
+            # does not run until a human frees space, which is the safe side.
+            reason = (
+                f"could not determine free space on {db_path.parent} ({exc}); "
+                "refusing the forensic copy rather than risk filling the "
+                f"volume. Free disk space, then retry (or recover manually "
+                f'with `sqlite3 {db_path} ".recover"`).'
+            )
+            logger.error("Refusing forensic backup of %s: %s", db_path, reason)
+            return None, reason
+        # Copy to a staging name OUTSIDE the ``.malformed-backup-`` prefix, then
+        # rename into place only once every copy has succeeded. The prefix
+        # matters: ``_existing_malformed_backups`` matches on
+        # ``startswith(f"{db}.malformed-backup-")`` and excludes only ``-wal``/
+        # ``-shm`` suffixes, so a staging name derived from the backup name (e.g.
+        # ``…malformed-backup-<stamp>.incomplete``) still counts as a backup —
+        # it sorts NEWEST (``.incomplete`` > the bare stamp), so prune's
+        # keep-3-newest slice retained partials and deleted intact copies, and
+        # the dedupe could hand a partial back as the official ``backup_path``,
+        # passing the #69603 hard-stop gate with no real forensic copy on disk.
+        staging = db_path.with_name(f"{db_path.name}.backup-staging-{stamp}")
+        staged: "List[Tuple[Path, Path]]" = []
+        try:
+            shutil.copy2(db_path, staging)
+            staged.append((staging, backup_path))
+            for suffix in _DB_SIDECAR_SUFFIXES:
+                sidecar = db_path.with_name(db_path.name + suffix)
+                if sidecar.exists():
+                    side_staging = staging.with_name(staging.name + suffix)
+                    shutil.copy2(sidecar, side_staging)
+                    staged.append(
+                        (side_staging, backup_path.with_name(backup_path.name + suffix))
+                    )
+            for src, dst in staged:
+                os.replace(src, dst)
+        except Exception:
+            for src, _ in staged:
+                try:
+                    src.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            try:
+                staging.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
         # Retention cap (#86747): keep only the newest few forensic copies.
         _prune_malformed_backups(db_path)
         return backup_path, None
